@@ -1,0 +1,31 @@
+{
+  "name": "relaybridge",
+  "version": "2.0.0",
+  "description": "Local PowerShell and multi-AI control plane with browser, REST, and MCP adapters",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "start:no-pty": "node -e \"process.env.PTY_MODE='none'; require('./server.js')\"",
+    "mcp": "node mcp/server.mjs",
+    "mcp:check": "node --check mcp/server.mjs",
+    "smoke:mcp": "node tools/mcp-smoke.mjs",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "^2.0.0",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
+    "express": "^4.22.2",
+    "ws": "^8.21.3",
+    "zod": "^4.4.3"
+  },
+  "optionalDependencies": {
+    "node-pty": "^1.1.0"
+  },
+  "engines": {
+    "node": ">=20.3"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "^2.0.0"
+  }
+}

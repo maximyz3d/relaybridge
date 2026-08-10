@@ -1,0 +1,504 @@
+{
+  "_comment": "Per-CLI config. 'safe'/'dangerous' launch interactive sessions. 'oneshot_safe'/'oneshot_dangerous' power Collab Mode. Use {prompt} for a bounded inline prompt, {prompt_file} when the CLI supports a file, or no placeholder to pipe stdin. 'probe' is a non-mutating readiness check. Edit freely.",
+  "powershell": {
+    "label": "PowerShell",
+    "company": "Microsoft",
+    "color": "#0078d4",
+    "safe": [
+      "powershell.exe",
+      "-NoLogo"
+    ],
+    "dangerous": [
+      "powershell.exe",
+      "-NoLogo",
+      "-ExecutionPolicy",
+      "Bypass"
+    ]
+  },
+  "claude": {
+    "label": "Claude Code",
+    "company": "Anthropic",
+    "transport": "subscription:anthropic",
+    "color": "#cc785c",
+    "safe": [
+      "claude",
+      "--permission-mode",
+      "plan",
+      "--model",
+      "opus",
+      "--effort",
+      "max"
+    ],
+    "dangerous": [
+      "claude",
+      "--model",
+      "opus",
+      "--effort",
+      "max",
+      "--dangerously-skip-permissions"
+    ],
+    "oneshot_safe": [
+      "claude",
+      "-p",
+      "--permission-mode",
+      "plan",
+      "--model",
+      "opus",
+      "--effort",
+      "max"
+    ],
+    "oneshot_dangerous": [
+      "claude",
+      "-p",
+      "--model",
+      "opus",
+      "--effort",
+      "max",
+      "--dangerously-skip-permissions"
+    ],
+    "probe": [
+      "claude",
+      "auth",
+      "status"
+    ],
+    "probe_redact": true,
+    "probe_success_detail": "authenticated Claude subscription session",
+    "version_probe": [
+      "claude",
+      "--version"
+    ],
+    "strip_env": [
+      "ANTHROPIC_API_KEY",
+      "ANTHROPIC_AUTH_TOKEN",
+      "ANTHROPIC_BASE_URL",
+      "CLAUDE_CODE_USE_BEDROCK",
+      "CLAUDE_CODE_USE_VERTEX",
+      "CLAUDE_CODE_USE_FOUNDRY"
+    ],
+    "npm_package": "@anthropic-ai/claude-code"
+  },
+  "claude_fable": {
+    "label": "Claude Fable 5",
+    "company": "Anthropic",
+    "transport": "subscription:anthropic",
+    "model": "claude-fable-5",
+    "color": "#d99574",
+    "safe": [
+      "claude",
+      "--permission-mode",
+      "plan",
+      "--model",
+      "fable",
+      "--effort",
+      "high"
+    ],
+    "dangerous": [
+      "claude",
+      "--model",
+      "fable",
+      "--effort",
+      "high",
+      "--dangerously-skip-permissions"
+    ],
+    "oneshot_safe": [
+      "claude",
+      "-p",
+      "--permission-mode",
+      "plan",
+      "--model",
+      "fable",
+      "--effort",
+      "high"
+    ],
+    "oneshot_dangerous": [
+      "claude",
+      "-p",
+      "--model",
+      "fable",
+      "--effort",
+      "high",
+      "--dangerously-skip-permissions"
+    ],
+    "probe": [
+      "claude",
+      "auth",
+      "status"
+    ],
+    "probe_redact": true,
+    "probe_success_detail": "authenticated Claude subscription session; Fable alias is accepted by the installed CLI",
+    "version_probe": [
+      "claude",
+      "--version"
+    ],
+    "strip_env": [
+      "ANTHROPIC_API_KEY",
+      "ANTHROPIC_AUTH_TOKEN",
+      "ANTHROPIC_BASE_URL",
+      "CLAUDE_CODE_USE_BEDROCK",
+      "CLAUDE_CODE_USE_VERTEX",
+      "CLAUDE_CODE_USE_FOUNDRY"
+    ],
+    "npm_package": "@anthropic-ai/claude-code",
+    "_note": "Fable 5 is an explicit lower-cost/review seat on the same Claude subscription. Readiness proves the installed CLI and login; an actual receipt is required before claiming end-to-end model availability."
+  },
+  "codex": {
+    "label": "Codex",
+    "company": "OpenAI",
+    "transport": "subscription:chatgpt",
+    "color": "#10a37f",
+    "safe": [
+      "codex",
+      "--sandbox",
+      "read-only"
+    ],
+    "dangerous": [
+      "codex",
+      "--dangerously-bypass-approvals-and-sandbox"
+    ],
+    "oneshot_safe": [
+      "codex",
+      "exec",
+      "--skip-git-repo-check",
+      "--sandbox",
+      "read-only",
+      "--ephemeral",
+      "-"
+    ],
+    "oneshot_dangerous": [
+      "codex",
+      "exec",
+      "--skip-git-repo-check",
+      "--dangerously-bypass-approvals-and-sandbox",
+      "-"
+    ],
+    "probe": [
+      "codex",
+      "login",
+      "status"
+    ],
+    "probe_success_detail": "authenticated ChatGPT Codex session",
+    "version_probe": [
+      "codex",
+      "--version"
+    ],
+    "strip_env": [
+      "OPENAI_API_KEY",
+      "CODEX_API_KEY",
+      "OPENAI_BASE_URL"
+    ],
+    "npm_package": "@openai/codex"
+  },
+  "gemini": {
+    "label": "Gemini (Antigravity)",
+    "company": "Google",
+    "transport": "subscription:antigravity",
+    "color": "#4285f4",
+    "safe": [
+      "agy.exe",
+      "--model",
+      "gemini-3.1-pro-high",
+      "--mode",
+      "plan",
+      "--sandbox"
+    ],
+    "dangerous": [
+      "agy.exe",
+      "--model",
+      "gemini-3.1-pro-high",
+      "--mode",
+      "accept-edits",
+      "--dangerously-skip-permissions"
+    ],
+    "oneshot_safe": [
+      "agy.exe",
+      "--model",
+      "gemini-3.1-pro-high",
+      "--mode",
+      "plan",
+      "--print-timeout",
+      "3m",
+      "--disable-slash-commands",
+      "--sandbox",
+      "--print",
+      "{prompt}"
+    ],
+    "oneshot_dangerous": [
+      "agy.exe",
+      "--model",
+      "gemini-3.1-pro-high",
+      "--mode",
+      "accept-edits",
+      "--print-timeout",
+      "3m",
+      "--disable-slash-commands",
+      "--dangerously-skip-permissions",
+      "--print",
+      "{prompt}"
+    ],
+    "prompt_max_chars": 24000,
+    "probe": [
+      "agy.exe",
+      "models"
+    ],
+    "probe_expect": "gemini-3.1-pro-high",
+    "probe_success_detail": "authenticated; configured Gemini model is available",
+    "version_probe": [
+      "agy.exe",
+      "--version"
+    ],
+    "strip_env": [
+      "GEMINI_API_KEY",
+      "GOOGLE_API_KEY",
+      "GOOGLE_GENAI_USE_VERTEXAI"
+    ],
+    "install_command": [
+      "powershell.exe",
+      "-NoLogo",
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-Command",
+      "irm https://antigravity.google/cli/install.ps1 | iex"
+    ],
+    "install_display": "irm https://antigravity.google/cli/install.ps1 | iex",
+    "post_install": "Open a fresh PowerShell and run agy once to sign in.",
+    "docs_url": "https://antigravity.google/docs/cli/gcli-migration"
+  },
+  "grok": {
+    "label": "Grok Build",
+    "company": "xAI",
+    "transport": "subscription:grok-build",
+    "color": "#f4f4f4",
+    "model": "grok-4.5",
+    "safe": [
+      "grok",
+      "--model",
+      "grok-4.5"
+    ],
+    "dangerous": [
+      "grok",
+      "--model",
+      "grok-4.5",
+      "--always-approve",
+      "--sandbox",
+      "off"
+    ],
+    "oneshot_safe": [
+      "grok",
+      "--model",
+      "grok-4.5",
+      "--prompt-file",
+      "{prompt_file}",
+      "--output-format",
+      "plain",
+      "--permission-mode",
+      "dontAsk",
+      "--sandbox",
+      "read-only",
+      "--no-subagents",
+      "--max-turns",
+      "1",
+      "--verbatim",
+      "--no-auto-update"
+    ],
+    "oneshot_dangerous": [
+      "grok",
+      "--model",
+      "grok-4.5",
+      "--prompt-file",
+      "{prompt_file}",
+      "--output-format",
+      "plain",
+      "--always-approve",
+      "--sandbox",
+      "off",
+      "--no-subagents",
+      "--max-turns",
+      "1",
+      "--verbatim",
+      "--no-auto-update"
+    ],
+    "probe": [
+      "grok",
+      "models"
+    ],
+    "probe_expect": "grok-4.5",
+    "probe_success_detail": "authenticated; configured Grok model is available",
+    "version_probe": [
+      "grok",
+      "--version"
+    ],
+    "strip_env": [
+      "XAI_API_KEY",
+      "XAI_BASE_URL"
+    ],
+    "npm_package": "@xai-official/grok",
+    "install_display": "npm install -g @xai-official/grok",
+    "post_install": "Run grok login once to sign in."
+  },
+  "perplexity": {
+    "label": "Perplexity",
+    "company": "Perplexity",
+    "transport": "subscription:pwm",
+    "model": "auto",
+    "color": "#20b8cd",
+    "safe": [
+      "node",
+      "tools/pplx.js"
+    ],
+    "dangerous": [
+      "node",
+      "tools/pplx.js"
+    ],
+    "oneshot_safe": [
+      "node",
+      "tools/pplx.js",
+      "--once"
+    ],
+    "oneshot_dangerous": [
+      "node",
+      "tools/pplx.js",
+      "--once"
+    ],
+    "probe": [
+      "node",
+      "tools/pplx.js",
+      "--check"
+    ],
+    "diagnostic_binary": "pwm",
+    "version_probe": [
+      "pwm",
+      "--version"
+    ],
+    "strip_env": [
+      "PERPLEXITY_API_KEY",
+      "PPLX_API_KEY",
+      "PPLX_ALLOW_PAID_API_FALLBACK"
+    ],
+    "pip_package": "perplexity-web-mcp-cli",
+    "install_command": [
+      "uv.exe",
+      "tool",
+      "install",
+      "--upgrade",
+      "perplexity-web-mcp-cli"
+    ],
+    "install_display": "uv tool install --upgrade perplexity-web-mcp-cli",
+    "post_install": "Run pwm login once to connect your Perplexity subscription.",
+    "docs_url": "https://github.com/jacob-bd/perplexity-web-mcp",
+    "_note": "Uses your Perplexity web subscription via the community pwm CLI. The RelayBridge subscription seat strips paid-API fallback variables and consumes normal Perplexity web/search quotas. Optional PPLX_MODEL defaults to auto; validate explicit names with pwm ask --help."
+  },
+  "ollama_fast": {
+    "label": "Local Qwen 2.5 1.5B (Fast)",
+    "company": "Ollama / Qwen",
+    "transport": "local:ollama",
+    "oneshot_adapter": "ollama_api",
+    "model": "qwen2.5:1.5b",
+    "prompt_max_chars": 16000,
+    "max_output_tokens": 512,
+    "color": "#65c18c",
+    "safe": ["ollama.exe", "run", "qwen2.5:1.5b"],
+    "dangerous": ["ollama.exe", "run", "qwen2.5:1.5b"],
+    "oneshot_safe": ["ollama.exe", "run", "qwen2.5:1.5b"],
+    "oneshot_dangerous": ["ollama.exe", "run", "qwen2.5:1.5b"],
+    "probe": ["ollama.exe", "show", "qwen2.5:1.5b"],
+    "probe_success_detail": "configured fast local Ollama model is installed",
+    "version_probe": ["ollama.exe", "--version"],
+    "diagnostic_binary": "ollama.exe",
+    "install_display": "winget install --id Ollama.Ollama -e",
+    "post_install": "Run ollama pull qwen2.5:1.5b, then restart RelayBridge.",
+    "docs_url": "https://docs.ollama.com/windows",
+    "_note": "Apache-2.0 model, no-API-fee, non-thinking local utility seat. Uses local compute, memory, storage, and electricity; escalate failed validations."
+  },
+  "ollama": {
+    "label": "Local Qwen3 4B",
+    "company": "Ollama / Qwen",
+    "transport": "local:ollama",
+    "oneshot_adapter": "ollama_api",
+    "model": "qwen3:4b",
+    "strip_thinking": true,
+    "prompt_max_chars": 24000,
+    "max_output_tokens": 1024,
+    "color": "#9b87f5",
+    "safe": [
+      "ollama.exe",
+      "run",
+      "qwen3:4b"
+    ],
+    "dangerous": [
+      "ollama.exe",
+      "run",
+      "qwen3:4b"
+    ],
+    "oneshot_safe": [
+      "ollama.exe",
+      "run",
+      "qwen3:4b"
+    ],
+    "oneshot_dangerous": [
+      "ollama.exe",
+      "run",
+      "qwen3:4b"
+    ],
+    "probe": [
+      "ollama.exe",
+      "show",
+      "qwen3:4b"
+    ],
+    "probe_success_detail": "configured local Ollama model is installed",
+    "version_probe": [
+      "ollama.exe",
+      "--version"
+    ],
+    "diagnostic_binary": "ollama.exe",
+    "install_display": "winget install --id Ollama.Ollama -e",
+    "post_install": "Run ollama pull qwen3:4b, then restart RelayBridge.",
+    "docs_url": "https://docs.ollama.com/windows",
+    "_note": "Zero API fee, but uses local compute, memory, storage, and electricity. This installed model is eligible for utility/standard work only until local task benchmarks qualify it."
+  },
+  "ollama_coder": {
+    "label": "Local Qwen Coder 7B",
+    "company": "Ollama / Qwen",
+    "transport": "local:ollama",
+    "oneshot_adapter": "ollama_api",
+    "model": "qwen2.5-coder:7b",
+    "prompt_max_chars": 32000,
+    "max_output_tokens": 1536,
+    "color": "#7c6ee6",
+    "safe": [
+      "ollama.exe",
+      "run",
+      "qwen2.5-coder:7b"
+    ],
+    "dangerous": [
+      "ollama.exe",
+      "run",
+      "qwen2.5-coder:7b"
+    ],
+    "oneshot_safe": [
+      "ollama.exe",
+      "run",
+      "qwen2.5-coder:7b"
+    ],
+    "oneshot_dangerous": [
+      "ollama.exe",
+      "run",
+      "qwen2.5-coder:7b"
+    ],
+    "probe": [
+      "ollama.exe",
+      "show",
+      "qwen2.5-coder:7b"
+    ],
+    "probe_success_detail": "configured local Ollama coding model is installed",
+    "version_probe": [
+      "ollama.exe",
+      "--version"
+    ],
+    "diagnostic_binary": "ollama.exe",
+    "install_display": "winget install --id Ollama.Ollama -e",
+    "post_install": "Run ollama pull qwen2.5-coder:7b, then restart RelayBridge.",
+    "docs_url": "https://docs.ollama.com/windows",
+    "_note": "Zero API fee local coding seat. Escalate validator or test failures; model-card claims are not a reproduced RelayBridge benchmark."
+  }
+}

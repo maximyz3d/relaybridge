@@ -1,0 +1,9 @@
+node_modules/
+.state.json
+.bridge-token
+.mcp-start.lock
+data/cache/
+data/receipts/
+data/runs/
+data/
+*.log

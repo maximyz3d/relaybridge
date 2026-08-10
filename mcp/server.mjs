@@ -1,0 +1,1493 @@
+#!/usr/bin/env node
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { McpServer } from '@modelcontextprotocol/server';
+import { serveStdio } from '@modelcontextprotocol/server/stdio';
+import { z } from 'zod';
+import {
+  BASE_URL,
+  BRIDGE_ROOT,
+  BridgeError,
+  bridgeRequest,
+  health,
+  restartBridge,
+  startBridge,
+  stopBridge,
+} from './bridge-client.mjs';
+import { classifyTask, estimateTokens, loadRoutingData, routeTask } from './router.mjs';
+import {
+  appendReceipt as persistReceipt,
+  listReceiptCursorPage,
+  listReceiptPage,
+  listReceipts,
+  listRunPage,
+  listRuns,
+  readCache,
+  readReceipt,
+  readRun,
+  stableHash,
+  writeCache,
+  writeRun as persistRun,
+} from './receipts.mjs';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const PACKAGE = JSON.parse(fs.readFileSync(path.join(BRIDGE_ROOT, 'package.json'), 'utf8'));
+function envFirst(...names) {
+  for (const name of names) {
+    const value = process.env[name];
+    if (value !== undefined && String(value).trim() !== '') return value;
+  }
+  return '';
+}
+
+const CLI_CONFIG_PATH = path.resolve(envFirst('RELAYBRIDGE_CONFIG_FILE', 'PS_BRIDGE_CONFIG_FILE') || path.join(BRIDGE_ROOT, 'cli-config.json'));
+
+const READ_ONLY = {
+  readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: false,
+};
+const EXTERNAL_READ = { ...READ_ONLY, openWorldHint: true };
+const AUDITED_READ = { ...READ_ONLY, idempotentHint: false };
+const ACTION = {
+  readOnlyHint: false,
+  destructiveHint: false,
+  idempotentHint: false,
+  openWorldHint: false,
+};
+const DESTRUCTIVE = {
+  readOnlyHint: false,
+  destructiveHint: true,
+  idempotentHint: false,
+  openWorldHint: false,
+};
+
+function loadCliConfig() {
+  return JSON.parse(fs.readFileSync(CLI_CONFIG_PATH, 'utf8'));
+}
+
+function providerIdentityMaterial(kind) {
+  const entry = loadCliConfig()[kind];
+  if (entry?.transport !== 'local:ollama' || !entry.model || !process.env.USERPROFILE) return '';
+  const match = /^([A-Za-z0-9._-]+)(?::([A-Za-z0-9._-]+))?$/.exec(String(entry.model));
+  if (!match) return '';
+  const manifestPath = path.join(
+    process.env.USERPROFILE,
+    '.ollama', 'models', 'manifests', 'registry.ollama.ai', 'library',
+    match[1], match[2] || 'latest',
+  );
+  try { return fs.readFileSync(manifestPath, 'utf8'); }
+  catch { return ''; }
+}
+
+function clip(value, maxChars) {
+  const text = String(value || '');
+  if (text.length <= maxChars) return { text, truncated: false, originalChars: text.length };
+  const marker = '\n\n...[truncated by RelayBridge MCP]...\n\n';
+  const head = Math.floor((maxChars - marker.length) * 0.35);
+  const tail = Math.max(0, maxChars - marker.length - head);
+  return {
+    text: text.slice(0, head) + marker + text.slice(-tail),
+    truncated: true,
+    originalChars: text.length,
+  };
+}
+
+function boundTranscript(messages, maxChars) {
+  const original = Array.isArray(messages) ? messages : [];
+  const items = [...original];
+  while (items.length && JSON.stringify(items).length > maxChars) items.shift();
+  if (items.length || !original.length) {
+    return { items, truncated: items.length !== original.length };
+  }
+
+  // Preserve valid JSON even when a single message is larger than the budget.
+  // A preview is deliberately wrapped instead of clipping serialized JSON.
+  const preview = clip(JSON.stringify(original.at(-1)), Math.max(256, maxChars - 256));
+  return {
+    items: [{ _psBridgeTruncated: true, preview: preview.text }],
+    truncated: true,
+  };
+}
+
+// The running-run list is derived from the runs directory rather than from a
+// caller-supplied limit, so it needs its own cap to stay inside the budget.
+const MAX_RUNNING_RUNS = 25;
+
+function result(data, { isError = false, textOverride } = {}) {
+  const structured = data && typeof data === 'object' && !Array.isArray(data) ? data : { value: data };
+  return {
+    content: [{ type: 'text', text: textOverride === undefined ? JSON.stringify(structured, null, 2) : String(textOverride) }],
+    structuredContent: structured,
+    ...(isError ? { isError: true } : {}),
+  };
+}
+
+function toolError(error) {
+  const payload = {
+    ok: false,
+    error: error?.message || String(error),
+  };
+  if (error instanceof BridgeError) {
+    payload.route = error.route;
+    payload.status = error.status;
+    payload.detail = error.detail;
+  }
+  return result(payload, { isError: true });
+}
+
+function safeHandler(handler) {
+  return async (args, context) => {
+    try { return await handler(args || {}, context); }
+    catch (error) { return toolError(error); }
+  };
+}
+
+function appendReceipt(event) {
+  try { return persistReceipt(event); }
+  catch (error) {
+    return {
+      ...event,
+      receiptId: event.receiptId || `rcpt_unpersisted_${Date.now().toString(36)}`,
+      timestamp: event.timestamp || new Date().toISOString(),
+      receiptPersistenceError: error?.message || String(error),
+    };
+  }
+}
+
+function writeRun(run) {
+  try { return persistRun(run); }
+  catch (error) {
+    return {
+      ...run,
+      runId: run.runId || `run_unpersisted_${Date.now().toString(36)}`,
+      createdAt: run.createdAt || new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      receiptPersistenceError: error?.message || String(error),
+    };
+  }
+}
+
+function providerSummaries(diagnostics = {}) {
+  const config = loadCliConfig();
+  const { evidence } = loadRoutingData();
+  return Object.entries(evidence.providers).map(([kind, item]) => {
+    const cli = config[kind] || {};
+    const diag = diagnostics[kind] || {};
+    return {
+      kind,
+      label: cli.label || kind,
+      company: cli.company || '',
+      transport: cli.transport || (kind === 'powershell' ? 'local:process' : 'cli'),
+      configuredModel: cli.model || item.modelIdentity,
+      readiness: {
+        found: diag.found ?? null,
+        ready: diag.ready ?? null,
+        detail: diag.detail || '',
+        path: Array.isArray(diag.paths) ? diag.paths[0] || null : null,
+        runtimeVersion: diag.runtimeVersion || null,
+      },
+      costClass: item.costClass,
+      privacyBoundary: item.privacyBoundary,
+      qualification: item.qualification,
+      capabilities: item.capabilities,
+      evidence: item.evidence || [],
+      references: item.references || [],
+      capabilityProvenance: item.capabilityProvenance || {},
+      qualificationEvidence: item.qualificationEvidence || null,
+      runtimeLicense: item.runtimeLicense || null,
+      modelLicense: item.modelLicense || null,
+      serviceTerms: item.serviceTerms || null,
+      limitations: item.limitations || [],
+    };
+  });
+}
+
+const DIAGNOSTIC_CACHE_TTL_MS = Math.max(0, Math.min(Number(envFirst('RELAYBRIDGE_DIAGNOSTIC_CACHE_TTL_MS', 'PS_BRIDGE_DIAGNOSTIC_CACHE_TTL_MS')) || 5000, 60000));
+const DIAGNOSTIC_UPSTREAM_TIMEOUT_MS = 30000;
+let diagnosticCache = null;
+let diagnosticFlight = null;
+
+// Test seam: readiness probes spawn real child processes, so the cache and the
+// in-flight request are process-global. Tests need a deterministic start.
+export function resetDiagnosticState() {
+  const flight = diagnosticFlight;
+  diagnosticCache = null;
+  diagnosticFlight = null;
+  if (flight && !flight.settled) flight.controller.abort(new Error('diagnostic state reset'));
+}
+
+function startDiagnosticFlight() {
+  const controller = new AbortController();
+  const flight = { controller, subscribers: 0, settled: false, promise: null };
+  flight.promise = bridgeRequest('/api/diag', {
+    timeoutMs: DIAGNOSTIC_UPSTREAM_TIMEOUT_MS,
+    signal: controller.signal,
+  }).then((response) => {
+    const value = response.results || {};
+    diagnosticCache = { at: Date.now(), value };
+    return value;
+  }).finally(() => {
+    flight.settled = true;
+    if (diagnosticFlight === flight) diagnosticFlight = null;
+  });
+  // Promise.race below attaches the only rejection handler. Guarantee one now so
+  // a flight that loses its last subscriber can never surface as an unhandled
+  // rejection during interpreter teardown.
+  flight.promise.catch(() => {});
+  return flight;
+}
+
+async function getDiagnostics(signal, timeoutMs = DIAGNOSTIC_UPSTREAM_TIMEOUT_MS) {
+  if (signal?.aborted) throw signal.reason || new Error('diagnostic request cancelled');
+  if (diagnosticCache && Date.now() - diagnosticCache.at <= DIAGNOSTIC_CACHE_TTL_MS) return diagnosticCache.value;
+
+  if (!diagnosticFlight) diagnosticFlight = startDiagnosticFlight();
+
+  const flight = diagnosticFlight;
+  flight.subscribers += 1;
+  const boundedTimeout = Math.max(1, Math.min(Number(timeoutMs) || DIAGNOSTIC_UPSTREAM_TIMEOUT_MS, DIAGNOSTIC_UPSTREAM_TIMEOUT_MS));
+  const timeoutSignal = AbortSignal.timeout(boundedTimeout);
+  const callerSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+  const abortReason = () => {
+    const reason = callerSignal.reason;
+    if (reason?.name === 'TimeoutError') {
+      return new Error(`provider readiness did not return within the ${boundedTimeout}ms remaining for this call`);
+    }
+    return reason || new Error('diagnostic request cancelled');
+  };
+  let abortHandler = null;
+  const releaseFlight = () => {
+    flight.subscribers -= 1;
+    if (flight.settled || flight.subscribers > 0) return;
+    // Drop the shared flight before aborting it. A caller arriving in the same
+    // tick must start a fresh request instead of subscribing to a doomed one.
+    if (diagnosticFlight === flight) diagnosticFlight = null;
+    flight.controller.abort(new Error('all diagnostic subscribers disconnected'));
+  };
+  if (callerSignal.aborted) {
+    releaseFlight();
+    throw abortReason();
+  }
+  const callerAbort = new Promise((_, reject) => {
+    abortHandler = () => reject(abortReason());
+    callerSignal.addEventListener('abort', abortHandler, { once: true });
+  });
+  try {
+    return await Promise.race([flight.promise, callerAbort]);
+  } finally {
+    if (abortHandler) callerSignal.removeEventListener('abort', abortHandler);
+    releaseFlight();
+  }
+}
+
+async function buildContextBundle({
+  includeDiagnostics = true,
+  includeSessionOutput = true,
+  sessionTailChars = 2000,
+  maxSessions = 8,
+  includeCollabMessages = true,
+  maxCollabs = 5,
+  maxMessagesPerCollab = 8,
+  recentRuns = 10,
+  recentReceipts = 20,
+  maxChars = 90000,
+  signal,
+} = {}) {
+  const sectionErrors = [];
+  const capture = async (name, loader, fallback) => {
+    try { return await loader(); }
+    catch (error) {
+      sectionErrors.push({ section: name, error: error?.message || String(error) });
+      return fallback;
+    }
+  };
+  const routing = loadRoutingData();
+  const [diagnostics, sessionsRaw, collabsRaw, projectsRaw] = await Promise.all([
+    includeDiagnostics ? capture('diagnostics', () => getDiagnostics(signal), {}) : {},
+    capture('sessions', () => bridgeRequest('/api/sessions', { signal }), []),
+    capture('collaborations', () => bridgeRequest('/api/collabs', { signal }), { collabs: [] }),
+    capture('projects', () => bridgeRequest('/api/projects', { signal }), { projects: [] }),
+  ]);
+  // Read health after diagnostics so the bundle does not count its own short-
+  // lived readiness probes as active delegated work.
+  const live = await capture('health', () => health(), {});
+
+  const sessionList = (Array.isArray(sessionsRaw) ? sessionsRaw : []).slice(0, maxSessions);
+  const sessions = await Promise.all(sessionList.map(async (session) => {
+    if (!includeSessionOutput) return { ...session, outputTail: null };
+    const output = await capture(
+      `session:${session.id}`,
+      () => bridgeRequest(`/api/sessions/${encodeURIComponent(session.id)}/buffer`, { signal }),
+      null,
+    );
+    const text = String(output?.text || '');
+    return {
+      ...session,
+      outputTail: text.slice(-sessionTailChars),
+      outputChars: text.length,
+      outputTruncated: text.length > sessionTailChars,
+      exited: output?.exited ?? session.exited ?? null,
+      exitCode: output?.exitCode ?? session.exitCode ?? null,
+    };
+  }));
+
+  const collabSummaries = (Array.isArray(collabsRaw?.collabs) ? collabsRaw.collabs : []).slice(0, maxCollabs);
+  const collaborations = await Promise.all(collabSummaries.map(async (summary) => {
+    if (!includeCollabMessages) return { ...summary, sharedContext: null, transcript: [] };
+    const data = await capture(
+      `collaboration:${summary.id}`,
+      () => bridgeRequest(`/api/collabs/${encodeURIComponent(summary.id)}`, { signal }),
+      null,
+    );
+    if (!data) return { ...summary, sharedContext: null, transcript: [], unavailable: true };
+    const original = Array.isArray(data.transcript) ? data.transcript : [];
+    const transcript = original.slice(-maxMessagesPerCollab);
+    const bounded = boundTranscript(transcript, Math.max(2000, Math.floor(maxChars / 4)));
+    const originalSharedContext = String(data.sharedContext || '');
+    const boundedSharedContext = clip(originalSharedContext, 12000);
+    return {
+      ...summary,
+      participants: data.participants || summary.participants || [],
+      respond: data.respond || [],
+      dropped: data.dropped || [],
+      sharedContext: boundedSharedContext.text,
+      sharedContextChars: originalSharedContext.length,
+      sharedContextTruncated: boundedSharedContext.truncated,
+      transcript: bounded.items,
+      transcriptTruncated: bounded.truncated || original.length > transcript.length,
+    };
+  }));
+
+  const runningRuns = listRuns(200).filter((run) => run.status === 'running');
+  const bundle = {
+    schemaVersion: 1,
+    generatedAt: new Date().toISOString(),
+    bridge: { baseUrl: BASE_URL.href, health: live },
+    registries: {
+      fingerprints: routing.fingerprints,
+      evidenceUpdatedAt: routing.evidence.updatedAt,
+      policyUpdatedAt: routing.policy.updatedAt,
+      policyMode: routing.policy.mode,
+      qualificationBoundary: routing.evidence.qualificationPolicy.rule,
+    },
+    providers: providerSummaries(diagnostics),
+    activeWork: {
+      // activeOneShotCount is the provider-call gauge; activeTaskCount also
+      // counts readiness probes and other short-lived bridge children.
+      activeProviderCalls: Number(live.activeOneShotCount || 0),
+      maxActiveProviderCalls: Number(live.maxActiveOneShots || 0) || null,
+      activeChildProcesses: Number(live.activeTaskCount || 0),
+      openTerminalSessions: Number(live.sessionCount || sessionList.length),
+      runningRuns: runningRuns.slice(0, MAX_RUNNING_RUNS),
+      runningRunsTotal: runningRuns.length,
+      runningRunsTruncated: runningRuns.length > MAX_RUNNING_RUNS,
+    },
+    sessions: {
+      total: Array.isArray(sessionsRaw) ? sessionsRaw.length : 0,
+      included: sessions,
+      truncated: Array.isArray(sessionsRaw) && sessionsRaw.length > sessions.length,
+    },
+    collaborations: {
+      total: Array.isArray(collabsRaw?.collabs) ? collabsRaw.collabs.length : 0,
+      included: collaborations,
+      truncated: Array.isArray(collabsRaw?.collabs) && collabsRaw.collabs.length > collaborations.length,
+    },
+    projects: Array.isArray(projectsRaw?.projects) ? projectsRaw.projects : [],
+    recentRuns: listRuns(recentRuns),
+    recentReceipts: listReceipts(recentReceipts),
+    sectionErrors,
+    transferGuide: {
+      statusAndRouting: ['bridge_status', 'list_providers', 'route_preview'],
+      terminalDetail: ['list_sessions', 'read_session_output'],
+      collaborationDetail: ['list_collabs', 'read_collab', 'list_projects'],
+      delegatedWork: ['list_runs', 'get_run', 'list_receipts', 'get_receipt'],
+      safeActions: ['start_safe_session', 'ask_provider', 'route_and_ask', 'run_committee'],
+      lifecycleActions: ['start_bridge', 'restart_bridge', 'stop_bridge', 'send_session_input', 'stop_session'],
+      resources: [
+        'psbridge://context', 'psbridge://health', 'psbridge://providers', 'psbridge://routing-policy',
+        'psbridge://evidence', 'psbridge://sessions', 'psbridge://collabs', 'psbridge://runs',
+      ],
+      note: 'This bundle is a bounded handoff. Use the named detail tools for omitted history or longer output; no secret token is included.',
+      cancellation: 'Cancellation is request-scoped only. Aborting an MCP call aborts its HTTP requests, and the bridge kills that provider process tree, but there is no job registry: a cancelled run is checkpointed as cancelled and cannot be resumed, and no tool can cancel a run started by a different MCP request.',
+    },
+    transfer: {
+      requestedMaxChars: maxChars,
+      truncated: false,
+      omissions: [],
+      actualChars: 0,
+      withinBudget: false,
+    },
+  };
+
+  const noteInitialOmission = (condition, label) => {
+    if (!condition) return;
+    bundle.transfer.truncated = true;
+    if (!bundle.transfer.omissions.includes(label)) bundle.transfer.omissions.push(label);
+  };
+  noteInitialOmission(!includeDiagnostics, 'live provider readiness probes (includeDiagnostics=false); call list_providers');
+  noteInitialOmission(bundle.sessions.truncated, 'session summaries beyond maxSessions');
+  noteInitialOmission(!includeSessionOutput && bundle.sessions.included.length > 0, 'all terminal output (includeSessionOutput=false); call read_session_output');
+  noteInitialOmission(bundle.sessions.included.some((item) => item.outputTruncated), 'terminal output before requested tails');
+  noteInitialOmission(bundle.collaborations.truncated, 'collaboration summaries beyond maxCollabs');
+  noteInitialOmission(!includeCollabMessages && bundle.collaborations.included.length > 0, 'all collaboration transcripts and shared context (includeCollabMessages=false); call read_collab');
+  noteInitialOmission(bundle.collaborations.included.some((item) => item.transcriptTruncated), 'collaboration messages beyond maxMessagesPerCollab');
+  noteInitialOmission(bundle.collaborations.included.some((item) => item.sharedContextTruncated), 'collaboration shared context beyond 12000 characters');
+  noteInitialOmission(bundle.collaborations.included.some((item) => item.unavailable), 'unreadable collaboration detail; see sectionErrors');
+  noteInitialOmission(bundle.activeWork.runningRunsTruncated, `running runs beyond ${MAX_RUNNING_RUNS}; call list_runs`);
+  noteInitialOmission(bundle.sectionErrors.length > 0, 'sections that failed to load; see sectionErrors');
+  noteInitialOmission(recentRuns === 0, 'recent run summaries (recentRuns=0); call list_runs');
+  noteInitialOmission(recentReceipts === 0, 'recent receipts (recentReceipts=0); call list_receipts');
+
+  const size = () => JSON.stringify(bundle).length;
+  // Keep a reserve for the bundle ID, receipt ID, and size metadata added after
+  // trimming so the final MCP payload stays inside the caller's character cap.
+  const targetMaxChars = Math.max(1000, maxChars - 2048);
+  while (size() > targetMaxChars && bundle.recentReceipts.length) {
+    bundle.recentReceipts.pop();
+    bundle.transfer.truncated = true;
+    if (!bundle.transfer.omissions.includes('older receipts')) bundle.transfer.omissions.push('older receipts');
+  }
+  while (size() > targetMaxChars && bundle.activeWork.runningRuns.length) {
+    bundle.activeWork.runningRuns.pop();
+    bundle.activeWork.runningRunsTruncated = true;
+    bundle.transfer.truncated = true;
+    if (!bundle.transfer.omissions.includes('older running runs')) bundle.transfer.omissions.push('older running runs');
+  }
+  while (size() > targetMaxChars && bundle.recentRuns.length) {
+    bundle.recentRuns.pop();
+    bundle.transfer.truncated = true;
+    if (!bundle.transfer.omissions.includes('older run summaries')) bundle.transfer.omissions.push('older run summaries');
+  }
+  while (size() > targetMaxChars && bundle.collaborations.included.some((item) => item.transcript?.length)) {
+    const item = bundle.collaborations.included.find((entry) => entry.transcript?.length);
+    item.transcript.shift();
+    item.transcriptTruncated = true;
+    bundle.transfer.truncated = true;
+    if (!bundle.transfer.omissions.includes('older collaboration messages')) bundle.transfer.omissions.push('older collaboration messages');
+  }
+  while (size() > targetMaxChars && bundle.collaborations.included.some((item) => String(item.sharedContext || '').length > 512)) {
+    const item = bundle.collaborations.included.find((entry) => String(entry.sharedContext || '').length > 512);
+    item.sharedContext = clip(item.sharedContext, Math.max(512, Math.floor(item.sharedContext.length / 2))).text;
+    item.sharedContextTruncated = true;
+    bundle.transfer.truncated = true;
+    if (!bundle.transfer.omissions.includes('long collaboration shared context')) bundle.transfer.omissions.push('long collaboration shared context');
+  }
+  if (size() > targetMaxChars) {
+    for (const session of bundle.sessions.included) {
+      if (!session.outputTail) continue;
+      session.outputTail = clip(session.outputTail, 512).text;
+      session.outputTruncated = true;
+    }
+    bundle.transfer.truncated = true;
+    bundle.transfer.omissions.push('long terminal output tails');
+  }
+  if (size() > targetMaxChars) {
+    bundle.providers = bundle.providers.map((provider) => ({
+      kind: provider.kind,
+      label: provider.label,
+      configuredModel: provider.configuredModel,
+      readiness: provider.readiness,
+      costClass: provider.costClass,
+      privacyBoundary: provider.privacyBoundary,
+      qualification: provider.qualification,
+      capabilities: provider.capabilities,
+      evidence: provider.evidence,
+    }));
+    bundle.transfer.truncated = true;
+    bundle.transfer.omissions.push('verbose provider provenance; call list_providers for full records');
+  }
+  while (size() > targetMaxChars && bundle.projects.length) {
+    bundle.projects.pop();
+    bundle.transfer.truncated = true;
+    if (!bundle.transfer.omissions.includes('older project labels')) bundle.transfer.omissions.push('older project labels');
+  }
+  while (size() > targetMaxChars && bundle.collaborations.included.length) {
+    bundle.collaborations.included.pop();
+    bundle.collaborations.truncated = true;
+    bundle.transfer.truncated = true;
+    if (!bundle.transfer.omissions.includes('older collaboration summaries')) bundle.transfer.omissions.push('older collaboration summaries');
+  }
+  while (size() > targetMaxChars && bundle.sessions.included.length) {
+    bundle.sessions.included.pop();
+    bundle.sessions.truncated = true;
+    bundle.transfer.truncated = true;
+    if (!bundle.transfer.omissions.includes('older session summaries')) bundle.transfer.omissions.push('older session summaries');
+  }
+  const contentHashMaterial = {
+    ...bundle,
+    transfer: { ...bundle.transfer, actualChars: 0, withinBudget: false },
+  };
+  bundle.contentSha256 = stableHash(contentHashMaterial);
+  bundle.contentHashScope = 'structured bundle before bundleId, receiptId, receipt persistence flags, and final size counters';
+  bundle.bundleId = `ctx_${bundle.contentSha256.slice(0, 20)}`;
+  // A second assignment accounts for the digits in actualChars itself.
+  bundle.transfer.actualChars = size();
+  bundle.transfer.actualChars = size();
+  bundle.transfer.withinBudget = size() <= maxChars;
+  return bundle;
+}
+
+function cacheTtlFor(classification, requestedTtlMs) {
+  const { policy } = loadRoutingData();
+  if (policy.cache.enabled === false) return 0;
+  if (Number.isInteger(requestedTtlMs)) return Math.max(0, Math.min(requestedTtlMs, 86400000));
+  return classification.tags.includes('research') ? policy.cache.researchTtlMs : policy.cache.defaultTtlMs;
+}
+
+function sanitizeProviderResponse(response) {
+  const stdout = clip(response.stdout || '', 24000);
+  const stderr = clip(response.stderr || '', 4000);
+  return {
+    kind: response.kind,
+    route: response.route || {},
+    transportReceiptId: response.receiptId || null,
+    transportReceiptPersisted: response.receiptPersisted ?? null,
+    transportReceiptPersistenceError: response.receiptPersistenceError || null,
+    exitCode: response.exitCode,
+    droppedOut: !!response.dropped_out,
+    rateLimited: !!response.rate_limited,
+    budgetExceeded: !!response.budget_exceeded,
+    authFailed: !!response.auth_failed,
+    permissionDenied: !!response.permission_denied,
+    timedOut: !!response.timed_out,
+    stdout: stdout.text,
+    stderr: stderr.text,
+    stdoutChars: stdout.originalChars,
+    stderrChars: stderr.originalChars,
+    stdoutSha256: stableHash(response.stdout || ''),
+    stderrSha256: stableHash(response.stderr || ''),
+    outputTruncated: stdout.truncated,
+    stderrTruncated: stderr.truncated,
+    usage: response.usage || null,
+  };
+}
+
+function providerSucceeded(response) {
+  return !!response &&
+    response.exitCode === 0 &&
+    !response.droppedOut &&
+    !response.rateLimited &&
+    !response.budgetExceeded &&
+    !response.authFailed &&
+    !response.permissionDenied &&
+    !response.timedOut &&
+    !!String(response.stdout || '').trim();
+}
+
+async function callProvider({
+  kind,
+  prompt,
+  cwd,
+  timeoutMs = 180000,
+  useCache = true,
+  cacheTtlMs,
+  parentReceiptId,
+  purpose = 'ask_provider',
+  signal,
+}) {
+  const classification = classifyTask(prompt);
+  const ttl = cacheTtlFor(classification, cacheTtlMs);
+  const configFingerprint = stableHash({
+    config: fs.readFileSync(CLI_CONFIG_PATH, 'utf8'),
+    providerIdentity: providerIdentityMaterial(kind),
+  });
+  const cacheKey = { kind, prompt, cwd: cwd || '', configFingerprint, purpose };
+  const cacheKeyHash = stableHash(cacheKey);
+  const startedAt = Date.now();
+  if (signal?.aborted) throw signal.reason || new Error('provider call cancelled before admission');
+  if (useCache && ttl > 0) {
+    const cached = readCache(cacheKey, ttl);
+    if (cached) {
+      const receipt = appendReceipt({
+        event: 'provider_call',
+        purpose,
+        parentReceiptId,
+        provider: kind,
+        inputHash: stableHash(prompt),
+        inputChars: prompt.length,
+        estimatedInputTokens: estimateTokens(prompt),
+        cacheHit: true,
+        durationMs: 0,
+        status: 'cached',
+        sourceReceiptId: cached.value?.receiptId || null,
+        cacheCreatedAt: cached.createdAt,
+        cacheKeyHash,
+      });
+      return {
+        ...cached.value,
+        cacheHit: true,
+        sourceReceiptId: cached.value?.receiptId || null,
+        cacheCreatedAt: cached.createdAt,
+        cacheKeyHash,
+        receiptId: receipt.receiptId,
+        receiptPersistenceError: receipt.receiptPersistenceError || null,
+      };
+    }
+  }
+
+  let sanitized;
+  let status = 'failed';
+  try {
+    const response = await bridgeRequest('/api/oneshot', {
+      method: 'POST',
+      body: {
+        kind,
+        prompt,
+        cwd,
+        timeoutMs: Math.max(1000, Math.min(Number(timeoutMs) || 180000, 300000)),
+        dangerous: false,
+      },
+      timeoutMs: Math.max(5000, Math.min(Number(timeoutMs) + 15000, 330000)),
+      signal,
+    });
+    sanitized = sanitizeProviderResponse(response);
+    status = providerSucceeded(sanitized) ? 'completed' : 'dropped';
+  } catch (error) {
+    sanitized = {
+      kind,
+      exitCode: -1,
+      droppedOut: true,
+      stdout: '',
+      stderr: error.message,
+      route: {},
+      cancelled: !!signal?.aborted,
+      admissionLimited: error instanceof BridgeError && error.status === 429,
+    };
+    status = signal?.aborted ? 'cancelled' : 'failed';
+  }
+
+  const receipt = appendReceipt({
+    event: 'provider_call',
+    purpose,
+    parentReceiptId,
+    provider: kind,
+    inputHash: stableHash(prompt),
+    inputChars: prompt.length,
+    estimatedInputTokens: estimateTokens(prompt),
+    actualInputTokens: sanitized.usage?.input_tokens ?? null,
+    actualOutputTokens: sanitized.usage?.output_tokens ?? null,
+    cacheHit: false,
+    durationMs: Date.now() - startedAt,
+    status,
+    route: sanitized.route,
+    exitCode: sanitized.exitCode,
+    failureClass: sanitized.rateLimited ? 'rate_limit'
+      : sanitized.budgetExceeded ? 'budget'
+        : sanitized.authFailed ? 'auth'
+          : sanitized.timedOut ? 'timeout'
+            : sanitized.permissionDenied ? 'policy'
+              : sanitized.cancelled ? 'cancelled'
+                : sanitized.admissionLimited ? 'admission_limit'
+                 : status === 'completed' ? null : 'provider_error',
+    cacheKeyHash,
+  });
+  const output = {
+    ...sanitized,
+    cacheHit: false,
+    cacheKeyHash,
+    receiptId: receipt.receiptId,
+    receiptPersistenceError: receipt.receiptPersistenceError || null,
+  };
+  const { policy } = loadRoutingData();
+  let cachePersistenceError = null;
+  if (
+    useCache && ttl > 0 && status === 'completed' &&
+    JSON.stringify(output).length <= Number(policy.cache.maxEntryChars || 100000)
+  ) {
+    try { writeCache(cacheKey, output); }
+    catch (error) { cachePersistenceError = error?.message || String(error); }
+  }
+  return { ...output, cachePersistenceError };
+}
+
+function eligibleOneShotKinds(route, config, { selectedOnly = false, allowedKinds = [] } = {}) {
+  const seen = new Set();
+  const allowed = new Set(allowedKinds);
+  const candidates = selectedOnly ? [...route.selected] : [...route.selected, ...route.candidates];
+  return candidates.filter((candidate) => {
+    if (seen.has(candidate.kind)) return false;
+    seen.add(candidate.kind);
+    if (allowed.size && !allowed.has(candidate.kind)) return false;
+    const entry = config[candidate.kind];
+    return candidate.policyScore >= 0 && entry && Array.isArray(entry.oneshot_safe) && entry.oneshot_safe.length;
+  });
+}
+
+function rolePrompt(task, role, classification, policy) {
+  const cap = policy.tiers[classification.tier].maxInputChars;
+  const bounded = clip(task, cap);
+  const roleInstructions = {
+    primary: 'Propose the strongest concrete solution and state assumptions and verification steps.',
+    critic: 'Independently find failure modes, unsupported assumptions, security risks, and cheaper alternatives.',
+    researcher: 'Identify which claims need current primary sources or live evidence and specify how to verify them.',
+    verifier: 'Define deterministic acceptance tests, qualification boundaries, and escalation conditions.',
+    chair: 'Synthesize the independent responses without hiding disagreements. Prefer evidence and executable gates.',
+  };
+  return [
+    `You are the ${role} in a read-only RelayBridge advisory committee.`,
+    'Do not edit files, run tools, or claim that a proposal was implemented. Return concise analysis only.',
+    roleInstructions[role] || roleInstructions.primary,
+    `Task tier: ${classification.tier}. Tags: ${classification.tags.join(', ')}.`,
+    bounded.truncated ? `The task was bounded from ${bounded.originalChars} characters for this seat.` : '',
+    '',
+    'TASK:',
+    bounded.text,
+  ].filter(Boolean).join('\n');
+}
+
+function parseChairAssessment(text) {
+  const raw = String(text || '').trim();
+  const unfenced = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '');
+  const start = unfenced.indexOf('{');
+  const end = unfenced.lastIndexOf('}');
+  if (start < 0 || end <= start) return null;
+  try {
+    const parsed = JSON.parse(unfenced.slice(start, end + 1));
+    if (!['agreement', 'mixed', 'disagreement'].includes(parsed.verdict)) return null;
+    const confidence = Number(parsed.confidence);
+    if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) return null;
+    if (!Array.isArray(parsed.agreements) || !Array.isArray(parsed.dissent)) return null;
+    if (typeof parsed.recommendation !== 'string' || !parsed.recommendation.trim()) return null;
+    const agreements = parsed.agreements.map((item) => String(item).trim()).filter(Boolean).slice(0, 20);
+    const dissent = parsed.dissent.map((item) => String(item).trim()).filter(Boolean).slice(0, 20);
+    if (parsed.verdict === 'agreement' && !agreements.length) return null;
+    return {
+      verdict: parsed.verdict,
+      confidence,
+      agreements,
+      dissent,
+      recommendation: parsed.recommendation.trim().slice(0, 8000),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function remainingTime(deadlineAt, floorMs = 1000) {
+  return Math.max(floorMs, deadlineAt - Date.now());
+}
+
+export function buildServer() {
+  const server = new McpServer({ name: 'relaybridge', version: PACKAGE.version }, {
+    instructions: 'Read before acting: call get_context_bundle when taking over existing work, then use bridge_status, list_providers, and route_preview as needed. AI provider one-shots (ask_provider, route_and_ask, run_committee) always force dangerous:false, so they consume subscription quotas or local compute in the provider CLI\'s own safe/headless mode. Terminals are different: start_safe_session only forces the vendor bypass flags off, and start_safe_session(kind="powershell") opens a real host PowerShell shell running with your account\'s full privileges. Anything sent through send_session_input executes on the host with no sandbox and no filesystem confinement, so it needs host approval and human review. The /api/exec route, provider installs, and the global full-permissions toggle are not exposed as tools. Routing scores are operator preferences, not universal model-quality claims; use receipts and preserve the human gate for high-stakes work.',
+    capabilities: { tools: {}, resources: {} },
+    cacheHints: {
+      'tools/list': { ttlMs: 60000, cacheScope: 'private' },
+      'resources/list': { ttlMs: 60000, cacheScope: 'private' },
+    },
+  });
+
+  server.registerTool('bridge_status', {
+    title: 'Bridge status',
+    description: 'Inspect RelayBridge health, CLI readiness, instance identity, sessions, and version without changing state.',
+    inputSchema: z.object({ includeDiagnostics: z.boolean().default(true) }),
+    annotations: READ_ONLY,
+  }, safeHandler(async ({ includeDiagnostics }, context) => {
+    const live = await health();
+    const diagnostics = includeDiagnostics ? await getDiagnostics(context?.mcpReq?.signal) : {};
+    return result({ ok: true, baseUrl: BASE_URL.href, health: live, providers: providerSummaries(diagnostics) });
+  }));
+
+  server.registerTool('list_providers', {
+    title: 'List provider capability registry',
+    description: 'List configured providers, live readiness, cost/privacy class, model identity when known, qualification receipts, provenance, references, and limitations.',
+    inputSchema: z.object({ includeCandidates: z.boolean().default(false) }),
+    annotations: READ_ONLY,
+  }, safeHandler(async ({ includeCandidates }, context) => {
+    const diagnostics = await getDiagnostics(context?.mcpReq?.signal);
+    const { evidence } = loadRoutingData();
+    return result({
+      updatedAt: evidence.updatedAt,
+      qualificationPolicy: evidence.qualificationPolicy,
+      providers: providerSummaries(diagnostics),
+      ...(includeCandidates ? { candidateIntegrations: evidence.candidateIntegrations } : {}),
+    });
+  }));
+
+  server.registerTool('route_preview', {
+    title: 'Preview deterministic task routing',
+    description: 'Classify a task and preview an auditable local/cheap-first route without calling any model.',
+    inputSchema: z.object({
+      task: z.string().min(1).max(100000),
+      preferredProviders: z.array(z.string()).max(8).default([]),
+      excludedProviders: z.array(z.string()).max(8).default([]),
+      localOnly: z.boolean().default(false),
+      maxProviders: z.number().int().min(1).max(4).optional(),
+      committeeMode: z.enum(['advisory', 'consensus']).default('advisory'),
+    }),
+    annotations: AUDITED_READ,
+  }, safeHandler(async (args, context) => {
+    const diagnostics = await getDiagnostics(context?.mcpReq?.signal);
+    const route = routeTask({ ...args, diagnostics });
+    const receipt = appendReceipt({
+      event: 'route_preview',
+      routeId: route.routeId,
+      taskHash: route.classification.taskHash,
+      tier: route.classification.tier,
+      tags: route.classification.tags,
+      selectedProviders: route.selected.map((item) => item.kind),
+      humanGateRequired: route.humanGateRequired,
+      status: 'previewed',
+    });
+    return result({ ...route, receiptId: receipt.receiptId });
+  }));
+
+  server.registerTool('list_sessions', {
+    title: 'List terminal sessions',
+    description: 'List current PowerShell and AI CLI terminal sessions owned by the singleton bridge.',
+    inputSchema: z.object({}),
+    annotations: READ_ONLY,
+  }, safeHandler(async () => result({ sessions: await bridgeRequest('/api/sessions') })));
+
+  server.registerTool('read_session_output', {
+    title: 'Read terminal output',
+    description: 'Read a bounded tail of an existing terminal session buffer.',
+    inputSchema: z.object({ sessionId: z.string().min(1).max(64), tailChars: z.number().int().min(1).max(65536).default(12000) }),
+    annotations: READ_ONLY,
+  }, safeHandler(async ({ sessionId, tailChars }) => {
+    const data = await bridgeRequest(`/api/sessions/${encodeURIComponent(sessionId)}/buffer`);
+    const text = String(data.text || '');
+    return result({ sessionId, exited: data.exited, exitCode: data.exitCode, text: text.slice(-tailChars), originalChars: text.length });
+  }));
+
+  server.registerTool('list_collabs', {
+    title: 'List saved collaborations',
+    description: 'List saved RelayBridge collaboration rooms and message counts.',
+    inputSchema: z.object({}),
+    annotations: READ_ONLY,
+  }, safeHandler(async () => result(await bridgeRequest('/api/collabs'))));
+
+  server.registerTool('read_collab', {
+    title: 'Read a saved collaboration',
+    description: 'Read bounded recent messages and shared context from a saved collaboration room.',
+    inputSchema: z.object({
+      collabId: z.string().min(1).max(128),
+      maxMessages: z.number().int().min(1).max(100).default(30),
+      offsetFromEnd: z.number().int().min(0).default(0),
+      maxChars: z.number().int().min(1000).max(100000).default(30000),
+    }),
+    annotations: READ_ONLY,
+  }, safeHandler(async ({ collabId, maxMessages, offsetFromEnd, maxChars }) => {
+    const data = await bridgeRequest(`/api/collabs/${encodeURIComponent(collabId)}`);
+    const original = Array.isArray(data.transcript) ? data.transcript : [];
+    const end = Math.max(0, original.length - offsetFromEnd);
+    const start = Math.max(0, end - maxMessages);
+    const transcript = original.slice(start, end);
+    const bounded = boundTranscript(transcript, maxChars);
+    const sharedContext = clip(data.sharedContext || '', Math.floor(maxChars / 3));
+    return result({
+      id: data.id,
+      name: data.name,
+      project: data.project,
+      participants: data.participants,
+      sharedContext: sharedContext.text,
+      sharedContextChars: sharedContext.originalChars,
+      sharedContextTruncated: sharedContext.truncated,
+      transcript: bounded.items,
+      totalMessages: original.length,
+      range: { start, end, offsetFromEnd },
+      transcriptTruncated: bounded.truncated || start > 0 || end < original.length,
+      nextOlderOffset: start > 0 ? offsetFromEnd + transcript.length : null,
+      updatedAt: data.updatedAt,
+    });
+  }));
+
+  server.registerTool('list_projects', {
+    title: 'List bridge projects',
+    description: 'List project labels saved by the bridge collaboration UI.',
+    inputSchema: z.object({}),
+    annotations: READ_ONLY,
+  }, safeHandler(async () => result(await bridgeRequest('/api/projects'))));
+
+  server.registerTool('list_runs', {
+    title: 'List routing and committee runs',
+    description: 'Page through persisted MCP routing/committee run summaries without repeating provider calls.',
+    inputSchema: z.object({ limit: z.number().int().min(1).max(200).default(25), offset: z.number().int().min(0).default(0) }),
+    annotations: READ_ONLY,
+  }, safeHandler(async ({ limit, offset }) => result(listRunPage(limit, offset))));
+
+  server.registerTool('get_run', {
+    title: 'Read a routing or committee run',
+    description: 'Read one persisted run, including members, partial failures, routes, and receipt IDs.',
+    inputSchema: z.object({ runId: z.string().min(1).max(128) }),
+    annotations: READ_ONLY,
+  }, safeHandler(async ({ runId }) => {
+    const run = readRun(runId);
+    if (!run) throw new Error('run not found');
+    return result(run);
+  }));
+
+  server.registerTool('list_receipts', {
+    title: 'List delegation receipts',
+    description: 'Page through append-only routing, provider, cache, fallback, context, and committee receipts. Newest first. Offsets are kept for existing clients but shift whenever a receipt is appended; pass the returned nextCursor for a stable page boundary.',
+    inputSchema: z.object({
+      limit: z.number().int().min(1).max(500).default(50),
+      offset: z.number().int().min(0).default(0),
+      cursor: z.string().min(1).max(512).optional(),
+    }),
+    annotations: READ_ONLY,
+  }, safeHandler(async ({ limit, offset, cursor }) => {
+    if (cursor === undefined) return result(listReceiptPage(limit, offset));
+    // A cursor is an exact append-only position, so offset is meaningless with
+    // it and is rejected rather than silently ignored.
+    if (offset) throw new Error('pass either cursor or offset, not both');
+    const page = listReceiptCursorPage(limit, cursor);
+    if (!page.cursorResolved) {
+      return result({
+        ...page,
+        ok: false,
+        error: 'the receipt file this cursor points at is no longer present; restart from the newest page',
+      }, { isError: true });
+    }
+    return result({ ...page, ok: true, offset: null, nextOffset: null });
+  }));
+
+  server.registerTool('get_receipt', {
+    title: 'Read one delegation receipt',
+    description: 'Dereference a single receipt ID, including the sourceReceiptId recorded on a cache hit and the parentReceiptId chain recorded by route_and_ask and run_committee.',
+    inputSchema: z.object({
+      receiptId: z.string().min(1).max(128),
+      followSource: z.boolean().default(false),
+    }),
+    annotations: READ_ONLY,
+  }, safeHandler(async ({ receiptId, followSource }) => {
+    const receipt = readReceipt(receiptId);
+    if (!receipt) throw new Error('receipt not found; it may predate retention or the ID may be malformed');
+    const chain = [];
+    if (followSource) {
+      const seen = new Set([receipt.receiptId]);
+      let next = receipt.sourceReceiptId || receipt.parentReceiptId || null;
+      while (next && !seen.has(next) && chain.length < 16) {
+        seen.add(next);
+        const linked = readReceipt(next);
+        if (!linked) {
+          chain.push({ receiptId: next, resolved: false });
+          break;
+        }
+        chain.push({ ...linked, resolved: true });
+        next = linked.sourceReceiptId || linked.parentReceiptId || null;
+      }
+    }
+    return result({ receipt, chain, chainTruncated: chain.length >= 16 });
+  }));
+
+  server.registerTool('get_context_bundle', {
+    title: 'Build an AI handoff context bundle',
+    description: 'Return one bounded, provenance-aware snapshot of bridge health, providers, active work, terminal tails, collaborations, projects, recent runs, receipts, and the detail tools needed to continue. This is the preferred first call when an AI takes over an existing RelayBridge workspace.',
+    inputSchema: z.object({
+      includeDiagnostics: z.boolean().default(true),
+      includeSessionOutput: z.boolean().default(true),
+      sessionTailChars: z.number().int().min(100).max(12000).default(2000),
+      maxSessions: z.number().int().min(0).max(20).default(8),
+      includeCollabMessages: z.boolean().default(true),
+      maxCollabs: z.number().int().min(0).max(20).default(5),
+      maxMessagesPerCollab: z.number().int().min(0).max(50).default(8),
+      recentRuns: z.number().int().min(0).max(100).default(10),
+      recentReceipts: z.number().int().min(0).max(200).default(20),
+      maxChars: z.number().int().min(30000).max(200000).default(90000),
+    }),
+    annotations: AUDITED_READ,
+  }, safeHandler(async (args, context) => {
+    const bundle = await buildContextBundle({ ...args, signal: context?.mcpReq?.signal });
+    const receipt = appendReceipt({
+      event: 'context_bundle',
+      bundleId: bundle.bundleId,
+      contentSha256: bundle.contentSha256,
+      status: bundle.sectionErrors.length || bundle.transfer.truncated ? 'partial' : 'completed',
+      actualChars: bundle.transfer.actualChars,
+      truncated: bundle.transfer.truncated,
+      omissions: bundle.transfer.omissions,
+      registryFingerprints: bundle.registries.fingerprints,
+    });
+    bundle.receiptId = receipt.receiptId;
+    bundle.receiptPersisted = !receipt.receiptPersistenceError;
+    bundle.receiptPersistenceError = receipt.receiptPersistenceError || null;
+    bundle.transfer.actualChars = JSON.stringify(bundle).length;
+    bundle.transfer.actualChars = JSON.stringify(bundle).length;
+    bundle.transfer.withinBudget = bundle.transfer.actualChars <= args.maxChars;
+    const provenance = bundle.receiptPersisted
+      ? `receipt ${bundle.receiptId}`
+      : `receipt ${bundle.receiptId} WAS NOT PERSISTED: ${bundle.receiptPersistenceError}`;
+    const omitted = bundle.transfer.truncated
+      ? ` Omitted: ${bundle.transfer.omissions.join('; ')}.`
+      : '';
+    return result(bundle, {
+      textOverride: `RelayBridge context bundle ${bundle.bundleId} is in structuredContent (${bundle.transfer.actualChars} characters; ${provenance}).${omitted}`,
+    });
+  }));
+
+  server.registerTool('start_bridge', {
+    title: 'Start RelayBridge',
+    description: 'Start the singleton bridge only if it is not already healthy. Uses a lock to prevent two MCP clients racing for the port.',
+    inputSchema: z.object({}),
+    annotations: ACTION,
+  }, safeHandler(async () => result(await startBridge())));
+
+  server.registerTool('restart_bridge', {
+    title: 'Restart RelayBridge',
+    description: 'Gracefully end current terminal sessions, restart the singleton bridge, and wait for the new instance to become healthy.',
+    inputSchema: z.object({ confirmation: z.literal('restart RelayBridge') }),
+    annotations: DESTRUCTIVE,
+  }, safeHandler(async () => result(await restartBridge())));
+
+  server.registerTool('stop_bridge', {
+    title: 'Stop RelayBridge',
+    description: 'Gracefully stop the bridge and every terminal session it owns.',
+    inputSchema: z.object({ confirmation: z.literal('stop RelayBridge') }),
+    annotations: DESTRUCTIVE,
+  }, safeHandler(async () => result(await stopBridge())));
+
+  server.registerTool('start_safe_session', {
+    title: 'Start a terminal session with bypass flags off',
+    description: 'Start a PowerShell or AI CLI terminal with the vendor dangerous/full-permission flags forced off, independent of the sticky browser toggle. This is not a sandbox: kind="powershell" opens a real host PowerShell shell with your account\'s privileges, and every kind runs as a normal host process under RELAYBRIDGE_ALLOWED_ROOTS only for its starting directory. Nothing executes until send_session_input is approved.',
+    inputSchema: z.object({ kind: z.string().min(1).max(64), cwd: z.string().max(1000).optional(), label: z.string().max(100).optional() }),
+    annotations: { ...ACTION, openWorldHint: true },
+  }, safeHandler(async ({ kind, cwd, label }) => {
+    const session = await bridgeRequest('/api/sessions', { method: 'POST', body: { kind, cwd, label, dangerous: false } });
+    const receipt = appendReceipt({ event: 'session_start', sessionId: session.id, provider: kind, cwd: session.cwd, dangerous: false, status: 'started' });
+    return result({ session, receiptId: receipt.receiptId });
+  }));
+
+  server.registerTool('send_session_input', {
+    title: 'Send terminal input',
+    description: 'Send bounded text to an existing terminal. For a PowerShell session this executes the text as a real host command with your account\'s privileges and no sandbox; for an AI CLI session it drives that CLI interactively. Always requires host approval and human review.',
+    inputSchema: z.object({ sessionId: z.string().min(1).max(64), data: z.string().min(1).max(8192), appendNewline: z.boolean().default(true) }),
+    annotations: { ...DESTRUCTIVE, openWorldHint: true },
+  }, safeHandler(async ({ sessionId, data, appendNewline }) => {
+    const sent = data + (appendNewline ? '\r' : '');
+    const response = await bridgeRequest(`/api/sessions/${encodeURIComponent(sessionId)}/input`, { method: 'POST', body: { data: sent } });
+    const receipt = appendReceipt({ event: 'session_input', sessionId, inputHash: stableHash(data), inputChars: data.length, appendNewline, status: response.ok ? 'sent' : 'rejected' });
+    return result({ ...response, sessionId, receiptId: receipt.receiptId });
+  }));
+
+  server.registerTool('stop_session', {
+    title: 'Stop a terminal session',
+    description: 'Terminate and remove one bridge-owned terminal session.',
+    inputSchema: z.object({ sessionId: z.string().min(1).max(64) }),
+    annotations: { ...DESTRUCTIVE, idempotentHint: true },
+  }, safeHandler(async ({ sessionId }) => {
+    const response = await bridgeRequest(`/api/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' });
+    const receipt = appendReceipt({ event: 'session_stop', sessionId, status: 'stopped' });
+    return result({ ...response, sessionId, receiptId: receipt.receiptId });
+  }));
+
+  server.registerTool('ask_provider', {
+    title: 'Ask one provider safely',
+    description: 'Run one bounded, non-agentic provider turn with dangerous:false forced, available route metadata, cache controls, quota/failure signals, and an append-only receipt. The provider CLI runs in its own safe/headless mode, which is a vendor-side restriction rather than an OS sandbox. Hosted CLIs may not reveal final model revisions, usage, plan, or provider request IDs.',
+    inputSchema: z.object({
+      kind: z.string().min(1).max(64),
+      prompt: z.string().min(1).max(100000),
+      cwd: z.string().max(1000).optional(),
+      timeoutMs: z.number().int().min(1000).max(300000).default(180000),
+      useCache: z.boolean().default(true),
+      cacheTtlMs: z.number().int().min(0).max(86400000).optional(),
+      acknowledgeHumanGate: z.boolean().default(false),
+    }),
+    annotations: EXTERNAL_READ,
+  }, safeHandler(async (args, context) => {
+    const classification = classifyTask(args.prompt);
+    const { policy } = loadRoutingData();
+    const gateReasons = classification.tags.filter((tag) => policy.neverAutoExecuteTags.includes(tag));
+    if (gateReasons.length && !args.acknowledgeHumanGate) {
+      return result({
+        ok: false,
+        blocked: true,
+        classification,
+        humanGateReasons: gateReasons,
+        error: 'High-stakes provider call requires acknowledgeHumanGate=true and remains advisory.',
+      }, { isError: true });
+    }
+    return result(await callProvider({ ...args, signal: context?.mcpReq?.signal }));
+  }));
+
+  server.registerTool('route_and_ask', {
+    title: 'Route and ask with bounded escalation',
+    description: 'Apply deterministic routing, call the first eligible safe provider, and escalate only on typed failure. High-stakes routes require explicit acknowledgement.',
+    inputSchema: z.object({
+      task: z.string().min(1).max(100000),
+      cwd: z.string().max(1000).optional(),
+      preferredProviders: z.array(z.string()).max(8).default([]),
+      excludedProviders: z.array(z.string()).max(8).default([]),
+      localOnly: z.boolean().default(false),
+      maxEscalations: z.number().int().min(0).max(3).default(2),
+      timeoutMs: z.number().int().min(1000).max(300000).default(180000),
+      useCache: z.boolean().default(true),
+      acknowledgeHumanGate: z.boolean().default(false),
+      allowModelForDeterministic: z.boolean().default(false),
+      allowInputTruncation: z.boolean().default(false),
+    }),
+    annotations: EXTERNAL_READ,
+  }, safeHandler(async (args, context) => {
+    const signal = context?.mcpReq?.signal;
+    const requestedDeadlineAt = Date.now() + args.timeoutMs;
+    const diagnostics = await getDiagnostics(signal, remainingTime(requestedDeadlineAt, 1));
+    const route = routeTask({
+      ...args,
+      diagnostics,
+      excludedProviders: [...args.excludedProviders, 'powershell'],
+      maxProviders: 4,
+    });
+    if (route.humanGateRequired && !args.acknowledgeHumanGate) {
+      return result({ ok: false, blocked: true, route, error: 'High-stakes route requires acknowledgeHumanGate=true and remains advisory.' }, { isError: true });
+    }
+    if (route.primaryTag === 'deterministic' && route.classification.tier === 'utility' && !args.allowModelForDeterministic) {
+      const receipt = appendReceipt({
+        event: 'route_execute',
+        routeId: route.routeId,
+        taskHash: route.classification.taskHash,
+        status: 'deterministic_gate',
+      });
+      return result({
+        ok: false,
+        blocked: true,
+        deterministicGate: true,
+        route,
+        receiptId: receipt.receiptId,
+        recommendation: 'Use the host deterministic shell/file/process tool. Set allowModelForDeterministic=true only when interpretation is actually needed.',
+      });
+    }
+    const { policy } = loadRoutingData();
+    const tierPolicy = policy.tiers[route.classification.tier];
+    const boundedTask = clip(args.task, tierPolicy.maxInputChars);
+    if (boundedTask.truncated && !args.allowInputTruncation) {
+      const receipt = appendReceipt({
+        event: 'route_execute',
+        routeId: route.routeId,
+        taskHash: route.classification.taskHash,
+        status: 'input_budget_gate',
+        inputChars: args.task.length,
+        maxInputChars: tierPolicy.maxInputChars,
+      });
+      return result({
+        ok: false,
+        blocked: true,
+        inputBudgetExceeded: true,
+        route,
+        receiptId: receipt.receiptId,
+        inputChars: args.task.length,
+        maxInputChars: tierPolicy.maxInputChars,
+        recommendation: 'Reduce the task/context or explicitly set allowInputTruncation=true.',
+      }, { isError: true });
+    }
+    const config = loadCliConfig();
+    const tierEscalations = Number.isInteger(tierPolicy.maxEscalations) ? tierPolicy.maxEscalations : 1;
+    const candidates = eligibleOneShotKinds(route, config).slice(0, Math.min(args.maxEscalations, tierEscalations) + 1);
+    const deadlineAt = Math.min(requestedDeadlineAt, Date.now() + tierPolicy.defaultTimeoutMs);
+    const rootReceipt = appendReceipt({ event: 'route_execute', routeId: route.routeId, taskHash: route.classification.taskHash, candidates: candidates.map((item) => item.kind), status: 'started' });
+    let run = writeRun({
+      mode: 'route_and_ask',
+      status: 'running',
+      taskHash: route.classification.taskHash,
+      route,
+      members: [],
+      parentReceiptId: rootReceipt.receiptId,
+      deadlineAt: new Date(deadlineAt).toISOString(),
+    });
+    const attempts = [];
+    for (const candidate of candidates) {
+      if (signal?.aborted || Date.now() >= deadlineAt) break;
+      const response = await callProvider({
+        kind: candidate.kind,
+        prompt: boundedTask.text,
+        cwd: args.cwd,
+        timeoutMs: remainingTime(deadlineAt),
+        useCache: args.useCache,
+        parentReceiptId: rootReceipt.receiptId,
+        purpose: 'route_and_ask',
+        signal,
+      });
+      attempts.push(response);
+      run = writeRun({ ...run, status: 'running', members: attempts });
+      if (providerSucceeded(response)) break;
+      if (signal?.aborted) break;
+    }
+    const winner = attempts.find(providerSucceeded) || null;
+    const cancelled = !!signal?.aborted;
+    const deadlineExceeded = !cancelled && !winner && Date.now() >= deadlineAt;
+    const status = cancelled ? 'cancelled' : deadlineExceeded ? 'timed_out' : winner ? 'completed' : 'failed';
+    run = writeRun({
+      ...run,
+      mode: 'route_and_ask',
+      status,
+      taskHash: route.classification.taskHash,
+      route,
+      members: attempts,
+      parentReceiptId: rootReceipt.receiptId,
+    });
+    const finalReceipt = appendReceipt({ event: 'route_execute', parentReceiptId: rootReceipt.receiptId, routeId: route.routeId, runId: run.runId, status: run.status, selectedProvider: winner?.kind || null });
+    return result({
+      ok: !!winner && !cancelled,
+      status,
+      cancelled,
+      deadlineExceeded,
+      route,
+      winner,
+      attempts,
+      runId: run.runId,
+      runPersistenceError: run.receiptPersistenceError || null,
+      receiptId: rootReceipt.receiptId,
+      receiptPersistenceError: rootReceipt.receiptPersistenceError || finalReceipt.receiptPersistenceError || null,
+    });
+  }));
+
+  server.registerTool('run_committee', {
+    title: 'Run a bounded multi-provider committee',
+    description: 'Fan out independent read-only roles to up to four diverse providers, checkpoint partial results, enforce one overall deadline, and optionally ask one safe chair for a structured agreement/mixed/disagreement assessment. Consensus is never inferred from successful text generation alone.',
+    inputSchema: z.object({
+      task: z.string().min(1).max(100000),
+      cwd: z.string().max(1000).optional(),
+      providers: z.array(z.string()).max(4).default([]),
+      excludedProviders: z.array(z.string()).max(8).default([]),
+      mode: z.enum(['advisory', 'consensus']).default(loadRoutingData().policy.committee.defaultMode),
+      maxProviders: z.number().int().min(1).max(4).default(3),
+      localOnly: z.boolean().default(false),
+      timeoutMs: z.number().int().min(1000).max(300000).default(180000),
+      useCache: z.boolean().default(true),
+      synthesisProvider: z.string().max(64).optional(),
+      acknowledgeHumanGate: z.boolean().default(false),
+      acknowledgeTruncatedEvidence: z.boolean().default(false),
+    }),
+    annotations: EXTERNAL_READ,
+  }, safeHandler(async (args, context) => {
+    const signal = context?.mcpReq?.signal;
+    const requestedDeadlineAt = Date.now() + args.timeoutMs;
+    const diagnostics = await getDiagnostics(signal, remainingTime(requestedDeadlineAt, 1));
+    const route = routeTask({
+      task: args.task,
+      diagnostics,
+      preferredProviders: args.providers,
+      excludedProviders: [...args.excludedProviders, 'powershell'],
+      localOnly: args.localOnly,
+      maxProviders: args.maxProviders,
+      committeeMode: args.mode,
+    });
+    if (route.humanGateRequired && !args.acknowledgeHumanGate) {
+      return result({ ok: false, blocked: true, route, error: 'High-stakes committee requires acknowledgeHumanGate=true and remains advisory.' }, { isError: true });
+    }
+    if (args.mode === 'consensus' && args.maxProviders < 2) {
+      return result({ ok: false, blocked: true, route, error: 'Consensus mode requires at least two independent members.' }, { isError: true });
+    }
+    const config = loadCliConfig();
+    const { policy } = loadRoutingData();
+    const tierPolicy = policy.tiers[route.classification.tier];
+    const eligible = eligibleOneShotKinds(route, config, {
+      selectedOnly: true,
+      allowedKinds: args.providers,
+    }).slice(0, Math.min(args.maxProviders, tierPolicy.maxProviders));
+    if (args.mode === 'consensus' && eligible.length < 2) {
+      return result({
+        ok: false,
+        blocked: true,
+        route,
+        eligibleProviders: eligible.map((item) => item.kind),
+        error: 'Consensus mode requires two eligible providers after readiness, capability, locality, exclusions, and the explicit provider allowlist are applied.',
+      }, { isError: true });
+    }
+    if (!eligible.length) {
+      const receipt = appendReceipt({ event: 'committee', routeId: route.routeId, taskHash: route.classification.taskHash, status: 'no_eligible_provider' });
+      return result({ ok: false, blocked: true, route, receiptId: receipt.receiptId, error: 'No eligible safe provider matched this committee policy.' }, { isError: true });
+    }
+    const deadlineAt = Math.min(requestedDeadlineAt, Date.now() + tierPolicy.defaultTimeoutMs);
+    const rootReceipt = appendReceipt({
+      event: 'committee',
+      routeId: route.routeId,
+      taskHash: route.classification.taskHash,
+      mode: args.mode,
+      providers: eligible.map((item) => item.kind),
+      status: 'started',
+    });
+    let run = writeRun({
+      mode: `committee:${args.mode}`,
+      status: 'running',
+      taskHash: route.classification.taskHash,
+      route,
+      members: [],
+      synthesis: null,
+      parentReceiptId: rootReceipt.receiptId,
+      deadlineAt: new Date(deadlineAt).toISOString(),
+    });
+    const roles = policy.committee.roles.filter((role) => role !== 'chair');
+    const membersByIndex = new Array(eligible.length);
+    const settledMembers = await Promise.allSettled(eligible.map(async (candidate, index) => {
+      const role = roles[Math.min(index, roles.length - 1)];
+      let member;
+      try {
+        if (signal?.aborted) throw signal.reason || new Error('committee cancelled before provider admission');
+        if (Date.now() >= deadlineAt) throw new Error('committee deadline exceeded before provider admission');
+        const seatPrompt = rolePrompt(args.task, role, route.classification, policy);
+        const response = await callProvider({
+          kind: candidate.kind,
+          prompt: seatPrompt,
+          cwd: args.cwd,
+          timeoutMs: remainingTime(deadlineAt),
+          useCache: args.useCache,
+          parentReceiptId: rootReceipt.receiptId,
+          purpose: `committee:${role}`,
+          signal,
+        });
+        member = {
+          ...response,
+          role,
+          inputTruncated: args.task.length > tierPolicy.maxInputChars,
+          originalTaskChars: args.task.length,
+          seatPromptChars: seatPrompt.length,
+          taskSha256: route.classification.taskHash,
+        };
+      } catch (error) {
+        member = { kind: candidate.kind, role, exitCode: -1, droppedOut: true, stdout: '', stderr: error?.message || String(error), failureClass: signal?.aborted ? 'cancelled' : 'adapter_error', cancelled: !!signal?.aborted };
+      }
+      membersByIndex[index] = member;
+      run = writeRun({ ...run, status: 'running', members: membersByIndex.filter(Boolean) });
+      return member;
+    }));
+    const members = settledMembers.map((settled, index) => settled.status === 'fulfilled'
+      ? settled.value
+      : (membersByIndex[index] || { kind: eligible[index].kind, role: roles[Math.min(index, roles.length - 1)], exitCode: -1, droppedOut: true, stdout: '', stderr: settled.reason?.message || String(settled.reason), failureClass: signal?.aborted ? 'cancelled' : 'adapter_error', cancelled: !!signal?.aborted }));
+    const successes = members.filter(providerSucceeded);
+    let synthesis = null;
+    let synthesisAssessment = null;
+    const memberEvidenceIncomplete = successes.some((member) =>
+      member.inputTruncated || member.outputTruncated || member.route?.prompt_truncated);
+    let synthesisInputTruncated = false;
+    if (args.mode === 'consensus' && successes.length >= 2 && !signal?.aborted && Date.now() < deadlineAt) {
+      const chairKind = args.synthesisProvider || successes[0].kind;
+      if (!successes.some((member) => member.kind === chairKind)) {
+        synthesis = { kind: chairKind, exitCode: -1, droppedOut: true, stdout: '', stderr: 'synthesisProvider must be one of the successful, policy-eligible committee members', failureClass: 'policy' };
+      } else {
+        const packet = clip(successes.map((member) => `## ${member.kind} (${member.role})\n${member.stdout}`).join('\n\n'), policy.committee.maxSynthesisChars);
+        const originalTask = clip(args.task, 8000);
+        synthesisInputTruncated = packet.truncated || originalTask.truncated;
+        const synthesisPrompt = [
+          'You are the read-only chair of a multi-provider committee.',
+          'Assess actual agreement; successful text generation alone is not consensus. Preserve material disagreements, distinguish evidence from opinion, propose explicit gates, and do not claim implementation.',
+          'Return JSON only with this schema:',
+          '{"verdict":"agreement|mixed|disagreement","confidence":0.0,"agreements":["..."],"dissent":["..."],"recommendation":"..."}',
+          '',
+          `ORIGINAL TASK:\n${originalTask.text}`,
+          '',
+          `MEMBER RESPONSES:\n${packet.text}`,
+        ].join('\n');
+        synthesis = await callProvider({
+          kind: chairKind,
+          prompt: synthesisPrompt,
+          cwd: args.cwd,
+          timeoutMs: remainingTime(deadlineAt),
+          useCache: args.useCache,
+          parentReceiptId: rootReceipt.receiptId,
+          purpose: 'committee:chair',
+          signal,
+        });
+        if (providerSucceeded(synthesis)) synthesisAssessment = parseChairAssessment(synthesis.stdout);
+      }
+    }
+    const cancelled = !!signal?.aborted;
+    const deadlineExceeded = !cancelled && Date.now() >= deadlineAt &&
+      (successes.length < eligible.length || (args.mode === 'consensus' && !providerSucceeded(synthesis)));
+    const synthesisCompleted = args.mode === 'consensus' && providerSucceeded(synthesis);
+    // Any truncation on the way in or out — seat prompt clipping, the chair
+    // packet, the provider's own prompt cap reported by the bridge, or the
+    // sanitized stdout cap — means the committee did not see the whole task.
+    const evidenceIncomplete = memberEvidenceIncomplete || synthesisInputTruncated || !!synthesis?.outputTruncated || !!synthesis?.route?.prompt_truncated;
+    const evidenceComplete = !evidenceIncomplete || args.acknowledgeTruncatedEvidence;
+    const consensusMinConfidence = Number(policy.committee.consensusMinConfidence ?? 0.6);
+    const allSeatsSucceeded = successes.length === eligible.length;
+    const consensusAchieved = args.mode === 'consensus' && successes.length >= 2 && synthesisCompleted &&
+      synthesisAssessment?.verdict === 'agreement' && synthesisAssessment.confidence >= consensusMinConfidence &&
+      evidenceComplete;
+    // "completed" means the whole committee ran on complete evidence. A chair
+    // that merely produced text, a dropped seat, or clipped evidence is partial.
+    // Acknowledging truncation permits a consensus claim; it does not make the
+    // evidence complete, so the status stays partial either way.
+    const status = cancelled ? 'cancelled'
+      : deadlineExceeded ? (successes.length ? 'partial' : 'timed_out')
+        : args.mode === 'consensus'
+          ? (synthesisCompleted && synthesisAssessment && allSeatsSucceeded && !evidenceIncomplete
+            ? 'completed'
+            : successes.length ? 'partial' : 'failed')
+          : (allSeatsSucceeded && !evidenceIncomplete ? 'completed' : successes.length ? 'partial' : 'failed');
+    const consensusBlockedReasons = args.mode !== 'consensus' ? [] : [
+      successes.length < 2 ? 'fewer than two successful independent members' : null,
+      !synthesisCompleted ? 'chair seat did not return a usable response' : null,
+      synthesisCompleted && !synthesisAssessment ? 'chair response was not a complete structured verdict' : null,
+      synthesisAssessment && synthesisAssessment.verdict !== 'agreement' ? `chair verdict was ${synthesisAssessment.verdict}` : null,
+      synthesisAssessment?.verdict === 'agreement' && synthesisAssessment.confidence < consensusMinConfidence
+        ? `chair confidence ${synthesisAssessment.confidence} is below the policy floor ${consensusMinConfidence}` : null,
+      evidenceIncomplete && !args.acknowledgeTruncatedEvidence ? 'evidence was truncated and acknowledgeTruncatedEvidence was not set' : null,
+    ].filter(Boolean);
+    run = writeRun({
+      ...run,
+      mode: `committee:${args.mode}`,
+      status,
+      taskHash: route.classification.taskHash,
+      route,
+      members,
+      synthesis,
+      synthesisAssessment,
+      synthesisCompleted,
+      consensusAchieved,
+      consensusMinConfidence,
+      consensusBlockedReasons,
+      evidenceIncomplete,
+      allSeatsSucceeded,
+      truncatedEvidenceAcknowledged: args.acknowledgeTruncatedEvidence,
+      parentReceiptId: rootReceipt.receiptId,
+    });
+    const finalReceipt = appendReceipt({ event: 'committee', parentReceiptId: rootReceipt.receiptId, routeId: route.routeId, runId: run.runId, status, successfulProviders: successes.map((item) => item.kind), synthesisCompleted, consensusAchieved, consensusVerdict: synthesisAssessment?.verdict || null, consensusConfidence: synthesisAssessment?.confidence ?? null, consensusMinConfidence, evidenceIncomplete });
+    return result({
+      ok: !cancelled && (args.mode === 'consensus' ? synthesisCompleted : successes.length > 0),
+      status,
+      cancelled,
+      deadlineExceeded,
+      synthesisCompleted,
+      consensusAchieved,
+      consensusVerdict: synthesisAssessment?.verdict || (args.mode === 'consensus' ? 'unknown' : 'not_requested'),
+      consensusMinConfidence,
+      consensusBlockedReasons,
+      synthesisAssessment,
+      evidenceIncomplete,
+      allSeatsSucceeded,
+      truncatedEvidenceAcknowledged: args.acknowledgeTruncatedEvidence,
+      route,
+      members,
+      synthesis,
+      runId: run.runId,
+      runPersistenceError: run.receiptPersistenceError || null,
+      receiptId: rootReceipt.receiptId,
+      receiptPersistenceError: rootReceipt.receiptPersistenceError || finalReceipt.receiptPersistenceError || null,
+    });
+  }));
+
+  const resource = (name, uri, title, description, loader) => {
+    server.registerResource(name, uri, { title, description, mimeType: 'application/json', cacheHint: { ttlMs: 5000, cacheScope: 'private' } }, async () => {
+      try {
+        return { contents: [{ uri, mimeType: 'application/json', text: JSON.stringify(await loader(), null, 2) }] };
+      } catch (error) {
+        return {
+          contents: [{
+            uri,
+            mimeType: 'application/json',
+            text: JSON.stringify({ ok: false, error: error?.message || String(error) }, null, 2),
+          }],
+        };
+      }
+    });
+  };
+  resource('bridge-health', 'psbridge://health', 'Bridge health', 'Current singleton bridge health.', () => health());
+  resource('context', 'psbridge://context', 'AI handoff context', 'Bounded current snapshot of providers, active work, sessions, collaborations, projects, runs, receipts, registry fingerprints, and the tools for retrieving more detail.', () => buildContextBundle({ includeSessionOutput: false, maxMessagesPerCollab: 4, recentRuns: 8, recentReceipts: 12, maxChars: 60000 }));
+  resource('provider-index', 'psbridge://providers', 'Provider capability index', 'Operator-maintained provider registry with live readiness, provenance, receipts, references, and limitations.', async () => ({ providers: providerSummaries(await getDiagnostics()), qualificationPolicy: loadRoutingData().evidence.qualificationPolicy }));
+  resource('routing-policy', 'psbridge://routing-policy', 'Routing policy', 'Deterministic tiers, budgets, and committee policy.', () => loadRoutingData().policy);
+  resource('evidence-index', 'psbridge://evidence', 'Evidence index', 'Primary sources, candidates, benchmark families, and qualification boundaries.', () => loadRoutingData().evidence);
+  resource('sessions', 'psbridge://sessions', 'Terminal sessions', 'Current bridge-owned terminal sessions.', () => bridgeRequest('/api/sessions'));
+  resource('collabs', 'psbridge://collabs', 'Saved collaborations', 'Saved collaboration room summaries.', () => bridgeRequest('/api/collabs'));
+  resource('runs', 'psbridge://runs', 'Recent MCP runs', 'Recent routing and committee run summaries.', () => ({ runs: listRuns(50) }));
+
+  return server;
+}
+
+if (path.resolve(process.argv[1] || '') === fileURLToPath(import.meta.url)) {
+  console.error(`[RelayBridge-mcp] stdio adapter ${PACKAGE.version} -> ${BASE_URL.href}`);
+  serveStdio(() => buildServer());
+}

@@ -1,0 +1,1846 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>RelayBridge — PowerShell + AI CLI + Collab</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<link rel="stylesheet" href="/vendor/xterm/css/xterm.css" />
+<style>
+  :root { --bg:#0e1116; --panel:#161b22; --panel-2:#1f262e; --border:#2a3038; --text:#d6dde6; --muted:#8b949e; --accent:#cc785c; --danger:#d9534f; --safe:#2ea043; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; padding:0; height:100%; width:100%; max-width:100%; overflow:hidden; background:var(--bg); color:var(--text); font:13px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif; }
+  body { display:flex; flex-direction:column; overflow:hidden; width:100%; max-width:100%; min-width:0; }
+  header { display:flex; align-items:center; gap:8px; padding:8px 12px; background:var(--panel); border-bottom:1px solid var(--border); flex-wrap:wrap; width:100%; max-width:100%; min-width:0; }
+  .brand { font-weight:600; margin-right:12px; }
+  .brand small { color:var(--muted); font-weight:400; margin-left:6px; }
+  .btn { background:var(--panel-2); color:var(--text); border:1px solid var(--border); padding:6px 10px; border-radius:6px; cursor:pointer; font-size:12px; display:inline-flex; align-items:center; gap:6px; }
+  .btn:hover { background:#2a3038; }
+  .btn:focus-visible, .toggle:focus-visible, .phase-btn:focus-visible, .collab-chip:focus-visible, .start-btn:focus-visible, textarea:focus-visible, input:focus-visible, select:focus-visible { outline:2px solid #7cc6ff; outline-offset:2px; }
+  .btn.kind { border-left:3px solid var(--accent); }
+  .btn.collab { background:linear-gradient(90deg,var(--accent),#4285f4); color:#fff; border-color:transparent; font-weight:600; }
+  .btn[disabled] { opacity:.4; cursor:not-allowed; }
+  .spacer { flex:1; }
+  .toggle { display:inline-flex; align-items:center; gap:8px; background:var(--panel-2); color:var(--text); padding:6px 10px; border-radius:6px; border:1px solid var(--border); cursor:pointer; user-select:none; font:inherit; }
+  .toggle .dot { width:32px; height:16px; background:#444; border-radius:999px; position:relative; transition:background .2s; }
+  .toggle .dot::after { content:''; position:absolute; top:2px; left:2px; width:12px; height:12px; border-radius:50%; background:#fff; transition:left .2s; }
+  .toggle.on .dot { background:var(--danger); }
+  .toggle.on .dot::after { left:18px; }
+  .toggle .label { font-weight:600; }
+  .toggle.on { border-color:var(--danger); }
+  .toggle.on .label { color:var(--danger); }
+
+  .tabs { display:flex; align-items:center; background:var(--panel); border-bottom:1px solid var(--border); padding:0 8px; gap:2px; overflow-x:auto; min-height:32px; }
+  .tab { display:inline-flex; align-items:center; gap:6px; padding:6px 10px; border-radius:6px 6px 0 0; cursor:pointer; color:var(--muted); border:1px solid transparent; border-bottom:none; max-width:240px; }
+  .tab.active { background:var(--bg); color:var(--text); border-color:var(--border); }
+  .tab .x { color:var(--muted); padding:0 4px; border-radius:4px; }
+  .tab .x:hover { background:var(--panel-2); color:var(--text); }
+  .tab .dotc { width:8px; height:8px; border-radius:50%; background:var(--accent); flex:none; }
+
+  main { flex:1; display:flex; flex-direction:column; min-height:0; min-width:0; max-width:100%; }
+  .pane { flex:1; display:flex; flex-direction:column; min-height:0; min-width:0; width:100%; max-width:100%; }
+  .pane.hidden { display:none; }
+  .term-bar { display:flex; align-items:center; gap:8px; padding:6px 10px; background:var(--panel); border-bottom:1px solid var(--border); font-size:12px; color:var(--muted); }
+  .term-bar input[type=text] { flex:1; background:var(--panel-2); border:1px solid var(--border); color:var(--text); padding:4px 8px; border-radius:4px; font:inherit; }
+  .term-bar .send { background:var(--accent); color:#fff; border-color:var(--accent); }
+  .term-host { flex:1; min-height:0; padding:6px 8px; background:#000; }
+  .term-host .xterm { height:100%; }
+
+  .empty { display:flex; flex:1; align-items:center; justify-content:center; color:var(--muted); flex-direction:column; gap:8px; padding:24px; text-align:center; min-width:0; width:100%; max-width:100%; overflow-wrap:anywhere; }
+  footer { padding:4px 12px; font-size:11px; color:var(--muted); background:var(--panel); border-top:1px solid var(--border); display:flex; gap:16px; min-width:0; max-width:100%; }
+  footer .ok { color:var(--safe); }
+  footer .warn { color:var(--danger); }
+  .status-pill { border:1px solid var(--border); border-radius:999px; padding:1px 7px; white-space:nowrap; }
+  .team-summary { display:grid; grid-template-columns:repeat(4,minmax(120px,1fr)); gap:8px; margin-bottom:14px; }
+  .team-card { background:var(--panel-2); border:1px solid var(--border); border-radius:8px; padding:10px; }
+  .team-card strong { display:block; font-size:18px; margin-top:2px; }
+  .team-provider { display:grid; grid-template-columns:minmax(150px,1fr) minmax(110px,auto) 90px; gap:10px; align-items:center; padding:8px 0; border-bottom:1px solid var(--border); }
+  .team-provider:last-child { border-bottom:0; }
+  .round-cancel { border-color:#6b3d44; color:#ffb6bf; }
+  .round-cancel:not([disabled]):hover { background:#4a242a; }
+  .save-status { margin-left:auto; background:transparent; border:0; color:var(--muted); font-size:11px; cursor:pointer; padding:3px 6px; }
+  .save-status.ok { color:#79d892; }
+  .save-status.warn { color:#ffb6bf; }
+
+  /* === Collab pane (WhatsApp-style chat) === */
+  .collab { display:flex; flex-direction:column; min-height:0; flex:1; background:#0b141a; }
+  .collab-toolbar { display:flex; gap:8px; padding:10px 14px; background:#202c33; border-bottom:1px solid #2a3942; align-items:center; flex-wrap:wrap; color:#e9edef; }
+  .collab-toolbar > strong { font-size:13px; }
+  .collab-chips { display:flex; gap:6px; flex-wrap:wrap; }
+  .collab-chip { display:inline-flex; align-items:center; gap:6px; padding:4px 10px; background:#2a3942; border:1px solid #2a3942; border-radius:999px; font-size:12px; color:#e9edef; }
+  .collab-chip .swatch { width:8px; height:8px; border-radius:50%; }
+  .collab-chip.dropped { opacity:.4; text-decoration:line-through; }
+  .collab-chip .x { color:#8696a0; cursor:pointer; padding:0 2px; font-size:14px; line-height:1; }
+  .collab-chip .x:hover { color:#f15c6d; }
+  .collab-add { background:transparent; color:#8696a0; border:1px dashed #3b4a54; border-radius:999px; padding:4px 12px; font-size:12px; cursor:pointer; }
+  .collab-add:hover { border-color:#00a884; color:#00a884; }
+  .phase-row { display:flex; gap:6px; align-items:center; padding:8px 12px; background:#202c33; border-bottom:1px solid #2a3942; flex-wrap:wrap; }
+  .phase-btn { background:#2a3942; color:#e9edef; border:1px solid #3b4a54; padding:5px 12px; border-radius:18px; cursor:pointer; font-size:12px; }
+  .phase-btn:hover { background:#3b4a54; }
+  .phase-btn[disabled] { opacity:.4; cursor:not-allowed; }
+  .ctx-box { padding:6px 14px; background:#202c33; border-bottom:1px solid #2a3942; }
+  .ctx-box details { font-size:12px; }
+  .ctx-box summary { cursor:pointer; color:#8696a0; padding:2px 0; outline:none; }
+  .ctx-box summary:hover { color:#e9edef; }
+  .ctx-box textarea { width:100%; min-height:70px; max-height:200px; background:#2a3942; border:1px solid #3b4a54; color:#e9edef; padding:8px 10px; border-radius:8px; font:12px/1.4 ui-monospace,Consolas,monospace; resize:vertical; margin-top:6px; overflow-y:auto; }
+
+  /* Transcript area — chat bubbles */
+  .transcript {
+    flex:1; overflow-y:auto; padding:14px 16px;
+    background:#0b141a;
+    /* subtle dot pattern reminiscent of WhatsApp wallpaper */
+    background-image:
+      radial-gradient(rgba(255,255,255,0.025) 1px, transparent 1px),
+      radial-gradient(rgba(255,255,255,0.02) 1px, transparent 1px);
+    background-size: 24px 24px, 12px 12px;
+    background-position: 0 0, 6px 6px;
+    scroll-behavior: smooth;
+  }
+  .transcript::-webkit-scrollbar { width:8px; }
+  .transcript::-webkit-scrollbar-thumb { background:#2a3942; border-radius:4px; }
+  .transcript::-webkit-scrollbar-thumb:hover { background:#3b4a54; }
+
+  /* Message row: avatar + bubble */
+  .msg {
+    margin:8px 0; display:flex; align-items:flex-end; gap:8px;
+    max-width: 78%;
+  }
+  .msg.from-user  { margin-left:auto; flex-direction:row-reverse; }
+  .msg.from-ai    { margin-right:auto; }
+  .msg.from-system { max-width:100%; justify-content:center; margin:6px 0; }
+
+  .msg .avatar {
+    width:30px; height:30px; flex:none; border-radius:50%;
+    background:#2a3942; color:#fff;
+    display:flex; align-items:center; justify-content:center;
+    font-weight:700; font-size:12px; letter-spacing:.5px;
+    box-shadow: 0 1px 2px rgba(0,0,0,.4);
+  }
+  .msg.from-system .avatar { display:none; }
+
+  .msg .bubble {
+    background:#202c33; color:#e9edef;
+    padding:8px 12px; border-radius:8px;
+    box-shadow: 0 1px 0.5px rgba(0,0,0,0.13);
+    position:relative;
+    min-width:0; word-break: break-word;
+  }
+  /* WhatsApp-style tail — small triangle on the bubble corner */
+  .msg.from-ai .bubble {
+    border-top-left-radius:0;
+    border-left:3px solid var(--bubble-accent, #00a884);
+  }
+  .msg.from-user .bubble {
+    background:#005c4b;
+    border-top-right-radius:0;
+  }
+  .msg.from-system .bubble {
+    background: rgba(54, 76, 86, 0.5);
+    color:#8696a0;
+    border-radius:14px;
+    padding:4px 14px;
+    font-size:11.5px;
+    font-style:italic;
+    border:1px solid rgba(60, 82, 92, 0.6);
+  }
+  .msg.error .bubble { background:#3a1f23; border-left:3px solid #f15c6d; color:#fbe5e7; }
+  .msg.thinking .bubble { opacity:.55; font-style:italic; }
+
+  .msg-head {
+    display:flex; gap:8px; align-items:baseline; margin-bottom:3px;
+    font-size:11.5px;
+  }
+  .msg-name { font-weight:700; color: var(--bubble-accent, #00a884); }
+  .msg.from-user .msg-name { color:#9be3c8; }
+  .msg-company { color:#8696a0; font-size:10.5px; }
+  .msg-phase {
+    margin-left:auto; color:#8696a0; font-size:10.5px;
+    background: rgba(255,255,255,0.04); padding:1px 6px; border-radius:6px;
+  }
+  .msg-body {
+    white-space: pre-wrap; word-wrap: break-word; font-family: inherit;
+    line-height:1.45; font-size:13.5px;
+  }
+  .msg-meta { margin-top:5px; display:flex; gap:5px; flex-wrap:wrap; color:#9fb1bc; font:10px/1.3 ui-monospace,Consolas,monospace; }
+  .msg-meta span { border:1px solid rgba(159,177,188,.25); border-radius:999px; padding:1px 5px; }
+  .msg-time { font-size:10px; color:#8696a0; text-align:right; margin-top:3px; }
+  .empty-msg { color:#8696a0; text-align:center; padding:40px 20px; font-size:13px; }
+
+  /* Composer — sticky bottom bar */
+  .prompt-row {
+    display:flex; gap:8px; align-items:flex-end;
+    padding:10px 14px;
+    background:#202c33;
+    border-top:1px solid #2a3942;
+  }
+  .prompt-row textarea {
+    flex:1;
+    min-height:42px; max-height:200px;
+    background:#2a3942; border:none; color:#e9edef;
+    padding:11px 14px; border-radius:22px;
+    font:14px/1.4 system-ui,sans-serif;
+    resize:none; overflow-y:auto; outline:none;
+  }
+  .prompt-row textarea::-webkit-scrollbar { width:6px; }
+  .prompt-row textarea::-webkit-scrollbar-thumb { background:#3b4a54; border-radius:3px; }
+  .prompt-row textarea::placeholder { color:#8696a0; }
+  .start-btn {
+    background:#00a884; color:#fff; border:none;
+    border-radius:50%; width:42px; height:42px; min-width:42px;
+    display:flex; align-items:center; justify-content:center;
+    font-size:18px; font-weight:600; cursor:pointer;
+    box-shadow: 0 2px 4px rgba(0,0,0,.3);
+    transition: background .15s;
+  }
+  .start-btn:hover { background:#06cf9c; }
+  .start-btn[disabled] { opacity:.4; cursor:not-allowed; }
+
+    dialog { background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:8px; padding:0; min-width:480px; max-width:80vw; }
+  dialog::backdrop { background:rgba(0,0,0,.5); }
+  .dlg-head { padding:14px 18px; border-bottom:1px solid var(--border); display:flex; align-items:center; justify-content:space-between; }
+  .dlg-body { padding:14px 18px; }
+  .dlg-foot { padding:12px 18px; border-top:1px solid var(--border); display:flex; justify-content:flex-end; gap:8px; }
+  .check-row { display:flex; align-items:center; gap:8px; padding:6px 0; }
+  .check-row input[type=checkbox] { width:16px; height:16px; cursor:pointer; }
+  .check-row .swatch { width:10px; height:10px; border-radius:50%; }
+  .check-row label { cursor:pointer; user-select:none; }
+
+  /* === group-chat: clickable participant chips === */
+  .collab-chip { cursor:pointer; transition:opacity .15s, filter .15s; user-select:none; }
+  .collab-chip:hover { filter:brightness(1.18); }
+  .collab-chip .reply-dot { width:7px; height:7px; border-radius:50%; flex:none; background:#5a6b75; }
+  .collab-chip.replying .reply-dot { background:#00d977; box-shadow:0 0 5px #00d977; }
+  .collab-chip.muted { opacity:.5; }
+  .collab-chip.muted .swatch { filter:grayscale(.7); }
+  .collab-chip.dropped { opacity:.55; text-decoration:none; }
+  .collab-chip.dropped strong { text-decoration:line-through; }
+  .collab-chip.dropped .reply-dot { background:#f15c6d; box-shadow:none; }
+
+  /* "who will reply" line above the composer */
+  .to-line { padding:6px 16px 0; font-size:11.5px; color:#8696a0; display:flex; gap:6px; align-items:center; flex-wrap:wrap; min-height:18px; }
+  .to-line b { color:#00d977; font-weight:600; }
+  .to-line .addr { color:#7cc6ff; }
+
+  .composer-wrap { background:#1c282f; }
+  .composer-wrap .phase-row { background:transparent; border-bottom:none; border-top:1px solid #2a3942; padding:7px 12px; }
+  .composer-wrap .phase-label { color:#8696a0; font-size:11px; }
+  .composer-wrap .prompt-row { background:transparent; border-top:none; padding:6px 14px 12px; }
+
+  /* typing indicator */
+  .typing-dots { display:inline-flex; gap:5px; padding:4px 2px; }
+  .typing-dots span { width:7px; height:7px; border-radius:50%; background:#8696a0; animation:tdot 1.2s infinite ease-in-out; }
+  .typing-dots span:nth-child(2) { animation-delay:.18s; }
+  .typing-dots span:nth-child(3) { animation-delay:.36s; }
+  @keyframes tdot { 0%,65%,100%{ transform:translateY(0); opacity:.35 } 32%{ transform:translateY(-5px); opacity:1 } }
+  @media (max-width:760px) {
+    header { align-items:stretch; max-height:48vh; overflow-y:auto; overflow-x:hidden; padding:7px 8px; }
+    header > * { min-width:0; max-width:100%; }
+    header > .spacer { display:none; }
+    .brand { width:100%; }
+    .brand small { overflow-wrap:anywhere; }
+    #kind-buttons { display:flex; gap:6px; overflow-x:auto; width:100%; min-width:0; padding-bottom:2px; }
+    #kind-buttons > .btn { flex:0 0 auto; }
+    header > .btn { flex:0 0 calc(50% - 4px); width:calc(50% - 4px); justify-content:center; white-space:normal; text-align:center; overflow:hidden; }
+    .toggle { flex:1 0 100%; width:100%; max-width:100%; min-width:0; justify-content:center; white-space:normal; }
+    .toggle .label { min-width:0; overflow-wrap:anywhere; }
+    dialog { min-width:0 !important; width:calc(100vw - 20px); max-width:calc(100vw - 20px); max-height:90vh; }
+    .dlg-body { overflow-x:hidden; overflow-wrap:anywhere; }
+    .team-summary { grid-template-columns:repeat(2,minmax(110px,1fr)); }
+    .team-provider { grid-template-columns:1fr auto; }
+    .team-provider > :last-child { grid-column:1 / -1; }
+    .msg { max-width:94%; }
+    footer { gap:6px; overflow-x:hidden; flex-wrap:wrap; }
+    footer .status-pill { flex:1 1 calc(50% - 3px); min-width:0; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:normal; overflow-wrap:anywhere; }
+  }
+  @media (max-width:520px) {
+    header > .btn { flex-basis:100%; width:100%; }
+    footer .status-pill { flex-basis:100%; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">RelayBridge <small>localhost — PowerShell + AI CLI + Collab</small></div>
+  <div id="kind-buttons"></div>
+  <button class="btn collab" id="new-collab-btn" title="Start a new multi-AI collab conversation">🤝 New Collab</button>
+  <button class="btn" id="saved-collabs-btn" title="Open a saved group chat">💬 Saved</button>
+  <button class="btn" id="team-status-btn" title="See providers, active agent work, sessions, collaborations, and MCP handoff status">🧭 Team status</button>
+  <div class="spacer"></div>
+  <button type="button" id="toggle" class="toggle" aria-pressed="false" title="When ON, new browser terminal sessions use their dangerous/yolo flags. MCP AI one-shots still force dangerous:false; MCP PowerShell terminals are real host shells.">
+    <div class="dot"></div>
+    <span class="label">Full Permissions: OFF</span>
+  </button>
+  <button class="btn" id="diag-btn" title="Check which CLIs are installed and on PATH">🔍 Check installs</button>
+  <button class="btn" id="install-all-btn" title="npm install -g for every AI CLI configured with an npm_package">📦 Install all</button>
+  <button class="btn" id="reload-btn">⟳ Reload</button>
+</header>
+
+<dialog id="install-dialog">
+  <div class="dlg-head"><strong>Install AI CLIs</strong><button class="btn" id="install-close-btn">Close</button></div>
+  <div class="dlg-body" id="install-body">Ready.</div>
+  <div class="dlg-foot">
+    <button class="btn collab" id="install-go-btn">Install all missing</button>
+  </div>
+</dialog>
+
+<dialog id="diag-dialog">
+  <div class="dlg-head"><strong>CLI install check</strong><button class="btn" id="diag-close-btn">Close</button></div>
+  <div class="dlg-body" id="diag-body">Checking…</div>
+</dialog>
+
+<dialog id="team-status-dialog" style="min-width:min(760px,90vw);">
+  <div class="dlg-head"><strong>AI team control center</strong><button class="btn" id="team-status-close">Close</button></div>
+  <div class="dlg-body" id="team-status-body" aria-live="polite" style="max-height:65vh; overflow:auto;">Loading…</div>
+  <div class="dlg-foot">
+    <button class="btn" id="team-copy-btn">Copy safe handoff snapshot</button>
+    <button class="btn collab" id="team-refresh-btn">Refresh</button>
+  </div>
+</dialog>
+
+<dialog id="collab-pick-dialog">
+  <div class="dlg-head"><strong>Start a Collab</strong><button class="btn" id="collab-pick-cancel">Cancel</button></div>
+  <div class="dlg-body">
+    <p style="margin:0 0 12px; color:var(--muted); font-size:13px;">Name this conversation and pick the AIs. The collab is auto-saved after every turn — you can close the tab and come back to it later from <b>💬 Saved</b>.</p>
+    <div style="margin-bottom:12px;">
+      <label style="display:block; font-size:12px; color:var(--muted); margin-bottom:4px;">Chat name (optional)</label>
+      <input type="text" id="collab-pick-name" placeholder="e.g. HyroxOS firmware Tab5 build" style="width:100%; background:var(--panel-2); border:1px solid var(--border); color:var(--text); padding:8px 10px; border-radius:6px; font:13px system-ui,sans-serif;" />
+    </div>
+    <div style="margin-bottom:14px;">
+      <label style="display:block; font-size:12px; color:var(--muted); margin-bottom:4px;">Project (optional)</label>
+      <div style="display:flex; gap:6px;">
+        <select id="collab-pick-project" style="flex:1; background:var(--panel-2); border:1px solid var(--border); color:var(--text); padding:8px 10px; border-radius:6px; font:13px system-ui,sans-serif;">
+          <option value="">(no project)</option>
+        </select>
+        <input type="text" id="collab-pick-newproject" placeholder="or new project name" style="flex:1; background:var(--panel-2); border:1px solid var(--border); color:var(--text); padding:8px 10px; border-radius:6px; font:13px system-ui,sans-serif;" />
+      </div>
+    </div>
+    <label style="display:block; font-size:12px; color:var(--muted); margin-bottom:6px;">Participants</label>
+    <div style="color:var(--muted);font-size:11px;margin-bottom:6px">Two ready local seats are preselected when available. Add hosted seats deliberately when their extra perspective is worth account quota.</div>
+    <div id="collab-pick-list"></div>
+  </div>
+  <div class="dlg-foot">
+    <button class="btn" id="collab-pick-cancel-2">Cancel</button>
+    <button class="btn collab" id="collab-pick-go">Open Collab</button>
+  </div>
+</dialog>
+
+<dialog id="saved-dialog">
+  <div class="dlg-head"><strong>Saved Collabs</strong><button class="btn" id="saved-close-btn">Close</button></div>
+  <div class="dlg-body" id="saved-body" style="max-height:60vh; overflow-y:auto;">Loading…</div>
+</dialog>
+
+<dialog id="collab-add-dialog">
+  <div class="dlg-head"><strong>Add AI to this conversation</strong><button class="btn" id="collab-add-close">Close</button></div>
+  <div class="dlg-body" id="collab-add-list"></div>
+</dialog>
+
+<div class="tabs" id="tabs"></div>
+
+<main id="main">
+  <div class="empty" id="empty-state">
+    <div style="font-size:24px">🔌</div>
+    <div>No tabs yet. Click a button above to launch a PowerShell, AI CLI, or 🤝 Collab.</div>
+    <div>Toggle <b>Full Permissions</b> first if you want CLIs in dangerous/yolo mode.</div>
+  </div>
+</main>
+
+<footer aria-live="polite">
+  <span id="status-mode">mode: …</span>
+  <span id="status-count">0 tabs</span>
+  <span id="status-perm">permissions: …</span>
+  <span id="status-providers" class="status-pill">providers: not checked</span>
+  <span id="status-work" class="status-pill">active calls: …</span>
+  <span id="status-version" class="status-pill">bridge: …</span>
+  <span class="spacer"></span>
+  <span>API: <a href="/api/health" target="_blank" style="color:var(--muted)">/api/health</a></span>
+</footer>
+
+<script src="/vendor/xterm/lib/xterm.js"></script>
+<script src="/vendor/xterm-addon-fit/lib/addon-fit.js"></script>
+<script>
+const API = location.origin;
+const WS_BASE = location.origin.replace(/^http/, 'ws');
+
+const state = {
+  config: {},
+  fullPermissions: false,
+  sessions: new Map(),
+  collabs: new Map(),
+  active: null,
+  teamSnapshot: null,
+};
+let nextCollabId = 1;
+const $ = (s) => document.querySelector(s);
+const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (ch) => ({
+  '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+}[ch]));
+const safeColor = (value, fallback = '#888888') => /^#[0-9a-f]{3}(?:[0-9a-f]{3})?(?:[0-9a-f]{2})?$/i.test(String(value || ''))
+  ? String(value)
+  : fallback;
+const tabsEl = $('#tabs');
+const mainEl = $('#main');
+const emptyEl = $('#empty-state');
+const toggleEl = $('#toggle');
+const kindBtnsEl = $('#kind-buttons');
+
+let capabilityToken = '';
+let capabilityPromise = null;
+
+async function ensureCapability() {
+  if (capabilityToken) return capabilityToken;
+  if (!capabilityPromise) {
+    capabilityPromise = fetch(API + '/api/capability', { cache: 'no-store' })
+      .then(async (res) => {
+        if (!res.ok) throw new Error(`capability bootstrap failed: ${res.status}`);
+        const data = await res.json();
+        if (!/^[A-Fa-f0-9]{64}$/.test(String(data.token || ''))) throw new Error('invalid bridge capability token');
+        capabilityToken = data.token;
+        return capabilityToken;
+      })
+      .finally(() => { capabilityPromise = null; });
+  }
+  return capabilityPromise;
+}
+
+async function bridgeFetch(path, opts = {}) {
+  const token = await ensureCapability();
+  const headers = { ...(opts.headers || {}), 'X-RelayBridge-Token': token };
+  if (opts.body !== undefined && !headers['Content-Type']) headers['Content-Type'] = 'application/json';
+  return fetch(path.startsWith('http') ? path : API + path, { ...opts, headers });
+}
+
+async function api(path, opts = {}) {
+  const res = await bridgeFetch(path, opts);
+  if (!res.ok) {
+    const raw = await res.text().catch(() => '');
+    let detail = raw;
+    try {
+      const parsed = raw ? JSON.parse(raw) : {};
+      detail = parsed.error || parsed.detail || raw;
+    } catch {}
+    throw new Error(`${res.status} ${res.statusText}${detail ? ': ' + String(detail).slice(0, 1000) : ''}`);
+  }
+  return res.json();
+}
+
+function updateProviderFooter(results) {
+  const providers = Object.values(results || {});
+  const ready = providers.filter((item) => item?.ready).length;
+  const el = $('#status-providers');
+  el.textContent = providers.length ? `providers: ${ready}/${providers.length} ready` : 'providers: none';
+  el.className = 'status-pill ' + (providers.length && ready === providers.length ? 'ok' : 'warn');
+}
+
+async function refreshHealthStatus() {
+  const live = await api('/api/health');
+  $('#status-mode').textContent = `mode: ${live.ptyMode}`;
+  const providerCalls = Number(live.activeOneShotCount || 0);
+  const childProcesses = Number(live.activeTaskCount || 0);
+  $('#status-work').textContent = `provider calls: ${providerCalls}`;
+  $('#status-work').title = `${childProcesses} total managed child process${childProcesses === 1 ? '' : 'es'}`;
+  $('#status-work').className = 'status-pill ' + (providerCalls ? 'warn' : 'ok');
+  $('#status-version').textContent = `bridge: v${live.version || '?'}`;
+  $('#status-version').className = 'status-pill ' + (live.capabilityAuth ? 'ok' : 'warn');
+  return live;
+}
+
+function safeTeamSnapshot({ live, diagnostics, sessions, collabs, projects, activity }) {
+  return {
+    schemaVersion: 1,
+    generatedAt: new Date().toISOString(),
+    bridge: {
+      version: live.version,
+      instanceId: live.instanceId,
+      startedAt: live.startedAt,
+      ptyMode: live.ptyMode,
+      fullPermissions: !!live.fullPermissions,
+      capabilityAuth: !!live.capabilityAuth,
+      activeProviderCallCount: Number(live.activeOneShotCount || 0),
+      activeChildProcessCount: Number(live.activeTaskCount || 0),
+      sessionCount: Number(live.sessionCount || 0),
+    },
+    providers: Object.entries(diagnostics || {}).map(([kind, info]) => ({
+      kind,
+      label: info.label || state.config[kind]?.label || kind,
+      ready: !!info.ready,
+      detail: info.detail || '',
+      runtimeVersion: info.runtimeVersion || '',
+      configuredModel: state.config[kind]?.model || null,
+    })),
+    sessions: (sessions || []).map((session) => ({
+      id: session.id,
+      kind: session.kind,
+      label: session.label,
+      cwd: session.cwd,
+      mode: session.mode,
+      exited: !!session.exited,
+      exitCode: session.exitCode ?? null,
+    })),
+    collaborations: collabs || [],
+    projects: projects || [],
+    recentRuns: activity?.runs || [],
+    recentReceipts: activity?.receipts || [],
+    mcpHandoff: {
+      preferredTool: 'get_context_bundle',
+      preferredResource: 'psbridge://context',
+      detailTools: ['read_session_output', 'read_collab', 'get_run', 'list_receipts'],
+      note: 'The MCP bundle adds bounded outputs, transcripts, runs, receipts, policy fingerprints, and provenance. No capability token is included here.',
+    },
+  };
+}
+
+function renderTeamStatus(snapshot) {
+  const ready = snapshot.providers.filter((provider) => provider.ready).length;
+  const providerRows = snapshot.providers.map((provider) => `
+    <div class="team-provider">
+      <div><strong>${escapeHtml(provider.label)}</strong><div style="color:var(--muted);font-size:11px">${escapeHtml(provider.configuredModel || provider.kind)}</div></div>
+      <div class="${provider.ready ? 'ok' : 'warn'}">${provider.ready ? '✓ ready' : '⚠ setup needed'}</div>
+      <div style="color:var(--muted);font-size:11px">${escapeHtml(provider.runtimeVersion || provider.detail || 'not reported')}</div>
+    </div>`).join('');
+  const runRows = snapshot.recentRuns.slice(0, 8).map((run) => `
+    <div style="display:flex;gap:8px;align-items:center;padding:6px 0;border-bottom:1px solid var(--border)">
+      <code style="color:#7cc6ff">${escapeHtml(run.runId)}</code>
+      <span>${escapeHtml(run.mode || '')}</span>
+      <span class="${run.status === 'completed' ? 'ok' : 'warn'}">${escapeHtml(run.status || 'unknown')}</span>
+      <span style="margin-left:auto;color:var(--muted);font-size:11px">${escapeHtml((run.providers || []).map((member) => member.kind + (member.role ? ':' + member.role : '')).join(', ') || 'no completed seats')}</span>
+    </div>`).join('');
+  $('#team-status-body').innerHTML = `
+    <div class="team-summary">
+      <div class="team-card"><span style="color:var(--muted)">Providers</span><strong>${ready}/${snapshot.providers.length}</strong></div>
+      <div class="team-card"><span style="color:var(--muted)">Provider calls</span><strong>${snapshot.bridge.activeProviderCallCount}</strong><div style="color:var(--muted);font-size:10px">${snapshot.bridge.activeChildProcessCount} managed child processes</div></div>
+      <div class="team-card"><span style="color:var(--muted)">Terminal sessions</span><strong>${snapshot.sessions.length}</strong></div>
+      <div class="team-card"><span style="color:var(--muted)">Saved collabs</span><strong>${snapshot.collaborations.length}</strong></div>
+    </div>
+    <div class="team-card" style="margin-bottom:12px">
+      <strong style="font-size:14px">MCP handoff is ready</strong>
+      <div style="margin-top:5px;color:var(--muted)">Codex or Claude can call <code>get_context_bundle</code> (or read <code>psbridge://context</code>) to receive providers, active work, terminal tails, collaboration history, projects, runs, receipts, and policy fingerprints in one bounded packet.</div>
+      <div style="margin-top:6px" class="${snapshot.bridge.fullPermissions ? 'warn' : 'ok'}">${snapshot.bridge.fullPermissions ? '⚠ Full Permissions is ON for new browser sessions.' : '✓ Full Permissions is OFF. MCP AI one-shots force dangerous:false.'}</div>
+      <div style="margin-top:4px;color:var(--muted);font-size:11px">PowerShell is still a real host shell, not a filesystem or process sandbox. Review commands before sending them.</div>
+    </div>
+    <div class="team-card" style="margin-bottom:12px"><strong style="font-size:14px;margin-bottom:5px">Provider roster</strong>${providerRows || '<em>No providers configured.</em>'}</div>
+    <div class="team-card"><strong style="font-size:14px;margin-bottom:5px">Recent delegated runs</strong>${runRows || '<em style="color:var(--muted)">No persisted MCP runs yet.</em>'}<div style="margin-top:7px;color:var(--muted);font-size:11px">${snapshot.recentReceipts.length} recent receipt summaries loaded. Use MCP <code>get_run</code> or <code>list_receipts</code> for full provenance and pagination.</div></div>`;
+}
+
+async function refreshTeamStatus() {
+  $('#team-status-body').textContent = 'Checking bridge, providers, sessions, and collaborations…';
+  const [diag, sessions, collabs, projects, activity] = await Promise.all([
+    api('/api/diag'),
+    api('/api/sessions'),
+    api('/api/collabs'),
+    api('/api/projects'),
+    api('/api/activity?limit=12'),
+  ]);
+  // Probe health after diagnostics so the UI does not count its own short-lived
+  // readiness processes as active agent calls.
+  const live = await refreshHealthStatus();
+  updateProviderFooter(diag.results || {});
+  state.teamSnapshot = safeTeamSnapshot({
+    live,
+    diagnostics: diag.results || {},
+    sessions,
+    collabs: collabs.collabs || [],
+    projects: projects.projects || [],
+    activity,
+  });
+  renderTeamStatus(state.teamSnapshot);
+}
+
+const teamStatusDialog = $('#team-status-dialog');
+$('#team-status-btn').onclick = async () => {
+  if (typeof teamStatusDialog.showModal === 'function') teamStatusDialog.showModal(); else teamStatusDialog.setAttribute('open', 'true');
+  try { await refreshTeamStatus(); }
+  catch (error) { $('#team-status-body').innerHTML = `<span class="warn">Team status failed: ${escapeHtml(error.message)}</span>`; }
+};
+$('#team-status-close').onclick = () => { try { teamStatusDialog.close(); } catch { teamStatusDialog.removeAttribute('open'); } };
+$('#team-refresh-btn').onclick = () => refreshTeamStatus().catch((error) => {
+  $('#team-status-body').innerHTML = `<span class="warn">Team status failed: ${escapeHtml(error.message)}</span>`;
+});
+$('#team-copy-btn').onclick = async () => {
+  if (!state.teamSnapshot) await refreshTeamStatus();
+  const text = JSON.stringify(state.teamSnapshot, null, 2);
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.style.position = 'fixed';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+    textarea.select();
+    document.execCommand('copy');
+    textarea.remove();
+  }
+  const button = $('#team-copy-btn');
+  button.textContent = 'Copied';
+  setTimeout(() => { button.textContent = 'Copy safe handoff snapshot'; }, 1200);
+};
+
+async function loadConfig() {
+  state.config = await api('/api/config');
+  renderKindButtons();
+}
+
+function renderKindButtons() {
+  kindBtnsEl.innerHTML = '';
+  for (const [kind, entry] of Object.entries(state.config)) {
+    if (kind.startsWith('_')) continue;
+    if (!entry || !entry.label) continue;
+    const b = document.createElement('button');
+    b.className = 'btn kind';
+    b.style.borderLeftColor = safeColor(entry.color, '#cc785c');
+    b.textContent = '+ ' + entry.label;
+    b.title = `Launch ${entry.label}`;
+    b.onclick = () => launchSession(kind);
+    kindBtnsEl.appendChild(b);
+  }
+}
+
+async function loadPermissions() {
+  const r = await api('/api/permissions');
+  renderPermissions(r.fullPermissions);
+}
+function renderPermissions(v) {
+  state.fullPermissions = !!v;
+  toggleEl.classList.toggle('on', !!v);
+  toggleEl.setAttribute('aria-pressed', String(!!v));
+  toggleEl.querySelector('.label').textContent = 'Full Permissions: ' + (v ? 'ON' : 'OFF');
+  $('#status-perm').textContent = v ? 'Full Permissions ON ⚠' : 'Full Permissions OFF';
+  $('#status-perm').className = v ? 'warn' : 'ok';
+}
+async function setPermissions(v) {
+  const previous = state.fullPermissions;
+  if (v && !confirm('Enable Full Permissions for NEW browser terminal sessions?\n\nThis allows configured CLIs to use dangerous/yolo flags. MCP AI one-shots still force dangerous:false; MCP PowerShell terminals remain real host shells.')) return;
+  toggleEl.disabled = true;
+  try {
+    const saved = await api('/api/permissions', { method: 'POST', body: JSON.stringify({ fullPermissions: !!v }) });
+    renderPermissions(saved.fullPermissions);
+  } catch (error) {
+    renderPermissions(previous);
+    alert('Could not change permissions: ' + error.message);
+  } finally {
+    toggleEl.disabled = false;
+  }
+}
+toggleEl.onclick = () => setPermissions(!state.fullPermissions);
+
+async function launchSession(kind) {
+  try {
+    const meta = await api('/api/sessions', { method: 'POST', body: JSON.stringify({ kind, dangerous: state.fullPermissions }) });
+    attachSession(meta);
+    setActive('session:' + meta.id);
+  } catch (err) { alert('Failed to launch: ' + err.message); }
+}
+
+async function refreshSessions() {
+  const list = await api('/api/sessions');
+  for (const id of [...state.sessions.keys()]) if (!list.find((m) => m.id === id)) closeSessionLocal(id);
+  for (const m of list) if (!state.sessions.has(m.id)) attachSession(m);
+  $('#status-mode').textContent = 'mode: ' + (list[0] ? list[0].mode : '—');
+  updateCounts();
+}
+
+function updateCounts() {
+  const total = state.sessions.size + state.collabs.size;
+  $('#status-count').textContent = total + (total === 1 ? ' tab' : ' tabs');
+  emptyEl.style.display = total === 0 ? '' : 'none';
+}
+
+function makeTab(tabId, labelText, color, idForClose, isSession) {
+  const tab = document.createElement('div');
+  tab.className = 'tab';
+  tab.setAttribute('role', 'tab');
+  tab.setAttribute('tabindex', '0');
+  tab.setAttribute('aria-selected', 'false');
+  tab.dataset.tabId = tabId;
+  const dot = document.createElement('span');
+  dot.className = 'dotc';
+  dot.style.background = color;
+  tab.appendChild(dot);
+  const lbl = document.createElement('span');
+  lbl.textContent = labelText;
+  lbl.style.overflow = 'hidden'; lbl.style.textOverflow = 'ellipsis'; lbl.style.whiteSpace = 'nowrap';
+  tab.appendChild(lbl);
+  const x = document.createElement('span');
+  x.className = 'x'; x.textContent = '×'; x.title = 'Close';
+  x.setAttribute('role', 'button'); x.setAttribute('tabindex', '0');
+  x.onclick = (e) => { e.stopPropagation(); if (isSession) closeSession(idForClose); else closeCollab(idForClose); };
+  x.onkeydown = (e) => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); x.click(); }
+  };
+  tab.appendChild(x);
+  tabsEl.appendChild(tab);
+  return tab;
+}
+
+function attachSession(meta) {
+  if (state.sessions.has(meta.id)) return;
+  const tabId = 'session:' + meta.id;
+  const tab = makeTab(tabId, `${meta.label} #${meta.id}`, safeColor(state.config[meta.kind]?.color, '#cc785c'), meta.id, true);
+  const pane = document.createElement('div');
+  pane.className = 'pane hidden';
+
+  const bar = document.createElement('div');
+  bar.className = 'term-bar';
+  const summary = document.createElement('span');
+  summary.textContent = `id ${meta.id} · ${meta.command} ${(meta.args || []).join(' ')}`;
+  const spacer = document.createElement('span');
+  spacer.style.flex = '1';
+  const inp = document.createElement('input');
+  inp.type = 'text';
+  inp.placeholder = 'One-line command + Enter (sent to terminal stdin)';
+  const sendBtn = document.createElement('button');
+  sendBtn.className = 'btn send';
+  sendBtn.textContent = 'Send';
+  bar.append(summary, spacer, inp, sendBtn);
+  const sendInput = async () => {
+    if (!inp.value) return;
+    const value = inp.value;
+    sendBtn.disabled = true;
+    try {
+      await api(`/api/sessions/${meta.id}/input`, { method: 'POST', body: JSON.stringify({ data: value + '\r' }) });
+      inp.value = '';
+    } catch (error) {
+      term.write(`\r\n\x1b[31m[input failed: ${error.message}]\x1b[0m\r\n`);
+    } finally { sendBtn.disabled = false; }
+  };
+  inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); sendInput(); } });
+  sendBtn.onclick = sendInput;
+  const host = document.createElement('div');
+  host.className = 'term-host';
+  pane.appendChild(bar); pane.appendChild(host);
+  mainEl.appendChild(pane);
+
+  const term = new Terminal({
+    fontFamily: 'Cascadia Code, Consolas, ui-monospace, monospace',
+    fontSize: 13,
+    theme: { background: '#000', foreground: '#d6dde6', cursor: '#cc785c' },
+    cursorBlink: true, convertEol: true, scrollback: 5000,
+  });
+  const fit = new FitAddon.FitAddon();
+  term.loadAddon(fit); term.open(host);
+  setTimeout(() => fit.fit(), 0);
+
+  const ws = new WebSocket(`${WS_BASE}/ws?session=${encodeURIComponent(meta.id)}&token=${encodeURIComponent(capabilityToken)}`);
+  ws.onmessage = (ev) => {
+    try {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === 'data') term.write(msg.data);
+      else if (msg.type === 'exit') term.write(`\r\n\x1b[2m[exit ${msg.code}]\x1b[0m\r\n`);
+    } catch {}
+  };
+  ws.onopen = () => ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+  ws.onerror = () => term.write('\r\n\x1b[31m[terminal connection error — use Reload to reconnect]\x1b[0m\r\n');
+  ws.onclose = (event) => {
+    if (event.code !== 1000) term.write(`\r\n\x1b[33m[terminal disconnected: ${event.reason || event.code}]\x1b[0m\r\n`);
+  };
+  term.onData((data) => { if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'input', data })); });
+  term.onResize(({ cols, rows }) => { if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'resize', cols, rows })); });
+
+  tab.onclick = () => setActive(tabId);
+  tab.onkeydown = (event) => {
+    if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); setActive(tabId); }
+  };
+  state.sessions.set(meta.id, { kind: 'session', meta, term, fit, ws, paneEl: pane, tabEl: tab });
+  updateCounts();
+}
+
+function setActive(tabId) {
+  for (const s of state.sessions.values()) { s.tabEl.classList.remove('active'); s.tabEl.setAttribute('aria-selected', 'false'); s.paneEl.classList.add('hidden'); }
+  for (const c of state.collabs.values()) { c.tabEl.classList.remove('active'); c.tabEl.setAttribute('aria-selected', 'false'); c.paneEl.classList.add('hidden'); }
+  state.active = tabId;
+  if (tabId.startsWith('session:')) {
+    const s = state.sessions.get(tabId.slice(8));
+    if (!s) return;
+    s.tabEl.classList.add('active'); s.paneEl.classList.remove('hidden');
+    s.tabEl.setAttribute('aria-selected', 'true');
+    setTimeout(() => { try { s.fit.fit(); } catch {} s.term.focus(); }, 0);
+  } else if (tabId.startsWith('collab:')) {
+    const c = state.collabs.get(tabId.slice(7));
+    if (!c) return;
+    c.tabEl.classList.add('active'); c.paneEl.classList.remove('hidden');
+    c.tabEl.setAttribute('aria-selected', 'true');
+    setTimeout(() => c.promptEl?.focus(), 0);
+  }
+}
+
+async function closeSession(id) {
+  try {
+    await api(`/api/sessions/${id}`, { method: 'DELETE' });
+    closeSessionLocal(id);
+  } catch (error) { alert('Could not close terminal: ' + error.message); }
+}
+function closeSessionLocal(id) {
+  const s = state.sessions.get(id); if (!s) return;
+  try { s.ws.close(); } catch {}
+  try { s.term.dispose(); } catch {}
+  s.tabEl.remove(); s.paneEl.remove();
+  state.sessions.delete(id);
+  if (state.active === 'session:' + id) {
+    state.active = null;
+    const ns = state.sessions.keys().next().value;
+    const nc = state.collabs.keys().next().value;
+    if (ns) setActive('session:' + ns);
+    else if (nc) setActive('collab:' + nc);
+  }
+  updateCounts();
+}
+
+$('#reload-btn').onclick = async () => {
+  const button = $('#reload-btn');
+  button.disabled = true;
+  button.textContent = '↻ Refreshing…';
+  try {
+    const [, , , diag] = await Promise.all([loadConfig(), loadPermissions(), refreshSessions(), api('/api/diag')]);
+    updateProviderFooter(diag.results || {});
+    await refreshHealthStatus();
+  } catch (error) { alert('Refresh failed: ' + error.message); }
+  finally { button.disabled = false; button.textContent = '⟳ Reload'; }
+};
+
+const diagDialog = document.getElementById('diag-dialog');
+const diagBody = document.getElementById('diag-body');
+const INSTALL_HINTS = {
+  powershell: 'Ships with Windows.',
+  claude: '<code>npm install -g @anthropic-ai/claude-code</code> then run <code>claude</code> to log in.',
+  codex: '<code>npm install -g @openai/codex</code> then run the ChatGPT sign-in flow once.',
+  gemini: 'Install Google Antigravity in PowerShell: <code>irm https://antigravity.google/cli/install.ps1 | iex</code>, then run <code>agy</code> once to sign in.',
+  grok: 'Install the official Grok Build CLI: <code>npm install -g @xai-official/grok</code>, then run <code>grok login</code>.',
+  perplexity: 'Uses your Perplexity subscription through <code>pwm</code>. Install/update: <code>uv tool install --upgrade perplexity-web-mcp-cli</code>, then <code>pwm login</code>.',
+  ollama_fast: 'Install Ollama with <code>winget install --id Ollama.Ollama -e</code>, then run <code>ollama pull qwen2.5:1.5b</code>.',
+  ollama: 'Install Ollama with <code>winget install --id Ollama.Ollama -e</code>, then run <code>ollama pull qwen3:4b</code>.',
+  ollama_coder: 'Install Ollama with <code>winget install --id Ollama.Ollama -e</code>, then run <code>ollama pull qwen2.5-coder:7b</code>.',
+};
+$('#diag-btn').onclick = async () => {
+  if (typeof diagDialog.showModal === 'function') diagDialog.showModal(); else diagDialog.setAttribute('open','true');
+  diagBody.innerHTML = 'Checking…';
+  try {
+    const r = await api('/api/diag');
+    updateProviderFooter(r.results || {});
+    const rows = Object.entries(r.results).map(([kind, info]) => {
+      const status = !info.found
+        ? `<span style="color:#d9534f">✗ NOT FOUND</span>`
+        : (info.ready === false
+          ? `<span style="color:#ddb000">⚠ setup needed</span>`
+          : `<span style="color:#2ea043">✓ ready</span>`);
+      const where = info.found && Array.isArray(info.paths) ? escapeHtml(info.paths[0]) : '';
+      const identity = [state.config[kind]?.model, info.runtimeVersion].filter(Boolean).join(' · ');
+      const installHint = Object.prototype.hasOwnProperty.call(INSTALL_HINTS, kind) ? INSTALL_HINTS[kind] : 'install via vendor docs';
+      const hint = (!info.found || info.ready === false) ? `<div style="color:var(--muted); font-size:12px; margin-top:4px;">${installHint}</div>` : '';
+      return `<div style="padding:8px 0; border-bottom:1px solid var(--border);">
+        <div style="display:flex; justify-content:space-between; gap:12px;">
+          <div><strong>${escapeHtml(info.label || kind)}</strong> <span style="color:var(--muted)">(${escapeHtml(info.binary || '—')})</span></div>
+          <div>${status}</div>
+        </div>
+        ${where ? `<div style="font-family:monospace; font-size:12px; color:var(--muted); margin-top:4px;">${where}</div>` : ''}
+        ${identity ? `<div style="font-size:12px; color:#7cc6ff; margin-top:4px;">${escapeHtml(identity)}</div>` : ''}
+        ${info.detail ? `<div style="font-size:12px; color:var(--muted); margin-top:4px;">${escapeHtml(info.detail)}</div>` : ''}
+        ${hint}
+      </div>`;
+    }).join('');
+    diagBody.innerHTML = rows || '<em>No CLIs configured.</em>';
+  } catch (err) {
+    diagBody.innerHTML = `<span style="color:#d9534f">Diag failed: ${escapeHtml(err.message)}</span>`;
+  }
+};
+$('#diag-close-btn').onclick = () => { try { diagDialog.close(); } catch { diagDialog.removeAttribute('open'); } };
+
+const savedDialog = document.getElementById('saved-dialog');
+const savedBody = document.getElementById('saved-body');
+
+async function openSavedCollabs() {
+  if (typeof savedDialog.showModal === 'function') savedDialog.showModal(); else savedDialog.setAttribute('open','true');
+  savedBody.innerHTML = 'Loading…';
+  try {
+    const r = await api('/api/collabs');
+    const list = r.collabs || [];
+    if (!list.length) { savedBody.innerHTML = '<em style="color:var(--muted);">No saved collabs yet. Start one with 🤝 New Collab.</em>'; return; }
+    // group by project
+    const byProj = {};
+    for (const c of list) {
+      const p = c.project || '(no project)';
+      (byProj[p] = byProj[p] || []).push(c);
+    }
+    savedBody.innerHTML = '';
+    for (const [proj, items] of Object.entries(byProj)) {
+      const h = document.createElement('div');
+      h.style.cssText = 'font-weight:600; color:#00a884; padding:10px 0 4px; font-size:12px; text-transform:uppercase; letter-spacing:.5px;';
+      h.textContent = proj;
+      savedBody.appendChild(h);
+      for (const c of items) {
+        const ago = c.updatedAt ? new Date(c.updatedAt).toLocaleString() : '';
+        const row = document.createElement('div');
+        row.style.cssText = 'padding:10px 12px; border-bottom:1px solid var(--border); display:flex; align-items:center; gap:10px; cursor:pointer; border-radius:6px;';
+        row.onmouseenter = () => row.style.background = 'var(--panel-2)';
+        row.onmouseleave = () => row.style.background = '';
+        const swatches = (Array.isArray(c.participants) ? c.participants : []).map(k => `<span style="display:inline-block; width:10px; height:10px; border-radius:50%; background:${safeColor(state.config[k]?.color)}; margin-left:-3px; border:1px solid var(--panel);"></span>`).join('');
+        row.innerHTML = `
+          <div style="flex:1; min-width:0;">
+            <div style="font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(c.name || 'Untitled')}</div>
+            <div style="font-size:11px; color:var(--muted);">${escapeHtml(c.msgCount)} messages · ${escapeHtml(ago)} · <span style="margin-left:4px;">${swatches}</span></div>
+          </div>
+          <button class="btn" data-act="open" data-id="${escapeHtml(c.id)}" style="background:var(--accent); color:#fff; border:none;">Open</button>
+          <button class="btn" data-act="del" data-id="${escapeHtml(c.id)}" title="Delete" style="color:#d9534f;">🗑</button>`;
+        savedBody.appendChild(row);
+      }
+    }
+    savedBody.querySelectorAll('button[data-act=open]').forEach(b => b.onclick = (e) => { e.stopPropagation(); loadSavedCollab(b.dataset.id); });
+    savedBody.querySelectorAll('button[data-act=del]').forEach(b => b.onclick = async (e) => {
+      e.stopPropagation();
+      if (!confirm('Delete this saved collab?')) return;
+      await bridgeFetch('/api/collabs/' + b.dataset.id, { method:'DELETE' }).catch(()=>{});
+      openSavedCollabs();
+    });
+  } catch (err) {
+    savedBody.innerHTML = '<span style="color:#d9534f;">Failed: ' + escapeHtml(err.message) + '</span>';
+  }
+}
+async function loadSavedCollab(id) {
+  try {
+    const data = await api('/api/collabs/' + id);
+    // close modal
+    try { savedDialog.close(); } catch { savedDialog.removeAttribute('open'); }
+    // if already open in a tab, just focus it
+    if (state.collabs.has(id)) { setActive('collab:' + id); return; }
+    createCollab(data.participants || [], { id: data.id, name: data.name, project: data.project });
+    const c = state.collabs.get(id);
+    if (!c) return;
+    if (data.sharedContext) c.contextEl.value = data.sharedContext;
+    c.dropped = new Set(data.dropped || []);
+    if (Array.isArray(data.respond)) {
+      c.respond = new Set(data.respond.filter(k => c.participants.includes(k)));
+    }
+    // replay transcript
+    for (const m of (data.transcript || [])) {
+      if (m.thinking) continue;   // skip any stale typing placeholders
+      // we don't want appendMsg to re-save; temporarily detach persisted id
+      const tmp = c.persistedId; c.persistedId = null;
+      appendMsg(c, m);
+      c.persistedId = tmp;
+    }
+    renderChips(c);
+    updateToLine(c);
+  } catch (err) {
+    alert('Failed to load: ' + err.message);
+  }
+}
+$('#saved-collabs-btn').onclick = openSavedCollabs;
+$('#saved-close-btn').onclick = () => { try { savedDialog.close(); } catch { savedDialog.removeAttribute('open'); } };
+
+window.addEventListener('resize', () => {
+  if (!state.active) return;
+  if (state.active.startsWith('session:')) {
+    const s = state.sessions.get(state.active.slice(8));
+    if (s) try { s.fit.fit(); } catch {}
+  }
+});
+
+// =====================================================================
+// COLLAB MODE
+// =====================================================================
+
+function aiKinds() {
+  return Object.entries(state.config)
+    .filter(([k, v]) => !k.startsWith('_') && v && (v.oneshot_safe || v.oneshot_dangerous))
+    .map(([k, v]) => ({ kind: k, ...v }));
+}
+
+const collabPickDialog = document.getElementById('collab-pick-dialog');
+const collabPickList = document.getElementById('collab-pick-list');
+const collabPickGo = document.getElementById('collab-pick-go');
+const collabAddDialog = document.getElementById('collab-add-dialog');
+const collabAddList = document.getElementById('collab-add-list');
+
+async function openCollabPicker() {
+  collabPickList.innerHTML = '<span style="color:var(--muted)">Checking provider readiness…</span>';
+  document.getElementById('collab-pick-name').value = '';
+  document.getElementById('collab-pick-newproject').value = '';
+  if (typeof collabPickDialog.showModal === 'function') collabPickDialog.showModal(); else collabPickDialog.setAttribute('open','true');
+  let diagnostics = {};
+  let projects = [];
+  let diagnosticError = '';
+  try {
+    const [diag, projectData] = await Promise.all([api('/api/diag'), api('/api/projects')]);
+    diagnostics = diag.results || {};
+    projects = projectData.projects || [];
+    updateProviderFooter(diagnostics);
+  } catch (error) { diagnosticError = error.message; }
+  const candidates = aiKinds();
+  const hasDiagnostics = Object.keys(diagnostics).length > 0;
+  const ready = candidates.filter((ai) => diagnostics[ai.kind]?.ready === true);
+  const preferredLocal = ['ollama', 'ollama_coder', 'ollama_fast'].filter((kind) => ready.some((ai) => ai.kind === kind));
+  const defaults = new Set(preferredLocal.slice(0, 2));
+  for (const ai of ready) {
+    if (defaults.size >= Math.min(2, ready.length)) break;
+    defaults.add(ai.kind);
+  }
+  collabPickList.innerHTML = '';
+  if (diagnosticError || !hasDiagnostics) {
+    const warning = document.createElement('div');
+    warning.className = 'warn';
+    warning.style.marginBottom = '8px';
+    warning.textContent = 'Provider readiness is unknown, so seats are disabled. Retry Team status or Check installs. ' + diagnosticError;
+    collabPickList.appendChild(warning);
+  }
+  for (const ai of candidates) {
+    const id = 'cpick-' + ai.kind;
+    const info = diagnostics[ai.kind] || {};
+    const readinessKnown = Object.prototype.hasOwnProperty.call(diagnostics, ai.kind);
+    const operational = info.ready === true;
+    const readinessLabel = operational ? 'ready' : (readinessKnown ? 'setup needed' : 'unknown');
+    const local = ai.transport === 'local:ollama';
+    const usageClass = local ? 'local compute' : 'account quota';
+    const identity = ai.model || info.runtimeVersion || usageClass;
+    const row = document.createElement('div');
+    row.className = 'check-row';
+    row.innerHTML = `
+      <input type="checkbox" id="${escapeHtml(id)}" value="${escapeHtml(ai.kind)}" ${defaults.has(ai.kind) ? 'checked' : ''} ${operational ? '' : 'disabled'} />
+      <span class="swatch" style="background:${safeColor(ai.color)}"></span>
+      <label for="${escapeHtml(id)}" style="flex:1"><strong>${escapeHtml(ai.label)}</strong> <span style="color:var(--muted); font-size:11px">${escapeHtml(ai.company || '')}</span><div style="color:var(--muted);font-size:11px">${escapeHtml(identity)} · ${usageClass}</div></label>
+      <span class="${operational ? 'ok' : 'warn'}" style="font-size:11px">${readinessLabel}</span>`;
+    collabPickList.appendChild(row);
+  }
+  // Load projects into select
+  const sel = document.getElementById('collab-pick-project');
+  sel.replaceChildren(new Option('(no project)', ''));
+  for (const project of projects) sel.add(new Option(String(project), String(project)));
+}
+function closeCollabPicker() { try { collabPickDialog.close(); } catch { collabPickDialog.removeAttribute('open'); } }
+$('#new-collab-btn').onclick = openCollabPicker;
+$('#collab-pick-cancel').onclick = closeCollabPicker;
+$('#collab-pick-cancel-2').onclick = closeCollabPicker;
+collabPickGo.onclick = async () => {
+  const picked = [...collabPickList.querySelectorAll('input[type=checkbox]')].filter(cb => cb.checked).map(cb => cb.value);
+  if (!picked.length) { alert('Pick at least one AI.'); return; }
+  const name = document.getElementById('collab-pick-name').value.trim();
+  const newProj = document.getElementById('collab-pick-newproject').value.trim();
+  const selProj = document.getElementById('collab-pick-project').value;
+  let project = newProj || selProj;
+  if (newProj) { try { await api('/api/projects', { method:'POST', body: JSON.stringify({ name: newProj }) }); } catch {} }
+  closeCollabPicker();
+  // Create persistent collab on the server first, then open the pane with that id
+  try {
+    const meta = await api('/api/collabs', { method:'POST', body: JSON.stringify({ name, project, participants: picked }) });
+    createCollab(picked, { id: meta.id, name: meta.name, project: meta.project });
+  } catch (err) {
+    alert('Failed to save new collab: ' + err.message + '\n(Opening unsaved collab instead.)');
+    createCollab(picked);
+  }
+};
+
+const saveTimers = new Map();
+function setSaveStatus(c, text, tone = '') {
+  if (!c?.saveStatusEl) return;
+  c.saveStatusEl.textContent = text;
+  c.saveStatusEl.className = 'save-status' + (tone ? ' ' + tone : '');
+}
+function scheduleSave(c) {
+  if (!c || !c.persistedId) return;
+  clearTimeout(saveTimers.get(c.persistedId));
+  setSaveStatus(c, 'Saving…');
+  const timer = setTimeout(async () => {
+    saveTimers.delete(c.persistedId);
+    try {
+      const response = await bridgeFetch('/api/collabs/' + c.persistedId, {
+        method:'PUT',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({
+          name: c.name || '',
+          project: c.project || '',
+          participants: c.participants,
+          respond: [...c.respond],
+          transcript: c.transcript,
+          sharedContext: c.contextEl?.value || '',
+          dropped: [...c.dropped],
+        })
+      });
+      if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+      setSaveStatus(c, 'Saved', 'ok');
+    } catch (error) {
+      setSaveStatus(c, 'Save failed · retry', 'warn');
+      c.saveStatusEl.title = error.message;
+    }
+  }, 600);
+  saveTimers.set(c.persistedId, timer);
+}
+
+function createCollab(participants, opts) {
+  opts = opts || {};
+  const persistedId = opts.id || null;
+  const id = persistedId || String(nextCollabId++);
+  const tabId = 'collab:' + id;
+  const pane = document.createElement('div');
+  pane.className = 'pane collab hidden';
+  pane.innerHTML = `
+    <div class="collab-toolbar">
+      <strong data-collab-title>💬 Group chat</strong>
+      <div class="collab-chips" data-collab-chips></div>
+      <button class="collab-add" data-collab-add>+ Add AI</button>
+      <button class="save-status" data-save-status title="Collaboration persistence status">${persistedId ? 'Saved' : 'Unsaved'}</button>
+    </div>
+    <div class="ctx-box">
+      <details>
+        <summary>📎 Shared context (pinned — every AI sees this on every turn)</summary>
+        <textarea data-context placeholder="Paste anything all participants should always have in view — file contents, project goals, constraints, prior decisions."></textarea>
+      </details>
+    </div>
+    <div class="transcript" data-transcript>
+      <div class="empty-msg">Say hi to the room 👋&nbsp; — everyone here can see the whole conversation.<br/>Address one AI by starting your message with its name (<b>claude, …</b> · <b>codex …</b> · <b>all …</b>), or tap a chip above to mute it.</div>
+    </div>
+    <div class="composer-wrap">
+      <div class="phase-row">
+        <span class="phase-label">Team rounds:</span>
+        <button class="phase-btn" data-phase="blind" title="Each AI answers independently, without seeing the others.">1 · Blind takes</button>
+        <button class="phase-btn" data-phase="discuss" title="Each AI sees everyone's takes and reacts.">2 · Discuss</button>
+        <button class="phase-btn" data-phase="divide" title="Each AI proposes what it will own.">3 · Split work</button>
+        <button class="phase-btn round-cancel" data-cancel disabled title="Cancel the current round and stop its provider processes">■ Cancel round</button>
+        <span style="flex:1"></span>
+        <button class="phase-btn" data-phase="pplx-web" title="Open the current message at perplexity.ai in your browser (free, uses your session).">🔍 Web search</button>
+        <button class="phase-btn" data-phase="pplx-help" title="How Perplexity works in this chat">ℹ️ Perplexity</button>
+        <button class="phase-btn" data-phase="reset" style="border-color:#5a3a3a; color:#f0a0a0;">Clear</button>
+      </div>
+      <div class="to-line" data-to-line></div>
+      <div class="prompt-row">
+        <textarea data-prompt rows="1" placeholder="Message the room — Enter to send, Shift+Enter for a new line. Start with an AI's name to address just them."></textarea>
+        <button class="start-btn" data-start title="Send (Enter)">➤</button>
+      </div>
+    </div>`;
+  mainEl.appendChild(pane);
+
+  const collab = {
+    kind: 'collab', id,
+    persistedId,
+    name: opts.name || '',
+    project: opts.project || '',
+    participants: [...participants],
+    respond: new Set(participants),   // who replies to an un-addressed message
+    dropped: new Set(),
+    transcript: [],
+    paneEl: pane, tabEl: null,
+    promptEl: pane.querySelector('[data-prompt]'),
+    toLineEl: pane.querySelector('[data-to-line]'),
+    contextEl: (() => {
+      const el = pane.querySelector('[data-context]');
+      el.addEventListener('input', () => scheduleSave(state.collabs.get(id)));
+      return el;
+    })(),
+    transcriptEl: pane.querySelector('[data-transcript]'),
+    chipsEl: pane.querySelector('[data-collab-chips]'),
+    saveStatusEl: pane.querySelector('[data-save-status]'),
+    busy: false,
+    abortController: null,
+  };
+
+  const titleText = (opts.name && opts.name.trim()) ? opts.name : 'Group chat';
+  pane.querySelector('[data-collab-title]').textContent = '💬 ' + titleText;
+
+  const tabLabel = (opts.name && opts.name.trim()) ? opts.name : `Group chat (${participants.length})`;
+  const tab = makeTab(tabId, tabLabel, '#00a884', id, false);
+  collab.tabEl = tab;
+  tab.onclick = () => setActive(tabId);
+
+  pane.querySelector('[data-collab-add]').onclick = () => openAddAi(id);
+  collab.saveStatusEl.onclick = () => scheduleSave(collab);
+  pane.querySelectorAll('.phase-btn[data-phase]').forEach(b => { b.onclick = () => onPhase(id, b.dataset.phase); });
+  pane.querySelector('[data-cancel]').onclick = () => cancelCollabRound(id);
+  pane.querySelector('[data-start]').onclick = () => onSend(id);
+
+  // Composer: auto-grows with content; Enter sends, Shift+Enter = newline.
+  const ta = collab.promptEl;
+  ta.addEventListener('input', () => {
+    ta.style.height = 'auto';
+    ta.style.height = Math.min(ta.scrollHeight, 200) + 'px';
+    updateToLine(state.collabs.get(id));
+  });
+  ta.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); onSend(id); }
+  });
+
+  state.collabs.set(id, collab);
+  renderChips(collab);
+  updateToLine(collab);
+  setActive(tabId);
+  updateCounts();
+}
+
+function renderChips(collab) {
+  collab.chipsEl.innerHTML = '';
+  for (const kind of collab.participants) {
+    const cfg = state.config[kind] || {};
+    const dropped = collab.dropped.has(kind);
+    const replying = collab.respond.has(kind);
+    const chip = document.createElement('span');
+    chip.className = 'collab-chip' + (dropped ? ' dropped' : (replying ? ' replying' : ' muted'));
+    chip.setAttribute('role', 'button');
+    chip.setAttribute('tabindex', '0');
+    chip.setAttribute('aria-pressed', String(replying && !dropped));
+    chip.title = dropped
+      ? (cfg.label || kind) + ' dropped out — retried automatically on your next message'
+      : (replying ? (cfg.label || kind) + ' is replying. Click to mute it (it still reads the chat).'
+                   : (cfg.label || kind) + ' is muted — reads the chat but won’t reply. Click to un-mute.');
+    chip.innerHTML = `
+      <span class="reply-dot"></span>
+      <span class="swatch" style="background:${safeColor(cfg.color)}"></span>
+      <strong>${escapeHtml(cfg.label || kind)}</strong>
+      <span style="color:#8696a0; font-size:11px">${escapeHtml(cfg.company || '')}</span>
+      <span class="x" title="Remove from chat">×</span>`;
+    chip.querySelector('.x').onclick = (e) => { e.stopPropagation(); removeParticipant(collab.id, kind); };
+    const toggleReply = () => {
+      if (collab.respond.has(kind)) collab.respond.delete(kind);
+      else collab.respond.add(kind);
+      renderChips(collab);
+      updateToLine(collab);
+      scheduleSave(collab);
+    };
+    chip.onclick = toggleReply;
+    chip.onkeydown = (event) => {
+      if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); toggleReply(); }
+    };
+    collab.chipsEl.appendChild(chip);
+  }
+}
+
+// Decide, from the message text, which AIs reply this turn. A message that
+// starts with an AI name (or "all"/"everyone") is ADDRESSED to just those AIs;
+// otherwise the currently un-muted (respond) set replies. Either way the
+// message is added to the transcript so every participant keeps the context.
+function parseAddress(collab, text) {
+  const parts = collab.participants;
+  const respondList = parts.filter(k => collab.respond.has(k));
+  const alias = {};
+  for (const k of parts) {
+    const cfg = state.config[k] || {};
+    const words = new Set([k.toLowerCase()]);
+    if (cfg.label) {
+      words.add(cfg.label.toLowerCase().replace(/\s+/g, ''));
+      words.add(cfg.label.toLowerCase().split(/\s+/)[0]);
+    }
+    if (k === 'perplexity') { words.add('pplx'); words.add('perp'); }
+    for (const w of words) if (w) alias[w] = k;
+  }
+  const groupWords = new Set(['all', 'everyone', 'everybody', 'team', 'group', 'both']);
+  const connectors = new Set(['and', '&', '+', 'also', 'then', 'plus']);
+  const tokens = (text || '').trim().toLowerCase().split(/\s+/).slice(0, 8);
+  const targets = [];
+  let addressed = false;
+  for (const raw of tokens) {
+    const tok = raw.replace(/^[@#]+/, '').replace(/[,:;.\-!?]+$/, '');
+    if (!tok) continue;
+    if (groupWords.has(tok)) return { targets: [...parts], addressed: true };
+    if (alias[tok]) {
+      if (!targets.includes(alias[tok])) targets.push(alias[tok]);
+      addressed = true;
+      continue;
+    }
+    if (connectors.has(tok)) continue;
+    break;   // first non-name word ends the address prefix
+  }
+  if (addressed && targets.length) return { targets, addressed: true };
+  return { targets: respondList, addressed: false };
+}
+
+// Refresh the "↳ … will reply" hint shown under the composer.
+function updateToLine(collab) {
+  if (!collab || !collab.toLineEl) return;
+  const addr = parseAddress(collab, collab.promptEl.value || '');
+  const names = addr.targets.map(k => state.config[k]?.label || k).join(', ');
+  if (!addr.targets.length) {
+    collab.toLineEl.innerHTML = '<span style="color:#f0a0a0;">Everyone is muted — tap a chip to un-mute, or start your message with an AI name.</span>';
+  } else if (addr.addressed) {
+    collab.toLineEl.innerHTML = `<span class="addr">↳ addressed to <b>${escapeHtml(names)}</b></span> <span style="color:#8696a0;">· the rest still read it</span>`;
+  } else {
+    collab.toLineEl.innerHTML = `↳ <b>${escapeHtml(names)}</b> will reply`;
+  }
+}
+
+function removeParticipant(collabId, kind) {
+  const c = state.collabs.get(collabId); if (!c) return;
+  if (c.busy) { alert('Cancel or finish the current round before changing participants.'); return; }
+  c.participants = c.participants.filter(k => k !== kind);
+  c.dropped.delete(kind);
+  c.respond.delete(kind);
+  renderChips(c);
+  updateToLine(c);
+  appendMsg(c, { who: 'system', text: `Removed ${state.config[kind]?.label || kind} from the chat.`, phase: '' });
+  scheduleSave(c);
+}
+
+async function openAddAi(collabId) {
+  const c = state.collabs.get(collabId); if (!c) return;
+  if (c.busy) { alert('Cancel or finish the current round before adding a participant.'); return; }
+  collabAddList.innerHTML = '<span style="color:var(--muted)">Checking provider readiness…</span>';
+  if (typeof collabAddDialog.showModal === 'function') collabAddDialog.showModal(); else collabAddDialog.setAttribute('open','true');
+  let diagnostics = {};
+  let diagnosticError = '';
+  try { diagnostics = (await api('/api/diag')).results || {}; }
+  catch (error) { diagnosticError = error.message; }
+  collabAddList.innerHTML = '';
+  if (diagnosticError || !Object.keys(diagnostics).length) {
+    collabAddList.innerHTML = `<span class="warn">Provider readiness is unknown; no seat can be added safely. ${escapeHtml(diagnosticError)}</span>`;
+    return;
+  }
+  for (const ai of aiKinds()) {
+    if (c.participants.includes(ai.kind)) continue;
+    const info = diagnostics[ai.kind];
+    const ready = info?.ready === true;
+    const row = document.createElement('div');
+    row.className = 'check-row';
+    row.style.cursor = ready ? 'pointer' : 'not-allowed';
+    row.style.opacity = ready ? '1' : '.55';
+    row.setAttribute('role', 'button');
+    row.setAttribute('tabindex', ready ? '0' : '-1');
+    row.innerHTML = `
+      <span class="swatch" style="background:${safeColor(ai.color)}"></span>
+      <strong>${escapeHtml(ai.label)}</strong>
+      <span style="color:var(--muted); font-size:11px">${escapeHtml(ai.company || '')}</span>
+      <span class="${ready ? 'ok' : 'warn'}" style="margin-left:auto;font-size:11px">${ready ? 'ready' : 'setup needed'}</span>`;
+    const add = () => {
+      if (!ready) return;
+      c.participants.push(ai.kind);
+      c.respond.add(ai.kind);
+      renderChips(c);
+      updateToLine(c);
+      appendMsg(c, { who: 'system', text: `Added ${ai.label} to the chat.`, phase: '' });
+      try { collabAddDialog.close(); } catch { collabAddDialog.removeAttribute('open'); }
+    };
+    row.onclick = add;
+    row.onkeydown = (event) => {
+      if (ready && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); add(); }
+    };
+    collabAddList.appendChild(row);
+  }
+  if (!collabAddList.children.length) collabAddList.innerHTML = '<em style="color:var(--muted);">All available AIs are already in this collab.</em>';
+}
+$('#collab-add-close').onclick = () => { try { collabAddDialog.close(); } catch { collabAddDialog.removeAttribute('open'); } };
+
+function closeCollab(id) {
+  const c = state.collabs.get(id); if (!c) return;
+  if (c.abortController) c.abortController.abort();
+  c.tabEl.remove(); c.paneEl.remove();
+  state.collabs.delete(id);
+  if (state.active === 'collab:' + id) {
+    state.active = null;
+    const ns = state.sessions.keys().next().value;
+    const nc = state.collabs.keys().next().value;
+    if (ns) setActive('session:' + ns);
+    else if (nc) setActive('collab:' + nc);
+  }
+  updateCounts();
+}
+
+function appendMsg(collab, m, transient) {
+  if (!transient) collab.transcript.push(m);
+  const empty = collab.transcriptEl.querySelector('.empty-msg');
+  if (empty) empty.remove();
+  const node = document.createElement('div');
+  node.className = 'msg';
+  let color = '#00a884', name = m.who, company = '', initial = '?';
+  if (m.who === 'user') {
+    node.classList.add('from-user');
+    name = 'You'; color = '#005c4b'; initial = 'YOU';
+  } else if (m.who === 'system') {
+    node.classList.add('from-system');
+    name = 'system'; color = '#8696a0';
+  } else {
+    node.classList.add('from-ai');
+    const cfg = state.config[m.who] || {};
+    color = safeColor(cfg.color, '#00a884');
+    name = cfg.label || m.who;
+    company = cfg.company || '';
+    initial = (cfg.label || m.who).slice(0,2).toUpperCase();
+  }
+  if (m.error) node.classList.add('error');
+  if (m.thinking) node.classList.add('thinking');
+  color = safeColor(color, '#00a884');
+  node.style.setProperty('--bubble-accent', color);
+
+  // Avatar (initials, colored)
+  const avatar = document.createElement('div');
+  avatar.className = 'avatar';
+  avatar.style.background = color;
+  avatar.textContent = initial;
+
+  // Bubble
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
+  const head = document.createElement('div');
+  head.className = 'msg-head';
+  if (m.who !== 'user' && m.who !== 'system') {
+    head.innerHTML = `<span class="msg-name" style="color:${safeColor(color)}">${escapeHtml(name)}</span>${company ? `<span class="msg-company">${escapeHtml(company)}</span>` : ''}${m.phase ? `<span class="msg-phase">${escapeHtml(m.phase)}</span>` : ''}`;
+  } else if (m.who === 'user' && m.phase) {
+    head.innerHTML = `<span class="msg-phase">${escapeHtml(m.phase)}</span>`;
+  }
+  if (head.innerHTML) bubble.appendChild(head);
+  const body = document.createElement('div');
+  body.className = 'msg-body';
+  if (m.thinking) {
+    body.innerHTML = '<span class="typing-dots"><span></span><span></span><span></span></span>';
+  } else {
+    body.textContent = m.text || '';
+  }
+  bubble.appendChild(body);
+  if (m.meta && m.who !== 'system') {
+    const route = m.meta.route || {};
+    const values = [
+      m.meta.roundId,
+      route.resolved_model_identity || route.resolved_model || route.requested_model,
+      route.transport,
+      route.dangerous === true ? 'dangerous' : (route.dangerous === false ? 'safe turn' : ''),
+      route.prompt_truncated ? 'input truncated' : '',
+      m.meta.receiptId,
+    ].filter(Boolean);
+    if (values.length) {
+      const meta = document.createElement('div');
+      meta.className = 'msg-meta';
+      for (const value of values) {
+        const chip = document.createElement('span');
+        chip.textContent = String(value);
+        meta.appendChild(chip);
+      }
+      bubble.appendChild(meta);
+    }
+  }
+  if (m.who !== 'system') {
+    const time = document.createElement('div');
+    time.className = 'msg-time';
+    const d = new Date();
+    time.textContent = String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0');
+    bubble.appendChild(time);
+  }
+
+  node.appendChild(avatar);
+  node.appendChild(bubble);
+  collab.transcriptEl.appendChild(node);
+  collab.transcriptEl.scrollTop = collab.transcriptEl.scrollHeight;
+  if (!transient) scheduleSave(collab);
+  return node;
+}
+
+function buildSharedHeader(collab) {
+  const ctx = (collab.contextEl.value || '').trim();
+  return ctx ? `=== SHARED CONTEXT (visible to all participants) ===\n${ctx}\n\n` : '';
+}
+
+function buildTranscriptText(collab) {
+  return collab.transcript
+    .filter(m => m.who !== 'system' && !m.error && !m.thinking)
+    .map(m => {
+      if (m.who === 'user') return `## User${m.phase ? ' ['+m.phase+']' : ''}:\n${m.text}`;
+      const cfg = state.config[m.who] || {};
+      const route = m.meta?.route || {};
+      const routeNote = m.meta ? `\n[RelayBridge: round=${m.meta.roundId || 'n/a'} model=${route.resolved_model_identity || route.resolved_model || route.requested_model || 'unknown'} transport=${route.transport || 'unknown'} inputTruncated=${!!route.prompt_truncated}]` : '';
+      return `## ${cfg.label || m.who} (${cfg.company || ''})${m.phase ? ' ['+m.phase+']' : ''}:\n${m.text}${routeNote}`;
+    }).join('\n\n');
+}
+
+async function callOneshot(kind, prompt, timeoutMs = 180000, signal) {
+  try {
+    const r = await bridgeFetch('/api/oneshot', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      // dangerous:false — Collab is a discussion; CLIs must not run tools/commands.
+      body: JSON.stringify({ kind, prompt, timeoutMs, dangerous: false }),
+      signal,
+    });
+    if (!r.ok) {
+      const t = await r.text().catch(() => '');
+      return { kind, exitCode: -1, stdout: '', stderr: t || (r.status + ' ' + r.statusText), dropped_out: true };
+    }
+    return await r.json();
+  } catch (err) {
+    return { kind, exitCode: -1, stdout: '', stderr: err.message, dropped_out: true, cancelled: err.name === 'AbortError' || !!signal?.aborted };
+  }
+}
+
+// One "turn": fire the prompt at each target AI in parallel, show a typing
+// bubble for each, then swap in the real reply (or a "dropped" notice).
+async function runTurn(c, targets, phaseLabel, promptFor) {
+  if (c.busy || !targets.length) return;
+  c.busy = true;
+  c.abortController = new AbortController();
+  const roundId = `ui_run_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 8)}`;
+  let completedCount = 0;
+  let cancelledCount = 0;
+  setBusyButtons(c, true);
+  const placeholders = new Map();
+  for (const kind of targets) {
+    // transient:true — the typing bubble is not stored in the transcript
+    placeholders.set(kind, appendMsg(c, { who: kind, phase: phaseLabel, thinking: true }, true));
+  }
+  const signal = c.abortController.signal;
+  try {
+    const jobs = targets.map(async (kind) => {
+      let response;
+      try {
+        response = await callOneshot(kind, promptFor(kind), 180000, signal);
+      } catch (error) {
+        response = { kind, exitCode: -1, stdout: '', stderr: error.message, dropped_out: true, cancelled: signal.aborted };
+      }
+      const ph = placeholders.get(kind);
+      if (ph) ph.remove();
+      const meta = { roundId, route: response.route || {}, usage: response.usage || null, receiptId: response.receiptId || null };
+      if (response.cancelled) {
+        cancelledCount++;
+        appendMsg(c, { who: 'system', phase: phaseLabel, text: `${state.config[kind]?.label || kind} was cancelled.` });
+      } else if (response.dropped_out || response.exitCode !== 0) {
+        let why = 'error';
+        if (response.rate_limited) why = 'rate limit';
+        else if (response.budget_exceeded) why = 'budget exceeded';
+        else if (response.auth_failed) why = 'not signed in';
+        else if (response.permission_denied) why = 'permission denied by safe mode';
+        else if (response.timed_out) why = 'timeout';
+        else if (response.exitCode === -1) why = 'not installed / spawn failed';
+        c.dropped.add(kind);
+        const detail = ((response.stderr || '').trim() || (response.stdout || '').trim() || 'no output').slice(0, 500);
+        appendMsg(c, { who: kind, phase: phaseLabel, error: true, text: `[dropped: ${why}]\n${detail}`, meta });
+      } else {
+        completedCount++;
+        appendMsg(c, { who: kind, phase: phaseLabel, text: (response.stdout || '').trim() || '[empty response]', meta });
+      }
+      renderChips(c);
+      return response;
+    });
+    await Promise.allSettled(jobs);
+  } finally {
+    for (const placeholder of placeholders.values()) placeholder.remove();
+    c.abortController = null;
+    c.busy = false;
+    setBusyButtons(c, false);
+    renderChips(c);
+    appendMsg(c, { who: 'system', phase: phaseLabel, text: `${roundId}: ${completedCount}/${targets.length} seats completed${cancelledCount ? `, ${cancelledCount} cancelled` : ''}. Route metadata is attached to each response and saved for MCP handoff.` });
+    scheduleSave(c);
+  }
+}
+
+function cancelCollabRound(collabId) {
+  const c = state.collabs.get(collabId);
+  if (!c?.busy || !c.abortController) return;
+  c.abortController.abort();
+  const button = c.paneEl.querySelector('[data-cancel]');
+  if (button) { button.disabled = true; button.textContent = 'Cancelling…'; }
+}
+
+// Per-AI prompt for a normal group-chat message.
+function buildGroupPrompt(c, kind, addr) {
+  const cfg = state.config[kind] || {};
+  const others = c.participants.filter(k => k !== kind).map(k => state.config[k]?.label || k);
+  let addressedNote = '';
+  if (addr && addr.addressed && addr.targets.includes(kind)) {
+    addressedNote = addr.targets.length === 1
+      ? '\n\nThe user addressed the latest message specifically to YOU — answer it directly.'
+      : '\n\nThe user addressed the latest message to: ' + addr.targets.map(k => state.config[k]?.label || k).join(', ') + '.';
+  }
+  return `${buildSharedHeader(c)}You are ${cfg.label} (${cfg.company || ''}) in a group chat with a human user${others.length ? ' and these other AIs: ' + others.join(', ') : ''}.
+
+This is a CONVERSATION, not a task. Reply ONLY with plain conversational text in your own voice. Do NOT run commands, execute tools, read or write files, or take any action — just talk. Never roleplay or speak as the other participants.${addressedNote}
+
+You can see the whole conversation below. Reply to the most recent message. Be concise, direct and concrete; reference other participants by name when you build on or disagree with what they said.
+
+=== CONVERSATION ===
+${buildTranscriptText(c) || '(no messages yet — the user just opened the chat)'}`;
+}
+
+// Default group-chat send. Figures out who the message is addressed to, posts
+// it, and runs a turn for those AIs. Un-addressed AIs still get the message in
+// the transcript, so they keep full context for whenever they next reply.
+async function onSend(collabId) {
+  const c = state.collabs.get(collabId); if (!c) return;
+  if (c.busy) return;
+  const text = (c.promptEl.value || '').trim();
+  if (!text) return;
+  if (!c.participants.length) { alert('No AIs in this chat yet — add one with “+ Add AI”.'); return; }
+
+  const addr = parseAddress(c, text);
+  if (!addr.targets.length) {
+    alert('No AI is set to reply. Tap a participant chip to un-mute it, or start your message with an AI name.');
+    return;
+  }
+
+  const toLabels = addr.targets.map(k => state.config[k]?.label || k).join(', ');
+  appendMsg(c, { who: 'user', text, phase: addr.addressed ? ('→ ' + toLabels) : '' });
+  c.promptEl.value = '';
+  c.promptEl.style.height = 'auto';
+  updateToLine(c);
+
+  // Auto-recovery: AIs we're about to call get a fresh attempt even if they
+  // dropped before. Muted / un-addressed AIs keep their state — they just read
+  // this message as context for whenever they next reply.
+  const recovered = addr.targets.filter(k => c.dropped.has(k));
+  for (const k of addr.targets) c.dropped.delete(k);
+  renderChips(c);
+  if (recovered.length) {
+    appendMsg(c, { who: 'system', text: 'Re-checking: ' + recovered.map(k => state.config[k]?.label || k).join(', ') });
+  }
+
+  await runTurn(c, addr.targets, '', (kind) => buildGroupPrompt(c, kind, addr));
+}
+
+// Team-round buttons (blind / discuss / split) + Perplexity helpers + clear.
+// Team rounds always involve every participant — they are a whole-team ritual.
+async function onPhase(collabId, phase) {
+  const c = state.collabs.get(collabId); if (!c) return;
+  if (c.busy) return;
+
+  if (phase === 'reset') {
+    if (!confirm('Clear the transcript? Participants stay.')) return;
+    c.transcript = [];
+    c.transcriptEl.innerHTML = '<div class="empty-msg">Transcript cleared. Send a message to start again.</div>';
+    scheduleSave(c);
+    return;
+  }
+  if (phase === 'pplx-web') {
+    const q = (c.promptEl.value || '').trim();
+    if (!q) { alert('Type a message first, then click Web search.'); return; }
+    appendMsg(c, { who: 'system', text: 'Opened Perplexity in your browser. Paste the answer into 📎 Shared context to share it with the room.' });
+    bridgeFetch('/api/open-url', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: 'https://www.perplexity.ai/search?q=' + encodeURIComponent(q) }) }).catch(err => alert('open failed: ' + err.message));
+    return;
+  }
+  if (phase === 'pplx-help') {
+    alert(
+      'Perplexity in this chat\n\n' +
+      'It uses your Perplexity subscription through the community "pwm" CLI. Calls consume your normal subscription quota.\n\n' +
+      'One-time setup:\n' +
+      '  1.  uv tool install --upgrade perplexity-web-mcp-cli\n' +
+      '  2.  pwm login   (sign in with your Perplexity account)\n' +
+      '  3.  restart the RelayBridge launcher\n\n' +
+      'Then Perplexity answers in the chat like any other AI. Paid API fallback stays OFF unless you explicitly set PPLX_ALLOW_PAID_API_FALLBACK=1.\n\n' +
+      'No CLI installed? The 🔍 Web search button opens perplexity.ai using your browser session.'
+    );
+    return;
+  }
+
+  const userPrompt = (c.promptEl.value || '').trim();
+  const active = [...c.participants];
+  if (!active.length) { alert('No AIs in this chat yet — add one with “+ Add AI”.'); return; }
+
+  // team rounds re-probe every participant (auto-recovery)
+  const recovered = active.filter(k => c.dropped.has(k));
+  c.dropped.clear();
+  renderChips(c);
+  if (recovered.length) {
+    appendMsg(c, { who: 'system', text: 'Re-checking: ' + recovered.map(k => state.config[k]?.label || k).join(', ') });
+  }
+
+  const transcriptSoFar = buildTranscriptText(c);
+  const clearPrompt = () => { c.promptEl.value = ''; c.promptEl.style.height = 'auto'; updateToLine(c); };
+  let phaseLabel, promptFor;
+
+  if (phase === 'blind') {
+    if (!userPrompt) { alert('Type a topic in the message box first.'); return; }
+    phaseLabel = 'blind take';
+    appendMsg(c, { who: 'user', text: userPrompt, phase: 'topic' });
+    clearPrompt();
+    promptFor = (kind) => {
+      const cfg = state.config[kind] || {};
+      return `${buildSharedHeader(c)}You are ${cfg.label} (${cfg.company || ''}). Several AIs are being asked this SAME question in parallel — you cannot see their answers and they cannot see yours. Give YOUR honest, specific, opinionated take. This is a discussion: reply with text only, do NOT run commands or tools. ~150-300 words.\n\nTOPIC:\n${userPrompt}`;
+    };
+  } else if (phase === 'discuss') {
+    if (!transcriptSoFar) { alert('Run "1 · Blind takes" first so there is something to discuss.'); return; }
+    phaseLabel = 'discuss';
+    if (userPrompt) { appendMsg(c, { who: 'user', text: userPrompt, phase: 'note' }); clearPrompt(); }
+    promptFor = (kind) => {
+      const cfg = state.config[kind] || {};
+      const others = active.filter(k => k !== kind).map(k => state.config[k]?.label || k).join(', ');
+      return `${buildSharedHeader(c)}You are ${cfg.label} (${cfg.company || ''}), in a group with: ${others || '(no one else)'}. Everyone gave a blind take and now you can see them all. Say where you AGREE, where you DISAGREE, what others missed, and the best path forward. Reference people by name. Reply with text only — do NOT run commands or tools. ~200-400 words.\n\n=== CONVERSATION ===\n${transcriptSoFar}`;
+    };
+  } else if (phase === 'divide') {
+    if (!transcriptSoFar) { alert('Build up some discussion first.'); return; }
+    phaseLabel = 'split work';
+    if (userPrompt) { appendMsg(c, { who: 'user', text: userPrompt, phase: 'note' }); clearPrompt(); }
+    promptFor = (kind) => {
+      const cfg = state.config[kind] || {};
+      const others = active.filter(k => k !== kind).map(k => state.config[k]?.label || k).join(', ');
+      return `${buildSharedHeader(c)}You are ${cfg.label} (${cfg.company || ''}). The team is you + ${others || '(no one else)'}. Based on the conversation, propose what YOU specifically will own — name the files/sections, the deliverables, and what you depend on from others. Avoid overlap. Reply with text only — do NOT run commands or tools.\n\nFormat:\nMY SCOPE:\n- ...\nDELIVERABLES:\n- ...\nDEPENDS ON:\n- ...\n\n=== CONVERSATION ===\n${transcriptSoFar}`;
+    };
+  } else { return; }
+
+  await runTurn(c, active, phaseLabel, promptFor);
+}
+
+function setBusyButtons(c, busy) {
+  c.paneEl.querySelectorAll('.phase-btn[data-phase], [data-start], [data-collab-add]').forEach(b => {
+    if (busy) b.setAttribute('disabled', 'true'); else b.removeAttribute('disabled');
+  });
+  const cancel = c.paneEl.querySelector('[data-cancel]');
+  if (cancel) {
+    cancel.disabled = !busy;
+    cancel.textContent = busy ? '■ Cancel round' : '■ Cancel round';
+  }
+}
+
+const installDialog = document.getElementById('install-dialog');
+const installBody = document.getElementById('install-body');
+const installGoBtn = document.getElementById('install-go-btn');
+let installRowsState = {};
+
+async function probeInstalls() {
+  try {
+    return { ok: true, results: (await api('/api/diag')).results || {}, error: null };
+  } catch (error) {
+    return { ok: false, results: {}, error: error?.message || String(error) };
+  }
+}
+
+function renderInstallStatus(rows, notice = '') {
+  const content = Object.entries(rows).map(([kind, info]) => {
+    const cfg = state.config[kind] || {};
+    const hasInstaller = !!(cfg.install_command || cfg.npm_package || cfg.pip_package);
+    const installDisplay = cfg.install_display ||
+      (cfg.npm_package ? `npm install -g ${cfg.npm_package}` :
+        (cfg.pip_package ? `python -m pip install --user --upgrade ${cfg.pip_package}` : ''));
+    let badge;
+    if (!hasInstaller) badge = '<span style="color:var(--muted)">manual setup</span>';
+    else if (info.status === 'unknown') badge = '<span style="color:#ddb000">? readiness unknown</span>';
+    else if (info.status === 'installing') badge = '<span style="color:#ddb000">⏳ installing…</span>';
+    else if (info.status === 'needs_setup') badge = '<span style="color:#ddb000">⚠ installed; setup needed</span>';
+    else if (info.status === 'success') badge = '<span style="color:#2ea043">✓ installed</span>';
+    else if (info.status === 'failed') badge = `<span style="color:#d9534f">✗ failed (exit ${escapeHtml(info.exitCode ?? '?')})</span>`;
+    else if (info.found && info.ready === false) badge = '<span style="color:#ddb000">⚠ installed; setup needed</span>';
+    else if (info.found) badge = '<span style="color:#2ea043">✓ already ready</span>';
+    else badge = '<span style="color:var(--muted)">not installed</span>';
+    return `<div style="padding:8px 0; border-bottom:1px solid var(--border);">
+      <div style="display:flex; justify-content:space-between; gap:12px; align-items:center;">
+        <div>
+          <strong style="color:${safeColor(cfg.color, '#d6dde6')}">${escapeHtml(cfg.label || kind)}</strong>
+          <span style="color:var(--muted); font-size:11px"> ${escapeHtml(cfg.company || '')}</span>
+          ${installDisplay ? `<div style="color:var(--muted); font-size:11px; font-family:monospace; margin-top:2px;">${escapeHtml(installDisplay)}</div>` : ''}
+          ${cfg.post_install ? `<div style="color:var(--muted); font-size:11px; margin-top:2px;">${escapeHtml(cfg.post_install)}</div>` : ''}
+        </div>
+        <div>${badge}</div>
+      </div>
+      ${info.errorTail ? `<pre style="color:#d9534f; font-size:11px; margin:6px 0 0; white-space:pre-wrap;">${escapeHtml(info.errorTail)}</pre>` : ''}
+    </div>`;
+  }).join('');
+  installBody.innerHTML = `${notice ? `<div style="padding:8px 10px;margin-bottom:8px;border:1px solid #6b5624;border-radius:6px;color:#ffd479;background:#332b17">${escapeHtml(notice)}</div>` : ''}${content}`;
+}
+
+async function refreshInstallProbe() {
+  installBody.innerHTML = 'Probing what\'s installed…';
+  const probe = await probeInstalls();
+  const diag = probe.results;
+  const rows = {};
+  const automaticKinds = [];
+  for (const [kind, entry] of Object.entries(state.config)) {
+    if (kind.startsWith('_')) continue;
+    const automatic = !!(entry.install_command || entry.npm_package || entry.pip_package);
+    if (!automatic && !entry.install_display && !entry.post_install) continue;
+    rows[kind] = {
+      found: !!(diag[kind] && diag[kind].found),
+      ready: diag[kind] ? diag[kind].ready : false,
+      status: probe.ok ? 'idle' : 'unknown',
+    };
+    if (automatic) automaticKinds.push(kind);
+  }
+  installRowsState = rows;
+  renderInstallStatus(rows, probe.ok ? '' : `Provider readiness could not be checked: ${probe.error}. No installer will run until a retry succeeds.`);
+  installGoBtn.dataset.rows = JSON.stringify(automaticKinds);
+  installGoBtn.dataset.probeOk = String(probe.ok);
+  installGoBtn.disabled = probe.ok && automaticKinds.length === 0;
+  installGoBtn.textContent = !probe.ok ? 'Retry readiness check' : (automaticKinds.length ? 'Install missing automatically' : 'Manual setup shown above');
+}
+
+$('#install-all-btn').onclick = async () => {
+  if (typeof installDialog.showModal === 'function') installDialog.showModal(); else installDialog.setAttribute('open','true');
+  await refreshInstallProbe();
+};
+
+installGoBtn.onclick = async () => {
+  if (installGoBtn.dataset.probeOk !== 'true') {
+    await refreshInstallProbe();
+    return;
+  }
+  const kinds = JSON.parse(installGoBtn.dataset.rows || '[]');
+  if (!kinds.length) return;
+  installGoBtn.disabled = true;
+  const rows = installRowsState;
+
+  // Refresh which are already installed (so we can skip them)
+  const preflight = await probeInstalls();
+  if (!preflight.ok) {
+    for (const k of kinds) rows[k] = { ...rows[k], status: 'unknown' };
+    renderInstallStatus(rows, `Provider readiness could not be checked: ${preflight.error}. Nothing was installed.`);
+    installGoBtn.dataset.probeOk = 'false';
+    installGoBtn.disabled = false;
+    installGoBtn.textContent = 'Retry readiness check';
+    return;
+  }
+  const diag = preflight.results;
+  for (const k of kinds) {
+    rows[k].found = !!(diag[k] && diag[k].found);
+    rows[k].ready = diag[k] ? diag[k].ready : false;
+  }
+
+  // Run installers sequentially; the set now spans npm, pip, and vendor
+  // PowerShell installers that should not mutate PATH/package state together.
+  for (const kind of kinds) {
+    if (rows[kind].found) {
+      rows[kind].status = rows[kind].ready === false ? 'needs_setup' : 'success';
+      renderInstallStatus(rows);
+      continue;
+    }
+    rows[kind].status = 'installing';
+    renderInstallStatus(rows);
+    try {
+      const r = await bridgeFetch('/api/install', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ kind }),
+      });
+      const j = await r.json();
+      rows[kind].status = j.success ? 'success' : 'failed';
+      rows[kind].exitCode = j.exitCode;
+      if (!j.success) {
+        const tail = (j.stderr || j.stdout || '').split('\n').slice(-6).join('\n').slice(0, 600);
+        rows[kind].errorTail = tail;
+      }
+    } catch (err) {
+      rows[kind].status = 'failed';
+      rows[kind].errorTail = err.message;
+    }
+    renderInstallStatus(rows);
+  }
+
+  // Installation exit code is not readiness. Re-probe authentication, model
+  // availability, and the resolved executable before reporting success.
+  const finalProbe = await probeInstalls();
+  if (!finalProbe.ok) {
+    for (const kind of kinds) {
+      if (rows[kind].status === 'success') rows[kind].status = 'unknown';
+    }
+    renderInstallStatus(rows, `Install commands completed, but readiness could not be rechecked: ${finalProbe.error}. Retry before installing anything else.`);
+    installGoBtn.dataset.probeOk = 'false';
+    installGoBtn.disabled = false;
+    installGoBtn.textContent = 'Retry readiness check';
+    return;
+  }
+  const finalDiag = finalProbe.results;
+  updateProviderFooter(finalDiag);
+  for (const kind of kinds) {
+    rows[kind].found = !!finalDiag[kind]?.found;
+    rows[kind].ready = finalDiag[kind]?.ready === true;
+    if (rows[kind].status === 'success' && !rows[kind].ready) rows[kind].status = 'needs_setup';
+  }
+  renderInstallStatus(rows);
+
+  installGoBtn.disabled = false;
+  installGoBtn.textContent = 'Refresh / install missing';
+};
+
+$('#install-close-btn').onclick = () => { try { installDialog.close(); } catch { installDialog.removeAttribute('open'); } };
+
+// ============= startup =============
+(async () => {
+  try {
+    await loadConfig();
+    await loadPermissions();
+    await refreshSessions();
+    await refreshHealthStatus();
+    setInterval(() => refreshHealthStatus().catch(() => {
+      $('#status-version').textContent = 'bridge: offline';
+      $('#status-version').className = 'status-pill warn';
+    }), 10000);
+  } catch (err) {
+    document.body.innerHTML = `<div style="padding:24px;color:#d9534f">Failed to reach RelayBridge server: ${escapeHtml(err.message)}<br/><br/>Is the server running? Try <code>npm start</code>.</div>`;
+  }
+})();
+</script>
+</body>
+</html>

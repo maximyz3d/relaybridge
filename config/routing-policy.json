@@ -1,0 +1,69 @@
+{
+  "schemaVersion": 1,
+  "updatedAt": "2026-08-09",
+  "mode": "active_guarded",
+  "lowConfidenceMode": "fail_up",
+  "principles": [
+    "Prefer deterministic tools over models when the task is mechanical.",
+    "Prefer local or lower-quota routes for utility work, then escalate on measurable failure.",
+    "Never infer universal model quality from a single public benchmark.",
+    "High-stakes or mutating work requires an explicit human gate; routing is advisory by default.",
+    "A committee may parallelize independent read-only analysis, but it never creates multiple writers."
+  ],
+  "tiers": {
+    "utility": {
+      "maxInputChars": 3000,
+      "maxProviders": 1,
+      "maxEscalations": 1,
+      "defaultTimeoutMs": 90000,
+      "description": "Status, lookup, classification, short explanation, or deterministic inspection."
+    },
+    "standard": {
+      "maxInputChars": 9000,
+      "maxProviders": 2,
+      "maxEscalations": 1,
+      "defaultTimeoutMs": 180000,
+      "description": "Normal coding, review, research, or reasoning with bounded context."
+    },
+    "complex": {
+      "maxInputChars": 18000,
+      "maxProviders": 3,
+      "maxEscalations": 2,
+      "defaultTimeoutMs": 240000,
+      "description": "Multi-part, long-context, cross-domain, architectural, or difficult debugging work."
+    },
+    "critical": {
+      "maxInputChars": 24000,
+      "maxProviders": 4,
+      "maxEscalations": 3,
+      "defaultTimeoutMs": 300000,
+      "description": "High-stakes or irreversible decisions. Requires diverse review and a human gate."
+    }
+  },
+  "taskPriorities": {
+    "deterministic": ["powershell"],
+    "quick_lookup": ["ollama_fast", "perplexity", "ollama", "gemini"],
+    "coding": ["ollama_coder", "claude", "claude_fable", "codex", "grok", "gemini"],
+    "code_review": ["ollama_coder", "claude_fable", "claude", "codex", "gemini", "grok"],
+    "research": ["perplexity", "grok", "gemini", "ollama"],
+    "reasoning": ["ollama", "claude", "claude_fable", "gemini", "grok", "codex"],
+    "vision": [],
+    "hardware": ["gemini", "claude", "codex", "grok"],
+    "general": ["ollama_fast", "ollama", "claude_fable", "claude", "gemini", "grok", "codex"]
+  },
+  "localFirstProviders": ["ollama_fast", "ollama", "ollama_coder"],
+  "neverAutoExecuteTags": ["medical", "legal", "financial", "safety_critical", "secrets", "destructive"],
+  "committee": {
+    "maxProviders": 4,
+    "maxSynthesisChars": 24000,
+    "consensusMinConfidence": 0.6,
+    "defaultMode": "advisory",
+    "roles": ["primary", "critic", "researcher", "verifier", "chair"]
+  },
+  "cache": {
+    "enabled": true,
+    "defaultTtlMs": 1800000,
+    "researchTtlMs": 300000,
+    "maxEntryChars": 100000
+  }
+}

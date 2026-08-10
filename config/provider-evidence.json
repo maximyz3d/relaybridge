@@ -1,0 +1,382 @@
+{
+  "schemaVersion": 1,
+  "updatedAt": "2026-08-10",
+  "qualificationPolicy": {
+    "levels": [
+      "discovered",
+      "available",
+      "local_smoke",
+      "task_evaluated",
+      "benchmark_reproduced"
+    ],
+    "rule": "A provider is eligible when its CLI is ready, but capability ranking remains provisional until the exact model, scaffold, tools, and local task family have been evaluated.",
+    "noGlobalScore": true
+  },
+  "provenancePolicy": {
+    "rule": "Source IDs are background references unless a provider qualification explicitly binds an exact runtime, model identity, task family, timestamp, result, and receipt ID.",
+    "capabilityLevels": ["operator_declared", "local_smoke", "task_evaluated", "benchmark_reproduced"],
+    "registryFingerprint": "computed at route time; see registryFingerprints in route previews and persisted runs"
+  },
+  "sources": [
+    {
+      "id": "codex_manual_mcp",
+      "kind": "official_documentation",
+      "title": "OpenAI Codex Model Context Protocol",
+      "url": "https://learn.chatgpt.com/docs/extend/mcp",
+      "supports": ["codex_mcp", "stdio_transport", "tool_approval"],
+      "limitations": "Describes product behavior, not comparative model quality."
+    },
+    {
+      "id": "mcp_typescript_sdk",
+      "kind": "official_repository",
+      "title": "Model Context Protocol TypeScript SDK",
+      "url": "https://github.com/modelcontextprotocol/typescript-sdk",
+      "supports": ["mcp_server_implementation"],
+      "limitations": "Protocol implementation only."
+    },
+    {
+      "id": "openclaw_utility_route",
+      "kind": "official_repository_documentation",
+      "title": "OpenClaw model and utility routing",
+      "url": "https://github.com/openclaw/openclaw/blob/main/docs/concepts/models.md",
+      "supports": ["utility_model", "fallback_policy", "free_model_scan"],
+      "limitations": "OpenClaw utility routing covers bounded internal tasks, not a universal quality router."
+    },
+    {
+      "id": "claw_auto_router",
+      "kind": "open_source_repository",
+      "title": "claw-auto-router",
+      "url": "https://github.com/yuga-hashimoto/claw-auto-router",
+      "supports": ["deterministic_tiers", "shadow_routing", "fallback_receipts"],
+      "limitations": "Heuristic tiers and maintainer claims require local replay evaluation."
+    },
+    {
+      "id": "routellm",
+      "kind": "research_repository",
+      "title": "RouteLLM",
+      "url": "https://github.com/lm-sys/RouteLLM",
+      "supports": ["strong_weak_routing", "threshold_calibration"],
+      "limitations": "Research results are model-pair and distribution specific; out-of-distribution routing requires recalibration."
+    },
+    {
+      "id": "terminal_bench",
+      "kind": "benchmark_owner",
+      "title": "Terminal-Bench",
+      "url": "https://www.tbench.ai/benchmarks",
+      "supports": ["terminal_agent_evaluation"],
+      "limitations": "Scores depend on exact agent scaffold, environment, model, and benchmark version."
+    },
+    {
+      "id": "livecodebench",
+      "kind": "benchmark_repository",
+      "title": "LiveCodeBench",
+      "url": "https://github.com/LiveCodeBench/LiveCodeBench",
+      "supports": ["coding_evaluation"],
+      "limitations": "Public benchmark exposure and harness differences require private task validation too."
+    },
+    {
+      "id": "bfcl",
+      "kind": "benchmark_owner",
+      "title": "Berkeley Function Calling Leaderboard",
+      "url": "https://gorilla.cs.berkeley.edu/leaderboard",
+      "supports": ["tool_calling_evaluation"],
+      "limitations": "Does not prove success with RelayBridge tools or a specific CLI scaffold."
+    },
+    {
+      "id": "ruler",
+      "kind": "benchmark_repository",
+      "title": "RULER long-context benchmark",
+      "url": "https://github.com/NVIDIA/RULER",
+      "supports": ["long_context_evaluation"],
+      "limitations": "Advertised context length is not effective context; test at the configured local lengths."
+    },
+    {
+      "id": "browsecomp",
+      "kind": "benchmark_owner",
+      "title": "BrowseComp",
+      "url": "https://openai.com/index/browsecomp/",
+      "supports": ["web_research_evaluation"],
+      "limitations": "Comparisons require identical search tools, budgets, dates, and citation rules."
+    },
+    {
+      "id": "osworld",
+      "kind": "benchmark_repository",
+      "title": "OSWorld",
+      "url": "https://github.com/xlang-ai/OSWorld",
+      "supports": ["computer_use_evaluation"],
+      "limitations": "Environment and computer-use scaffold materially affect results."
+    },
+    {
+      "id": "ollama_local",
+      "kind": "official_documentation",
+      "title": "Ollama Windows and OpenAI compatibility",
+      "url": "https://docs.ollama.com/windows",
+      "supports": ["local_inference", "windows_runtime"],
+      "limitations": "No API fee does not mean zero compute, storage, or electricity cost."
+    },
+    {
+      "id": "ollama_source_license",
+      "kind": "official_repository_license",
+      "title": "Ollama source license",
+      "url": "https://github.com/ollama/ollama/blob/main/LICENSE",
+      "checkedAt": "2026-08-09",
+      "supports": ["ollama_cli_source_license_mit"],
+      "limitations": "The installed Windows application may include separately governed components; this entry covers the public repository source."
+    },
+    {
+      "id": "qwen25_15_model_card",
+      "kind": "official_model_card",
+      "title": "Qwen2.5-1.5B-Instruct",
+      "url": "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct",
+      "checkedAt": "2026-08-09",
+      "supports": ["model_identity", "apache_2_license"],
+      "limitations": "Model-card claims are not RelayBridge task evaluation results."
+    },
+    {
+      "id": "qwen3_4b_model_card",
+      "kind": "official_model_card",
+      "title": "Qwen3-4B",
+      "url": "https://huggingface.co/Qwen/Qwen3-4B",
+      "checkedAt": "2026-08-09",
+      "supports": ["model_identity", "apache_2_license"],
+      "limitations": "Model-card claims are not RelayBridge task evaluation results."
+    },
+    {
+      "id": "qwen25_coder_7b_model_card",
+      "kind": "official_model_card",
+      "title": "Qwen2.5-Coder-7B-Instruct",
+      "url": "https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct",
+      "checkedAt": "2026-08-09",
+      "supports": ["model_identity", "apache_2_license"],
+      "limitations": "Model-card claims and context limits are not RelayBridge task evaluation results."
+    },
+    {
+      "id": "perplexity_pwm",
+      "kind": "community_project_documentation",
+      "title": "Perplexity Web MCP and CLI",
+      "url": "https://pypi.org/project/perplexity-web-mcp-cli/0.14.8/",
+      "supports": ["account_research_route", "citations", "wrapper_license_mit"],
+      "limitations": "Unofficial and dependent on undocumented Perplexity web behavior."
+    }
+  ],
+  "providers": {
+    "powershell": {
+      "family": "deterministic",
+      "costClass": "local_compute",
+      "privacyBoundary": "local_process",
+      "modelIdentity": "none",
+      "qualification": "available",
+      "capabilities": ["deterministic", "shell", "filesystem", "process_inspection"],
+      "capabilityProvenance": {"deterministic": "operator_declared", "shell": "operator_declared", "filesystem": "operator_declared", "process_inspection": "operator_declared"},
+      "evidence": [],
+      "references": [],
+      "runtimeLicense": "Microsoft Windows component; governed by installed Windows terms",
+      "limitations": ["Not an AI model", "MCP action tools request host approval, but direct REST authority is possession of the capability token", "Allowed cwd roots are not a filesystem sandbox"]
+    },
+    "ollama_fast": {
+      "family": "local_qwen",
+      "costClass": "local_compute",
+      "privacyBoundary": "local_model",
+      "modelIdentity": "qwen2.5:1.5b",
+      "qualification": "local_smoke",
+      "capabilities": ["quick_lookup", "general", "privacy_sensitive"],
+      "capabilityProvenance": {"quick_lookup": "local_smoke", "general": "operator_declared", "privacy_sensitive": "operator_declared"},
+      "maxRecommendedTier": "utility",
+      "evidence": ["rcpt_msmdm2zf_8edf9fc9"],
+      "references": ["ollama_local", "ollama_source_license", "qwen25_15_model_card"],
+      "qualificationEvidence": {"testedAt": "2026-08-09T22:30:36.699Z", "receiptId": "rcpt_msmdm2zf_8edf9fc9", "taskFamily": "exact-output utility routing", "runtimeVersion": "ollama 0.32.5", "resolvedModelIdentity": "qwen2.5:1.5b@sha256:65ec06548149b04c096a120e4a6da9d4017ea809c91734ea5631e89f96ddc57b", "result": "completed", "actualInputTokens": 40, "actualOutputTokens": 6},
+      "runtimeLicense": "Ollama CLI source: MIT; installed Windows app terms should be checked separately",
+      "modelLicense": "Apache-2.0 (Qwen2.5-1.5B-Instruct official model card)",
+      "limitations": ["Locally smoke-tested only", "Escalate validator failures and tasks needing current sources"]
+    },
+    "ollama": {
+      "family": "local_qwen",
+      "costClass": "local_compute",
+      "privacyBoundary": "local_model",
+      "modelIdentity": "qwen3:4b",
+      "qualification": "local_smoke",
+      "capabilities": ["quick_lookup", "reasoning", "general", "privacy_sensitive"],
+      "capabilityProvenance": {"quick_lookup": "operator_declared", "reasoning": "operator_declared", "general": "operator_declared", "privacy_sensitive": "operator_declared"},
+      "maxRecommendedTier": "standard",
+      "evidence": ["rcpt_msmdmejp_c90bd5f7"],
+      "references": ["ollama_local", "ollama_source_license", "qwen3_4b_model_card"],
+      "qualificationEvidence": {"testedAt": "2026-08-09T22:30:51.685Z", "receiptId": "rcpt_msmdmejp_c90bd5f7", "taskFamily": "exact-output reasoning-seat transport", "runtimeVersion": "ollama 0.32.5", "resolvedModelIdentity": "qwen3:4b@sha256:359d7dd4bcdab3d86b87d73ac27966f4dbb9f5efdfcc75d34a8764a09474fae7", "result": "completed", "actualInputTokens": 22, "actualOutputTokens": 65},
+      "runtimeLicense": "Ollama CLI source: MIT; installed Windows app terms should be checked separately",
+      "modelLicense": "Apache-2.0 (Qwen3-4B official model card)",
+      "limitations": ["Installed model is not yet locally benchmarked", "Long context and tool use require exact runtime validation"]
+    },
+    "ollama_coder": {
+      "family": "local_qwen",
+      "costClass": "local_compute",
+      "privacyBoundary": "local_model",
+      "modelIdentity": "qwen2.5-coder:7b",
+      "qualification": "local_smoke",
+      "capabilities": ["coding", "code_review", "quick_lookup", "privacy_sensitive"],
+      "capabilityProvenance": {"coding": "operator_declared", "code_review": "local_smoke", "quick_lookup": "operator_declared", "privacy_sensitive": "operator_declared"},
+      "maxRecommendedTier": "standard",
+      "evidence": ["rcpt_msmdl5uy_0081e34c"],
+      "references": ["ollama_local", "ollama_source_license", "qwen25_coder_7b_model_card", "livecodebench"],
+      "qualificationEvidence": {"testedAt": "2026-08-09T22:29:53.770Z", "receiptId": "rcpt_msmdl5uy_0081e34c", "taskFamily": "simple JavaScript review committee role", "runtimeVersion": "ollama 0.32.5", "resolvedModelIdentity": "qwen2.5-coder:7b@sha256:dae161e27b0e90dd1856c8bb3209201fd6736d8eb66298e75ed87571486f4364", "result": "completed", "actualInputTokens": 106, "actualOutputTokens": 103},
+      "runtimeLicense": "Ollama CLI source: MIT; installed Windows app terms should be checked separately",
+      "modelLicense": "Apache-2.0 (Qwen2.5-Coder-7B-Instruct official model card)",
+      "limitations": ["Model-card suitability is not a reproduced RelayBridge benchmark", "Escalate validator failures"]
+    },
+    "claude": {
+      "family": "anthropic",
+      "costClass": "subscription_quota",
+      "privacyBoundary": "hosted_provider",
+      "modelIdentity": "resolve_at_runtime",
+      "qualification": "available",
+      "capabilities": ["coding", "code_review", "reasoning", "hardware", "general"],
+      "capabilityProvenance": {"coding": "operator_declared", "code_review": "operator_declared", "reasoning": "operator_declared", "hardware": "operator_declared", "general": "operator_declared"},
+      "evidence": [],
+      "references": ["terminal_bench", "livecodebench", "bfcl"],
+      "limitations": ["CLI alias may change resolved model", "Current quota or plan limits may block a call", "No RelayBridge task-family score yet"]
+    },
+    "claude_fable": {
+      "family": "anthropic",
+      "costClass": "subscription_quota",
+      "privacyBoundary": "hosted_provider",
+      "modelIdentity": "claude-fable-5",
+      "qualification": "available",
+      "capabilities": ["coding", "code_review", "reasoning", "general"],
+      "capabilityProvenance": {"coding": "operator_declared", "code_review": "operator_declared", "reasoning": "operator_declared", "general": "operator_declared"},
+      "maxRecommendedTier": "standard",
+      "evidence": ["rcpt_msmhmoym_c94b62b9"],
+      "references": ["terminal_bench", "livecodebench", "bfcl"],
+      "qualificationEvidence": {"testedAt": "2026-08-10T00:24:00Z", "receiptId": "rcpt_msmhmoym_c94b62b9", "taskFamily": "read-only release review", "resolvedModelIdentity": "claude-fable-5", "result": "timed_out_without_output"},
+      "limitations": ["Shares the Claude subscription quota with the Opus seat", "The bridge resolved claude-fable-5 but the first five-minute review timed out without output", "No RelayBridge task-family score yet"]
+    },
+    "codex": {
+      "family": "openai",
+      "costClass": "subscription_quota",
+      "privacyBoundary": "hosted_provider",
+      "modelIdentity": "resolve_at_runtime",
+      "qualification": "available",
+      "capabilities": ["coding", "code_review", "reasoning", "hardware", "general"],
+      "capabilityProvenance": {"coding": "operator_declared", "code_review": "operator_declared", "reasoning": "operator_declared", "hardware": "operator_declared", "general": "operator_declared"},
+      "evidence": [],
+      "references": ["codex_manual_mcp", "terminal_bench", "livecodebench", "bfcl"],
+      "limitations": ["Exact model and reasoning effort must be captured per run", "No RelayBridge task-family score yet"]
+    },
+    "gemini": {
+      "family": "google",
+      "costClass": "subscription_quota",
+      "privacyBoundary": "hosted_provider",
+      "modelIdentity": "gemini-3.1-pro-high",
+      "qualification": "task_evaluated",
+      "capabilities": ["reasoning", "coding", "code_review", "hardware", "general"],
+      "capabilityProvenance": {"reasoning": "operator_declared", "coding": "operator_declared", "code_review": "operator_declared", "hardware": "operator_declared", "general": "operator_declared"},
+      "evidence": ["rcpt_msmhvmys_2a781968"],
+      "references": ["bfcl", "ruler"],
+      "qualificationEvidence": {"testedAt": "2026-08-10T00:30:00.964Z", "receiptId": "rcpt_msmhvmys_2a781968", "taskFamily": "safe exact-output one-shot connectivity", "runtimeVersion": "Antigravity 1.1.11", "requestedModel": "gemini-3.1-pro-high", "result": "completed", "durationMs": 19170},
+      "limitations": ["One exact-output connectivity task is not a comparative quality score", "The provider did not return a resolved remote model identity beyond the requested configured model", "Antigravity one-shot input is capped", "Vision is not an operational MCP capability until an image/path adapter is implemented and receipt-tested"]
+    },
+    "grok": {
+      "family": "xai",
+      "costClass": "subscription_quota",
+      "privacyBoundary": "hosted_provider",
+      "modelIdentity": "grok-4.5",
+      "qualification": "task_evaluated",
+      "capabilities": ["coding", "code_review", "research", "reasoning", "hardware", "general"],
+      "capabilityProvenance": {"coding": "operator_declared", "code_review": "operator_declared", "research": "operator_declared", "reasoning": "operator_declared", "hardware": "operator_declared", "general": "operator_declared"},
+      "evidence": ["rcpt_msmhvmcx_4fa0b73e"],
+      "references": ["terminal_bench", "browsecomp"],
+      "qualificationEvidence": {"testedAt": "2026-08-10T00:30:00.177Z", "receiptId": "rcpt_msmhvmcx_4fa0b73e", "taskFamily": "safe exact-output one-shot connectivity", "runtimeVersion": "grok 0.2.106", "resolvedModelIdentity": "grok-4.5", "result": "completed", "durationMs": 18371},
+      "limitations": ["One exact-output connectivity task is not a comparative quality score", "Unrelated plugin warnings can appear on stderr", "No broader RelayBridge task-family score yet"]
+    },
+    "perplexity": {
+      "family": "perplexity",
+      "costClass": "account_web_search_quota",
+      "privacyBoundary": "hosted_provider",
+      "modelIdentity": "auto",
+      "qualification": "task_evaluated",
+      "capabilities": ["research", "quick_lookup", "citations"],
+      "capabilityProvenance": {"research": "operator_declared", "quick_lookup": "operator_declared", "citations": "operator_declared"},
+      "evidence": ["rcpt_msmhvgzv_e8672dce"],
+      "references": ["perplexity_pwm", "browsecomp"],
+      "qualificationEvidence": {"testedAt": "2026-08-10T00:29:53.227Z", "receiptId": "rcpt_msmhvgzv_e8672dce", "taskFamily": "safe exact-output subscription-wrapper connectivity", "runtimeVersion": "perplexity-web-mcp-cli 0.14.8", "resolvedModelIdentity": "auto", "result": "completed", "durationMs": 11398},
+      "runtimeLicense": "perplexity-web-mcp-cli 0.14.8: MIT",
+      "limitations": ["Unofficial wrapper", "One exact-output connectivity task is not a research-quality or citation benchmark", "Auto routing is volatile", "Calls consume the connected account's web/search quotas; the bridge does not identify that account's free or paid plan"]
+    }
+  },
+  "candidateIntegrations": [
+    {
+      "id": "openclaw",
+      "class": "agent_gateway",
+      "license": "MIT",
+      "url": "https://github.com/openclaw/openclaw",
+      "status": "optional_external_control_plane",
+      "fit": "Model policies, isolated agent workspaces, sessions, and free-model discovery.",
+      "decision": "Do not replace RelayBridge PTY/UI/subscription CLI functions; integrate through MCP or an OpenAI-compatible adapter when needed."
+    },
+    {
+      "id": "manifest",
+      "class": "openai_compatible_router",
+      "license": "MIT",
+      "url": "https://github.com/mnfst/manifest",
+      "status": "evaluation_candidate",
+      "fit": "Rules, limits, cost logs, and fallbacks for API-style providers.",
+      "decision": "Useful when API providers are added; it does not directly route the current subscription CLIs."
+    },
+    {
+      "id": "vllm_semantic_router",
+      "class": "semantic_router",
+      "license": "Apache-2.0",
+      "url": "https://github.com/vllm-project/semantic-router",
+      "status": "heavyweight_candidate",
+      "fit": "Intent, domain, reasoning, tool, privacy, and safety policies.",
+      "decision": "Defer until a local replay corpus proves deterministic routing is insufficient."
+    },
+    {
+      "id": "litellm",
+      "class": "provider_gateway",
+      "license": "MIT outside enterprise directory",
+      "url": "https://github.com/BerriAI/litellm",
+      "status": "api_gateway_candidate",
+      "fit": "Budgets, authentication, retries, fallbacks, and provider normalization.",
+      "decision": "Integrate only for API/OpenAI-compatible seats; not a semantic router by itself."
+    },
+    {
+      "id": "routellm",
+      "class": "learned_router",
+      "license": "Apache-2.0",
+      "url": "https://github.com/lm-sys/RouteLLM",
+      "status": "research_baseline",
+      "fit": "Strong-versus-weak threshold routing and offline calibration.",
+      "decision": "Use its evaluation concepts after collecting local RelayBridge task labels; do not import its older model-pair weights."
+    },
+    {
+      "id": "groq_free",
+      "class": "hosted_recurring_free_quota",
+      "url": "https://console.groq.com/docs/rate-limits",
+      "status": "opt_in_candidate",
+      "fit": "Fast hosted diversity with documented free organization limits.",
+      "decision": "Require an explicit key, zero-paid-fallback policy, exact model pin, and live quota receipt."
+    },
+    {
+      "id": "openrouter_free",
+      "class": "hosted_recurring_free_quota",
+      "url": "https://openrouter.ai/docs/guides/routing/model-variants/free",
+      "status": "opt_in_candidate",
+      "fit": "Free-model catalog and volatile free router.",
+      "decision": "Pin an exact :free model for evaluations and assert zero pricing; never silently fall into paid routes."
+    },
+    {
+      "id": "llama_cpp",
+      "class": "local_runtime",
+      "license": "MIT",
+      "url": "https://github.com/ggml-org/llama.cpp",
+      "status": "optional_local_runtime",
+      "fit": "CPU/GPU quantized local inference and OpenAI-compatible server.",
+      "decision": "Add through the generic OpenAI-compatible adapter when a tested GGUF model is selected."
+    }
+  ],
+  "benchmarkFamilies": {
+    "coding": ["terminal_bench", "livecodebench", "bfcl"],
+    "reasoning": ["https://arxiv.org/abs/2311.12022", "https://arcprize.org/competitions/2026"],
+    "long_context": ["ruler", "https://longbench2.github.io/", "https://github.com/adobe-research/NoLiMa"],
+    "research": ["browsecomp", "https://ai.meta.com/research/publications/gaia-a-benchmark-for-general-ai-assistants/"],
+    "vision_and_computer_use": ["https://mmmu-benchmark.github.io/", "osworld"]
+  }
+}
