@@ -6,18 +6,39 @@
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <link rel="stylesheet" href="/vendor/xterm/css/xterm.css" />
 <style>
-  :root { --bg:#0e1116; --panel:#161b22; --panel-2:#1f262e; --border:#2a3038; --text:#d6dde6; --muted:#8b949e; --accent:#cc785c; --danger:#d9534f; --safe:#2ea043; }
+  :root {
+    --bg:#0d1117;
+    --panel:#151a21;
+    --panel-2:#1b222b;
+    --panel-3:#222b36;
+    --border:#2e3742;
+    --text:#e3e8ef;
+    --muted:#9aa6b2;
+    --accent:#4ea1ff;
+    --accent-2:#cc785c;
+    --danger:#e5535b;
+    --safe:#3fb950;
+    --warn:#d29922;
+    --shadow:0 18px 50px rgba(0,0,0,.35);
+  }
   * { box-sizing: border-box; }
   html, body { margin:0; padding:0; height:100%; width:100%; max-width:100%; overflow:hidden; background:var(--bg); color:var(--text); font:13px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif; }
   body { display:flex; flex-direction:column; overflow:hidden; width:100%; max-width:100%; min-width:0; }
-  header { display:flex; align-items:center; gap:8px; padding:8px 12px; background:var(--panel); border-bottom:1px solid var(--border); flex-wrap:wrap; width:100%; max-width:100%; min-width:0; }
-  .brand { font-weight:600; margin-right:12px; }
-  .brand small { color:var(--muted); font-weight:400; margin-left:6px; }
-  .btn { background:var(--panel-2); color:var(--text); border:1px solid var(--border); padding:6px 10px; border-radius:6px; cursor:pointer; font-size:12px; display:inline-flex; align-items:center; gap:6px; }
-  .btn:hover { background:#2a3038; }
+  header { display:grid; grid-template-columns:minmax(170px,220px) minmax(240px,1fr); align-items:center; gap:10px; padding:10px 12px; background:linear-gradient(180deg,#171d25,#121820); border-bottom:1px solid var(--border); width:100%; max-width:100%; min-width:0; box-shadow:0 1px 0 rgba(255,255,255,.03) inset; }
+  .brand { font-weight:700; margin-right:4px; letter-spacing:.2px; display:flex; flex-direction:column; gap:1px; line-height:1.15; }
+  .brand small { color:var(--muted); font-weight:500; margin-left:0; font-size:11px; }
+  .top-actions { grid-column:1 / -1; display:flex; gap:8px; align-items:center; flex-wrap:wrap; justify-content:flex-start; min-width:0; }
+  .btn { background:var(--panel-2); color:var(--text); border:1px solid var(--border); padding:6px 10px; border-radius:6px; cursor:pointer; font-size:12px; display:inline-flex; align-items:center; gap:6px; min-height:31px; }
+  .btn:hover { background:var(--panel-3); border-color:#3c4856; }
   .btn:focus-visible, .toggle:focus-visible, .phase-btn:focus-visible, .collab-chip:focus-visible, .start-btn:focus-visible, textarea:focus-visible, input:focus-visible, select:focus-visible { outline:2px solid #7cc6ff; outline-offset:2px; }
-  .btn.kind { border-left:3px solid var(--accent); }
-  .btn.collab { background:linear-gradient(90deg,var(--accent),#4285f4); color:#fff; border-color:transparent; font-weight:600; }
+  .btn.kind { border-left:3px solid var(--accent-2); justify-content:flex-start; max-width:190px; }
+  .btn.kind .provider-dot { width:7px; height:7px; border-radius:50%; background:var(--muted); flex:none; box-shadow:0 0 0 2px rgba(255,255,255,.04); }
+  .btn.kind.ready .provider-dot { background:var(--safe); }
+  .btn.kind.warn .provider-dot { background:var(--warn); }
+  .btn.kind.missing .provider-dot { background:var(--danger); }
+  .btn.kind .provider-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .btn.kind .provider-state { color:var(--muted); font-size:10px; margin-left:auto; }
+  .btn.collab { background:#225f8e; color:#fff; border-color:#2f75aa; font-weight:700; }
   .btn[disabled] { opacity:.4; cursor:not-allowed; }
   .spacer { flex:1; }
   .toggle { display:inline-flex; align-items:center; gap:8px; background:var(--panel-2); color:var(--text); padding:6px 10px; border-radius:6px; border:1px solid var(--border); cursor:pointer; user-select:none; font:inherit; }
@@ -29,7 +50,7 @@
   .toggle.on { border-color:var(--danger); }
   .toggle.on .label { color:var(--danger); }
 
-  .tabs { display:flex; align-items:center; background:var(--panel); border-bottom:1px solid var(--border); padding:0 8px; gap:2px; overflow-x:auto; min-height:32px; }
+  .tabs { display:flex; align-items:center; background:#0f141b; border-bottom:1px solid var(--border); padding:0 8px; gap:3px; overflow-x:auto; min-height:36px; }
   .tab { display:inline-flex; align-items:center; gap:6px; padding:6px 10px; border-radius:6px 6px 0 0; cursor:pointer; color:var(--muted); border:1px solid transparent; border-bottom:none; max-width:240px; }
   .tab.active { background:var(--bg); color:var(--text); border-color:var(--border); }
   .tab .x { color:var(--muted); padding:0 4px; border-radius:4px; }
@@ -39,19 +60,19 @@
   main { flex:1; display:flex; flex-direction:column; min-height:0; min-width:0; max-width:100%; }
   .pane { flex:1; display:flex; flex-direction:column; min-height:0; min-width:0; width:100%; max-width:100%; }
   .pane.hidden { display:none; }
-  .term-bar { display:flex; align-items:center; gap:8px; padding:6px 10px; background:var(--panel); border-bottom:1px solid var(--border); font-size:12px; color:var(--muted); }
+  .term-bar { display:flex; align-items:center; gap:8px; padding:8px 10px; background:#111820; border-bottom:1px solid var(--border); font-size:12px; color:var(--muted); }
   .term-bar input[type=text] { flex:1; background:var(--panel-2); border:1px solid var(--border); color:var(--text); padding:4px 8px; border-radius:4px; font:inherit; }
   .term-bar .send { background:var(--accent); color:#fff; border-color:var(--accent); }
   .term-host { flex:1; min-height:0; padding:6px 8px; background:#000; }
   .term-host .xterm { height:100%; }
 
   .empty { display:flex; flex:1; align-items:center; justify-content:center; color:var(--muted); flex-direction:column; gap:8px; padding:24px; text-align:center; min-width:0; width:100%; max-width:100%; overflow-wrap:anywhere; }
-  footer { padding:4px 12px; font-size:11px; color:var(--muted); background:var(--panel); border-top:1px solid var(--border); display:flex; gap:16px; min-width:0; max-width:100%; }
+  footer { padding:6px 12px; font-size:11px; color:var(--muted); background:#10161d; border-top:1px solid var(--border); display:flex; gap:10px; align-items:center; min-width:0; max-width:100%; }
   footer .ok { color:var(--safe); }
   footer .warn { color:var(--danger); }
-  .status-pill { border:1px solid var(--border); border-radius:999px; padding:1px 7px; white-space:nowrap; }
+  .status-pill { border:1px solid var(--border); border-radius:999px; padding:2px 8px; white-space:nowrap; background:rgba(255,255,255,.025); }
   .team-summary { display:grid; grid-template-columns:repeat(4,minmax(120px,1fr)); gap:8px; margin-bottom:14px; }
-  .team-card { background:var(--panel-2); border:1px solid var(--border); border-radius:8px; padding:10px; }
+  .team-card { background:var(--panel-2); border:1px solid var(--border); border-radius:8px; padding:10px; box-shadow:0 1px 0 rgba(255,255,255,.03) inset; }
   .team-card strong { display:block; font-size:18px; margin-top:2px; }
   .team-provider { display:grid; grid-template-columns:minmax(150px,1fr) minmax(110px,auto) 90px; gap:10px; align-items:center; padding:8px 0; border-bottom:1px solid var(--border); }
   .team-provider:last-child { border-bottom:0; }
@@ -62,8 +83,8 @@
   .save-status.warn { color:#ffb6bf; }
 
   /* === Collab pane (WhatsApp-style chat) === */
-  .collab { display:flex; flex-direction:column; min-height:0; flex:1; background:#0b141a; }
-  .collab-toolbar { display:flex; gap:8px; padding:10px 14px; background:#202c33; border-bottom:1px solid #2a3942; align-items:center; flex-wrap:wrap; color:#e9edef; }
+  .collab { display:flex; flex-direction:column; min-height:0; flex:1; background:#0c131a; }
+  .collab-toolbar { display:flex; gap:8px; padding:10px 14px; background:#151e27; border-bottom:1px solid var(--border); align-items:center; flex-wrap:wrap; color:#e9edef; }
   .collab-toolbar > strong { font-size:13px; }
   .collab-chips { display:flex; gap:6px; flex-wrap:wrap; }
   .collab-chip { display:inline-flex; align-items:center; gap:6px; padding:4px 10px; background:#2a3942; border:1px solid #2a3942; border-radius:999px; font-size:12px; color:#e9edef; }
@@ -86,7 +107,7 @@
   /* Transcript area — chat bubbles */
   .transcript {
     flex:1; overflow-y:auto; padding:14px 16px;
-    background:#0b141a;
+    background:#0c131a;
     /* subtle dot pattern reminiscent of WhatsApp wallpaper */
     background-image:
       radial-gradient(rgba(255,255,255,0.025) 1px, transparent 1px),
@@ -194,8 +215,8 @@
   .start-btn:hover { background:#06cf9c; }
   .start-btn[disabled] { opacity:.4; cursor:not-allowed; }
 
-    dialog { background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:8px; padding:0; min-width:480px; max-width:80vw; }
-  dialog::backdrop { background:rgba(0,0,0,.5); }
+  dialog { background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:8px; padding:0; min-width:480px; max-width:80vw; box-shadow:var(--shadow); }
+  dialog::backdrop { background:rgba(0,0,0,.58); backdrop-filter:blur(2px); }
   .dlg-head { padding:14px 18px; border-bottom:1px solid var(--border); display:flex; align-items:center; justify-content:space-between; }
   .dlg-body { padding:14px 18px; }
   .dlg-foot { padding:12px 18px; border-top:1px solid var(--border); display:flex; justify-content:flex-end; gap:8px; }
@@ -231,15 +252,26 @@
   .typing-dots span:nth-child(2) { animation-delay:.18s; }
   .typing-dots span:nth-child(3) { animation-delay:.36s; }
   @keyframes tdot { 0%,65%,100%{ transform:translateY(0); opacity:.35 } 32%{ transform:translateY(-5px); opacity:1 } }
+  .toast-stack { position:fixed; right:14px; bottom:42px; display:flex; flex-direction:column; gap:8px; z-index:50; width:min(380px, calc(100vw - 28px)); pointer-events:none; }
+  .toast { pointer-events:auto; background:#17202a; border:1px solid var(--border); border-left:3px solid var(--accent); color:var(--text); border-radius:8px; padding:9px 11px; box-shadow:var(--shadow); font-size:12px; }
+  .toast.ok { border-left-color:var(--safe); }
+  .toast.warn { border-left-color:var(--warn); }
+  .toast.error { border-left-color:var(--danger); }
+  .palette-search { width:100%; background:var(--panel-2); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:10px 12px; font:14px system-ui,sans-serif; }
+  .palette-list { margin-top:10px; max-height:50vh; overflow:auto; border:1px solid var(--border); border-radius:8px; }
+  .palette-item { width:100%; text-align:left; background:transparent; color:var(--text); border:0; border-bottom:1px solid var(--border); padding:9px 11px; cursor:pointer; display:flex; gap:10px; align-items:center; }
+  .palette-item:last-child { border-bottom:0; }
+  .palette-item:hover, .palette-item.active { background:var(--panel-2); }
+  .palette-item small { color:var(--muted); display:block; margin-top:2px; }
   @media (max-width:760px) {
-    header { align-items:stretch; max-height:48vh; overflow-y:auto; overflow-x:hidden; padding:7px 8px; }
+    header { grid-template-columns:1fr; align-items:stretch; max-height:48vh; overflow-y:auto; overflow-x:hidden; padding:8px; }
     header > * { min-width:0; max-width:100%; }
-    header > .spacer { display:none; }
     .brand { width:100%; }
     .brand small { overflow-wrap:anywhere; }
     #kind-buttons { display:flex; gap:6px; overflow-x:auto; width:100%; min-width:0; padding-bottom:2px; }
     #kind-buttons > .btn { flex:0 0 auto; }
-    header > .btn { flex:0 0 calc(50% - 4px); width:calc(50% - 4px); justify-content:center; white-space:normal; text-align:center; overflow:hidden; }
+    .top-actions { justify-content:stretch; }
+    .top-actions > .btn { flex:1 1 calc(50% - 4px); justify-content:center; white-space:normal; text-align:center; overflow:hidden; }
     .toggle { flex:1 0 100%; width:100%; max-width:100%; min-width:0; justify-content:center; white-space:normal; }
     .toggle .label { min-width:0; overflow-wrap:anywhere; }
     dialog { min-width:0 !important; width:calc(100vw - 20px); max-width:calc(100vw - 20px); max-height:90vh; }
@@ -334,6 +366,14 @@
   <div class="dlg-body" id="collab-add-list"></div>
 </dialog>
 
+<dialog id="command-palette-dialog" style="min-width:min(620px,92vw);">
+  <div class="dlg-head"><strong>Command Palette</strong><button class="btn" id="command-palette-close">Close</button></div>
+  <div class="dlg-body">
+    <input class="palette-search" id="command-palette-search" type="text" placeholder="Search commands or providers..." autocomplete="off" />
+    <div class="palette-list" id="command-palette-list"></div>
+  </div>
+</dialog>
+
 <div class="tabs" id="tabs"></div>
 
 <main id="main">
@@ -355,6 +395,8 @@
   <span>API: <a href="/api/health" target="_blank" style="color:var(--muted)">/api/health</a></span>
 </footer>
 
+<div class="toast-stack" id="toast-stack" aria-live="polite" aria-atomic="false"></div>
+
 <script src="/vendor/xterm/lib/xterm.js"></script>
 <script src="/vendor/xterm-addon-fit/lib/addon-fit.js"></script>
 <script>
@@ -368,6 +410,7 @@ const state = {
   collabs: new Map(),
   active: null,
   teamSnapshot: null,
+  providerDiag: {},
 };
 let nextCollabId = 1;
 const $ = (s) => document.querySelector(s);
@@ -382,9 +425,45 @@ const mainEl = $('#main');
 const emptyEl = $('#empty-state');
 const toggleEl = $('#toggle');
 const kindBtnsEl = $('#kind-buttons');
+const toastStackEl = $('#toast-stack');
+const commandPaletteDialog = $('#command-palette-dialog');
+const commandPaletteSearch = $('#command-palette-search');
+const commandPaletteList = $('#command-palette-list');
 
 let capabilityToken = '';
 let capabilityPromise = null;
+
+function normalizeHeader() {
+  const header = document.querySelector('header');
+  if (!header || header.querySelector('.top-actions')) return;
+  const actions = document.createElement('div');
+  actions.className = 'top-actions';
+  const commandButton = document.createElement('button');
+  commandButton.className = 'btn';
+  commandButton.id = 'command-palette-btn';
+  commandButton.title = 'Open command palette (Ctrl+K)';
+  commandButton.textContent = 'Commands';
+  const movable = [...header.children].filter((child) => child !== header.querySelector('.brand') && child !== kindBtnsEl);
+  for (const child of movable) {
+    if (child.classList?.contains('spacer')) continue;
+    actions.appendChild(child);
+  }
+  actions.insertBefore(commandButton, actions.children[3] || null);
+  header.appendChild(actions);
+  const brandSmall = header.querySelector('.brand small');
+  if (brandSmall) brandSmall.textContent = 'local PowerShell + AI CLI control plane';
+}
+
+function toast(message, type = 'ok', timeoutMs = 4200) {
+  if (!toastStackEl) return;
+  const item = document.createElement('div');
+  item.className = `toast ${type}`;
+  item.textContent = String(message || '');
+  toastStackEl.appendChild(item);
+  setTimeout(() => item.remove(), timeoutMs);
+}
+
+normalizeHeader();
 
 async function ensureCapability() {
   if (capabilityToken) return capabilityToken;
@@ -424,11 +503,13 @@ async function api(path, opts = {}) {
 }
 
 function updateProviderFooter(results) {
+  state.providerDiag = results || {};
   const providers = Object.values(results || {});
   const ready = providers.filter((item) => item?.ready).length;
   const el = $('#status-providers');
   el.textContent = providers.length ? `providers: ${ready}/${providers.length} ready` : 'providers: none';
   el.className = 'status-pill ' + (providers.length && ready === providers.length ? 'ok' : 'warn');
+  renderKindButtons();
 }
 
 async function refreshHealthStatus() {
@@ -585,15 +666,91 @@ function renderKindButtons() {
   for (const [kind, entry] of Object.entries(state.config)) {
     if (kind.startsWith('_')) continue;
     if (!entry || !entry.label) continue;
+    const diag = state.providerDiag[kind];
+    const statusClass = diag ? (diag.ready ? 'ready' : (diag.found ? 'warn' : 'missing')) : '';
+    const statusText = diag ? (diag.ready ? 'ready' : (diag.found ? 'setup' : 'missing')) : '';
     const b = document.createElement('button');
-    b.className = 'btn kind';
+    b.className = `btn kind ${statusClass}`;
     b.style.borderLeftColor = safeColor(entry.color, '#cc785c');
-    b.textContent = '+ ' + entry.label;
-    b.title = `Launch ${entry.label}`;
+    b.title = diag?.detail ? `Launch ${entry.label}. ${diag.detail}` : `Launch ${entry.label}`;
+    const dot = document.createElement('span');
+    dot.className = 'provider-dot';
+    const name = document.createElement('span');
+    name.className = 'provider-name';
+    name.textContent = entry.label;
+    const stateLabel = document.createElement('span');
+    stateLabel.className = 'provider-state';
+    stateLabel.textContent = statusText;
+    b.append(dot, name, stateLabel);
     b.onclick = () => launchSession(kind);
     kindBtnsEl.appendChild(b);
   }
 }
+
+function paletteCommands() {
+  const providerCommands = Object.entries(state.config)
+    .filter(([kind, entry]) => !kind.startsWith('_') && entry?.label)
+    .map(([kind, entry]) => ({
+      title: `Launch ${entry.label}`,
+      detail: state.providerDiag[kind]?.ready ? 'provider ready' : 'opens configured terminal session',
+      run: () => launchSession(kind),
+    }));
+  return [
+    { title: 'New Collab', detail: 'start a multi-AI room', run: () => $('#new-collab-btn')?.click() },
+    { title: 'Saved Collabs', detail: 'open saved collaboration rooms', run: () => $('#saved-collabs-btn')?.click() },
+    { title: 'Team Status', detail: 'providers, runs, receipts, and MCP handoff', run: () => $('#team-status-btn')?.click() },
+    { title: 'Check Installs', detail: 'probe provider CLIs and login readiness', run: () => $('#diag-btn')?.click() },
+    { title: 'Install Providers', detail: 'run configured provider installers', run: () => $('#install-all-btn')?.click() },
+    { title: 'Reload Sessions', detail: 'refresh sessions, health, and provider footer', run: () => $('#reload-btn')?.click() },
+    ...providerCommands,
+  ];
+}
+
+function renderPalette() {
+  const query = (commandPaletteSearch?.value || '').trim().toLowerCase();
+  const commands = paletteCommands().filter((cmd) =>
+    !query || cmd.title.toLowerCase().includes(query) || cmd.detail.toLowerCase().includes(query));
+  commandPaletteList.innerHTML = '';
+  for (const cmd of commands) {
+    const button = document.createElement('button');
+    button.className = 'palette-item';
+    button.innerHTML = `<div><strong>${escapeHtml(cmd.title)}</strong><small>${escapeHtml(cmd.detail)}</small></div>`;
+    button.onclick = () => {
+      closePalette();
+      cmd.run();
+    };
+    commandPaletteList.appendChild(button);
+  }
+  if (!commands.length) commandPaletteList.innerHTML = '<div class="palette-item"><div><strong>No matches</strong><small>Try a provider name or action.</small></div></div>';
+}
+
+function openPalette() {
+  renderPalette();
+  if (typeof commandPaletteDialog.showModal === 'function') commandPaletteDialog.showModal(); else commandPaletteDialog.setAttribute('open', 'true');
+  setTimeout(() => { commandPaletteSearch.focus(); commandPaletteSearch.select(); }, 0);
+}
+
+function closePalette() {
+  try { commandPaletteDialog.close(); } catch { commandPaletteDialog.removeAttribute('open'); }
+}
+
+$('#command-palette-btn')?.addEventListener('click', openPalette);
+$('#command-palette-close')?.addEventListener('click', closePalette);
+commandPaletteSearch?.addEventListener('input', renderPalette);
+commandPaletteSearch?.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') {
+    event.preventDefault();
+    commandPaletteList.querySelector('.palette-item')?.click();
+  }
+});
+document.addEventListener('keydown', (event) => {
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
+    event.preventDefault();
+    openPalette();
+  } else if (event.key === 'Escape' && commandPaletteDialog?.open) {
+    closePalette();
+  }
+});
 
 async function loadPermissions() {
   const r = await api('/api/permissions');
@@ -616,7 +773,7 @@ async function setPermissions(v) {
     renderPermissions(saved.fullPermissions);
   } catch (error) {
     renderPermissions(previous);
-    alert('Could not change permissions: ' + error.message);
+    toast('Could not change permissions: ' + error.message, 'error');
   } finally {
     toggleEl.disabled = false;
   }
@@ -628,7 +785,7 @@ async function launchSession(kind) {
     const meta = await api('/api/sessions', { method: 'POST', body: JSON.stringify({ kind, dangerous: state.fullPermissions }) });
     attachSession(meta);
     setActive('session:' + meta.id);
-  } catch (err) { alert('Failed to launch: ' + err.message); }
+  } catch (err) { toast('Failed to launch: ' + err.message, 'error'); }
 }
 
 async function refreshSessions() {
@@ -767,7 +924,7 @@ async function closeSession(id) {
   try {
     await api(`/api/sessions/${id}`, { method: 'DELETE' });
     closeSessionLocal(id);
-  } catch (error) { alert('Could not close terminal: ' + error.message); }
+  } catch (error) { toast('Could not close terminal: ' + error.message, 'error'); }
 }
 function closeSessionLocal(id) {
   const s = state.sessions.get(id); if (!s) return;
@@ -793,8 +950,8 @@ $('#reload-btn').onclick = async () => {
     const [, , , diag] = await Promise.all([loadConfig(), loadPermissions(), refreshSessions(), api('/api/diag')]);
     updateProviderFooter(diag.results || {});
     await refreshHealthStatus();
-  } catch (error) { alert('Refresh failed: ' + error.message); }
-  finally { button.disabled = false; button.textContent = '⟳ Reload'; }
+  } catch (error) { toast('Refresh failed: ' + error.message, 'error'); }
+  finally { button.disabled = false; button.textContent = 'Reload'; }
 };
 
 const diagDialog = document.getElementById('diag-dialog');
@@ -920,7 +1077,7 @@ async function loadSavedCollab(id) {
     renderChips(c);
     updateToLine(c);
   } catch (err) {
-    alert('Failed to load: ' + err.message);
+    toast('Failed to load: ' + err.message, 'error');
   }
 }
 $('#saved-collabs-btn').onclick = openSavedCollabs;
@@ -1010,7 +1167,7 @@ $('#collab-pick-cancel').onclick = closeCollabPicker;
 $('#collab-pick-cancel-2').onclick = closeCollabPicker;
 collabPickGo.onclick = async () => {
   const picked = [...collabPickList.querySelectorAll('input[type=checkbox]')].filter(cb => cb.checked).map(cb => cb.value);
-  if (!picked.length) { alert('Pick at least one AI.'); return; }
+  if (!picked.length) { toast('Pick at least one AI.', 'warn'); return; }
   const name = document.getElementById('collab-pick-name').value.trim();
   const newProj = document.getElementById('collab-pick-newproject').value.trim();
   const selProj = document.getElementById('collab-pick-project').value;
@@ -1022,7 +1179,7 @@ collabPickGo.onclick = async () => {
     const meta = await api('/api/collabs', { method:'POST', body: JSON.stringify({ name, project, participants: picked }) });
     createCollab(picked, { id: meta.id, name: meta.name, project: meta.project });
   } catch (err) {
-    alert('Failed to save new collab: ' + err.message + '\n(Opening unsaved collab instead.)');
+    toast('Failed to save new collab; opening an unsaved collab instead. ' + err.message, 'warn');
     createCollab(picked);
   }
 };
@@ -1254,7 +1411,7 @@ function updateToLine(collab) {
 
 function removeParticipant(collabId, kind) {
   const c = state.collabs.get(collabId); if (!c) return;
-  if (c.busy) { alert('Cancel or finish the current round before changing participants.'); return; }
+  if (c.busy) { toast('Cancel or finish the current round before changing participants.', 'warn'); return; }
   c.participants = c.participants.filter(k => k !== kind);
   c.dropped.delete(kind);
   c.respond.delete(kind);
@@ -1266,7 +1423,7 @@ function removeParticipant(collabId, kind) {
 
 async function openAddAi(collabId) {
   const c = state.collabs.get(collabId); if (!c) return;
-  if (c.busy) { alert('Cancel or finish the current round before adding a participant.'); return; }
+  if (c.busy) { toast('Cancel or finish the current round before adding a participant.', 'warn'); return; }
   collabAddList.innerHTML = '<span style="color:var(--muted)">Checking provider readiness…</span>';
   if (typeof collabAddDialog.showModal === 'function') collabAddDialog.showModal(); else collabAddDialog.setAttribute('open','true');
   let diagnostics = {};
@@ -1547,11 +1704,11 @@ async function onSend(collabId) {
   if (c.busy) return;
   const text = (c.promptEl.value || '').trim();
   if (!text) return;
-  if (!c.participants.length) { alert('No AIs in this chat yet — add one with “+ Add AI”.'); return; }
+  if (!c.participants.length) { toast('No AIs in this chat yet. Add one with + Add AI.', 'warn'); return; }
 
   const addr = parseAddress(c, text);
   if (!addr.targets.length) {
-    alert('No AI is set to reply. Tap a participant chip to un-mute it, or start your message with an AI name.');
+    toast('No AI is set to reply. Unmute a participant or start with an AI name.', 'warn');
     return;
   }
 
@@ -1589,9 +1746,9 @@ async function onPhase(collabId, phase) {
   }
   if (phase === 'pplx-web') {
     const q = (c.promptEl.value || '').trim();
-    if (!q) { alert('Type a message first, then click Web search.'); return; }
+    if (!q) { toast('Type a message first, then click Web search.', 'warn'); return; }
     appendMsg(c, { who: 'system', text: 'Opened Perplexity in your browser. Paste the answer into 📎 Shared context to share it with the room.' });
-    bridgeFetch('/api/open-url', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: 'https://www.perplexity.ai/search?q=' + encodeURIComponent(q) }) }).catch(err => alert('open failed: ' + err.message));
+    bridgeFetch('/api/open-url', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: 'https://www.perplexity.ai/search?q=' + encodeURIComponent(q) }) }).catch(err => toast('Open failed: ' + err.message, 'error'));
     return;
   }
   if (phase === 'pplx-help') {
@@ -1610,7 +1767,7 @@ async function onPhase(collabId, phase) {
 
   const userPrompt = (c.promptEl.value || '').trim();
   const active = [...c.participants];
-  if (!active.length) { alert('No AIs in this chat yet — add one with “+ Add AI”.'); return; }
+  if (!active.length) { toast('No AIs in this chat yet. Add one with + Add AI.', 'warn'); return; }
 
   // team rounds re-probe every participant (auto-recovery)
   const recovered = active.filter(k => c.dropped.has(k));
@@ -1625,7 +1782,7 @@ async function onPhase(collabId, phase) {
   let phaseLabel, promptFor;
 
   if (phase === 'blind') {
-    if (!userPrompt) { alert('Type a topic in the message box first.'); return; }
+    if (!userPrompt) { toast('Type a topic in the message box first.', 'warn'); return; }
     phaseLabel = 'blind take';
     appendMsg(c, { who: 'user', text: userPrompt, phase: 'topic' });
     clearPrompt();
@@ -1634,7 +1791,7 @@ async function onPhase(collabId, phase) {
       return `${buildSharedHeader(c)}You are ${cfg.label} (${cfg.company || ''}). Several AIs are being asked this SAME question in parallel — you cannot see their answers and they cannot see yours. Give YOUR honest, specific, opinionated take. This is a discussion: reply with text only, do NOT run commands or tools. ~150-300 words.\n\nTOPIC:\n${userPrompt}`;
     };
   } else if (phase === 'discuss') {
-    if (!transcriptSoFar) { alert('Run "1 · Blind takes" first so there is something to discuss.'); return; }
+    if (!transcriptSoFar) { toast('Run Blind takes first so there is something to discuss.', 'warn'); return; }
     phaseLabel = 'discuss';
     if (userPrompt) { appendMsg(c, { who: 'user', text: userPrompt, phase: 'note' }); clearPrompt(); }
     promptFor = (kind) => {
@@ -1643,7 +1800,7 @@ async function onPhase(collabId, phase) {
       return `${buildSharedHeader(c)}You are ${cfg.label} (${cfg.company || ''}), in a group with: ${others || '(no one else)'}. Everyone gave a blind take and now you can see them all. Say where you AGREE, where you DISAGREE, what others missed, and the best path forward. Reference people by name. Reply with text only — do NOT run commands or tools. ~200-400 words.\n\n=== CONVERSATION ===\n${transcriptSoFar}`;
     };
   } else if (phase === 'divide') {
-    if (!transcriptSoFar) { alert('Build up some discussion first.'); return; }
+    if (!transcriptSoFar) { toast('Build up some discussion first.', 'warn'); return; }
     phaseLabel = 'split work';
     if (userPrompt) { appendMsg(c, { who: 'user', text: userPrompt, phase: 'note' }); clearPrompt(); }
     promptFor = (kind) => {
