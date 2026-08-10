@@ -388,14 +388,15 @@
       "costClass": "free_quota_or_metered_api",
       "privacyBoundary": "hosted_provider_us",
       "modelIdentity": "llama-3.1-8b-instant",
-      "qualification": "discovered",
+      "qualification": "task_evaluated",
       "autoRoute": false,
       "capabilities": ["quick_lookup", "general", "coding"],
-      "capabilityProvenance": {"quick_lookup": "operator_declared", "general": "operator_declared", "coding": "operator_declared"},
+      "capabilityProvenance": {"quick_lookup": "local_smoke", "general": "local_smoke", "coding": "operator_declared"},
       "maxRecommendedTier": "utility",
-      "evidence": [],
+      "evidence": ["rcpt_msnb5gkb_739ed68a"],
       "references": ["groq_llama31_8b", "groq_model_catalog"],
-      "limitations": ["Opt-in only; not auto-routed unless explicitly preferred", "Requires GROQ_API_KEY", "Account-specific quota and billing must be checked before treating it as free", "China-hosted DeepSeek/Qwen APIs are intentionally not configured"]
+      "qualificationEvidence": {"testedAt": "2026-08-10T14:10:00Z", "receiptId": "rcpt_msnb5gkb_739ed68a", "taskFamily": "safe exact-output hosted one-shot connectivity", "resolvedModelIdentity": "llama-3.1-8b-instant", "result": "completed"},
+      "limitations": ["Opt-in only; not auto-routed unless explicitly preferred", "Requires GROQ_API_KEY", "Account-specific quota and billing must be checked before treating it as free", "One exact-output connectivity task is not a coding-quality score", "China-hosted DeepSeek/Qwen APIs are intentionally not configured"]
     }
   },
   "candidateIntegrations": [
