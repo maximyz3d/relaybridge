@@ -30,6 +30,11 @@ test('provider config uses the installed subscription CLIs and safe headless mod
   assert.equal(config.codex.oneshot_safe[config.codex.oneshot_safe.indexOf('--sandbox') + 1], 'read-only');
   assert.ok(config.codex.oneshot_safe.includes('--ephemeral'));
   assert.deepEqual(config.codex.probe, ['codex', 'login', 'status']);
+  assert.equal(config.copilot.npm_package, '@github/copilot');
+  assert.deepEqual(config.copilot.probe, ['copilot', '--version']);
+  assert.ok(config.copilot.oneshot_safe.includes('--prompt'));
+  assert.ok(config.copilot.oneshot_safe.includes('{prompt}'));
+  assert.ok(config.copilot.strip_env.includes('COPILOT_GITHUB_TOKEN'));
   assert.equal(config.gemini.safe[0], 'agy.exe');
   assert.match(config.gemini.label, /Antigravity/);
   assert.deepEqual(config.gemini.probe, ['agy.exe', 'models']);
@@ -60,6 +65,12 @@ test('provider config uses the installed subscription CLIs and safe headless mod
   assert.equal(config.ollama_coder.oneshot_adapter, 'ollama_api');
   assert.equal(config.ollama_fast.model, 'qwen2.5:1.5b');
   assert.equal(config.ollama_fast.oneshot_adapter, 'ollama_api');
+  assert.equal(config.ollama_llama.model, 'llama3.2:3b');
+  assert.equal(config.ollama_llama.oneshot_adapter, 'ollama_api');
+  assert.equal(config.groq_llama_fast.oneshot_adapter, 'openai_chat_api');
+  assert.equal(config.groq_llama_fast.api_key_env, 'GROQ_API_KEY');
+  assert.equal(config.groq_llama_fast.allow_paid_fallback, false);
+  assert.equal(config.groq_llama_fast.autoRoute, false);
 });
 
 test('server, MCP adapter, Perplexity wrapper, and inline browser script parse', () => {
@@ -364,4 +375,58 @@ test('local Ollama adapter uses loopback HTTP, returns final-only text, and reco
   assert.equal(requestPayload.stream, false);
   assert.equal(requestPayload.think, false);
   assert.equal(requestPayload.options.num_predict, 64);
+});
+
+test('hosted OpenAI-compatible adapter blocks China-hosted endpoints before network access', async (t) => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ps-bridge-hosted-block-test-'));
+  const configPath = path.join(tempRoot, 'config.json');
+  const tokenPath = path.join(tempRoot, 'capability.token');
+  fs.writeFileSync(configPath, JSON.stringify({
+    blocked: {
+      label: 'Blocked hosted model',
+      transport: 'hosted:openai-compatible',
+      oneshot_adapter: 'openai_chat_api',
+      api_base_url: 'https://api.deepseek.com/chat/completions',
+      api_key_env: 'TEST_BLOCKED_HOSTED_KEY',
+      model: 'deepseek-chat',
+      safe: ['hosted-openai-compatible'],
+      dangerous: ['hosted-openai-compatible'],
+      oneshot_safe: ['hosted-openai-compatible'],
+      oneshot_dangerous: ['hosted-openai-compatible'],
+    },
+  }), 'utf8');
+
+  const bridgePort = await reservePort();
+  const baseUrl = `http://127.0.0.1:${bridgePort}`;
+  const bridge = spawn(process.execPath, [path.join(ROOT, 'server.js')], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      PORT: String(bridgePort),
+      PTY_MODE: 'none',
+      PS_BRIDGE_CONFIG_FILE: configPath,
+      PS_BRIDGE_TOKEN_FILE: tokenPath,
+      PS_BRIDGE_DATA_DIR: path.join(tempRoot, 'data'),
+      TEST_BLOCKED_HOSTED_KEY: 'sk-test-not-real',
+    },
+    windowsHide: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  t.after(async () => {
+    if (bridge.exitCode === null) bridge.kill('SIGTERM');
+    await new Promise((resolve) => bridge.exitCode !== null ? resolve() : bridge.once('exit', resolve));
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  });
+
+  await waitForHealth(baseUrl, bridge);
+  const headers = await capabilityHeaders(baseUrl, true);
+  const response = await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ kind: 'blocked', prompt: 'test prompt', dangerous: false }),
+  });
+  const result = await response.json();
+  assert.equal(result.exitCode, -1);
+  assert.equal(result.dropped_out, true);
+  assert.match(result.stderr, /blocked by geo\/supply-chain policy/);
 });

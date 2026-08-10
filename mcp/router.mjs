@@ -203,6 +203,10 @@ export function routeTask({
       policyScore += 1000;
       reasons.push('explicitly preferred by caller');
     }
+    if (provider.autoRoute === false && !preferred.has(kind)) {
+      policyScore -= 10000;
+      reasons.push('opt-in provider; excluded unless explicitly preferred');
+    }
     if (capabilityMatch.length) {
       policyScore += 25 + capabilityMatch.length * 3;
       reasons.push(`registry tags match: ${capabilityMatch.join(', ')}`);

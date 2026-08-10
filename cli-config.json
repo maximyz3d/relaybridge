@@ -188,6 +188,57 @@
     ],
     "npm_package": "@openai/codex"
   },
+  "copilot": {
+    "label": "GitHub Copilot CLI",
+    "company": "GitHub",
+    "transport": "subscription:github-copilot",
+    "color": "#6e40c9",
+    "safe": [
+      "copilot"
+    ],
+    "dangerous": [
+      "copilot"
+    ],
+    "oneshot_safe": [
+      "copilot",
+      "--prompt",
+      "{prompt}"
+    ],
+    "oneshot_dangerous": [
+      "copilot",
+      "--prompt",
+      "{prompt}"
+    ],
+    "prompt_max_chars": 12000,
+    "probe": [
+      "copilot",
+      "--version"
+    ],
+    "probe_success_detail": "GitHub Copilot CLI is installed; authentication and workspace trust are verified by the first live receipt",
+    "version_probe": [
+      "copilot",
+      "--version"
+    ],
+    "strip_env": [
+      "COPILOT_GITHUB_TOKEN",
+      "GH_TOKEN",
+      "GITHUB_TOKEN"
+    ],
+    "npm_package": "@github/copilot",
+    "install_command": [
+      "powershell.exe",
+      "-NoLogo",
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-Command",
+      "winget install GitHub.Copilot"
+    ],
+    "install_display": "winget install GitHub.Copilot  # or: npm install -g @github/copilot",
+    "post_install": "Run copilot once, use /login if prompted, and trust only workspaces you want Copilot CLI to inspect.",
+    "docs_url": "https://docs.github.com/en/copilot/how-tos/copilot-cli/use-copilot-cli/overview",
+    "_note": "The official CLI supports copilot --prompt for direct prompts and Copilot CLI custom agents. RelayBridge runs it in bounded one-shot mode; mutating tool approval remains governed by Copilot CLI."
+  },
   "gemini": {
     "label": "Gemini (Antigravity)",
     "company": "Google",
@@ -410,6 +461,28 @@
     "docs_url": "https://docs.ollama.com/windows",
     "_note": "Apache-2.0 model, no-API-fee, non-thinking local utility seat. Uses local compute, memory, storage, and electricity; escalate failed validations."
   },
+  "ollama_llama": {
+    "label": "Local Meta Llama 3.2 3B",
+    "company": "Ollama / Meta",
+    "transport": "local:ollama",
+    "oneshot_adapter": "ollama_api",
+    "model": "llama3.2:3b",
+    "prompt_max_chars": 16000,
+    "max_output_tokens": 1024,
+    "color": "#4f9cf9",
+    "safe": ["ollama.exe", "run", "llama3.2:3b"],
+    "dangerous": ["ollama.exe", "run", "llama3.2:3b"],
+    "oneshot_safe": ["ollama.exe", "run", "llama3.2:3b"],
+    "oneshot_dangerous": ["ollama.exe", "run", "llama3.2:3b"],
+    "probe": ["ollama.exe", "show", "llama3.2:3b"],
+    "probe_success_detail": "configured local Meta Llama Ollama model is installed",
+    "version_probe": ["ollama.exe", "--version"],
+    "diagnostic_binary": "ollama.exe",
+    "install_display": "winget install --id Ollama.Ollama -e",
+    "post_install": "Run ollama pull llama3.2:3b, then restart RelayBridge.",
+    "docs_url": "https://ollama.com/library/llama3.2",
+    "_note": "Local Meta Llama utility/general seat. No China-hosted API path; uses local compute and must earn higher routing tiers through receipts."
+  },
   "ollama": {
     "label": "Local Qwen3 4B",
     "company": "Ollama / Qwen",
@@ -500,5 +573,28 @@
     "post_install": "Run ollama pull qwen2.5-coder:7b, then restart RelayBridge.",
     "docs_url": "https://docs.ollama.com/windows",
     "_note": "Zero API fee local coding seat. Escalate validator or test failures; model-card claims are not a reproduced RelayBridge benchmark."
+  },
+  "groq_llama_fast": {
+    "label": "Groq Llama 3.1 8B",
+    "company": "Groq / Meta",
+    "transport": "hosted:openai-compatible",
+    "oneshot_adapter": "openai_chat_api",
+    "api_base_url": "https://api.groq.com/openai/v1/chat/completions",
+    "api_key_env": "GROQ_API_KEY",
+    "hosting_region": "US",
+    "allow_paid_fallback": false,
+    "autoRoute": false,
+    "model": "llama-3.1-8b-instant",
+    "prompt_max_chars": 24000,
+    "max_output_tokens": 1024,
+    "temperature": 0.2,
+    "color": "#f55036",
+    "safe": ["hosted-openai-compatible"],
+    "dangerous": ["hosted-openai-compatible"],
+    "oneshot_safe": ["hosted-openai-compatible"],
+    "oneshot_dangerous": ["hosted-openai-compatible"],
+    "docs_url": "https://console.groq.com/docs/models",
+    "post_install": "Create a Groq key, set GROQ_API_KEY, and prefer this provider explicitly until quota/cost receipts are collected.",
+    "_note": "Opt-in hosted Meta Llama diversity seat. The bridge blocks known China-hosted endpoints and never treats this as paid fallback; account quota/billing still depends on your Groq account."
   }
 }

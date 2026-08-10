@@ -11,7 +11,7 @@ test.before(async () => {
 
 function readyDiagnostics() {
   return Object.fromEntries([
-    'powershell', 'ollama_fast', 'ollama', 'ollama_coder', 'claude', 'codex', 'gemini', 'grok', 'perplexity',
+    'powershell', 'ollama_fast', 'ollama_llama', 'ollama', 'ollama_coder', 'claude', 'codex', 'copilot', 'gemini', 'grok', 'perplexity', 'groq_llama_fast',
   ].map((kind) => [kind, { found: true, ready: true, detail: 'test ready' }]));
 }
 
@@ -32,6 +32,22 @@ test('utility lookup is local-first and a complex coding task fails up', () => {
   assert.equal(complex.primaryTag, 'coding');
   assert.notEqual(complex.selected[0].kind, 'ollama_coder');
   assert.ok(complex.selected[0].qualification);
+});
+
+test('hosted free/quota providers are opt-in and can be explicitly preferred', () => {
+  const normal = router.routeTask({
+    task: 'Answer a quick coding question.',
+    diagnostics: readyDiagnostics(),
+  });
+  assert.ok(!normal.selected.some((candidate) => candidate.kind === 'groq_llama_fast'));
+  assert.ok(normal.candidates.find((candidate) => candidate.kind === 'groq_llama_fast').policyReasons.some((reason) => /opt-in provider/.test(reason)));
+
+  const preferred = router.routeTask({
+    task: 'Answer a quick coding question.',
+    diagnostics: readyDiagnostics(),
+    preferredProviders: ['groq_llama_fast'],
+  });
+  assert.equal(preferred.selected[0].kind, 'groq_llama_fast');
 });
 
 test('fresh research uses a source-capable route and local-only stays local', () => {

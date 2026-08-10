@@ -26,7 +26,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubus
 - PowerShell 5.1 or PowerShell 7+
 - Node.js 20.3 or newer
 - Optional: GitHub CLI only if you want to contribute to the repo
-- Optional provider CLIs: Codex, Claude, Antigravity/Gemini, Grok, Perplexity `pwm`, and Ollama
+- Optional provider CLIs: Codex, Claude, Antigravity/Gemini, GitHub Copilot CLI, Grok, Perplexity `pwm`, and Ollama
 
 RelayBridge works with only PowerShell installed, but AI delegation requires the relevant provider CLIs to be installed and logged in.
 
@@ -90,18 +90,24 @@ Common setup commands:
 
 ```powershell
 npm install -g @openai/codex
+npm install -g @github/copilot
 npm install -g @xai-official/grok
 irm https://antigravity.google/cli/install.ps1 | iex
 uv tool install --upgrade perplexity-web-mcp-cli
 winget install --id Ollama.Ollama -e
 ollama pull qwen2.5:1.5b
+ollama pull llama3.2:3b
 ollama pull qwen3:4b
 ollama pull qwen2.5-coder:7b
 ```
 
 Run each provider login once in a normal terminal, then restart RelayBridge and open `/api/diag` or the dashboard diagnostics view.
 
+GitHub Copilot CLI can also be installed with `winget install GitHub.Copilot`. It requires an active Copilot plan and may ask you to trust the current workspace before it reads or changes files. RelayBridge configures Copilot as a bounded one-shot provider using `copilot --prompt`, and it strips GitHub token environment variables from child processes.
+
 The default Perplexity route uses the community `pwm` wrapper and strips paid API fallback variables. It depends on the connected Perplexity web account and may change if that upstream wrapper changes.
+
+Hosted free/quota providers are intentionally opt-in. `groq_llama_fast` uses Groq's OpenAI-compatible endpoint with `GROQ_API_KEY`, pins Meta Llama `llama-3.1-8b-instant`, sets `allow_paid_fallback=false`, and is marked `autoRoute=false` so normal routing will not silently spend hosted quota. Direct China-hosted endpoints such as DeepSeek API and Alibaba DashScope are blocked by the hosted adapter. Local Qwen through Ollama remains available because it runs on your machine rather than a China-hosted service.
 
 ## Routing
 

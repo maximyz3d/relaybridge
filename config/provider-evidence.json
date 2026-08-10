@@ -151,6 +151,60 @@
       "limitations": "Model-card claims and context limits are not RelayBridge task evaluation results."
     },
     {
+      "id": "github_copilot_cli_docs",
+      "kind": "official_documentation",
+      "title": "GitHub Copilot CLI",
+      "url": "https://docs.github.com/en/copilot/how-tos/copilot-cli/use-copilot-cli/overview",
+      "checkedAt": "2026-08-10",
+      "supports": ["terminal_ai_cli", "custom_agents", "mcp_client", "prompt_flag"],
+      "limitations": "Requires an active Copilot plan, policy enablement, workspace trust, and live receipt validation."
+    },
+    {
+      "id": "github_copilot_cli_install",
+      "kind": "official_documentation",
+      "title": "Installing GitHub Copilot CLI",
+      "url": "https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/install-copilot-cli",
+      "checkedAt": "2026-08-10",
+      "supports": ["winget_install", "npm_install", "token_env"],
+      "limitations": "Install readiness does not prove authentication or plan quota."
+    },
+    {
+      "id": "ollama_llama32",
+      "kind": "official_model_library",
+      "title": "Ollama Llama 3.2",
+      "url": "https://ollama.com/library/llama3.2",
+      "checkedAt": "2026-08-10",
+      "supports": ["local_inference", "meta_llama", "1b_3b_models"],
+      "limitations": "Model-library claims are not local RelayBridge benchmark results."
+    },
+    {
+      "id": "groq_llama31_8b",
+      "kind": "official_provider_documentation",
+      "title": "Groq Llama 3.1 8B",
+      "url": "https://console.groq.com/docs/model/llama-3.1-8b-instant",
+      "checkedAt": "2026-08-10",
+      "supports": ["hosted_meta_llama", "openai_compatible_api", "json_mode", "function_calling"],
+      "limitations": "Pricing, limits, and free quota depend on the current Groq account and developer plan."
+    },
+    {
+      "id": "groq_model_catalog",
+      "kind": "official_provider_documentation",
+      "title": "Groq supported models",
+      "url": "https://console.groq.com/docs/models",
+      "checkedAt": "2026-08-10",
+      "supports": ["model_ids", "developer_plan_limits", "pricing"],
+      "limitations": "Catalog and pricing are current-source inputs, not proof of local suitability."
+    },
+    {
+      "id": "huggingface_inference_pricing",
+      "kind": "official_provider_documentation",
+      "title": "Hugging Face Inference Providers pricing",
+      "url": "https://huggingface.co/docs/inference-providers/pricing",
+      "checkedAt": "2026-08-10",
+      "supports": ["free_monthly_credits", "provider_marketplace"],
+      "limitations": "Provider region/upstream varies by selected provider and must be allowlisted before enabling."
+    },
+    {
       "id": "perplexity_pwm",
       "kind": "community_project_documentation",
       "title": "Perplexity Web MCP and CLI",
@@ -221,6 +275,21 @@
       "modelLicense": "Apache-2.0 (Qwen2.5-Coder-7B-Instruct official model card)",
       "limitations": ["Model-card suitability is not a reproduced RelayBridge benchmark", "Escalate validator failures"]
     },
+    "ollama_llama": {
+      "family": "local_llama",
+      "costClass": "local_compute",
+      "privacyBoundary": "local_model",
+      "modelIdentity": "llama3.2:3b",
+      "qualification": "discovered",
+      "capabilities": ["quick_lookup", "general", "privacy_sensitive"],
+      "capabilityProvenance": {"quick_lookup": "operator_declared", "general": "operator_declared", "privacy_sensitive": "operator_declared"},
+      "maxRecommendedTier": "utility",
+      "evidence": [],
+      "references": ["ollama_local", "ollama_source_license", "ollama_llama32"],
+      "runtimeLicense": "Ollama CLI source: MIT; installed Windows app terms should be checked separately",
+      "modelLicense": "Meta Llama license terms apply to the downloaded model",
+      "limitations": ["Not installed or smoke-tested until an Ollama receipt exists", "Use for cheap local utility/general work only until evaluated"]
+    },
     "claude": {
       "family": "anthropic",
       "costClass": "subscription_quota",
@@ -258,6 +327,19 @@
       "evidence": [],
       "references": ["codex_manual_mcp", "terminal_bench", "livecodebench", "bfcl"],
       "limitations": ["Exact model and reasoning effort must be captured per run", "No RelayBridge task-family score yet"]
+    },
+    "copilot": {
+      "family": "github_copilot",
+      "costClass": "subscription_quota",
+      "privacyBoundary": "hosted_provider",
+      "modelIdentity": "resolve_at_runtime",
+      "qualification": "discovered",
+      "capabilities": ["coding", "code_review", "general"],
+      "capabilityProvenance": {"coding": "operator_declared", "code_review": "operator_declared", "general": "operator_declared"},
+      "maxRecommendedTier": "standard",
+      "evidence": [],
+      "references": ["github_copilot_cli_docs", "github_copilot_cli_install", "terminal_bench", "livecodebench"],
+      "limitations": ["Requires an active Copilot plan and CLI policy enablement", "Workspace trust and auth must be receipt-tested before claiming operational readiness", "No RelayBridge task-family score yet"]
     },
     "gemini": {
       "family": "google",
@@ -298,6 +380,20 @@
       "qualificationEvidence": {"testedAt": "2026-08-10T00:29:53.227Z", "receiptId": "rcpt_msmhvgzv_e8672dce", "taskFamily": "safe exact-output subscription-wrapper connectivity", "runtimeVersion": "perplexity-web-mcp-cli 0.14.8", "resolvedModelIdentity": "auto", "result": "completed", "durationMs": 11398},
       "runtimeLicense": "perplexity-web-mcp-cli 0.14.8: MIT",
       "limitations": ["Unofficial wrapper", "One exact-output connectivity task is not a research-quality or citation benchmark", "Auto routing is volatile", "Calls consume the connected account's web/search quotas; the bridge does not identify that account's free or paid plan"]
+    },
+    "groq_llama_fast": {
+      "family": "hosted_llama",
+      "costClass": "free_quota_or_metered_api",
+      "privacyBoundary": "hosted_provider_us",
+      "modelIdentity": "llama-3.1-8b-instant",
+      "qualification": "discovered",
+      "autoRoute": false,
+      "capabilities": ["quick_lookup", "general", "coding"],
+      "capabilityProvenance": {"quick_lookup": "operator_declared", "general": "operator_declared", "coding": "operator_declared"},
+      "maxRecommendedTier": "utility",
+      "evidence": [],
+      "references": ["groq_llama31_8b", "groq_model_catalog"],
+      "limitations": ["Opt-in only; not auto-routed unless explicitly preferred", "Requires GROQ_API_KEY", "Account-specific quota and billing must be checked before treating it as free", "China-hosted DeepSeek/Qwen APIs are intentionally not configured"]
     }
   },
   "candidateIntegrations": [
@@ -350,9 +446,25 @@
       "id": "groq_free",
       "class": "hosted_recurring_free_quota",
       "url": "https://console.groq.com/docs/rate-limits",
-      "status": "opt_in_candidate",
+      "status": "implemented_opt_in_as_groq_llama_fast",
       "fit": "Fast hosted diversity with documented free organization limits.",
       "decision": "Require an explicit key, zero-paid-fallback policy, exact model pin, and live quota receipt."
+    },
+    {
+      "id": "huggingface_inference_providers",
+      "class": "hosted_free_monthly_credit",
+      "url": "https://huggingface.co/docs/inference-providers/pricing",
+      "status": "allowlist_candidate",
+      "fit": "Can host Meta Llama and other open models with small monthly free credits.",
+      "decision": "Do not auto-enable until a specific provider, region, model, and pay-as-you-go behavior are allowlisted."
+    },
+    {
+      "id": "deepseek_direct_api",
+      "class": "blocked_hosted_provider",
+      "url": "https://api-docs.deepseek.com/quick_start/pricing",
+      "status": "blocked_by_policy",
+      "fit": "Cheap reasoning models, but direct hosted API conflicts with the user's China-hosting constraint.",
+      "decision": "Do not configure direct hosted DeepSeek. Local-only model experiments may be added separately with explicit consent."
     },
     {
       "id": "openrouter_free",

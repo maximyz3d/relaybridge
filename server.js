@@ -499,6 +499,150 @@ function localOllamaUrl() {
   return url;
 }
 
+const BLOCKED_HOSTED_AI_HOSTS = new Set([
+  'api.deepseek.com',
+  'api-docs.deepseek.com',
+  'dashscope.aliyuncs.com',
+]);
+
+function isBlockedHostedAiHost(hostname) {
+  const host = String(hostname || '').toLowerCase();
+  if (BLOCKED_HOSTED_AI_HOSTS.has(host)) return true;
+  return host.endsWith('.aliyuncs.com');
+}
+
+function hostedChatUrl(entry) {
+  const raw = String(entry.api_base_url || '').trim();
+  if (!raw) throw new Error('hosted provider missing api_base_url');
+  const url = new URL(raw);
+  if (url.protocol !== 'https:') throw new Error('hosted provider api_base_url must use HTTPS');
+  if (isBlockedHostedAiHost(url.hostname)) {
+    throw new Error(`hosted provider is blocked by geo/supply-chain policy: ${url.hostname}`);
+  }
+  return url;
+}
+
+function hostedApiKey(entry) {
+  const names = [
+    entry.api_key_env,
+    ...(Array.isArray(entry.api_key_env_aliases) ? entry.api_key_env_aliases : []),
+  ].filter(Boolean);
+  for (const name of names) {
+    const value = process.env[name];
+    if (value && String(value).trim()) return { name, value: String(value) };
+  }
+  throw new Error(`hosted provider key is not set; define ${names[0] || 'the configured API key environment variable'}`);
+}
+
+async function runOpenAIChatOneShot({ entry, prompt, timeoutMs, res, route, startedAt }) {
+  const bounded = capPrompt(prompt, Number(entry.prompt_max_chars || 12000));
+  route.prompt_transport = 'hosted_openai_compatible';
+  route.prompt_truncated = bounded.truncated;
+  route.allow_paid_fallback = entry.allow_paid_fallback === true;
+  route.hosting_region = entry.hosting_region || null;
+  route.requires_explicit_preference = entry.autoRoute === false || null;
+
+  const controller = new AbortController();
+  let timedOut = false;
+  let clientGone = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort(new Error('hosted provider request timed out'));
+  }, Math.max(1000, Math.min(Number(timeoutMs) || 180000, 300000)));
+  res.on('close', () => {
+    if (!res.writableEnded) {
+      clientGone = true;
+      controller.abort(new Error('bridge client disconnected'));
+    }
+  });
+
+  try {
+    const url = hostedChatUrl(entry);
+    const key = hostedApiKey(entry);
+    route.endpoint_host = url.hostname;
+    route.api_key_env = key.name;
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${key.value}`,
+        ...(entry.http_referer ? { 'HTTP-Referer': String(entry.http_referer) } : {}),
+        ...(entry.x_title ? { 'X-Title': String(entry.x_title) } : {}),
+      },
+      body: JSON.stringify({
+        model: entry.model,
+        messages: [
+          ...(entry.system_prompt ? [{ role: 'system', content: String(entry.system_prompt) }] : []),
+          { role: 'user', content: bounded.text },
+        ],
+        temperature: Number.isFinite(Number(entry.temperature)) ? Number(entry.temperature) : 0.2,
+        max_tokens: Math.max(64, Math.min(Number(entry.max_output_tokens || 1024), 4096)),
+        stream: false,
+      }),
+      signal: controller.signal,
+    });
+    const responseText = await response.text();
+    let payload = {};
+    try { payload = responseText ? JSON.parse(responseText) : {}; } catch {}
+    if (!response.ok) {
+      const detail = cleanOutput(payload.error?.message || payload.error || responseText || `hosted provider HTTP ${response.status}`);
+      if (!clientGone && !res.writableEnded) {
+        sendOneShotResult(res, {
+          kind: route.provider,
+          route,
+          exitCode: response.status,
+          stdout: '',
+          stderr: detail,
+          rate_limited: response.status === 429,
+          budget_exceeded: /budget|credit|quota/i.test(detail),
+          auth_failed: response.status === 401 || response.status === 403,
+          timed_out: false,
+          dropped_out: true,
+        }, { kind: route.provider, prompt, route, startedAt });
+      }
+      return;
+    }
+    const stdout = cleanOutput(payload.choices?.[0]?.message?.content || payload.output_text || '');
+    route.resolved_model = payload.model || entry.model;
+    const usage = payload.usage ? {
+      input_tokens: Number.isFinite(Number(payload.usage.prompt_tokens)) ? Number(payload.usage.prompt_tokens) : null,
+      output_tokens: Number.isFinite(Number(payload.usage.completion_tokens)) ? Number(payload.usage.completion_tokens) : null,
+      total_tokens: Number.isFinite(Number(payload.usage.total_tokens)) ? Number(payload.usage.total_tokens) : null,
+    } : null;
+    if (!clientGone && !res.writableEnded) {
+      sendOneShotResult(res, {
+        kind: route.provider,
+        route,
+        exitCode: 0,
+        stdout,
+        stderr: '',
+        usage,
+        rate_limited: false,
+        budget_exceeded: false,
+        auth_failed: false,
+        permission_denied: false,
+        timed_out: false,
+        dropped_out: !stdout,
+      }, { kind: route.provider, prompt, route, startedAt });
+    }
+  } catch (error) {
+    if (!clientGone && !res.writableEnded) {
+      sendOneShotResult(res, {
+        kind: route.provider,
+        route,
+        exitCode: -1,
+        stdout: '',
+        stderr: cleanOutput(error?.message || String(error)),
+        auth_failed: /key is not set|401|403/i.test(error?.message || ''),
+        timed_out: timedOut,
+        dropped_out: true,
+      }, { kind: route.provider, prompt, route, startedAt });
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function runOllamaApiOneShot({ entry, prompt, timeoutMs, res, route, startedAt }) {
   const bounded = capPrompt(prompt, Number(entry.prompt_max_chars || 24000));
   route.prompt_transport = 'local_http';
@@ -984,6 +1128,30 @@ app.get('/api/diag', async (req, res) => {
   const kinds = Object.keys(cfg).filter((k) => !k.startsWith('_'));
   const pairs = await Promise.all(kinds.map(async (kind) => {
     const entry = cfg[kind];
+    if (entry.oneshot_adapter === 'openai_chat_api') {
+      let ready = false;
+      let detail = '';
+      let found = false;
+      try {
+        const url = hostedChatUrl(entry);
+        const key = hostedApiKey(entry);
+        found = true;
+        ready = true;
+        detail = `API key present in ${key.name}; live quota untested for ${url.hostname}`;
+      } catch (err) {
+        detail = err.message;
+      }
+      return [kind, {
+        binary: null,
+        found,
+        ready,
+        paths: [],
+        label: entry.label,
+        detail,
+        probeExitCode: null,
+        runtimeVersion: '',
+      }];
+    }
     const binary = entry.diagnostic_binary ||
       (entry.safe && entry.safe[0]) || (entry.dangerous && entry.dangerous[0]);
     if (!binary) return [kind, { binary: null, found: false, ready: false, paths: [], label: entry.label }];
@@ -1204,6 +1372,10 @@ app.post('/api/oneshot', async (req, res) => {
   if (entry.oneshot_adapter === 'ollama_api') {
     cleanupPromptFile();
     return runOllamaApiOneShot({ entry, prompt, timeoutMs, res, route, startedAt });
+  }
+  if (entry.oneshot_adapter === 'openai_chat_api') {
+    cleanupPromptFile();
+    return runOpenAIChatOneShot({ entry, prompt, timeoutMs, res, route, startedAt });
   }
   const isWindows = process.platform === 'win32';
   let proc;

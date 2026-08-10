@@ -42,16 +42,17 @@
   },
   "taskPriorities": {
     "deterministic": ["powershell"],
-    "quick_lookup": ["ollama_fast", "perplexity", "ollama", "gemini"],
-    "coding": ["ollama_coder", "claude", "claude_fable", "codex", "grok", "gemini"],
-    "code_review": ["ollama_coder", "claude_fable", "claude", "codex", "gemini", "grok"],
+    "quick_lookup": ["ollama_fast", "ollama_llama", "perplexity", "ollama", "gemini"],
+    "coding": ["ollama_coder", "copilot", "claude", "claude_fable", "codex", "grok", "gemini"],
+    "code_review": ["ollama_coder", "copilot", "claude_fable", "claude", "codex", "gemini", "grok"],
     "research": ["perplexity", "grok", "gemini", "ollama"],
-    "reasoning": ["ollama", "claude", "claude_fable", "gemini", "grok", "codex"],
+    "reasoning": ["ollama", "ollama_llama", "claude", "claude_fable", "gemini", "grok", "codex"],
     "vision": [],
     "hardware": ["gemini", "claude", "codex", "grok"],
-    "general": ["ollama_fast", "ollama", "claude_fable", "claude", "gemini", "grok", "codex"]
+    "general": ["ollama_fast", "ollama_llama", "ollama", "copilot", "claude_fable", "claude", "gemini", "grok", "codex"]
   },
-  "localFirstProviders": ["ollama_fast", "ollama", "ollama_coder"],
+  "localFirstProviders": ["ollama_fast", "ollama_llama", "ollama", "ollama_coder"],
+  "blockedHostedAiHosts": ["api.deepseek.com", "dashscope.aliyuncs.com", "*.aliyuncs.com"],
   "neverAutoExecuteTags": ["medical", "legal", "financial", "safety_critical", "secrets", "destructive"],
   "committee": {
     "maxProviders": 4,
