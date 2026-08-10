@@ -280,15 +280,16 @@
       "costClass": "local_compute",
       "privacyBoundary": "local_model",
       "modelIdentity": "llama3.2:3b",
-      "qualification": "discovered",
+      "qualification": "local_smoke",
       "capabilities": ["quick_lookup", "general", "privacy_sensitive"],
-      "capabilityProvenance": {"quick_lookup": "operator_declared", "general": "operator_declared", "privacy_sensitive": "operator_declared"},
+      "capabilityProvenance": {"quick_lookup": "local_smoke", "general": "operator_declared", "privacy_sensitive": "operator_declared"},
       "maxRecommendedTier": "utility",
-      "evidence": [],
+      "evidence": ["rcpt_msn8y7qs_1ee00acc"],
       "references": ["ollama_local", "ollama_source_license", "ollama_llama32"],
+      "qualificationEvidence": {"testedAt": "2026-08-10T13:09:00Z", "receiptId": "rcpt_msn8y7qs_1ee00acc", "taskFamily": "safe exact-output local one-shot connectivity", "resolvedModelIdentity": "llama3.2:3b", "result": "completed"},
       "runtimeLicense": "Ollama CLI source: MIT; installed Windows app terms should be checked separately",
       "modelLicense": "Meta Llama license terms apply to the downloaded model",
-      "limitations": ["Not installed or smoke-tested until an Ollama receipt exists", "Use for cheap local utility/general work only until evaluated"]
+      "limitations": ["One exact-output connectivity task is not a comparative quality score", "Use for cheap local utility/general work only until evaluated"]
     },
     "claude": {
       "family": "anthropic",
@@ -333,13 +334,14 @@
       "costClass": "subscription_quota",
       "privacyBoundary": "hosted_provider",
       "modelIdentity": "resolve_at_runtime",
-      "qualification": "discovered",
+      "qualification": "task_evaluated",
       "capabilities": ["coding", "code_review", "general"],
-      "capabilityProvenance": {"coding": "operator_declared", "code_review": "operator_declared", "general": "operator_declared"},
+      "capabilityProvenance": {"coding": "operator_declared", "code_review": "operator_declared", "general": "local_smoke"},
       "maxRecommendedTier": "standard",
-      "evidence": [],
+      "evidence": ["rcpt_msn8ygqr_c80a8907"],
       "references": ["github_copilot_cli_docs", "github_copilot_cli_install", "terminal_bench", "livecodebench"],
-      "limitations": ["Requires an active Copilot plan and CLI policy enablement", "Workspace trust and auth must be receipt-tested before claiming operational readiness", "No RelayBridge task-family score yet"]
+      "qualificationEvidence": {"testedAt": "2026-08-10T13:09:00Z", "receiptId": "rcpt_msn8ygqr_c80a8907", "taskFamily": "safe exact-output one-shot connectivity", "resolvedModelIdentity": "resolve_at_runtime", "result": "completed"},
+      "limitations": ["Requires an active Copilot plan and CLI policy enablement", "Exact remote model identity was not reported by the CLI", "One exact-output connectivity task is not a coding-quality score", "Calls consume Copilot AI credits or subscription quota"]
     },
     "gemini": {
       "family": "google",
