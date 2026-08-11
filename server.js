@@ -409,6 +409,7 @@ function buildEnv(extras = {}, stripNames = []) {
     const candidates = [
       path.join(process.env.LOCALAPPDATA || '', 'agy', 'bin'),
       path.join(process.env.USERPROFILE || '', '.local', 'bin'),
+      path.join(process.env.USERPROFILE || '', '.cursor', 'bin'),
       path.join(process.env.APPDATA || '', 'npm'),
       path.join(process.env.LOCALAPPDATA || '', 'npm'),
       path.join(process.env.LOCALAPPDATA || '', 'RelayBridge', 'tools', 'perplexity-web-mcp', '.venv', 'Scripts'),

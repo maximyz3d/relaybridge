@@ -239,6 +239,67 @@
     "docs_url": "https://docs.github.com/en/copilot/how-tos/copilot-cli/use-copilot-cli/overview",
     "_note": "The official CLI supports copilot --prompt for direct prompts and Copilot CLI custom agents. RelayBridge runs it in bounded one-shot mode; mutating tool approval remains governed by Copilot CLI."
   },
+  "cursor": {
+    "label": "Cursor Agent",
+    "company": "Cursor (Anysphere)",
+    "transport": "subscription:cursor",
+    "color": "#7d8590",
+    "safe": [
+      "agent",
+      "--mode",
+      "plan"
+    ],
+    "dangerous": [
+      "agent",
+      "--force"
+    ],
+    "oneshot_safe": [
+      "agent",
+      "-p",
+      "--output-format",
+      "text",
+      "--mode",
+      "ask",
+      "--trust",
+      "{prompt}"
+    ],
+    "oneshot_dangerous": [
+      "agent",
+      "-p",
+      "--output-format",
+      "text",
+      "--force",
+      "--trust",
+      "{prompt}"
+    ],
+    "prompt_max_chars": 24000,
+    "probe": [
+      "agent",
+      "status"
+    ],
+    "probe_redact": true,
+    "probe_success_detail": "authenticated Cursor subscription session",
+    "version_probe": [
+      "agent",
+      "--version"
+    ],
+    "strip_env": [
+      "CURSOR_API_KEY"
+    ],
+    "install_command": [
+      "powershell.exe",
+      "-NoLogo",
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-Command",
+      "irm 'https://cursor.com/install?win32=true' | iex"
+    ],
+    "install_display": "irm 'https://cursor.com/install?win32=true' | iex",
+    "post_install": "Open a fresh PowerShell and run agent login once to connect your Cursor subscription.",
+    "docs_url": "https://cursor.com/docs/cli/overview",
+    "_note": "Uses your Cursor subscription via the native Windows agent CLI. No model pinned; the account default applies (run agent models to pin one). Print mode has full write access by default, so the safe one-shot seat pins --mode ask; --trust prevents the headless workspace-trust prompt from hanging bounded calls. CURSOR_API_KEY is stripped so calls never silently fall back to metered API billing."
+  },
   "gemini": {
     "label": "Gemini (Antigravity)",
     "company": "Google",

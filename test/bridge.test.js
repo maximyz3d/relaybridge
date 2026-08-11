@@ -84,6 +84,36 @@ test('provider config uses the installed subscription CLIs and safe headless mod
   assert.equal(config.groq_llama_fast.autoRoute, false);
 });
 
+test('cursor provider pins safe modes, probe, and guided install metadata', () => {
+  const config = readConfig();
+  assert.equal(config.cursor.safe[0], 'agent');
+  assert.equal(config.cursor.safe[config.cursor.safe.indexOf('--mode') + 1], 'plan');
+  assert.ok(config.cursor.dangerous.includes('--force'));
+  assert.ok(config.cursor.oneshot_safe.includes('-p'));
+  assert.equal(config.cursor.oneshot_safe[config.cursor.oneshot_safe.indexOf('--mode') + 1], 'ask');
+  assert.ok(config.cursor.oneshot_safe.includes('--trust'));
+  assert.ok(!config.cursor.oneshot_safe.includes('--force'));
+  assert.equal(config.cursor.oneshot_safe.at(-1), '{prompt}');
+  assert.ok(config.cursor.oneshot_dangerous.includes('--force'));
+  assert.deepEqual(config.cursor.probe, ['agent', 'status']);
+  assert.equal(config.cursor.probe_redact, true);
+  assert.ok(config.cursor.strip_env.includes('CURSOR_API_KEY'));
+  assert.match(config.cursor.install_display, /cursor\.com\/install\?win32=true/);
+  assert.equal(config.cursor.model, undefined);
+  const routing = JSON.parse(fs.readFileSync(path.join(ROOT, 'config', 'routing-policy.json'), 'utf8'));
+  for (const family of ['coding', 'code_review', 'general']) {
+    assert.ok(routing.taskPriorities[family].includes('cursor'), family + ' priorities include cursor');
+    assert.ok(
+      routing.taskPriorities[family].indexOf('cursor') > routing.taskPriorities[family].indexOf('codex'),
+      'cursor ranks after codex in ' + family,
+    );
+  }
+  const evidence = JSON.parse(fs.readFileSync(path.join(ROOT, 'config', 'provider-evidence.json'), 'utf8'));
+  assert.equal(evidence.providers.cursor.qualification, 'available');
+  assert.deepEqual(evidence.providers.cursor.evidence, []);
+  assert.ok(evidence.sources.some((source) => source.id === 'cursor_cli_docs'));
+});
+
 test('server, MCP adapter, Perplexity wrapper, and inline browser script parse', () => {
   for (const file of [
     'server.js',

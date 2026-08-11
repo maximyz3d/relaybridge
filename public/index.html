@@ -315,6 +315,15 @@
   </div>
 </dialog>
 
+<dialog id="quick-install-dialog">
+  <div class="dlg-head"><strong id="quick-install-title">Install provider</strong><button class="btn" id="quick-install-close-btn">Close</button></div>
+  <div class="dlg-body" id="quick-install-body">Checking&hellip;</div>
+  <div class="dlg-foot">
+    <button class="btn" id="quick-install-skip-btn" title="Skip the install and open the terminal tab anyway">Open terminal anyway</button>
+    <button class="btn collab" id="quick-install-go-btn">Install &amp; open</button>
+  </div>
+</dialog>
+
 <dialog id="diag-dialog">
   <div class="dlg-head"><strong>CLI install check</strong><button class="btn" id="diag-close-btn">Close</button></div>
   <div class="dlg-body" id="diag-body">Checking…</div>
@@ -780,12 +789,22 @@ async function setPermissions(v) {
 }
 toggleEl.onclick = () => setPermissions(!state.fullPermissions);
 
-async function launchSession(kind) {
+async function startSessionNow(kind) {
   try {
     const meta = await api('/api/sessions', { method: 'POST', body: JSON.stringify({ kind, dangerous: state.fullPermissions }) });
     attachSession(meta);
     setActive('session:' + meta.id);
   } catch (err) { toast('Failed to launch: ' + err.message, 'error'); }
+}
+
+// Clicking a provider whose CLI is missing offers a guided install instead of
+// opening a dead terminal. Anything without an install path falls through.
+async function launchSession(kind) {
+  const entry = state.config[kind] || {};
+  const diag = state.providerDiag[kind];
+  const hasInstallPath = !!(entry.install_command || entry.npm_package || entry.pip_package || entry.install_display);
+  if (diag && diag.found === false && hasInstallPath) return openQuickInstall(kind);
+  return startSessionNow(kind);
 }
 
 async function refreshSessions() {
@@ -960,11 +979,14 @@ const INSTALL_HINTS = {
   powershell: 'Ships with Windows.',
   claude: '<code>npm install -g @anthropic-ai/claude-code</code> then run <code>claude</code> to log in.',
   codex: '<code>npm install -g @openai/codex</code> then run the ChatGPT sign-in flow once.',
+  copilot: '<code>winget install GitHub.Copilot</code> (or <code>npm install -g @github/copilot</code>), then run <code>copilot</code> and <code>/login</code> if prompted.',
+  cursor: 'Install the native Cursor CLI in PowerShell: <code>irm \'https://cursor.com/install?win32=true\' | iex</code>, then run <code>agent login</code>.',
   gemini: 'Install Google Antigravity in PowerShell: <code>irm https://antigravity.google/cli/install.ps1 | iex</code>, then run <code>agy</code> once to sign in.',
   grok: 'Install the official Grok Build CLI: <code>npm install -g @xai-official/grok</code>, then run <code>grok login</code>.',
   perplexity: 'Uses your Perplexity subscription through <code>pwm</code>. Install/update: <code>uv tool install --upgrade perplexity-web-mcp-cli</code>, then <code>pwm login</code>.',
   ollama_fast: 'Install Ollama with <code>winget install --id Ollama.Ollama -e</code>, then run <code>ollama pull qwen2.5:1.5b</code>.',
   ollama: 'Install Ollama with <code>winget install --id Ollama.Ollama -e</code>, then run <code>ollama pull qwen3:4b</code>.',
+  ollama_llama: 'Install Ollama with <code>winget install --id Ollama.Ollama -e</code>, then run <code>ollama pull llama3.2:3b</code>.',
   ollama_coder: 'Install Ollama with <code>winget install --id Ollama.Ollama -e</code>, then run <code>ollama pull qwen2.5-coder:7b</code>.',
 };
 $('#diag-btn').onclick = async () => {
@@ -1983,6 +2005,124 @@ installGoBtn.onclick = async () => {
 
 $('#install-close-btn').onclick = () => { try { installDialog.close(); } catch { installDialog.removeAttribute('open'); } };
 
+// ============= per-provider quick install =============
+const quickInstallDialog = document.getElementById('quick-install-dialog');
+const quickInstallBody = document.getElementById('quick-install-body');
+const quickInstallGoBtn = document.getElementById('quick-install-go-btn');
+let quickInstallKind = null;
+
+function providerInstallable(entry) {
+  return !!(entry && (entry.install_command || entry.npm_package || entry.pip_package));
+}
+
+function quickInstallDisplay(entry) {
+  return entry.install_display ||
+    (entry.npm_package ? `npm install -g ${entry.npm_package}` :
+      (entry.pip_package ? `python -m pip install --user --upgrade ${entry.pip_package}` : ''));
+}
+
+function renderQuickInstall(kind, message, busy) {
+  const entry = state.config[kind] || {};
+  const automatic = providerInstallable(entry);
+  const display = quickInstallDisplay(entry);
+  document.getElementById('quick-install-title').textContent = `Install ${entry.label || kind}`;
+  quickInstallBody.innerHTML = `
+    <div><strong style="color:${safeColor(entry.color, '#d6dde6')}">${escapeHtml(entry.label || kind)}</strong>
+      <span style="color:var(--muted); font-size:11px"> ${escapeHtml(entry.company || '')}</span></div>
+    <div style="color:var(--muted); margin-top:6px;">${automatic
+      ? 'This CLI is not installed yet. Nothing runs without your OK. Clicking Install &amp; open runs exactly:'
+      : 'This CLI is not installed yet and needs a manual install. Run this in a terminal:'}</div>
+    ${display ? `<div style="font-family:monospace; font-size:12px; margin-top:6px; padding:6px 8px; border:1px solid var(--border); border-radius:6px; word-break:break-all;">${escapeHtml(display)}</div>` : ''}
+    ${entry.post_install ? `<div style="color:var(--muted); font-size:11px; margin-top:6px;">After install: ${escapeHtml(entry.post_install)}</div>` : ''}
+    ${entry.docs_url ? `<div style="font-size:11px; margin-top:6px;"><a href="${escapeHtml(entry.docs_url)}" target="_blank" rel="noreferrer noopener" style="color:#7cc6ff">Vendor docs</a></div>` : ''}
+    ${message ? `<div style="margin-top:8px; padding:8px 10px; border:1px solid #6b5624; border-radius:6px; color:#ffd479; background:#332b17;">${escapeHtml(message)}</div>` : ''}
+  `;
+  quickInstallGoBtn.dataset.mode = 'install';
+  quickInstallGoBtn.disabled = !!busy || !automatic;
+  quickInstallGoBtn.textContent = busy ? 'Installing…' : (automatic ? 'Install & open' : 'No automatic installer');
+}
+
+function closeQuickInstall() {
+  quickInstallKind = null;
+  try { quickInstallDialog.close(); } catch { quickInstallDialog.removeAttribute('open'); }
+}
+
+async function openQuickInstall(kind) {
+  quickInstallKind = kind;
+  const entry = state.config[kind] || {};
+  document.getElementById('quick-install-title').textContent = `Install ${entry.label || kind}`;
+  if (typeof quickInstallDialog.showModal === 'function') quickInstallDialog.showModal(); else quickInstallDialog.setAttribute('open', 'true');
+  quickInstallBody.innerHTML = 'Re-checking what\'s installed\u2026';
+  quickInstallGoBtn.disabled = true;
+  const probe = await probeInstalls();
+  if (quickInstallKind !== kind) return; // dialog was closed while probing
+  if (probe.ok) {
+    updateProviderFooter(probe.results);
+    renderKindButtons();
+    const diag = probe.results[kind];
+    if (diag && diag.found) {
+      // Installed since the last probe (e.g. manually, or from another window).
+      closeQuickInstall();
+      if (diag.ready === false && entry.post_install) toast(entry.post_install);
+      return startSessionNow(kind);
+    }
+    renderQuickInstall(kind, '', false);
+  } else {
+    renderQuickInstall(kind, `Provider readiness could not be checked: ${probe.error}. Nothing will be installed until a recheck succeeds.`, false);
+    quickInstallGoBtn.dataset.mode = 'retry';
+    quickInstallGoBtn.disabled = false;
+    quickInstallGoBtn.textContent = 'Retry readiness check';
+  }
+}
+
+quickInstallGoBtn.onclick = async () => {
+  const kind = quickInstallKind;
+  if (!kind) return;
+  if (quickInstallGoBtn.dataset.mode === 'retry') return openQuickInstall(kind);
+  renderQuickInstall(kind, '', true);
+  let result;
+  try {
+    const r = await bridgeFetch('/api/install', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kind }),
+    });
+    result = await r.json();
+  } catch (err) {
+    if (quickInstallKind === kind) renderQuickInstall(kind, `Install failed: ${err.message}`, false);
+    return;
+  }
+  if (quickInstallKind !== kind) return;
+  if (!result.success) {
+    const tail = (result.stderr || result.stdout || result.error || '').split('\n').slice(-6).join('\n').slice(0, 600);
+    renderQuickInstall(kind, `Install failed (exit ${result.exitCode ?? '?'}). ${tail}`, false);
+    return;
+  }
+  // Installer exit code is not readiness. Re-probe the resolved executable
+  // before opening a terminal on it.
+  const probe = await probeInstalls();
+  if (probe.ok) {
+    updateProviderFooter(probe.results);
+    renderKindButtons();
+  }
+  if (quickInstallKind !== kind) return;
+  const diag = probe.ok ? probe.results[kind] : null;
+  if (!diag || !diag.found) {
+    renderQuickInstall(kind, 'The installer finished, but the CLI is not resolvable yet. Open a fresh terminal to confirm, then restart RelayBridge if it still does not appear.', false);
+    return;
+  }
+  closeQuickInstall();
+  const entry = state.config[kind] || {};
+  if (diag.ready === false && entry.post_install) toast(entry.post_install);
+  startSessionNow(kind);
+};
+
+$('#quick-install-close-btn').onclick = () => closeQuickInstall();
+$('#quick-install-skip-btn').onclick = () => {
+  const kind = quickInstallKind;
+  closeQuickInstall();
+  if (kind) startSessionNow(kind);
+};
+
 // ============= startup =============
 (async () => {
   try {
@@ -1990,6 +2130,12 @@ $('#install-close-btn').onclick = () => { try { installDialog.close(); } catch {
     await loadPermissions();
     await refreshSessions();
     await refreshHealthStatus();
+    // Background CLI probe so provider dots and click-to-install detection
+    // work immediately without blocking first paint.
+    api('/api/diag').then((r) => {
+      updateProviderFooter(r.results || {});
+      renderKindButtons();
+    }).catch(() => {});
     setInterval(() => refreshHealthStatus().catch(() => {
       $('#status-version').textContent = 'bridge: offline';
       $('#status-version').className = 'status-pill warn';

@@ -20,13 +20,22 @@ If PowerShell blocks scripts on a new computer, use:
 powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/maximyz3d/relaybridge/main/install.ps1 | iex"
 ```
 
+After the core install, the installer lists every configured AI CLI in a numbered menu — installed or not, with the exact command each would run — and asks which ones to install (for example `1,3`, `A` for all missing, or Enter to skip). Nothing is installed without your selection, and sign-in still happens in each CLI on first use. Seats that share one installer are grouped, so Claude Code and Claude Fable are a single npm install and the local Ollama models are a single winget install.
+
+For scripted or repeat installs, download `install.ps1` and pass parameters:
+
+```powershell
+.\install.ps1 -Providers cursor,claude   # install specific provider CLIs without the menu
+.\install.ps1 -SkipProviderSetup        # core bridge only, no provider prompt
+```
+
 ## Requirements
 
 - Windows 10/11
 - PowerShell 5.1 or PowerShell 7+
 - Node.js 20.3 or newer
 - Optional: GitHub CLI only if you want to contribute to the repo
-- Optional provider CLIs: Codex, Claude, Antigravity/Gemini, GitHub Copilot CLI, Grok, Perplexity `pwm`, and Ollama
+- Optional provider CLIs: Codex, Claude, Cursor Agent, Antigravity/Gemini, GitHub Copilot CLI, Grok, Perplexity `pwm`, and Ollama
 
 RelayBridge works with only PowerShell installed, but AI delegation requires the relevant provider CLIs to be installed and logged in.
 
@@ -96,6 +105,7 @@ Common setup commands:
 ```powershell
 npm install -g @openai/codex
 npm install -g @github/copilot
+irm 'https://cursor.com/install?win32=true' | iex
 npm install -g @xai-official/grok
 irm https://antigravity.google/cli/install.ps1 | iex
 uv tool install --upgrade perplexity-web-mcp-cli
@@ -109,6 +119,8 @@ ollama pull qwen2.5-coder:7b
 Run each provider login once in a normal terminal, then restart RelayBridge and open `/api/diag` or the dashboard diagnostics view.
 
 GitHub Copilot CLI can also be installed with `winget install GitHub.Copilot`. It requires an active Copilot plan and may ask you to trust the current workspace before it reads or changes files. RelayBridge configures Copilot as a bounded one-shot provider using `copilot --prompt`, and it strips GitHub token environment variables from child processes.
+
+Cursor Agent uses the native Windows CLI (the `agent` binary in `%USERPROFILE%\.local\bin`). RelayBridge runs the interactive safe seat in plan mode and the bounded one-shot safe seat as read-only Q&A (`--mode ask` with `--trust`, since headless print mode otherwise has full write access and would prompt for workspace trust). No model is pinned, so your account default applies; run `agent models` to list options and pin one in `cli-config.json` if you want. `CURSOR_API_KEY` is stripped from child processes so calls use your Cursor subscription login rather than silently billing a metered API key.
 
 The default Perplexity route uses the community `pwm` wrapper and strips paid API fallback variables. It depends on the connected Perplexity web account and may change if that upstream wrapper changes.
 
@@ -126,6 +138,7 @@ The dashboard includes:
 
 - terminal tabs for PowerShell and configured AI CLIs
 - provider diagnostics and install hints
+- click-to-install: launching a provider whose CLI is missing opens a guided install dialog (shows the exact command, installs only after you confirm, then opens the terminal)
 - saved collaboration rooms
 - AI team controls for provider selection, routing, and committee runs
 - runs and receipt history

@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "updatedAt": "2026-08-10",
+  "updatedAt": "2026-08-11",
   "qualificationPolicy": {
     "levels": [
       "discovered",
@@ -167,6 +167,15 @@
       "checkedAt": "2026-08-10",
       "supports": ["winget_install", "npm_install", "token_env"],
       "limitations": "Install readiness does not prove authentication or plan quota."
+    },
+    {
+      "id": "cursor_cli_docs",
+      "kind": "official_documentation",
+      "title": "Cursor CLI documentation",
+      "url": "https://cursor.com/docs/cli/overview",
+      "checkedAt": "2026-08-11",
+      "supports": ["terminal_ai_cli", "windows_native_install", "print_mode", "plan_ask_modes", "workspace_trust_flag"],
+      "limitations": "Documents CLI behavior and flags, not comparative model quality; print mode has full write access unless a restrictive mode is pinned."
     },
     {
       "id": "ollama_llama32",
@@ -342,6 +351,19 @@
       "references": ["github_copilot_cli_docs", "github_copilot_cli_install", "terminal_bench", "livecodebench"],
       "qualificationEvidence": {"testedAt": "2026-08-10T13:09:00Z", "receiptId": "rcpt_msn8ygqr_c80a8907", "taskFamily": "safe exact-output one-shot connectivity", "resolvedModelIdentity": "resolve_at_runtime", "result": "completed"},
       "limitations": ["Requires an active Copilot plan and CLI policy enablement", "Exact remote model identity was not reported by the CLI", "One exact-output connectivity task is not a coding-quality score", "Calls consume Copilot AI credits or subscription quota"]
+    },
+    "cursor": {
+      "family": "cursor_agent",
+      "costClass": "subscription_quota",
+      "privacyBoundary": "hosted_provider",
+      "modelIdentity": "account_default_resolve_at_runtime",
+      "qualification": "available",
+      "capabilities": ["coding", "code_review", "general"],
+      "capabilityProvenance": {"coding": "operator_declared", "code_review": "operator_declared", "general": "operator_declared"},
+      "maxRecommendedTier": "standard",
+      "evidence": [],
+      "references": ["cursor_cli_docs", "terminal_bench", "livecodebench"],
+      "limitations": ["No RelayBridge receipt yet; readiness proves install and login, not end-to-end output", "Model identity resolves to the account default until one is pinned with agent models", "Print mode defaults to full write access, so the safe seat pins --mode ask", "Calls consume the connected Cursor plan's usage quota"]
     },
     "gemini": {
       "family": "google",
