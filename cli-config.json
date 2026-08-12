@@ -1,5 +1,5 @@
 {
-  "_comment": "Per-CLI config. 'safe'/'dangerous' launch interactive sessions. 'oneshot_safe'/'oneshot_dangerous' power Collab Mode. Use {prompt} for a bounded inline prompt, {prompt_file} when the CLI supports a file, or no placeholder to pipe stdin. 'probe' is a non-mutating readiness check. Edit freely.",
+  "_comment": "Per-CLI config. 'safe'/'dangerous' launch interactive sessions. 'oneshot_safe'/'oneshot_dangerous' power Collab Mode. Use {prompt} for a bounded inline prompt, {prompt_file} when the CLI supports a file, or no placeholder to pipe stdin. 'oneshot_env' applies validated string environment overrides only to one-shot children. 'probe' is a non-mutating readiness check. Edit freely.",
   "powershell": {
     "label": "PowerShell",
     "company": "Microsoft",
@@ -264,6 +264,10 @@
       "agy.exe",
       "--model",
       "gemini-3.1-pro-high",
+      "--effort",
+      "high",
+      "--add-dir",
+      "{cwd}",
       "--mode",
       "plan",
       "--print-timeout",
@@ -277,6 +281,10 @@
       "agy.exe",
       "--model",
       "gemini-3.1-pro-high",
+      "--effort",
+      "high",
+      "--add-dir",
+      "{cwd}",
       "--mode",
       "accept-edits",
       "--print-timeout",
@@ -347,10 +355,12 @@
       "--sandbox",
       "read-only",
       "--no-subagents",
+      "--no-plan",
       "--max-turns",
-      "1",
+      "32",
       "--verbatim",
-      "--no-auto-update"
+      "--no-auto-update",
+      "--no-leader"
     ],
     "oneshot_dangerous": [
       "grok",
@@ -364,10 +374,12 @@
       "--sandbox",
       "off",
       "--no-subagents",
+      "--no-plan",
       "--max-turns",
-      "1",
+      "32",
       "--verbatim",
-      "--no-auto-update"
+      "--no-auto-update",
+      "--no-leader"
     ],
     "probe": [
       "grok",
@@ -379,6 +391,10 @@
       "grok",
       "--version"
     ],
+    "oneshot_env": {
+      "GROK_CLAUDE_MCPS_ENABLED": "false",
+      "GROK_CURSOR_MCPS_ENABLED": "false"
+    },
     "strip_env": [
       "XAI_API_KEY",
       "XAI_BASE_URL"

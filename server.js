@@ -420,6 +420,24 @@ function buildEnv(extras = {}, stripNames = []) {
   return env;
 }
 
+function normalizeEnvOverrides(raw, fieldName = 'oneshot_env') {
+  if (raw == null) return {};
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new TypeError(`${fieldName} must be an object of string environment values`);
+  }
+  const normalized = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (!key || key.includes('=') || key.includes('\0')) {
+      throw new TypeError(`${fieldName} contains an invalid environment name`);
+    }
+    if (typeof value !== 'string' || value.includes('\0')) {
+      throw new TypeError(`${fieldName}.${key} must be a NUL-free string`);
+    }
+    normalized[key] = value;
+  }
+  return normalized;
+}
+
 function resolveExecutable(command, env = buildEnv()) {
   if (!command || process.platform !== 'win32') return command;
   if (path.isAbsolute(command)) return command;
@@ -1295,6 +1313,12 @@ app.post('/api/oneshot', async (req, res) => {
   const cfg = loadConfig();
   const entry = cfg[kind];
   if (!entry) return res.status(400).json({ error: 'unknown kind: ' + kind });
+  let oneShotEnv;
+  try {
+    oneShotEnv = normalizeEnvOverrides(entry.oneshot_env);
+  } catch (err) {
+    return res.status(500).json({ error: `invalid oneshot environment for ${kind}: ${err.message}` });
+  }
   // Collab Mode is a discussion, not an agentic task — it passes dangerous:false
   // so CLIs run non-agentically (no auto tool/command execution). When the
   // caller doesn't specify, fall back to the global Full Permissions toggle.
@@ -1306,6 +1330,12 @@ app.post('/api/oneshot', async (req, res) => {
   const hasPromptFile = slot.some((a) => typeof a === 'string' && a.includes('{prompt_file}'));
   if (hasInlinePrompt && hasPromptFile) {
     return res.status(400).json({ error: 'oneshot config cannot mix {prompt} and {prompt_file}' });
+  }
+  let resolvedCwd;
+  try {
+    resolvedCwd = resolveAllowedCwd(cwd);
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
   }
   if (!acquireOneShot(kind, res)) {
     return res.status(429).json({
@@ -1337,7 +1367,10 @@ app.post('/api/oneshot', async (req, res) => {
   }
   const slotResolved = slot.map((arg) => {
     if (typeof arg !== 'string') return arg;
-    return arg.replace('{prompt_file}', promptFile).replace('{prompt}', promptForArgs);
+    return arg
+      .replace('{prompt_file}', promptFile)
+      .replace('{prompt}', promptForArgs)
+      .replace('{cwd}', resolvedCwd);
   });
   const promptTransport = hasPromptFile ? 'file' : (hasInlinePrompt ? 'argument' : 'stdin');
   const cleanupPromptFile = () => {
@@ -1346,7 +1379,7 @@ app.post('/api/oneshot', async (req, res) => {
     promptFileDir = null;
   };
   const [bin, ...args] = slotResolved;
-  const childEnv = buildEnv({}, entry.strip_env || []);
+  const childEnv = buildEnv(oneShotEnv, entry.strip_env || []);
   const resolvedBin = resolveExecutable(bin, childEnv);
   const flagValue = (name) => {
     const index = args.indexOf(name);
@@ -1368,6 +1401,7 @@ app.post('/api/oneshot', async (req, res) => {
     dangerous: useDanger,
     prompt_transport: promptTransport,
     prompt_truncated: promptTruncated,
+    environment_overrides: Object.keys(oneShotEnv).sort(),
   };
   if (entry.oneshot_adapter === 'ollama_api') {
     cleanupPromptFile();
@@ -1387,7 +1421,7 @@ app.post('/api/oneshot', async (req, res) => {
     let spawnBin = resolvedBin;
     let spawnArgs = args;
     let spawnOpts = {
-      cwd: resolveAllowedCwd(cwd),
+      cwd: resolvedCwd,
       env: childEnv,
       windowsHide: true,
     };
