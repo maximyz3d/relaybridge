@@ -39,5 +39,6 @@ if (Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyCon
   throw "Port $Port did not become available after stopping PID $TargetPid."
 }
 
-$nodePath = (Get-Command node.exe -ErrorAction Stop).Source
-Start-Process -FilePath $nodePath -ArgumentList 'server.js' -WorkingDirectory $resolvedRoot -WindowStyle Hidden
+$startPath = Join-Path $resolvedRoot 'start.ps1'
+if (-not (Test-Path -LiteralPath $startPath -PathType Leaf)) { throw "RelayBridge launcher not found: $startPath" }
+& $startPath -NoBrowser

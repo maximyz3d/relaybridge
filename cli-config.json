@@ -231,15 +231,12 @@
     ],
     "npm_package": "@github/copilot",
     "install_command": [
-      "powershell.exe",
-      "-NoLogo",
-      "-NoProfile",
-      "-ExecutionPolicy",
-      "Bypass",
-      "-Command",
-      "winget install GitHub.Copilot"
+      "npm",
+      "install",
+      "-g",
+      "@github/copilot"
     ],
-    "install_display": "winget install GitHub.Copilot  # or: npm install -g @github/copilot",
+    "install_display": "npm install -g @github/copilot  # or: winget install GitHub.Copilot",
     "post_install": "Run copilot once, use /login if prompted, and trust only workspaces you want Copilot CLI to inspect.",
     "docs_url": "https://docs.github.com/en/copilot/how-tos/copilot-cli/use-copilot-cli/overview",
     "_note": "The official CLI supports copilot --prompt for direct prompts and Copilot CLI custom agents. RelayBridge runs it in bounded one-shot mode; mutating tool approval remains governed by Copilot CLI."
@@ -283,6 +280,11 @@
       "agent",
       "status"
     ],
+    "probe_reject": [
+      "not logged in",
+      "not authenticated"
+    ],
+    "probe_expect": "Logged in as",
     "probe_redact": true,
     "probe_success_detail": "authenticated Cursor subscription session",
     "version_probe": [
