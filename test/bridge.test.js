@@ -41,6 +41,8 @@ test('provider config uses the installed subscription CLIs and safe headless mod
   assert.ok(config.gemini.safe.includes('--sandbox'));
   assert.equal(config.gemini.oneshot_safe.at(-2), '--print');
   assert.equal(config.gemini.oneshot_safe.at(-1), '{prompt}');
+  assert.equal(config.gemini.oneshot_safe[config.gemini.oneshot_safe.indexOf('--add-dir') + 1], '{cwd}');
+  assert.equal(config.gemini.oneshot_safe[config.gemini.oneshot_safe.indexOf('--effort') + 1], 'high');
   assert.equal(config.gemini.oneshot_safe[config.gemini.oneshot_safe.indexOf('--mode') + 1], 'plan');
   assert.ok(config.gemini.dangerous.includes('--dangerously-skip-permissions'));
   assert.equal(config.gemini.npm_package, undefined);
@@ -51,7 +53,16 @@ test('provider config uses the installed subscription CLIs and safe headless mod
   assert.ok(config.grok.oneshot_safe.includes('{prompt_file}'));
   assert.equal(config.grok.oneshot_safe[config.grok.oneshot_safe.indexOf('--permission-mode') + 1], 'dontAsk');
   assert.equal(config.grok.oneshot_safe[config.grok.oneshot_safe.indexOf('--sandbox') + 1], 'read-only');
-  assert.equal(config.grok.oneshot_safe[config.grok.oneshot_safe.indexOf('--max-turns') + 1], '1');
+  assert.equal(config.grok.oneshot_safe[config.grok.oneshot_safe.indexOf('--max-turns') + 1], '32');
+  assert.equal(config.grok.oneshot_dangerous[config.grok.oneshot_dangerous.indexOf('--max-turns') + 1], '32');
+  assert.ok(config.grok.oneshot_safe.includes('--no-leader'));
+  assert.ok(config.grok.oneshot_dangerous.includes('--no-leader'));
+  assert.ok(config.grok.oneshot_safe.includes('--no-plan'));
+  assert.ok(config.grok.oneshot_dangerous.includes('--no-plan'));
+  assert.deepEqual(config.grok.oneshot_env, {
+    GROK_CLAUDE_MCPS_ENABLED: 'false',
+    GROK_CURSOR_MCPS_ENABLED: 'false',
+  });
 
   assert.equal(config.perplexity.diagnostic_binary, 'pwm');
   assert.deepEqual(config.perplexity.probe.slice(-2), ['tools/pplx.js', '--check']);
@@ -164,6 +175,29 @@ test('prompt-file transport preserves long special-character prompts and cleans 
       diagnostic_binary: process.execPath,
       probe: [process.execPath, helper, '--version'],
     },
+    env_echo: {
+      label: 'Environment Echo',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--print-env', 'BRIDGE_TEST_OVERRIDE'],
+      oneshot_dangerous: [...baseSlot, '--print-env', 'BRIDGE_TEST_OVERRIDE'],
+      oneshot_env: { BRIDGE_TEST_OVERRIDE: 'isolated-value' },
+    },
+    cwd_echo: {
+      label: 'Working Directory Echo',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--output', '{cwd}'],
+      oneshot_dangerous: [...baseSlot, '--output', '{cwd}'],
+    },
+    bad_env: {
+      label: 'Invalid Environment',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: baseSlot,
+      oneshot_dangerous: baseSlot,
+      oneshot_env: ['not', 'an', 'object'],
+    },
   }), 'utf8');
 
   const port = await reservePort();
@@ -237,6 +271,33 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(result.route.prompt_transport, 'file');
   assert.equal(result.route.prompt_truncated, false);
   assert.deepEqual(fs.readdirSync(promptTemp), []);
+
+  const envResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST',
+    headers: jsonAuth,
+    body: JSON.stringify({ kind: 'env_echo', prompt: 'environment isolation', dangerous: false }),
+  });
+  assert.equal(envResponse.status, 200);
+  const envResult = await envResponse.json();
+  assert.equal(envResult.stdout, 'isolated-value');
+  assert.deepEqual(envResult.route.environment_overrides, ['BRIDGE_TEST_OVERRIDE']);
+  assert.equal(Object.prototype.hasOwnProperty.call(envResult.route, 'BRIDGE_TEST_OVERRIDE'), false);
+
+  const cwdResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST',
+    headers: jsonAuth,
+    body: JSON.stringify({ kind: 'cwd_echo', prompt: 'workspace binding', cwd: tempRoot, dangerous: false }),
+  });
+  assert.equal(cwdResponse.status, 200);
+  assert.equal((await cwdResponse.json()).stdout, tempRoot);
+
+  const badEnvResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST',
+    headers: jsonAuth,
+    body: JSON.stringify({ kind: 'bad_env', prompt: 'must fail before spawn', dangerous: false }),
+  });
+  assert.equal(badEnvResponse.status, 500);
+  assert.match((await badEnvResponse.json()).error, /invalid oneshot environment/);
 
   const failedResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST',

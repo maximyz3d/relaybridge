@@ -86,6 +86,11 @@ Action tools include starting/restarting/stopping the local bridge, opening safe
 
 Provider definitions live in `cli-config.json`. Each provider can define interactive safe/dangerous commands, one-shot safe/dangerous commands, readiness probes, install text, prompt caps, models, and environment variables to strip before execution.
 
+Agentic one-shot providers use bounded multi-turn budgets. Grok receives up to
+32 turns so a repository review can inspect evidence and still return a final
+answer; the bridge deadline, process-tree cancellation, read-only sandbox, and
+no-subagent rules remain the hard safety limits.
+
 Common setup commands:
 
 ```powershell
@@ -127,6 +132,8 @@ The dashboard includes:
 - a Full Permissions toggle for browser-created sessions
 
 New collaboration rooms preselect local seats when available. Hosted seats are opt-in so a fresh room does not accidentally spend subscription quota.
+
+Provider entries may declare a string-only `oneshot_env` map for child-process isolation and use a validated `{cwd}` placeholder to bind tools to the requested workspace. RelayBridge applies overrides only to that provider's one-shot process and reports only the overridden variable names in route metadata. Grok one-shots disable automatic Claude/Cursor MCP discovery and bypass inherited leader processes, preventing a repository review from recursively reconnecting to RelayBridge; interactive Grok sessions retain their normal MCP configuration. Gemini one-shots receive the validated workspace explicitly so safe headless reads do not depend on launch-directory inference.
 
 ## REST API
 

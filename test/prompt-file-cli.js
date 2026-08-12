@@ -25,6 +25,11 @@ setTimeout(() => {
     process.exit(Number(process.argv[exitIndex + 1] || 1));
   }
   if (process.argv.includes('--empty')) return;
+  const envIndex = process.argv.indexOf('--print-env');
+  if (envIndex >= 0) {
+    process.stdout.write(String(process.env[process.argv[envIndex + 1]] || ''));
+    return;
+  }
   const outputIndex = process.argv.indexOf('--output');
   process.stdout.write(outputIndex >= 0 ? String(process.argv[outputIndex + 1] || '') : prompt);
 }, delayMs);
