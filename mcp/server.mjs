@@ -1460,6 +1460,65 @@ export function buildServer() {
     });
   }));
 
+  server.registerTool('list_agents', {
+    title: 'List AI agents and routing tags',
+    description: 'List the configured AI providers (PowerShell excluded) with label, model, routing tags, autoRoute opt-in flag, and the last cached readiness snapshot. Never spawns readiness probes.',
+    inputSchema: z.object({}),
+    annotations: READ_ONLY,
+  }, safeHandler(async () => result(await bridgeRequest('/api/agents'))));
+
+  server.registerTool('set_agent_tags', {
+    title: 'Set an agent\'s routing tags',
+    description: 'Replace the routing tags for one configured provider and persist them to cli-config.json. Tags are short lowercase labels such as coding, audit, search, or local.',
+    inputSchema: z.object({
+      providerId: z.string().min(1).max(64),
+      tags: z.array(z.string().regex(/^[a-z][a-z0-9-]{0,23}$/)).max(16),
+    }),
+    annotations: ACTION,
+  }, safeHandler(async ({ providerId, tags }) => {
+    const response = await bridgeRequest(`/api/agents/${encodeURIComponent(providerId)}/tags`, {
+      method: 'POST',
+      body: { tags },
+    });
+    const receipt = appendReceipt({ event: 'agent_tags_update', provider: providerId, tags: response.tags, status: 'updated' });
+    return result({ ...response, receiptId: receipt.receiptId });
+  }));
+
+  server.registerTool('broadcast', {
+    title: 'Broadcast one prompt to many providers',
+    description: 'Send the same prompt to every matching AI provider in one call. WARNING: this spends quota, credits, or local compute on MULTIPLE provider accounts at once — one broadcast can consume a seat of Claude, Codex, Gemini, Grok, and more simultaneously. Target by explicit providers, by a shared tag, or all:true; tag/all selection always skips opt-in autoRoute:false hosted seats unless they are named explicitly in providers. Calls run with dangerous:false through the same bounded one-shot path and receipts as ask_provider.',
+    inputSchema: z.object({
+      prompt: z.string().min(1).max(100000),
+      tag: z.string().regex(/^[a-z][a-z0-9-]{0,23}$/).optional(),
+      providers: z.array(z.string()).max(16).default([]),
+      all: z.boolean().default(false),
+      cwd: z.string().max(1000).optional(),
+      timeoutMs: z.number().int().min(1000).max(300000).default(180000),
+    }),
+    annotations: { ...ACTION, openWorldHint: true },
+  }, safeHandler(async ({ prompt, tag, providers, all, cwd, timeoutMs }, context) => {
+    const response = await bridgeRequest('/api/broadcast', {
+      method: 'POST',
+      body: { prompt, tag, providers, all, cwd, timeoutMs, dangerous: false },
+      timeoutMs: Math.max(30000, timeoutMs + 330000),
+      signal: context?.mcpReq?.signal,
+    });
+    const results = (response.results || []).map((member) => {
+      const output = clip(member.output || '', 16000);
+      return { ...member, output: output.text, outputChars: output.originalChars, outputTruncated: output.truncated };
+    });
+    const receipt = appendReceipt({
+      event: 'broadcast',
+      providers: response.targets || [],
+      runId: response.runId || null,
+      inputHash: stableHash(prompt),
+      inputChars: prompt.length,
+      status: response.status || 'unknown',
+      succeededProviders: results.filter((member) => member.ok).map((member) => member.provider),
+    });
+    return result({ ...response, results, receiptId: receipt.receiptId });
+  }));
+
   const resource = (name, uri, title, description, loader) => {
     server.registerResource(name, uri, { title, description, mimeType: 'application/json', cacheHint: { ttlMs: 5000, cacheScope: 'private' } }, async () => {
       try {

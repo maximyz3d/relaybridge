@@ -1130,6 +1130,127 @@ function runProbe(slotRaw, timeoutMs = 15000, stripEnv = [], signal) {
   });
 }
 
+// Latest completed /api/diag snapshot. /api/agents reuses it instead of
+// spawning fresh readiness probes on every listing.
+let lastDiagnostics = null;
+
+const PROVIDER_TAG_RE = /^[a-z][a-z0-9-]{0,23}$/;
+const MAX_PROVIDER_TAGS = 16;
+
+// An "AI provider" is any configured entry with a one-shot path. Plain
+// PowerShell (interactive-only, no oneshot slots) is deliberately excluded.
+function isAiProviderEntry(kind, entry) {
+  if (!entry || typeof entry !== 'object' || kind.startsWith('_')) return false;
+  return !!(entry.oneshot_adapter ||
+    (Array.isArray(entry.oneshot_safe) && entry.oneshot_safe.length) ||
+    (Array.isArray(entry.oneshot_dangerous) && entry.oneshot_dangerous.length));
+}
+
+function agentSummary(kind, entry) {
+  const diag = lastDiagnostics?.results?.[kind] || null;
+  return {
+    id: kind,
+    label: entry.label || kind,
+    model: entry.model || null,
+    tags: Array.isArray(entry.tags) ? entry.tags.filter((tag) => PROVIDER_TAG_RE.test(String(tag))) : [],
+    autoRoute: entry.autoRoute !== false,
+    readiness: diag ? {
+      found: diag.found ?? null,
+      ready: diag.ready ?? null,
+      detail: diag.detail || '',
+      checkedAt: new Date(lastDiagnostics.at).toISOString(),
+    } : null,
+  };
+}
+
+function normalizeProviderTags(raw) {
+  if (!Array.isArray(raw)) throw new Error('tags must be an array of strings');
+  if (raw.length > MAX_PROVIDER_TAGS) throw new Error(`tags cannot exceed ${MAX_PROVIDER_TAGS} entries`);
+  const tags = [];
+  for (const value of raw) {
+    if (typeof value !== 'string' || !PROVIDER_TAG_RE.test(value)) {
+      throw new Error(`invalid tag ${JSON.stringify(String(value ?? '')).slice(0, 40)}; tags must match ${PROVIDER_TAG_RE}`);
+    }
+    if (!tags.includes(value)) tags.push(value);
+  }
+  return tags;
+}
+
+// Persist the whole registry atomically with the same 2-space formatting the
+// repo file uses. server.js re-reads CONFIG_FILE on every request, so the
+// rewrite is also the in-memory routing update.
+function saveConfig(cfg) {
+  const tempPath = path.join(path.dirname(CONFIG_FILE), `.cli-config.${crypto.randomUUID()}.tmp`);
+  try {
+    fs.writeFileSync(tempPath, JSON.stringify(cfg, null, 2) + '\n', 'utf8');
+    fs.renameSync(tempPath, CONFIG_FILE);
+  } finally {
+    try { if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath); } catch {}
+  }
+}
+
+// Resolve the target providers for one broadcast. Explicitly named providers
+// are honored even when opt-in (autoRoute:false); tag and all selection always
+// skip opt-in hosted quota seats so a broad fan-out cannot silently spend them.
+function resolveBroadcastTargets(cfg, { providers, tag, all } = {}) {
+  const aiKinds = Object.entries(cfg).filter(([kind, entry]) => isAiProviderEntry(kind, entry));
+  const explicit = Array.isArray(providers) ? [...new Set(providers.map((value) => String(value)))] : [];
+  if (explicit.length) {
+    const unknown = explicit.filter((kind) => !aiKinds.some(([known]) => known === kind));
+    if (unknown.length) throw new Error('unknown or non-AI provider(s): ' + unknown.join(', '));
+    return explicit;
+  }
+  let matched;
+  if (typeof tag === 'string' && tag.trim()) {
+    matched = aiKinds.filter(([, entry]) => Array.isArray(entry.tags) && entry.tags.includes(tag.trim()));
+  } else if (all === true) {
+    matched = aiKinds;
+  } else {
+    matched = [];
+  }
+  return matched.filter(([, entry]) => entry.autoRoute !== false).map(([kind]) => kind);
+}
+
+// Minimal Express-response stand-in that executeOneShot can drive. It captures
+// the JSON payload and emits 'finish' so the one-shot admission slot releases
+// exactly like it does for a real HTTP response.
+class CapturedOneShotResponse extends require('events').EventEmitter {
+  constructor() {
+    super();
+    this.statusCode = 200;
+    this.writableEnded = false;
+    this.destroyed = false;
+    this.done = new Promise((resolve) => { this._resolve = resolve; });
+  }
+  status(code) { this.statusCode = code; return this; }
+  json(payload) {
+    if (this.writableEnded) return this;
+    this.writableEnded = true;
+    this.emit('finish');
+    this._resolve({ statusCode: this.statusCode, body: payload });
+    return this;
+  }
+}
+
+function writeBroadcastRun(run) {
+  const runId = run.runId || `run_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 8)}`;
+  const record = {
+    runId,
+    createdAt: run.createdAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    ...run,
+    runId,
+  };
+  const tempPath = path.join(RUNS_DIR, `.${runId}.${crypto.randomUUID()}.tmp`);
+  try {
+    fs.writeFileSync(tempPath, JSON.stringify(record, null, 2), 'utf8');
+    fs.renameSync(tempPath, path.join(RUNS_DIR, `${runId}.json`));
+  } finally {
+    try { if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath); } catch {}
+  }
+  return record;
+}
+
 // Resolve the real provider dependency and optionally run its non-mutating
 // readiness probe. In particular, Perplexity must prove pwm authentication;
 // merely finding node.exe is not an operational signal.
@@ -1209,7 +1330,9 @@ app.get('/api/diag', async (req, res) => {
       runtimeVersion,
     }];
   }));
-  if (!clientGone && !res.writableEnded) res.json({ results: Object.fromEntries(pairs) });
+  const results = Object.fromEntries(pairs);
+  if (!controller.signal.aborted) lastDiagnostics = { at: Date.now(), results };
+  if (!clientGone && !res.writableEnded) res.json({ results });
 });
 
 app.get('/api/permissions', (req, res) => {
@@ -1305,9 +1428,14 @@ app.post('/api/exec', (req, res) => {
 // declared in config, and captures full output. Returns
 // stdout/stderr/exitCode + heuristic flags (rate_limited, budget_exceeded) so
 // the frontend can mark a participant as dropped-out and continue without it.
-app.post('/api/oneshot', async (req, res) => {
+// The full one-shot execution path, factored out of the route handler so
+// /api/broadcast can fan the same prompt out through identical provider
+// resolution, admission control, receipts, and cleanup. `res` only needs the
+// Express response surface this function touches (status/json/on/once/
+// writableEnded/destroyed), so broadcast passes a captured stand-in.
+async function executeOneShot(body, res) {
   const startedAt = Date.now();
-  const { kind, prompt, timeoutMs = 180000, cwd, dangerous } = req.body || {};
+  const { kind, prompt, timeoutMs = 180000, cwd, dangerous } = body || {};
   if (!kind || typeof prompt !== 'string' || !prompt.trim()) {
     return res.status(400).json({ error: 'kind + non-empty prompt required' });
   }
@@ -1516,6 +1644,117 @@ app.post('/api/oneshot', async (req, res) => {
   } else {
     try { proc.stdin.end(); } catch {}
   }
+}
+
+app.post('/api/oneshot', (req, res) => executeOneShot(req.body, res));
+
+
+// ---- Agent registry (AI providers with routing tags) -------------------
+app.get('/api/agents', (req, res) => {
+  const cfg = loadConfig();
+  const agents = Object.entries(cfg)
+    .filter(([kind, entry]) => isAiProviderEntry(kind, entry))
+    .map(([kind, entry]) => agentSummary(kind, entry));
+  res.json({ agents, readinessCheckedAt: lastDiagnostics ? new Date(lastDiagnostics.at).toISOString() : null });
+});
+
+app.post('/api/agents/:id/tags', (req, res) => {
+  const kind = String(req.params.id || '');
+  const cfg = loadConfig();
+  const entry = cfg[kind];
+  if (!entry || typeof entry !== 'object' || (!isAiProviderEntry(kind, entry) && kind !== 'powershell')) {
+    return res.status(404).json({ error: 'unknown provider: ' + kind });
+  }
+  let tags;
+  try {
+    tags = normalizeProviderTags((req.body || {}).tags);
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+  try {
+    entry.tags = tags;
+    saveConfig(cfg);
+  } catch (err) {
+    return res.status(500).json({ error: 'could not persist tags: ' + err.message });
+  }
+  res.json({ ok: true, id: kind, tags });
+});
+
+// ---- Broadcast: one prompt, many providers ------------------------------
+// Fans the same prompt through executeOneShot for every resolved target, so
+// admission caps, per-provider limits, receipts, and output cleaning behave
+// exactly like /api/oneshot. Members that hit the global concurrency cap are
+// queued (bounded retry on admission_limit) instead of failing.
+const BROADCAST_QUEUE_WAIT_MS = 300000;
+app.post('/api/broadcast', async (req, res) => {
+  const { prompt, tag, providers, all, dangerous, timeoutMs = 180000, cwd } = req.body || {};
+  if (typeof prompt !== 'string' || !prompt.trim()) {
+    return res.status(400).json({ error: 'non-empty prompt required' });
+  }
+  const cfg = loadConfig();
+  let targets;
+  try {
+    targets = resolveBroadcastTargets(cfg, { providers, tag, all });
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+  if (!targets.length) {
+    return res.status(400).json({
+      error: 'no matching broadcast targets; pass providers, a tag that AI providers carry, or all:true (opt-in autoRoute:false seats must be named explicitly)',
+      tag: typeof tag === 'string' ? tag : null,
+    });
+  }
+  const startedAt = Date.now();
+  const queueDeadline = startedAt + BROADCAST_QUEUE_WAIT_MS;
+  let run = writeBroadcastRun({
+    mode: 'broadcast',
+    status: 'running',
+    promptHash: crypto.createHash('sha256').update(prompt).digest('hex'),
+    promptChars: prompt.length,
+    selection: { tag: typeof tag === 'string' ? tag : null, all: all === true, explicitProviders: Array.isArray(providers) ? providers : [] },
+    targets,
+    members: [],
+  });
+  const callOnce = async (kind) => {
+    const captured = new CapturedOneShotResponse();
+    executeOneShot({ kind, prompt, timeoutMs, cwd, dangerous }, captured)
+      .catch((err) => captured.status(500).json({ error: err.message, dropped_out: true }));
+    return captured.done;
+  };
+  const results = await Promise.all(targets.map(async (kind) => {
+    const memberStartedAt = Date.now();
+    let response = await callOnce(kind);
+    while (
+      response.statusCode === 429 &&
+      response.body?.failureClass === 'admission_limit' &&
+      Date.now() < queueDeadline &&
+      !res.destroyed
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 400 + Math.floor(Math.random() * 400)));
+      response = await callOnce(kind);
+    }
+    const body = response.body || {};
+    const ok = response.statusCode === 200 && body.exitCode === 0 && !body.dropped_out;
+    return {
+      provider: kind,
+      label: cfg[kind]?.label || kind,
+      ok,
+      output: String(body.stdout || ''),
+      error: ok ? null : String(body.error || body.stderr || (body.timed_out ? 'timed out' : '') || `provider dropped out (HTTP ${response.statusCode})`).slice(0, 4000),
+      durationMs: Date.now() - memberStartedAt,
+      exitCode: body.exitCode ?? null,
+      timedOut: !!body.timed_out,
+      receiptId: body.receiptId || null,
+    };
+  }));
+  run = writeBroadcastRun({
+    ...run,
+    status: results.every((member) => member.ok) ? 'completed' : results.some((member) => member.ok) ? 'partial' : 'failed',
+    members: results.map((member) => ({ kind: member.provider, role: 'broadcast', exitCode: member.exitCode, droppedOut: !member.ok, durationMs: member.durationMs, receiptId: member.receiptId })),
+    durationMs: Date.now() - startedAt,
+  });
+  if (res.writableEnded || res.destroyed) return;
+  res.json({ targets, results, runId: run.runId, status: run.status });
 });
 
 
@@ -1669,6 +1908,31 @@ app.post('/api/projects', (req, res) => {
 app.post('/api/admin/shutdown', (req, res) => {
   res.json({ ok: true, stopping: true, pid: process.pid, instanceId: INSTANCE_ID });
   setTimeout(shutdown, 100);
+});
+
+// Full restart: reply first, then hand off to the detached restart.ps1 helper,
+// which waits for this PID to release the port and relaunches server.js. The
+// helper only exists for Windows; other platforms report 501 instead of
+// killing the process without a relauncher.
+app.post('/api/admin/restart', (req, res) => {
+  if (process.platform !== 'win32') {
+    return res.status(501).json({ ok: false, restarting: false, error: 'restart helper is Windows-only; stop and start the bridge manually', platform: process.platform });
+  }
+  res.json({ ok: true, restarting: true, pid: process.pid, instanceId: INSTANCE_ID });
+  setTimeout(() => {
+    try {
+      const helper = spawn('powershell.exe', [
+        '-NoProfile',
+        '-ExecutionPolicy', 'Bypass',
+        '-File', path.join(ROOT, 'restart.ps1'),
+        '-TargetPid', String(process.pid),
+        '-Port', String(PORT),
+      ], { cwd: ROOT, detached: true, stdio: 'ignore', windowsHide: true });
+      helper.unref();
+    } catch (err) {
+      console.warn('[RelayBridge] restart helper failed to launch: ' + err.message);
+    }
+  }, 100);
 });
 
 const server = http.createServer(app);

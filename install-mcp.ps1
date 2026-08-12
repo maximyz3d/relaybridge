@@ -71,7 +71,8 @@ if (-not $SkipCodex) {
     'read_session_output', 'list_collabs', 'read_collab', 'list_projects',
     'list_runs', 'get_run', 'list_receipts', 'get_receipt', 'get_context_bundle', 'start_bridge', 'restart_bridge',
     'stop_bridge', 'start_safe_session', 'send_session_input', 'stop_session',
-    'ask_provider', 'route_and_ask', 'run_committee'
+    'ask_provider', 'route_and_ask', 'run_committee',
+    'list_agents', 'set_agent_tags', 'broadcast'
   )
   $toolList = ($toolNames | ForEach-Object { '"' + $_ + '"' }) -join ', '
   $settings = @(

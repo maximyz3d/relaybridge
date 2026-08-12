@@ -114,6 +114,27 @@ test('cursor provider pins safe modes, probe, and guided install metadata', () =
   assert.ok(evidence.sources.some((source) => source.id === 'cursor_cli_docs'));
 });
 
+test('provider tags are declared, lowercase, unique, and match the shared vocabulary shape', () => {
+  const config = readConfig();
+  const TAG_RE = /^[a-z][a-z0-9-]{0,23}$/;
+  for (const [kind, entry] of Object.entries(config)) {
+    if (kind.startsWith('_')) continue;
+    assert.ok(Array.isArray(entry.tags), kind + ' declares a tags array');
+    for (const tag of entry.tags) assert.match(tag, TAG_RE, `${kind} tag ${JSON.stringify(tag)}`);
+    assert.equal(new Set(entry.tags).size, entry.tags.length, kind + ' tags are unique');
+  }
+  assert.deepEqual(config.powershell.tags, []);
+  assert.ok(config.claude.tags.includes('coding') && config.claude.tags.includes('audit'));
+  assert.ok(config.claude_fable.tags.includes('reasoning'));
+  assert.ok(config.codex.tags.includes('delegation'));
+  assert.ok(config.cursor.tags.includes('delegation'));
+  assert.ok(config.perplexity.tags.includes('search') && config.perplexity.tags.includes('research'));
+  for (const kind of ['ollama', 'ollama_fast', 'ollama_llama', 'ollama_coder']) {
+    assert.ok(config[kind].tags.includes('local'), kind + ' is tagged local');
+  }
+  assert.deepEqual(config.groq_llama_fast.tags, ['hosted', 'utility']);
+});
+
 test('server, MCP adapter, Perplexity wrapper, and inline browser script parse', () => {
   for (const file of [
     'server.js',
@@ -520,4 +541,155 @@ test('hosted OpenAI-compatible adapter blocks China-hosted endpoints before netw
   assert.equal(result.exitCode, -1);
   assert.equal(result.dropped_out, true);
   assert.match(result.stderr, /blocked by geo\/supply-chain policy/);
+});
+
+test('agents listing, tag updates, and broadcast fan-out respect auth, autoRoute, and the global cap', { timeout: 60000 }, async (t) => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ps-bridge-broadcast-test-'));
+  const configPath = path.join(tempRoot, 'config.json');
+  const tokenPath = path.join(tempRoot, 'capability.token');
+  const helper = path.join(ROOT, 'test', 'prompt-file-cli.js');
+  const provider = (label, extra = {}, slotExtra = []) => ({
+    label,
+    safe: [process.execPath, helper, '--version'],
+    dangerous: [process.execPath, helper, '--version'],
+    oneshot_safe: [process.execPath, helper, '--prompt-file', '{prompt_file}', ...slotExtra],
+    oneshot_dangerous: [process.execPath, helper, '--prompt-file', '{prompt_file}', ...slotExtra],
+    diagnostic_binary: process.execPath,
+    probe: [process.execPath, helper, '--version'],
+    ...extra,
+  });
+  fs.writeFileSync(configPath, JSON.stringify({
+    alpha_one: provider('Alpha One', { tags: ['alpha'] }, ['--delay', '250']),
+    alpha_two: provider('Alpha Two', { tags: ['alpha', 'beta'] }, ['--delay', '250']),
+    beta_only: provider('Beta Only', { tags: ['beta'] }, ['--delay', '250']),
+    optin: provider('Opt-in Quota Seat', { tags: ['alpha'], autoRoute: false }, ['--delay', '250']),
+    broken: provider('Broken', { tags: ['beta'] }, ['--exit', '5']),
+    shell: {
+      label: 'Interactive Shell',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+    },
+  }), 'utf8');
+
+  const port = await reservePort();
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const proc = spawn(process.execPath, [path.join(ROOT, 'server.js')], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      PORT: String(port),
+      PTY_MODE: 'none',
+      RELAYBRIDGE_CONFIG_FILE: configPath,
+      RELAYBRIDGE_TOKEN_FILE: tokenPath,
+      RELAYBRIDGE_DATA_DIR: path.join(tempRoot, 'data'),
+      RELAYBRIDGE_MAX_ACTIVE_ONESHOTS: '2',
+    },
+    windowsHide: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let serverOutput = '';
+  proc.stdout.on('data', (chunk) => { serverOutput += chunk; });
+  proc.stderr.on('data', (chunk) => { serverOutput += chunk; });
+  t.after(async () => {
+    if (proc.exitCode === null) proc.kill('SIGTERM');
+    await new Promise((resolve) => proc.exitCode !== null ? resolve() : proc.once('exit', resolve));
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  });
+  try {
+    await waitForHealth(baseUrl, proc);
+  } catch (err) {
+    throw new Error(err.message + '\n' + serverOutput);
+  }
+  const jsonAuth = await capabilityHeaders(baseUrl, true);
+
+  // Auth gating: every new endpoint rejects requests without the token.
+  for (const [method, route] of [
+    ['GET', '/api/agents'],
+    ['POST', '/api/agents/alpha_one/tags'],
+    ['POST', '/api/broadcast'],
+    ['POST', '/api/admin/restart'],
+  ]) {
+    const response = await fetch(baseUrl + route, { method });
+    assert.equal(response.status, 401, method + ' ' + route + ' must require the capability token');
+  }
+
+  // Listing excludes interactive-only shells and reports autoRoute + tags.
+  const listed = await (await fetch(baseUrl + '/api/agents', { headers: jsonAuth })).json();
+  const ids = listed.agents.map((agent) => agent.id).sort();
+  assert.deepEqual(ids, ['alpha_one', 'alpha_two', 'beta_only', 'broken', 'optin']);
+  const optin = listed.agents.find((agent) => agent.id === 'optin');
+  assert.equal(optin.autoRoute, false);
+  assert.deepEqual(optin.tags, ['alpha']);
+  assert.equal(listed.agents.find((agent) => agent.id === 'alpha_one').readiness, null);
+
+  // Readiness in the listing is reused from the last /api/diag snapshot.
+  await (await fetch(baseUrl + '/api/diag', { headers: jsonAuth })).json();
+  const relisted = await (await fetch(baseUrl + '/api/agents', { headers: jsonAuth })).json();
+  assert.equal(relisted.agents.find((agent) => agent.id === 'alpha_one').readiness.ready, true);
+
+  // Tag updates validate and persist atomically with 2-space formatting.
+  const badTags = await fetch(baseUrl + '/api/agents/alpha_one/tags', {
+    method: 'POST', headers: jsonAuth, body: JSON.stringify({ tags: ['Bad Tag'] }),
+  });
+  assert.equal(badTags.status, 400);
+  const notArray = await fetch(baseUrl + '/api/agents/alpha_one/tags', {
+    method: 'POST', headers: jsonAuth, body: JSON.stringify({ tags: 'alpha' }),
+  });
+  assert.equal(notArray.status, 400);
+  const unknown = await fetch(baseUrl + '/api/agents/nope/tags', {
+    method: 'POST', headers: jsonAuth, body: JSON.stringify({ tags: [] }),
+  });
+  assert.equal(unknown.status, 404);
+  const saved = await fetch(baseUrl + '/api/agents/alpha_one/tags', {
+    method: 'POST', headers: jsonAuth, body: JSON.stringify({ tags: ['alpha', 'gamma', 'alpha'] }),
+  });
+  assert.equal(saved.status, 200);
+  assert.deepEqual((await saved.json()).tags, ['alpha', 'gamma']);
+  const persistedText = fs.readFileSync(configPath, 'utf8');
+  assert.match(persistedText, /^\{\n  "/);
+  assert.deepEqual(JSON.parse(persistedText).alpha_one.tags, ['alpha', 'gamma']);
+
+  // Target resolution: tag match skips autoRoute:false unless named explicitly.
+  const broadcast = (body) => fetch(baseUrl + '/api/broadcast', {
+    method: 'POST', headers: jsonAuth, body: JSON.stringify(body),
+  });
+  assert.equal((await broadcast({ prompt: '   ' })).status, 400);
+  assert.equal((await broadcast({ prompt: 'x', tag: 'no-such-tag' })).status, 400);
+  assert.equal((await broadcast({ prompt: 'x' })).status, 400);
+  assert.equal((await broadcast({ prompt: 'x', providers: ['shell'] })).status, 400);
+
+  const tagged = await (await broadcast({ prompt: 'tag fan-out', tag: 'alpha' })).json();
+  assert.deepEqual(tagged.targets.sort(), ['alpha_one', 'alpha_two']);
+  assert.ok(tagged.results.every((member) => member.ok && member.output === 'tag fan-out'));
+
+  const explicit = await (await broadcast({ prompt: 'explicit opt-in', providers: ['optin', 'beta_only'] })).json();
+  assert.deepEqual(explicit.targets, ['optin', 'beta_only']);
+  assert.ok(explicit.results.find((member) => member.provider === 'optin').ok);
+
+  // all:true fans out to every AI provider except opt-in seats, queues past the
+  // global cap of 2, and reports per-member failures without failing the run.
+  const everyone = await (await broadcast({ prompt: 'all hands', all: true })).json();
+  assert.deepEqual(everyone.targets.sort(), ['alpha_one', 'alpha_two', 'beta_only', 'broken']);
+  assert.equal(everyone.status, 'partial');
+  assert.match(everyone.runId, /^run_/);
+  const byProvider = Object.fromEntries(everyone.results.map((member) => [member.provider, member]));
+  assert.equal(byProvider.alpha_one.ok, true);
+  assert.equal(byProvider.alpha_one.output, 'all hands');
+  assert.equal(byProvider.broken.ok, false);
+  assert.equal(byProvider.broken.exitCode, 5);
+  assert.equal(byProvider.broken.output, '');
+  assert.match(byProvider.broken.error, /requested failure/);
+  assert.ok(everyone.results.every((member) => Number.isFinite(member.durationMs)));
+
+  // The broadcast run is recorded next to committee/oneshot provenance.
+  const activity = await (await fetch(baseUrl + '/api/activity?limit=10', { headers: jsonAuth })).json();
+  assert.ok(activity.runs.some((run) => run.runId === everyone.runId && run.mode === 'broadcast'));
+  assert.ok(activity.receipts.some((receipt) => receipt.provider === 'alpha_one'));
+
+  // Restart is Windows-only; elsewhere it must refuse instead of dying.
+  if (process.platform !== 'win32') {
+    const restart = await fetch(baseUrl + '/api/admin/restart', { method: 'POST', headers: jsonAuth });
+    assert.equal(restart.status, 501);
+    assert.equal((await restart.json()).restarting, false);
+  }
 });

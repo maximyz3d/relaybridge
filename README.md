@@ -132,6 +132,12 @@ Hosted free/quota providers are intentionally opt-in. `groq_llama_fast` uses Gro
 
 `config/provider-evidence.json` records why providers and integrations are tagged the way they are. The registry is deliberately conservative: public benchmark links and model cards are references, not proof that a specific local CLI setup is best for your task. RelayBridge receipts are the local evidence trail.
 
+## Agent Tags and Broadcast
+
+Every provider in `cli-config.json` carries a `tags` array (for example `coding`, `audit`, `delegation`, `search`, `research`, `general`, `reasoning`, `utility`, `local`, `hosted`). Tags group providers for broadcast targeting and are editable from the 🧩 Agents dialog, `POST /api/agents/:id/tags`, or the `set_agent_tags` MCP tool.
+
+`POST /api/broadcast` sends one prompt through the same bounded one-shot path as `/api/oneshot` to every resolved target: an explicit `providers` list, every AI provider carrying `tag`, or `all:true`. Tag and all selection always skip opt-in `autoRoute:false` hosted seats (such as `groq_llama_fast`) unless they are named explicitly, the global one-shot concurrency cap still applies (extra members queue), and each member writes a normal provider receipt plus one broadcast run record. A broadcast deliberately spends several providers' quota or local compute at once — target it narrowly.
+
 ## Browser UI
 
 The dashboard includes:
@@ -143,6 +149,9 @@ The dashboard includes:
 - AI team controls for provider selection, routing, and committee runs
 - runs and receipt history
 - a Full Permissions toggle for browser-created sessions
+- 📡 Broadcast: send one prompt to several providers at once (pick a tag or check providers; opt-in hosted quota seats start unchecked) and read per-provider result cards
+- 🧩 Agents: a provider table with model, readiness, the autoRoute flag, and editable routing tags saved back to `cli-config.json`
+- ⟳ Restart and ⏻ Stop buttons: restart relaunches the bridge through `restart.ps1` and reloads the page when the new instance is healthy; stop shuts the bridge down and shows an offline screen
 
 New collaboration rooms preselect local seats when available. Hosted seats are opt-in so a fresh room does not accidentally spend subscription quota.
 
@@ -181,12 +190,16 @@ Core routes:
 | GET/POST/DELETE | `/api/sessions/:id/...` | Read, write to, or stop a session |
 | POST | `/api/exec` | Raw one-shot shell execution |
 | POST | `/api/oneshot` | One provider call |
+| GET | `/api/agents` | AI providers with tags, autoRoute, and cached readiness |
+| POST | `/api/agents/:id/tags` | Replace one provider's routing tags in `cli-config.json` |
+| POST | `/api/broadcast` | Fan one prompt out to many providers (by `providers`, `tag`, or `all:true`) |
 | POST | `/api/install` | Run a configured provider installer |
 | GET/POST/PUT/DELETE | `/api/collabs...` | Collaboration rooms |
 | GET/POST | `/api/projects` | Saved project labels |
 | GET | `/api/activity` | Recent run and receipt summaries |
 | POST | `/api/open-url` | Open an allowed HTTP(S) URL locally |
 | POST | `/api/admin/shutdown` | Graceful bridge shutdown |
+| POST | `/api/admin/restart` | Full restart via the detached `restart.ps1` helper (Windows; 501 elsewhere) |
 
 Direct REST callers holding the token are trusted operators.
 
@@ -230,6 +243,8 @@ The test suite validates configuration, safety boundaries, transport cleanup, ro
 When an AI client connects through MCP, it should start with `get_context_bundle`. That returns a bounded snapshot with health, providers, active work, terminal tails, collaboration history, projects, recent runs, receipts, registry fingerprints, and the exact detail tools needed for anything omitted.
 
 Use `route_preview` before spending a hosted provider call. Use `route_and_ask` for one bounded answer with policy routing. Use `run_committee` when you need independent advisory views. Use `start_safe_session` and `send_session_input` only when host shell execution is actually required and approved.
+
+Agent management tools: `list_agents` lists AI providers with tags, autoRoute, and cached readiness without spawning probes; `set_agent_tags` replaces one provider's routing tags; `broadcast` fans one prompt out to many providers at once and can therefore spend multiple providers' quota in a single call — prefer a narrow tag or explicit provider list.
 
 Every provider call writes receipts where possible. Use `list_runs`, `get_run`, `list_receipts`, and `get_receipt` to recover provenance instead of relying on a chat transcript alone.
 

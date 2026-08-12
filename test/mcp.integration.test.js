@@ -126,7 +126,7 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
 
   const listedTools = await client.listTools();
   const toolNames = new Set(listedTools.tools.map((tool) => tool.name));
-  for (const expected of ['bridge_status', 'list_providers', 'get_context_bundle', 'route_preview', 'ask_provider', 'run_committee', 'get_receipt', 'restart_bridge']) {
+  for (const expected of ['bridge_status', 'list_providers', 'get_context_bundle', 'route_preview', 'ask_provider', 'run_committee', 'get_receipt', 'restart_bridge', 'list_agents', 'set_agent_tags', 'broadcast']) {
     assert.ok(toolNames.has(expected), `missing MCP tool ${expected}`);
   }
   assert.ok(!toolNames.has('exec'), 'raw command execution must not be exposed over MCP');
@@ -197,6 +197,28 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   assert.equal(preview.isError, undefined);
   assert.equal(preview.structuredContent.classification.tier, 'utility');
   assert.match(preview.structuredContent.note, /not a universal model-quality score/);
+
+  const agents = await client.callTool({ name: 'list_agents', arguments: {} });
+  assert.equal(agents.isError, undefined, JSON.stringify(agents.structuredContent));
+  assert.ok(agents.structuredContent.agents.some((agent) => agent.id === 'echo'));
+
+  const taggedAgent = await client.callTool({
+    name: 'set_agent_tags',
+    arguments: { providerId: 'echo', tags: ['utility'] },
+  });
+  assert.equal(taggedAgent.isError, undefined, JSON.stringify(taggedAgent.structuredContent));
+  assert.deepEqual(taggedAgent.structuredContent.tags, ['utility']);
+  assert.match(taggedAgent.structuredContent.receiptId, /^rcpt_/);
+
+  const broadcastReply = await client.callTool({
+    name: 'broadcast',
+    arguments: { prompt: 'broadcast smoke', tag: 'utility' },
+  });
+  assert.equal(broadcastReply.isError, undefined, JSON.stringify(broadcastReply.structuredContent));
+  assert.deepEqual(broadcastReply.structuredContent.targets, ['echo']);
+  assert.equal(broadcastReply.structuredContent.results[0].ok, true);
+  assert.equal(broadcastReply.structuredContent.results[0].output, 'broadcast smoke');
+  assert.match(broadcastReply.structuredContent.runId, /^run_/);
 
   const prompt = 'MCP_SAFE_MARKER_42';
   const provider = await client.callTool({

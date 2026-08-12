@@ -303,6 +303,10 @@
     <span class="label">Full Permissions: OFF</span>
   </button>
   <button class="btn" id="diag-btn" title="Check which CLIs are installed and on PATH">🔍 Check installs</button>
+  <button class="btn" id="broadcast-btn" title="Send one prompt to several AI providers at once">📡 Broadcast</button>
+  <button class="btn" id="agents-btn" title="View AI providers, readiness, and edit routing tags">🧩 Agents</button>
+  <button class="btn" id="restart-btn" title="Restart the RelayBridge server; all terminal sessions close">⟳ Restart</button>
+  <button class="btn" id="stop-btn" title="Stop the RelayBridge server">⏻ Stop</button>
   <button class="btn" id="install-all-btn" title="npm install -g for every AI CLI configured with an npm_package">📦 Install all</button>
   <button class="btn" id="reload-btn">⟳ Reload</button>
 </header>
@@ -327,6 +331,30 @@
 <dialog id="diag-dialog">
   <div class="dlg-head"><strong>CLI install check</strong><button class="btn" id="diag-close-btn">Close</button></div>
   <div class="dlg-body" id="diag-body">Checking…</div>
+</dialog>
+
+<dialog id="broadcast-dialog" style="min-width:min(720px,92vw);">
+  <div class="dlg-head"><strong>📡 Broadcast a prompt</strong><button class="btn" id="broadcast-close-btn">Close</button></div>
+  <div class="dlg-body" style="max-height:65vh; overflow:auto;">
+    <label style="display:block; font-size:12px; color:var(--muted); margin-bottom:4px;">Prompt sent to every selected provider</label>
+    <textarea id="broadcast-prompt" rows="4" placeholder="e.g. Review this plan and list the top three risks…" style="width:100%; background:var(--panel-2); border:1px solid var(--border); color:var(--text); padding:8px 10px; border-radius:6px; font:13px system-ui,sans-serif; resize:vertical;"></textarea>
+    <div style="display:flex; gap:8px; align-items:center; margin:10px 0 6px;">
+      <label style="font-size:12px; color:var(--muted);">Target tag</label>
+      <select id="broadcast-tag" style="flex:1; background:var(--panel-2); border:1px solid var(--border); color:var(--text); padding:6px 10px; border-radius:6px; font:13px system-ui,sans-serif;"></select>
+    </div>
+    <div style="color:var(--muted); font-size:11px; margin-bottom:6px;">Every checked provider gets the same prompt and spends its own quota or local compute. Opt-in hosted seats (autoRoute off) start unchecked.</div>
+    <div id="broadcast-provider-list" style="display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:4px;"></div>
+    <div id="broadcast-results" style="margin-top:10px;"></div>
+  </div>
+  <div class="dlg-foot">
+    <span id="broadcast-status" style="margin-right:auto; color:var(--muted); font-size:12px;"></span>
+    <button class="btn collab" id="broadcast-run-btn">📡 Run broadcast</button>
+  </div>
+</dialog>
+
+<dialog id="agents-dialog" style="min-width:min(780px,92vw);">
+  <div class="dlg-head"><strong>🧩 Agents &amp; routing tags</strong><button class="btn" id="agents-close-btn">Close</button></div>
+  <div class="dlg-body" id="agents-body" style="max-height:65vh; overflow:auto;">Loading…</div>
 </dialog>
 
 <dialog id="team-status-dialog" style="min-width:min(760px,90vw);">
@@ -709,6 +737,10 @@ function paletteCommands() {
     { title: 'Saved Collabs', detail: 'open saved collaboration rooms', run: () => $('#saved-collabs-btn')?.click() },
     { title: 'Team Status', detail: 'providers, runs, receipts, and MCP handoff', run: () => $('#team-status-btn')?.click() },
     { title: 'Check Installs', detail: 'probe provider CLIs and login readiness', run: () => $('#diag-btn')?.click() },
+    { title: 'Broadcast Prompt', detail: 'send one prompt to several providers', run: () => $('#broadcast-btn')?.click() },
+    { title: 'Agents & Tags', detail: 'view providers and edit routing tags', run: () => $('#agents-btn')?.click() },
+    { title: 'Restart Bridge', detail: 'restart the RelayBridge server', run: () => $('#restart-btn')?.click() },
+    { title: 'Stop Bridge', detail: 'stop the RelayBridge server', run: () => $('#stop-btn')?.click() },
     { title: 'Install Providers', detail: 'run configured provider installers', run: () => $('#install-all-btn')?.click() },
     { title: 'Reload Sessions', detail: 'refresh sessions, health, and provider footer', run: () => $('#reload-btn')?.click() },
     ...providerCommands,
@@ -1022,6 +1054,264 @@ $('#diag-btn').onclick = async () => {
   }
 };
 $('#diag-close-btn').onclick = () => { try { diagDialog.close(); } catch { diagDialog.removeAttribute('open'); } };
+
+// ============= restart / stop =============
+function showBridgeOffline(message, { reloadButton = true } = {}) {
+  let overlay = document.getElementById('bridge-offline-overlay');
+  if (!overlay) {
+    overlay = document.createElement('div');
+    overlay.id = 'bridge-offline-overlay';
+    overlay.style.cssText = 'position:fixed; inset:0; background:rgba(10,14,18,.93); z-index:9999; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; color:var(--text); font:15px system-ui,sans-serif; text-align:center; padding:24px;';
+    document.body.appendChild(overlay);
+  }
+  overlay.innerHTML = '';
+  const icon = document.createElement('div');
+  icon.style.fontSize = '30px';
+  icon.textContent = '⏻';
+  const text = document.createElement('div');
+  text.textContent = message;
+  overlay.append(icon, text);
+  if (reloadButton) {
+    const button = document.createElement('button');
+    button.className = 'btn';
+    button.textContent = '⟳ Reload page';
+    button.onclick = () => location.reload();
+    overlay.appendChild(button);
+  }
+  $('#status-version').textContent = 'bridge: offline';
+  $('#status-version').className = 'status-pill warn';
+  return overlay;
+}
+
+async function waitForNewInstance(previousInstanceId, deadlineMs = 60000) {
+  const deadline = Date.now() + deadlineMs;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    try {
+      const response = await fetch(API + '/api/health', { cache: 'no-store' });
+      if (response.ok) {
+        const live = await response.json();
+        if (live.instanceId && live.instanceId !== previousInstanceId) return live;
+      }
+    } catch {}
+  }
+  return null;
+}
+
+$('#restart-btn').onclick = async () => {
+  if (!confirm('Restart RelayBridge? All terminal sessions and running provider calls will close.')) return;
+  const button = $('#restart-btn');
+  button.disabled = true;
+  try {
+    const before = await api('/api/health');
+    const reply = await api('/api/admin/restart', { method: 'POST' });
+    if (!reply.restarting) throw new Error(reply.error || 'restart was not accepted');
+    showBridgeOffline('RelayBridge is restarting…', { reloadButton: false });
+    const live = await waitForNewInstance(before.instanceId);
+    if (live) { location.reload(); return; }
+    showBridgeOffline('The bridge did not come back within 60 seconds. Start it manually (start.ps1), then reload this page.');
+  } catch (error) {
+    document.getElementById('bridge-offline-overlay')?.remove();
+    toast('Restart failed: ' + error.message, 'error');
+  } finally { button.disabled = false; }
+};
+
+$('#stop-btn').onclick = async () => {
+  if (!confirm('Stop RelayBridge? All terminal sessions close and this page goes offline until you start the bridge again.')) return;
+  try {
+    await api('/api/admin/shutdown', { method: 'POST' });
+    showBridgeOffline('RelayBridge is stopped. Start it again with start.ps1 (or the desktop shortcut), then reload this page.');
+  } catch (error) {
+    toast('Stop failed: ' + error.message, 'error');
+  }
+};
+
+// ============= agents + broadcast =============
+const broadcastDialog = $('#broadcast-dialog');
+const agentsDialog = $('#agents-dialog');
+let agentsCache = [];
+
+async function loadAgents() {
+  const data = await api('/api/agents');
+  agentsCache = data.agents || [];
+  return agentsCache;
+}
+
+function agentReadinessBadge(agent) {
+  const readiness = agent.readiness;
+  const badge = document.createElement('span');
+  badge.style.fontSize = '11px';
+  if (!readiness) { badge.style.color = 'var(--muted)'; badge.textContent = 'not checked'; }
+  else if (readiness.ready) { badge.style.color = '#2ea043'; badge.textContent = '✓ ready'; }
+  else if (readiness.found) { badge.style.color = '#ddb000'; badge.textContent = '⚠ setup'; }
+  else { badge.style.color = '#d9534f'; badge.textContent = '✗ missing'; }
+  if (readiness?.detail) badge.title = readiness.detail;
+  return badge;
+}
+
+function renderBroadcastProviders() {
+  const tag = $('#broadcast-tag').value;
+  const list = $('#broadcast-provider-list');
+  list.innerHTML = '';
+  for (const agent of agentsCache) {
+    if (tag !== '__all__' && !(agent.tags || []).includes(tag)) continue;
+    const row = document.createElement('label');
+    row.style.cssText = 'display:flex; gap:8px; align-items:center; background:var(--panel-2); border:1px solid var(--border); border-radius:6px; padding:6px 10px; font-size:12px; cursor:pointer;';
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.value = agent.id;
+    checkbox.checked = agent.autoRoute !== false;
+    const name = document.createElement('span');
+    name.textContent = agent.label;
+    name.style.cssText = 'overflow:hidden; text-overflow:ellipsis; white-space:nowrap;';
+    row.append(checkbox, name);
+    if (agent.autoRoute === false) {
+      const warn = document.createElement('span');
+      warn.style.cssText = 'margin-left:auto; color:#ddb000; font-size:10px; flex:none;';
+      warn.title = 'Opt-in hosted seat: broadcasting to it spends account quota.';
+      warn.textContent = 'quota seat';
+      row.appendChild(warn);
+    }
+    list.appendChild(row);
+  }
+  if (!list.children.length) list.innerHTML = '<em style="color:var(--muted); font-size:12px;">No providers carry this tag.</em>';
+}
+
+async function openBroadcast() {
+  if (typeof broadcastDialog.showModal === 'function') broadcastDialog.showModal(); else broadcastDialog.setAttribute('open', 'true');
+  $('#broadcast-status').textContent = 'Loading providers…';
+  $('#broadcast-results').innerHTML = '';
+  try {
+    await loadAgents();
+    const select = $('#broadcast-tag');
+    const previous = select.value;
+    const tags = [...new Set(agentsCache.flatMap((agent) => agent.tags || []))].sort();
+    select.innerHTML = '';
+    const allOption = document.createElement('option');
+    allOption.value = '__all__';
+    allOption.textContent = 'All agents';
+    select.appendChild(allOption);
+    for (const tag of tags) {
+      const option = document.createElement('option');
+      option.value = tag;
+      option.textContent = tag;
+      select.appendChild(option);
+    }
+    if ([...select.options].some((option) => option.value === previous)) select.value = previous;
+    renderBroadcastProviders();
+    $('#broadcast-status').textContent = '';
+  } catch (error) {
+    $('#broadcast-status').textContent = 'Failed to load providers: ' + error.message;
+  }
+}
+
+$('#broadcast-btn').onclick = openBroadcast;
+$('#broadcast-close-btn').onclick = () => { try { broadcastDialog.close(); } catch { broadcastDialog.removeAttribute('open'); } };
+$('#broadcast-tag').onchange = renderBroadcastProviders;
+
+function renderBroadcastResults(results) {
+  const container = $('#broadcast-results');
+  container.innerHTML = '';
+  for (const member of results) {
+    const card = document.createElement('div');
+    card.style.cssText = 'border:1px solid var(--border); border-radius:6px; padding:8px 10px; margin-bottom:8px; background:var(--panel-2);';
+    const head = document.createElement('div');
+    head.style.cssText = 'display:flex; gap:8px; align-items:center; margin-bottom:4px;';
+    const name = document.createElement('strong');
+    name.textContent = member.label || member.provider;
+    const badge = document.createElement('span');
+    badge.style.cssText = 'font-size:11px; font-weight:700; color:' + (member.ok ? '#2ea043' : '#d9534f') + ';';
+    badge.textContent = member.ok ? '✓ ok' : '✗ failed';
+    const duration = document.createElement('span');
+    duration.style.cssText = 'margin-left:auto; color:var(--muted); font-size:11px;';
+    duration.textContent = (Math.round((member.durationMs || 0) / 100) / 10) + 's';
+    head.append(name, badge, duration);
+    const bodyText = document.createElement('div');
+    bodyText.style.cssText = 'white-space:pre-wrap; font-size:12px; max-height:220px; overflow:auto;' + (member.ok ? '' : ' color:#d9534f;');
+    bodyText.textContent = member.ok ? (member.output || '(empty output)') : (member.error || 'provider dropped out');
+    card.append(head, bodyText);
+    container.appendChild(card);
+  }
+}
+
+$('#broadcast-run-btn').onclick = async () => {
+  const prompt = $('#broadcast-prompt').value.trim();
+  if (!prompt) { toast('Type a prompt to broadcast first.', 'error'); return; }
+  const providers = [...$('#broadcast-provider-list').querySelectorAll('input[type=checkbox]:checked')].map((checkbox) => checkbox.value);
+  if (!providers.length) { toast('Check at least one provider.', 'error'); return; }
+  const button = $('#broadcast-run-btn');
+  button.disabled = true;
+  $('#broadcast-status').textContent = `Broadcasting to ${providers.length} provider${providers.length === 1 ? '' : 's'}… (each spends its own quota)`;
+  $('#broadcast-results').innerHTML = '';
+  try {
+    const reply = await api('/api/broadcast', { method: 'POST', body: JSON.stringify({ prompt, providers }) });
+    renderBroadcastResults(reply.results || []);
+    const okCount = (reply.results || []).filter((member) => member.ok).length;
+    $('#broadcast-status').textContent = `${okCount}/${(reply.results || []).length} providers answered${reply.runId ? ' · ' + reply.runId : ''}`;
+  } catch (error) {
+    $('#broadcast-status').textContent = 'Broadcast failed: ' + error.message;
+  } finally { button.disabled = false; }
+};
+
+async function openAgents() {
+  if (typeof agentsDialog.showModal === 'function') agentsDialog.showModal(); else agentsDialog.setAttribute('open', 'true');
+  const body = $('#agents-body');
+  body.textContent = 'Loading…';
+  try {
+    await loadAgents();
+    body.innerHTML = '';
+    const note = document.createElement('div');
+    note.style.cssText = 'color:var(--muted); font-size:11px; margin-bottom:8px;';
+    note.textContent = 'Tags group providers for 📡 Broadcast and MCP targeting. Comma-separated, lowercase (e.g. coding, audit, search, local). Readiness comes from the last install check.';
+    body.appendChild(note);
+    for (const agent of agentsCache) {
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex; gap:10px; align-items:center; padding:8px 0; border-bottom:1px solid var(--border); flex-wrap:wrap;';
+      const info = document.createElement('div');
+      info.style.cssText = 'flex:0 0 200px; min-width:160px;';
+      const label = document.createElement('strong');
+      label.textContent = agent.label;
+      const model = document.createElement('div');
+      model.style.cssText = 'color:var(--muted); font-size:11px;';
+      model.textContent = [agent.model || agent.id, agent.autoRoute === false ? 'opt-in (autoRoute off)' : null].filter(Boolean).join(' · ');
+      info.append(label, model);
+      const badge = agentReadinessBadge(agent);
+      badge.style.flex = 'none';
+      const tagsInput = document.createElement('input');
+      tagsInput.type = 'text';
+      tagsInput.value = (agent.tags || []).join(', ');
+      tagsInput.placeholder = 'comma-separated tags';
+      tagsInput.style.cssText = 'flex:1; min-width:160px; background:var(--panel-2); border:1px solid var(--border); color:var(--text); padding:6px 10px; border-radius:6px; font:12px system-ui,sans-serif;';
+      const save = document.createElement('button');
+      save.className = 'btn';
+      save.textContent = 'Save';
+      const feedback = document.createElement('span');
+      feedback.style.cssText = 'font-size:11px; flex:none; min-width:60px;';
+      save.onclick = async () => {
+        const tags = tagsInput.value.split(',').map((value) => value.trim().toLowerCase()).filter(Boolean);
+        save.disabled = true;
+        feedback.style.color = 'var(--muted)';
+        feedback.textContent = 'Saving…';
+        try {
+          const reply = await api(`/api/agents/${encodeURIComponent(agent.id)}/tags`, { method: 'POST', body: JSON.stringify({ tags }) });
+          tagsInput.value = (reply.tags || []).join(', ');
+          feedback.style.color = '#2ea043';
+          feedback.textContent = '✓ saved';
+        } catch (error) {
+          feedback.style.color = '#d9534f';
+          feedback.textContent = '✗ ' + error.message.slice(0, 120);
+        } finally { save.disabled = false; }
+      };
+      row.append(info, badge, tagsInput, save, feedback);
+      body.appendChild(row);
+    }
+  } catch (error) {
+    body.innerHTML = `<span style="color:#d9534f">Agents failed: ${escapeHtml(error.message)}</span>`;
+  }
+}
+
+$('#agents-btn').onclick = openAgents;
+$('#agents-close-btn').onclick = () => { try { agentsDialog.close(); } catch { agentsDialog.removeAttribute('open'); } };
 
 const savedDialog = document.getElementById('saved-dialog');
 const savedBody = document.getElementById('saved-body');
