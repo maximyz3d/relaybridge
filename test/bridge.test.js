@@ -50,7 +50,7 @@ test('provider config uses the installed subscription CLIs and safe headless mod
   assert.equal(config.gemini.npm_package, undefined);
 
   assert.equal(config.grok.npm_package, '@xai-official/grok');
-  assert.equal(config.grok.model, 'grok-4.5');
+  assert.equal(config.grok.model, 'grok-4.6');
   assert.ok(config.grok.dangerous.includes('--always-approve'));
   assert.ok(config.grok.oneshot_safe.includes('{prompt_file}'));
   assert.equal(config.grok.oneshot_safe[config.grok.oneshot_safe.indexOf('--permission-mode') + 1], 'dontAsk');

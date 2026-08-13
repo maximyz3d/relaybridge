@@ -399,16 +399,16 @@
     "company": "xAI",
     "transport": "subscription:grok-build",
     "color": "#f4f4f4",
-    "model": "grok-4.5",
+    "model": "grok-4.6",
     "safe": [
       "grok",
       "--model",
-      "grok-4.5"
+      "grok-4.6"
     ],
     "dangerous": [
       "grok",
       "--model",
-      "grok-4.5",
+      "grok-4.6",
       "--always-approve",
       "--sandbox",
       "off"
@@ -416,7 +416,7 @@
     "oneshot_safe": [
       "grok",
       "--model",
-      "grok-4.5",
+      "grok-4.6",
       "--prompt-file",
       "{prompt_file}",
       "--output-format",
@@ -436,7 +436,7 @@
     "oneshot_dangerous": [
       "grok",
       "--model",
-      "grok-4.5",
+      "grok-4.6",
       "--prompt-file",
       "{prompt_file}",
       "--output-format",
@@ -456,7 +456,7 @@
       "grok",
       "models"
     ],
-    "probe_expect": "grok-4.5",
+    "probe_expect": "grok-4.6",
     "probe_success_detail": "authenticated; configured Grok model is available",
     "version_probe": [
       "grok",
