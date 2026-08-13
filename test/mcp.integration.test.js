@@ -137,7 +137,7 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   assert.ok(listedResources.resources.some((resource) => resource.uri === 'psbridge://context'));
   const healthResource = await client.readResource({ uri: 'psbridge://health' });
   const healthPayload = JSON.parse(healthResource.contents[0].text);
-  assert.equal(healthPayload.version, '2.0.0');
+  assert.equal(healthPayload.version, '2.0.1');
   assert.equal(healthPayload.capabilityAuth, true);
 
   const capability = await (await fetch(`${baseUrl}/api/capability`)).json();
@@ -169,7 +169,7 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   assert.equal(contextBundle.isError, undefined, JSON.stringify(contextBundle.structuredContent));
   assert.match(contextBundle.structuredContent.bundleId, /^ctx_/);
   assert.equal(contextBundle.structuredContent.bundleId, `ctx_${contextBundle.structuredContent.contentSha256.slice(0, 20)}`);
-  assert.equal(contextBundle.structuredContent.bridge.health.version, '2.0.0');
+  assert.equal(contextBundle.structuredContent.bridge.health.version, '2.0.1');
   assert.ok(contextBundle.structuredContent.providers.length >= 3);
   assert.equal(contextBundle.structuredContent.transfer.withinBudget, true);
   assert.ok(contextBundle.structuredContent.transferGuide.delegatedWork.includes('get_run'));

@@ -10,12 +10,20 @@ const os = require('os');
 const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 const { spawn, spawnSync } = require('child_process');
+const ROOT = __dirname;
 const BRIDGE_VERSION = require('./package.json').version;
+function loadBuildId() {
+  try {
+    const value = JSON.parse(fs.readFileSync(path.join(ROOT, 'build-info.json'), 'utf8')).buildId;
+    if (/^[A-Za-z0-9._+-]{1,128}$/.test(String(value || ''))) return String(value);
+  } catch {}
+  return BRIDGE_VERSION;
+}
+const BRIDGE_BUILD_ID = loadBuildId();
 
 // ---- config ----
 const PORT = parseInt(process.env.PORT || '8787', 10);
 const HOST = '127.0.0.1';
-const ROOT = __dirname;
 const STATE_FILE = path.join(ROOT, '.state.json');
 function envFirst(...names) {
   for (const name of names) {
@@ -71,7 +79,7 @@ function readTokenAclState(filePath) {
 
 function currentUserSid() {
   const result = spawnSync('whoami.exe', ['/user', '/fo', 'csv', '/nh'], { encoding: 'utf8', windowsHide: true, timeout: 15000 });
-  const match = /(S-1-5-21-[0-9-]+)/.exec(String(result.stdout || ''));
+  const match = /(S-[0-9]+(?:-[0-9]+)+)/.exec(String(result.stdout || ''));
   return match ? match[1] : null;
 }
 
@@ -145,6 +153,11 @@ const ALLOWED_ROOTS = (ALLOWED_ROOTS_VALUE
   .filter(Boolean)
   .map((value) => path.resolve(value));
 
+function isDirectory(value) {
+  try { return fs.statSync(value).isDirectory(); }
+  catch { return false; }
+}
+
 function isInsideAllowedRoot(candidate) {
   const normalized = process.platform === 'win32' ? candidate.toLowerCase() : candidate;
   return ALLOWED_ROOTS.some((root) => {
@@ -153,11 +166,41 @@ function isInsideAllowedRoot(candidate) {
   });
 }
 
-function resolveAllowedCwd(value, fallback = process.env.USERPROFILE || ROOT) {
-  const resolved = path.resolve(value || fallback);
-  if (!isInsideAllowedRoot(resolved)) throw new Error(`cwd is outside RELAYBRIDGE_ALLOWED_ROOTS: ${resolved}`);
+function defaultAllowedCwd() {
+  const preferred = path.resolve(process.env.USERPROFILE || ROOT);
+  const candidates = [preferred, ...ALLOWED_ROOTS];
+  const seen = new Set();
+  for (const candidate of candidates) {
+    const normalized = process.platform === 'win32' ? candidate.toLowerCase() : candidate;
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    if (isInsideAllowedRoot(candidate) && isDirectory(candidate)) return candidate;
+  }
+  throw new Error(`no usable default cwd exists inside RELAYBRIDGE_ALLOWED_ROOTS: ${ALLOWED_ROOTS.join('; ')}`);
+}
+
+function resolveAllowedCwd(value, fallback) {
+  const resolved = path.resolve(value || fallback || defaultAllowedCwd());
+  if (!isInsideAllowedRoot(resolved)) {
+    throw new Error(`cwd is outside RELAYBRIDGE_ALLOWED_ROOTS: ${resolved}; allowed roots: ${ALLOWED_ROOTS.join('; ')}`);
+  }
   if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) throw new Error(`cwd is not a directory: ${resolved}`);
   return resolved;
+}
+
+function workspacePolicy() {
+  let defaultCwd = null;
+  let error = null;
+  try { defaultCwd = defaultAllowedCwd(); }
+  catch (err) { error = err.message; }
+  const userProfile = path.resolve(process.env.USERPROFILE || ROOT);
+  return {
+    explicit: !!ALLOWED_ROOTS_VALUE,
+    allowedRoots: [...ALLOWED_ROOTS],
+    defaultCwd,
+    defaultSource: defaultCwd === userProfile ? 'user-profile' : (defaultCwd ? 'allowed-root' : null),
+    error,
+  };
 }
 
 function tokenMatches(value) {
@@ -408,6 +451,7 @@ function buildEnv(extras = {}, stripNames = []) {
     const cur = env[pathKey] || '';
     const candidates = [
       path.join(process.env.LOCALAPPDATA || '', 'agy', 'bin'),
+      path.join(process.env.LOCALAPPDATA || '', 'cursor-agent'),
       path.join(process.env.USERPROFILE || '', '.local', 'bin'),
       path.join(process.env.USERPROFILE || '', '.cursor', 'bin'),
       path.join(process.env.APPDATA || '', 'npm'),
@@ -1052,6 +1096,7 @@ app.get('/api/health', (req, res) => {
     activeOneShotCount,
     maxActiveOneShots: MAX_ACTIVE_ONESHOTS,
     version: BRIDGE_VERSION,
+    buildId: BRIDGE_BUILD_ID,
     capabilityAuth: true,
     tokenAcl: TOKEN_ACL,
     stickyDangerousEnabled: envFirst('RELAYBRIDGE_ALLOW_STICKY_DANGEROUS', 'PS_BRIDGE_ALLOW_STICKY_DANGEROUS') === '1',
@@ -1079,6 +1124,13 @@ app.use('/api', (req, res, next) => {
 
 app.get('/api/config', (req, res) => {
   res.json(loadConfig());
+});
+
+// Authenticated workspace-policy discovery keeps browser defaults aligned with
+// an operator-supplied allowlist. The public health endpoint intentionally does
+// not expose local filesystem paths.
+app.get('/api/workspace', (req, res) => {
+  res.json(workspacePolicy());
 });
 
 function runProbe(slotRaw, timeoutMs = 15000, stripEnv = [], signal) {
@@ -1304,8 +1356,10 @@ app.get('/api/diag', async (req, res) => {
       const probe = await runProbe(entry.probe, Number(entry.probe_timeout_ms || 30000), entry.strip_env || [], controller.signal);
       probeExitCode = probe.exitCode;
       ready = !probe.timedOut && probe.exitCode === 0;
-      const probeText = cleanOutput(probe.stdout || probe.stderr);
+      const probeText = cleanOutput([probe.stdout, probe.stderr].filter(Boolean).join('\n'));
       if (entry.probe_expect && !probeText.toLowerCase().includes(String(entry.probe_expect).toLowerCase())) ready = false;
+      const probeReject = Array.isArray(entry.probe_reject) ? entry.probe_reject : [];
+      if (probeReject.some((value) => probeText.toLowerCase().includes(String(value).toLowerCase()))) ready = false;
       detail = ready && entry.probe_success_detail
         ? String(entry.probe_success_detail).slice(0, 300)
         : (entry.probe_redact ? (ready ? 'readiness check passed' : 'readiness check failed') : probeText.split('\n')[0].slice(0, 300));
@@ -1598,7 +1652,13 @@ async function executeOneShot(body, res) {
     clearTimeout(t);
     cleanupPromptFile();
     if (clientGone || res.writableEnded) return;
-    const blob = (stdout + '\n' + stderr).toLowerCase();
+    const cleanedStdout = cleanOutput(stdout);
+    // Treat model prose on stdout as content when the provider exited zero and
+    // returned a usable answer. Failure phrases are authoritative on stderr,
+    // or in stdout only when the process itself failed / returned no answer.
+    // This prevents an audit discussing "rate limit" or HTTP 429 handling from
+    // being misclassified as a provider failure.
+    const failureBlob = (stderr + ((code !== 0 || !cleanedStdout) ? ('\n' + stdout) : '')).toLowerCase();
     const rate_signals = ['rate limit','rate-limit','too many requests','quota exceeded','usage limit reached','hit your usage limit','hit your limit','upgrade to pro','429','credit balance is too low','usage limit','out of credits'];
     const budget_signals = ['exceeded usd budget','exceeded the usd budget','max-budget-usd','budget exceeded','budget cap reached'];
     // Word boundaries avoid false positives such as "deSIGN INtent" in a
@@ -1611,17 +1671,16 @@ async function executeOneShot(body, res) {
       /\blogin required\b/,
       /\bauthentication required\b/,
     ];
-    const rate_limited = rate_signals.some(s => blob.includes(s));
-    const budget_exceeded = budget_signals.some(s => blob.includes(s));
-    const cleanedStdout = cleanOutput(stdout);
+    const rate_limited = rate_signals.some(s => failureBlob.includes(s));
+    const budget_exceeded = budget_signals.some(s => failureBlob.includes(s));
     // Some CLIs report unrelated MCP authentication warnings on stderr even
     // after the selected provider completed successfully. Only classify the
     // provider route as unauthenticated when the command failed or produced no
     // usable answer.
-    const auth_failed = auth_signals.some((pattern) => pattern.test(blob))
+    const auth_failed = auth_signals.some((pattern) => pattern.test(failureBlob))
       && (code !== 0 || !cleanedStdout);
     const permission_signals = ['headless mode cannot prompt', 'auto-denied', 'no output produced'];
-    const permission_denied = permission_signals.some((signal) => blob.includes(signal));
+    const permission_denied = permission_signals.some((signal) => failureBlob.includes(signal));
     const dropped_out = timedOut || code !== 0 || permission_denied || rate_limited || budget_exceeded || auth_failed || !cleanedStdout;
     sendOneShotResult(res, {
       kind,
@@ -1788,8 +1847,11 @@ app.post('/api/install', (req, res) => {
   const spawnArgs = isWindowsShim
     ? ['/d', '/s', '/c', [resolvedBinary, ...configuredArgs].map(quoteCmdArg).join(' ')]
     : configuredArgs;
+  let installCwd;
+  try { installCwd = defaultAllowedCwd(); }
+  catch (err) { return res.status(400).json({ error: err.message }); }
   const proc = trackChild(spawn(spawnBinary, spawnArgs, {
-    cwd: process.env.USERPROFILE || ROOT,
+    cwd: installCwd,
     env,
     windowsHide: true,
   }));

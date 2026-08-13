@@ -12,7 +12,9 @@ Run this in PowerShell:
 irm https://raw.githubusercontent.com/maximyz3d/relaybridge/main/install.ps1 | iex
 ```
 
-That installs RelayBridge to `%LOCALAPPDATA%\RelayBridge`, installs Node dependencies, starts `http://127.0.0.1:8787`, and opens the dashboard.
+That installs RelayBridge to `%LOCALAPPDATA%\RelayBridge`, installs locked Node dependencies in a sibling staging directory, starts `http://127.0.0.1:8787`, verifies the exact staged build, and then opens the dashboard.
+
+Updates are transactional. The installer tests the staged release before draining a matching old bridge, atomically promotes it, and restores and restarts the previous build if promotion, startup, health verification, or MCP registration fails. `.bridge-token`, `.state.json`, and `data/` move with the release instead of being copied, while existing `cli-config.json` and `config/*.json` values win a schema-aware merge so operator model pins, tags, routing policy, and unknown providers are preserved. Optional provider installation happens only after the core cutover succeeds.
 
 If PowerShell blocks scripts on a new computer, use:
 
@@ -27,7 +29,10 @@ For scripted or repeat installs, download `install.ps1` and pass parameters:
 ```powershell
 .\install.ps1 -Providers cursor,claude   # install specific provider CLIs without the menu
 .\install.ps1 -SkipProviderSetup        # core bridge only, no provider prompt
+.\install.ps1 -MigrateFrom 'C:\old\RelayBridge'  # explicitly move token/state/data from one legacy root
 ```
+
+`-MigrateFrom` is deliberately explicit. If both the destination and migration source already exist, the installer stops rather than silently merging two security tokens or two data histories; archive the unwanted root and rerun with the intended source of truth.
 
 ## Requirements
 
@@ -47,6 +52,8 @@ From the install folder:
 Set-Location "$env:LOCALAPPDATA\RelayBridge"
 .\start.ps1
 ```
+
+`start.ps1` does not install or update dependencies. It refuses to open the dashboard until the listener reports the install's exact `buildId`; rerun `install.ps1` if the locked dependencies are missing.
 
 Use a staging port:
 
@@ -72,7 +79,7 @@ For a staged bridge:
 .\install-mcp.ps1 -BridgeUrl 'http://127.0.0.1:8788'
 ```
 
-The installer registers a user-scoped MCP server named `relaybridge` with Codex and Claude when those CLIs are available. It stores the loopback URL and the path to the local token file, not the token value itself. Restart Codex or Claude after registration so they reload MCP configuration.
+The installer registers a user-scoped MCP server named `relaybridge` with Codex and Claude when those CLIs are available. It stores the loopback URL and the path to the local token file, not the token value itself. After the canonical registration succeeds, recognized legacy names (`ps_bridge` and `ps-bridge`) are removed only when their command is confirmed to target a RelayBridge `mcp/server.mjs`; unrelated lookalikes are retained. A partial registration restores both client configuration files to their original bytes. Restart Codex or Claude after registration so they reload MCP configuration.
 
 Useful checks:
 
@@ -93,7 +100,7 @@ Action tools include starting/restarting/stopping the local bridge, opening safe
 
 ## Provider Setup
 
-Provider definitions live in `cli-config.json`. Each provider can define interactive safe/dangerous commands, one-shot safe/dangerous commands, readiness probes, install text, prompt caps, models, and environment variables to strip before execution.
+Provider definitions live in `cli-config.json`. Each provider can define interactive safe/dangerous commands, one-shot safe/dangerous commands, readiness probes, install text, prompt caps, models, and environment variables to strip before execution. A probe may combine `probe_expect` with a `probe_reject` string array; rejected output always wins, even when the CLI exits zero or the positive phrase is also present as part of a negative status.
 
 Agentic one-shot providers use bounded multi-turn budgets. Grok receives up to
 32 turns so a repository review can inspect evidence and still return a final
@@ -118,9 +125,11 @@ ollama pull qwen2.5-coder:7b
 
 Run each provider login once in a normal terminal, then restart RelayBridge and open `/api/diag` or the dashboard diagnostics view.
 
+Provider buttons and terminal tabs describe configured launch seats; they are not proof that a provider can complete a bounded one-shot. Diagnostics distinguish binary discovery (`found`) from the configured authentication/readiness probe (`ready`), and probe success is still not a quota or task-quality claim. Require a current one-shot receipt before claiming end-to-end availability for delegation or committee work.
+
 GitHub Copilot CLI can also be installed with `winget install GitHub.Copilot`. It requires an active Copilot plan and may ask you to trust the current workspace before it reads or changes files. RelayBridge configures Copilot as a bounded one-shot provider using `copilot --prompt`, and it strips GitHub token environment variables from child processes.
 
-Cursor Agent uses the native Windows CLI (the `agent` binary in `%USERPROFILE%\.local\bin`). RelayBridge runs the interactive safe seat in plan mode and the bounded one-shot safe seat as read-only Q&A (`--mode ask` with `--trust`, since headless print mode otherwise has full write access and would prompt for workspace trust). No model is pinned, so your account default applies; run `agent models` to list options and pin one in `cli-config.json` if you want. `CURSOR_API_KEY` is stripped from child processes so calls use your Cursor subscription login rather than silently billing a metered API key.
+Cursor Agent uses the native Windows CLI (the official PowerShell installer places the `agent` launcher in `%LOCALAPPDATA%\cursor-agent`). RelayBridge prepends that directory for child processes, so a bridge that started before Cursor was installed can resolve it without inheriting a refreshed shell PATH. The interactive safe seat runs in plan mode and the bounded one-shot safe seat runs as read-only Q&A (`--mode ask` with `--trust`, since headless print mode otherwise has full write access and would prompt for workspace trust). No model is pinned, so your account default applies; run `agent models` to list options and pin one in `cli-config.json` if you want. `CURSOR_API_KEY` is stripped from child processes so calls use your Cursor subscription login rather than silently billing a metered API key.
 
 The default Perplexity route uses the community `pwm` wrapper and strips paid API fallback variables. It depends on the connected Perplexity web account and may change if that upstream wrapper changes.
 
@@ -182,9 +191,9 @@ Core routes:
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| GET | `/api/health` | Liveness and instance identity |
+| GET | `/api/health` | Liveness, exact build identity, and instance identity |
 | GET | `/api/capability` | Same-origin token bootstrap |
-| GET | `/api/config`, `/api/diag`, `/api/permissions` | Configuration, readiness, permissions |
+| GET | `/api/config`, `/api/diag`, `/api/permissions`, `/api/workspace` | Configuration, readiness, permissions, effective cwd policy |
 | POST | `/api/permissions` | Change browser/global permission state |
 | GET/POST | `/api/sessions` | List or create sessions |
 | GET/POST/DELETE | `/api/sessions/:id/...` | Read, write to, or stop a session |
@@ -212,11 +221,12 @@ Runtime files that should not be committed:
 - `.bridge-token`
 - `.state.json`
 - `.mcp-start.lock`
+- `build-info.json`
 - `data/`
 - `node_modules/`
 - `*.log`
 
-Set `RELAYBRIDGE_DATA_DIR` to move retained data. Set `RELAYBRIDGE_ALLOWED_ROOTS` to restrict process start directories. That setting is not a complete filesystem sandbox for already-running host processes.
+Set `RELAYBRIDGE_DATA_DIR` to move retained data. Set `RELAYBRIDGE_ALLOWED_ROOTS` to a semicolon-separated list of directories to restrict process start directories. When an explicit allowlist excludes your user profile, RelayBridge defaults new browser, REST, MCP, and provider-installer work to the first existing allowed root; it never broadens the configured list. The authenticated `/api/workspace` endpoint reports the effective default and allowed roots. This setting is not a complete filesystem sandbox for already-running host processes.
 
 Legacy `PS_BRIDGE_*` environment variables are still accepted as fallbacks for existing installations.
 
@@ -226,6 +236,8 @@ No-spend checks:
 
 ```powershell
 npm test
+npm run test:install
+npm run test:install-mcp
 npm audit --omit=dev
 ```
 
@@ -236,7 +248,7 @@ $env:RELAYBRIDGE_URL = 'http://127.0.0.1:8787'
 npm run smoke:mcp -- --committee
 ```
 
-The test suite validates configuration, safety boundaries, transport cleanup, routing, cancellation, MCP tools/resources, and browser script parsing with fake providers. It does not prove provider authentication, quota, model quality, or benchmark performance.
+The test suite validates configuration, safety boundaries, transport cleanup, routing, cancellation, MCP tools/resources, browser script parsing, transactional update/rollback, config and runtime preservation, exact-build health, and MCP name migration with fake providers and fake client CLIs. It does not install or call providers, and it does not prove provider authentication, quota, model quality, or benchmark performance.
 
 ## For AI Agents
 

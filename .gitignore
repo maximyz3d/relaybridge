@@ -7,3 +7,4 @@ data/receipts/
 data/runs/
 data/
 *.log
+build-info.json

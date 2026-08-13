@@ -425,6 +425,7 @@
   <span id="status-mode">mode: …</span>
   <span id="status-count">0 tabs</span>
   <span id="status-perm">permissions: …</span>
+  <span id="status-workspace" class="status-pill">cwd: …</span>
   <span id="status-providers" class="status-pill">providers: not checked</span>
   <span id="status-work" class="status-pill">active calls: …</span>
   <span id="status-version" class="status-pill">bridge: …</span>
@@ -448,6 +449,7 @@ const state = {
   active: null,
   teamSnapshot: null,
   providerDiag: {},
+  workspacePolicy: {},
 };
 let nextCollabId = 1;
 const $ = (s) => document.querySelector(s);
@@ -698,6 +700,19 @@ async function loadConfig() {
   renderKindButtons();
 }
 
+async function loadWorkspacePolicy() {
+  const policy = await api('/api/workspace');
+  state.workspacePolicy = policy || {};
+  const el = $('#status-workspace');
+  const defaultCwd = policy?.defaultCwd || 'unavailable';
+  el.textContent = `cwd: ${defaultCwd}`;
+  el.title = policy?.explicit
+    ? `Explicit RELAYBRIDGE_ALLOWED_ROOTS: ${(policy.allowedRoots || []).join('; ')}`
+    : `Default roots: ${(policy?.allowedRoots || []).join('; ')}`;
+  el.className = 'status-pill ' + (policy?.error ? 'warn' : 'ok');
+  return policy;
+}
+
 function renderKindButtons() {
   kindBtnsEl.innerHTML = '';
   for (const [kind, entry] of Object.entries(state.config)) {
@@ -823,7 +838,10 @@ toggleEl.onclick = () => setPermissions(!state.fullPermissions);
 
 async function startSessionNow(kind) {
   try {
-    const meta = await api('/api/sessions', { method: 'POST', body: JSON.stringify({ kind, dangerous: state.fullPermissions }) });
+    const meta = await api('/api/sessions', {
+      method: 'POST',
+      body: JSON.stringify({ kind, dangerous: state.fullPermissions, cwd: state.workspacePolicy.defaultCwd || undefined }),
+    });
     attachSession(meta);
     setActive('session:' + meta.id);
   } catch (err) { toast('Failed to launch: ' + err.message, 'error'); }
@@ -890,7 +908,7 @@ function attachSession(meta) {
   const bar = document.createElement('div');
   bar.className = 'term-bar';
   const summary = document.createElement('span');
-  summary.textContent = `id ${meta.id} · ${meta.command} ${(meta.args || []).join(' ')}`;
+  summary.textContent = `id ${meta.id} · cwd ${meta.cwd} · ${meta.command} ${(meta.args || []).join(' ')}`;
   const spacer = document.createElement('span');
   spacer.style.flex = '1';
   const inp = document.createElement('input');
@@ -998,7 +1016,7 @@ $('#reload-btn').onclick = async () => {
   button.disabled = true;
   button.textContent = '↻ Refreshing…';
   try {
-    const [, , , diag] = await Promise.all([loadConfig(), loadPermissions(), refreshSessions(), api('/api/diag')]);
+    const [, , , , diag] = await Promise.all([loadConfig(), loadPermissions(), loadWorkspacePolicy(), refreshSessions(), api('/api/diag')]);
     updateProviderFooter(diag.results || {});
     await refreshHealthStatus();
   } catch (error) { toast('Refresh failed: ' + error.message, 'error'); }
@@ -2418,6 +2436,7 @@ $('#quick-install-skip-btn').onclick = () => {
   try {
     await loadConfig();
     await loadPermissions();
+    await loadWorkspacePolicy();
     await refreshSessions();
     await refreshHealthStatus();
     // Background CLI probe so provider dots and click-to-install detection

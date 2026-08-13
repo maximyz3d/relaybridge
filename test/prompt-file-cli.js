@@ -19,6 +19,8 @@ const delayIndex = process.argv.indexOf('--delay');
 const delayMs = delayIndex >= 0 ? Math.max(0, Number(process.argv[delayIndex + 1] || 0)) : 0;
 
 setTimeout(() => {
+  const stderrIndex = process.argv.indexOf('--stderr');
+  if (stderrIndex >= 0) process.stderr.write(String(process.argv[stderrIndex + 1] || '') + '\n');
   const exitIndex = process.argv.indexOf('--exit');
   if (exitIndex >= 0) {
     process.stderr.write('requested failure after reading ' + prompt.length + ' characters\n');

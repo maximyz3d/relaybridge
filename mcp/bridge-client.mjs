@@ -5,6 +5,15 @@ import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const BRIDGE_ROOT = path.resolve(HERE, '..');
+const PACKAGE = JSON.parse(fs.readFileSync(path.join(BRIDGE_ROOT, 'package.json'), 'utf8'));
+function loadExpectedBuildId() {
+  try {
+    const value = JSON.parse(fs.readFileSync(path.join(BRIDGE_ROOT, 'build-info.json'), 'utf8')).buildId;
+    if (/^[A-Za-z0-9._+-]{1,128}$/.test(String(value || ''))) return String(value);
+  } catch {}
+  return PACKAGE.version;
+}
+const EXPECTED_BUILD_ID = loadExpectedBuildId();
 function envFirst(...names) {
   for (const name of names) {
     const value = process.env[name];
@@ -140,6 +149,11 @@ export async function waitForHealth({ timeoutMs = 15000, expectDown = false } = 
   throw new BridgeError(`RelayBridge did not become healthy: ${lastError?.message || 'timeout'}`);
 }
 
+function requireExpectedBuild(result) {
+  if (result?.capabilityAuth && String(result.buildId || '') === EXPECTED_BUILD_ID) return result;
+  throw new BridgeError(`RelayBridge build ${result?.buildId || result?.version || 'unknown'} is using this port, but MCP expects ${EXPECTED_BUILD_ID}; perform a one-time restart before MCP can manage it`);
+}
+
 function acquireStartLock() {
   try {
     const handle = fs.openSync(START_LOCK, 'wx');
@@ -167,12 +181,11 @@ export async function startBridge() {
   let existing = null;
   try { existing = await health(); } catch {}
   if (existing) {
-    if (existing.capabilityAuth && /^2\./.test(String(existing.version || ''))) return { started: false, health: existing };
-    throw new BridgeError('an older RelayBridge-compatible server is already using this port; perform a one-time restart before MCP autostart can manage it');
+    return { started: false, health: requireExpectedBuild(existing) };
   }
 
   if (!acquireStartLock()) {
-    return { started: false, waitedForPeer: true, health: await waitForHealth({ timeoutMs: 20000 }) };
+    return { started: false, waitedForPeer: true, health: requireExpectedBuild(await waitForHealth({ timeoutMs: 20000 })) };
   }
   try {
     const stdoutFd = fs.openSync(OUT_LOG, 'a');
@@ -187,7 +200,12 @@ export async function startBridge() {
     child.unref();
     fs.closeSync(stdoutFd);
     fs.closeSync(stderrFd);
-    const live = await waitForHealth({ timeoutMs: 20000 });
+    let live;
+    try { live = requireExpectedBuild(await waitForHealth({ timeoutMs: 20000 })); }
+    catch (error) {
+      try { process.kill(child.pid, 'SIGTERM'); } catch {}
+      throw error;
+    }
     await getCapabilityToken({ refresh: true });
     return { started: true, pid: child.pid, health: live, logs: { stdout: OUT_LOG, stderr: ERR_LOG } };
   } finally {

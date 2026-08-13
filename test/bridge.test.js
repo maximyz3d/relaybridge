@@ -6,6 +6,7 @@ const fs = require('fs');
 const http = require('http');
 const os = require('os');
 const path = require('path');
+const { pathToFileURL } = require('url');
 const { spawn, spawnSync } = require('child_process');
 
 const ROOT = path.resolve(__dirname, '..');
@@ -31,6 +32,7 @@ test('provider config uses the installed subscription CLIs and safe headless mod
   assert.ok(config.codex.oneshot_safe.includes('--ephemeral'));
   assert.deepEqual(config.codex.probe, ['codex', 'login', 'status']);
   assert.equal(config.copilot.npm_package, '@github/copilot');
+  assert.deepEqual(config.copilot.install_command, ['npm', 'install', '-g', '@github/copilot']);
   assert.deepEqual(config.copilot.probe, ['copilot', '--version']);
   assert.ok(config.copilot.oneshot_safe.includes('--prompt'));
   assert.ok(config.copilot.oneshot_safe.includes('{prompt}'));
@@ -96,6 +98,8 @@ test('cursor provider pins safe modes, probe, and guided install metadata', () =
   assert.equal(config.cursor.oneshot_safe.at(-1), '{prompt}');
   assert.ok(config.cursor.oneshot_dangerous.includes('--force'));
   assert.deepEqual(config.cursor.probe, ['agent', 'status']);
+  assert.ok(config.cursor.probe_reject.includes('not logged in'));
+  assert.equal(config.cursor.probe_expect, 'Logged in as');
   assert.equal(config.cursor.probe_redact, true);
   assert.ok(config.cursor.strip_env.includes('CURSOR_API_KEY'));
   assert.match(config.cursor.install_display, /cursor\.com\/install\?win32=true/);
@@ -155,6 +159,55 @@ test('server, MCP adapter, Perplexity wrapper, and inline browser script parse',
   const match = html.match(/<script>\s*(const API =[\s\S]*?)<\/script>/);
   assert.ok(match, 'inline application script was not found');
   assert.doesNotThrow(() => new Function(match[1]));
+  const startScript = fs.readFileSync(path.join(ROOT, 'start.ps1'), 'utf8');
+  assert.doesNotMatch(startScript, /^\s*(?:&\s*)?npm\s+(?:ci|install)/im, 'normal start must not mutate dependencies');
+  assert.match(startScript, /expectedBuildId/);
+  assert.match(startScript, /api\/health/);
+});
+
+test('MCP bridge startup rejects a healthy same-version listener with a different build identity', async (t) => {
+  const port = await reservePort();
+  const listener = http.createServer((req, res) => {
+    if (req.url === '/api/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ version: '2.0.1', buildId: '2.0.1+stale-build', capabilityAuth: true }));
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  await new Promise((resolve, reject) => {
+    listener.once('error', reject);
+    listener.listen(port, '127.0.0.1', resolve);
+  });
+  t.after(() => new Promise((resolve) => listener.close(resolve)));
+
+  const moduleUrl = pathToFileURL(path.join(ROOT, 'mcp', 'bridge-client.mjs')).href;
+  const childScript = `
+    import { startBridge } from ${JSON.stringify(moduleUrl)};
+    try {
+      await startBridge();
+      console.error('unexpected startup acceptance');
+      process.exit(2);
+    } catch (error) {
+      console.error(error.message);
+      process.exit(/MCP expects 2\\.0\\.1/.test(error.message) ? 0 : 3);
+    }
+  `;
+  const child = spawn(process.execPath, ['--input-type=module', '--eval', childScript], {
+    cwd: ROOT,
+    env: { ...process.env, RELAYBRIDGE_URL: `http://127.0.0.1:${port}` },
+    windowsHide: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let output = '';
+  child.stdout.on('data', (chunk) => { output += chunk; });
+  child.stderr.on('data', (chunk) => { output += chunk; });
+  const exitCode = await new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('close', resolve);
+  });
+  assert.equal(exitCode, 0, output);
+  assert.match(output, /stale-build/);
 });
 
 function reservePort() {
@@ -216,6 +269,13 @@ test('prompt-file transport preserves long special-character prompts and cleans 
       dangerous: [process.execPath, helper, '--version'],
       oneshot_safe: [...baseSlot, '--exit', '7'],
       oneshot_dangerous: [...baseSlot, '--exit', '7'],
+    },
+    rate_fail: {
+      label: 'Rate Limited Failure',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--stderr', 'HTTP 429 rate limit exceeded', '--exit', '29'],
+      oneshot_dangerous: [...baseSlot, '--stderr', 'HTTP 429 rate limit exceeded', '--exit', '29'],
     },
     slow: {
       label: 'Slow',
@@ -293,6 +353,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.match(dashboardHtml, /<script nonce="[A-Za-z0-9+/=]+">\s*const API/);
   const runningHealth = await (await fetch(baseUrl + '/api/health')).json();
   assert.equal(runningHealth.fullPermissions, false);
+  assert.equal(runningHealth.buildId, '2.0.1');
   assert.equal(runningHealth.stickyDangerousEnabled, false);
   assert.ok(Object.prototype.hasOwnProperty.call(runningHealth, 'tokenAcl'));
   if (process.platform === 'win32') {
@@ -342,6 +403,21 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(cwdResponse.status, 200);
   assert.equal((await cwdResponse.json()).stdout, tempRoot);
 
+  const healthyRateDiscussion = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST',
+    headers: jsonAuth,
+    body: JSON.stringify({
+      kind: 'echo',
+      prompt: 'Healthy audit prose: rate limit handling should preserve HTTP 429 details.',
+      dangerous: false,
+    }),
+  });
+  assert.equal(healthyRateDiscussion.status, 200);
+  const healthyRateResult = await healthyRateDiscussion.json();
+  assert.equal(healthyRateResult.exitCode, 0);
+  assert.equal(healthyRateResult.rate_limited, false);
+  assert.equal(healthyRateResult.dropped_out, false);
+
   const badEnvResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST',
     headers: jsonAuth,
@@ -359,6 +435,16 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(failed.exitCode, 7);
   assert.equal(failed.dropped_out, true);
   assert.deepEqual(fs.readdirSync(promptTemp), []);
+
+  const rateFailureResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST',
+    headers: jsonAuth,
+    body: JSON.stringify({ kind: 'rate_fail', prompt: 'genuine provider failure', dangerous: false }),
+  });
+  const rateFailure = await rateFailureResponse.json();
+  assert.equal(rateFailure.exitCode, 29);
+  assert.equal(rateFailure.rate_limited, true);
+  assert.equal(rateFailure.dropped_out, true);
 
   const blankResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST',
