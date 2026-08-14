@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { McpServer } from '@modelcontextprotocol/server';
 import { serveStdio } from '@modelcontextprotocol/server/stdio';
@@ -538,9 +539,273 @@ function cacheTtlFor(classification, requestedTtlMs) {
   return classification.tags.includes('research') ? policy.cache.researchTtlMs : policy.cache.defaultTtlMs;
 }
 
+function strictTokenCount(value) {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+    ? value : null;
+}
+
+function strictProviderCost(value) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+    ? value : null;
+}
+
+function strictTokenSum(values) {
+  let total = 0;
+  for (const value of values) {
+    if (!Number.isSafeInteger(value) || value < 0) return null;
+    total += value;
+    if (!Number.isSafeInteger(total)) return null;
+  }
+  return total;
+}
+
+export function normalizeProviderUsage(value, modelInvocation) {
+  if (!modelInvocation || !value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const has = (name) => Object.prototype.hasOwnProperty.call(value, name);
+  const strictOptionalCount = (name, absentValue = null) => {
+    if (!has(name)) return absentValue;
+    return strictTokenCount(value[name]);
+  };
+  const inputTokens = strictOptionalCount('input_tokens');
+  const outputTokens = strictOptionalCount('output_tokens');
+  const cacheReadTokens = strictOptionalCount('cache_read_input_tokens', 0);
+  const cacheCreationTokens = strictOptionalCount('cache_creation_input_tokens', 0);
+  const reportedTotal = strictOptionalCount('total_tokens');
+  if (
+    (has('input_tokens') && inputTokens === null)
+    || (has('output_tokens') && outputTokens === null)
+    || (has('cache_read_input_tokens') && cacheReadTokens === null)
+    || (has('cache_creation_input_tokens') && cacheCreationTokens === null)
+    || (has('total_tokens') && reportedTotal === null)
+  ) return null;
+  const computedTotal = inputTokens !== null && outputTokens !== null
+    ? strictTokenSum([inputTokens, outputTokens, cacheReadTokens || 0, cacheCreationTokens || 0])
+    : null;
+  const totalTokens = computedTotal ?? reportedTotal;
+  const thinkingCandidate = strictOptionalCount('thinking_tokens');
+  if (has('thinking_tokens') && thinkingCandidate === null) return null;
+  const thinkingTokens = thinkingCandidate !== null
+    && (outputTokens === null || thinkingCandidate <= outputTokens) ? thinkingCandidate : null;
+  const cost = strictProviderCost(value.cost_usd);
+  if (has('cost_usd') && value.cost_usd !== null && cost === null) return null;
+  if (totalTokens === null && inputTokens === null && outputTokens === null && cost === null) return null;
+  if (has('model_usage') && !Array.isArray(value.model_usage)) return null;
+  const modelUsage = [];
+  const seenModels = new Set();
+  for (const row of value.model_usage || []) {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) return null;
+    const model = strictBoundedString(row.model, 160);
+    const provider = row.provider === '' ? '' : strictBoundedString(row.provider, 80);
+    const rowInput = strictTokenCount(row.input_tokens);
+    const rowOutput = strictTokenCount(row.output_tokens);
+    const rowCacheRead = strictTokenCount(row.cache_read_input_tokens);
+    const rowCacheCreation = strictTokenCount(row.cache_creation_input_tokens);
+    const rowCost = row.cost_usd === null ? null : strictProviderCost(row.cost_usd);
+    if (!model || seenModels.has(model) || provider === null
+      || [rowInput, rowOutput, rowCacheRead, rowCacheCreation].some((item) => item === null)
+      || (row.cost_usd !== null && rowCost === null)) return null;
+    seenModels.add(model);
+    modelUsage.push({
+      model, provider, input_tokens: rowInput, output_tokens: rowOutput,
+      cache_read_input_tokens: rowCacheRead,
+      cache_creation_input_tokens: rowCacheCreation,
+      cost_usd: rowCost,
+    });
+  }
+  if (modelUsage.length) {
+    const sumRows = (name) => strictTokenSum(modelUsage.map((row) => row[name]));
+    if (inputTokens === null || outputTokens === null
+      || inputTokens !== sumRows('input_tokens') || outputTokens !== sumRows('output_tokens')
+      || cacheReadTokens !== sumRows('cache_read_input_tokens')
+      || cacheCreationTokens !== sumRows('cache_creation_input_tokens')) return null;
+  }
+  return {
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    cache_read_input_tokens: cacheReadTokens,
+    cache_creation_input_tokens: cacheCreationTokens,
+    total_tokens: totalTokens,
+    thinking_tokens: thinkingTokens,
+    cost_usd: cost,
+    token_source: totalTokens !== null || inputTokens !== null || outputTokens !== null
+      ? 'provider_reported' : 'provider_reported_cost_only',
+    model_usage: modelUsage,
+  };
+}
+
+const PROVIDER_RETRY_ERROR_CATEGORIES = new Set([
+  'authentication_failed', 'oauth_org_not_allowed', 'billing_error', 'rate_limit',
+  'overloaded', 'invalid_request', 'model_not_found', 'server_error',
+  'max_output_tokens', 'unknown',
+]);
+
+const PROVIDER_FAILURE_CLASSES = new Set([
+  'cancelled', 'rate_limit', 'budget', 'auth', 'timeout', 'policy',
+  'max_tokens', 'refusal', 'max_turns', 'structured_output_retry_exhausted',
+  'tool_deferred', 'aborted_streaming', 'aborted_tools', 'hook_stopped',
+  'stop_hook_prevented', 'blocking_limit', 'prompt_too_long',
+  'provider_error', 'admission_limit',
+]);
+
+const PROVIDER_TERMINAL_REASONS = new Set([
+  'completed', 'max_turns', 'tool_deferred', 'aborted_streaming', 'aborted_tools',
+  'hook_stopped', 'stop_hook_prevented', 'blocking_limit', 'rapid_refill_breaker',
+  'prompt_too_long', 'image_error', 'model_error',
+]);
+
+function strictBoundedString(value, maxChars = 128) {
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim();
+  return normalized ? normalized.slice(0, maxChars) : null;
+}
+
+function strictCountMap(value, allowedKey) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const rows = [];
+  for (const [key, rawCount] of Object.entries(value)) {
+    if (!allowedKey(key)) continue;
+    const count = strictTokenCount(rawCount);
+    if (count === null) continue;
+    rows.push([key, count]);
+  }
+  rows.sort(([left], [right]) => left.localeCompare(right));
+  return Object.fromEntries(rows);
+}
+
+function zeroProviderRetries() {
+  return {
+    count: 0,
+    total_delay_ms: 0,
+    max_attempt: 0,
+    declared_max_retries: 0,
+    by_error: {},
+    by_status: {},
+    events: [],
+    truncated: false,
+    observed_events: 0,
+    invalid_events: 0,
+    duplicate_events: 0,
+  };
+}
+
+export function normalizeProviderRetries(value, modelInvocation) {
+  if (modelInvocation === false) return zeroProviderRetries();
+  if (modelInvocation !== true || !value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const events = [];
+  const eventIds = new Set();
+  if (Array.isArray(value.events)) {
+    for (const event of value.events.slice(0, 256)) {
+      if (!event || typeof event !== 'object' || Array.isArray(event)) continue;
+      const attempt = strictTokenCount(event.attempt);
+      const maxRetries = strictTokenCount(event.max_retries);
+      const retryDelayMs = strictTokenCount(event.retry_delay_ms);
+      const eventIdHash = typeof event.event_id_hash === 'string' && /^[0-9a-f]{64}$/.test(event.event_id_hash)
+        ? event.event_id_hash : null;
+      const statusAbsent = event.error_status === null || event.error_status === undefined;
+      const status = statusAbsent ? null : strictTokenCount(event.error_status);
+      const category = typeof event.error === 'string' && PROVIDER_RETRY_ERROR_CATEGORIES.has(event.error)
+        ? event.error : 'unknown';
+      if (!eventIdHash || attempt === null || attempt < 1 || maxRetries === null || retryDelayMs === null) continue;
+      if (!statusAbsent && (status === null || status < 100 || status > 599)) continue;
+      if (eventIds.has(eventIdHash)) continue;
+      eventIds.add(eventIdHash);
+      events.push({
+        event_id_hash: eventIdHash,
+        attempt,
+        max_retries: maxRetries,
+        retry_delay_ms: retryDelayMs,
+        error_status: status,
+        error: category,
+      });
+    }
+  }
+  const count = strictTokenCount(value.count);
+  const totalDelayMs = value.total_delay_ms === null ? null : strictTokenCount(value.total_delay_ms);
+  const maxAttempt = strictTokenCount(value.max_attempt);
+  const declaredMaxRetries = strictTokenCount(value.declared_max_retries);
+  const observedEvents = strictTokenCount(value.observed_events);
+  const invalidEvents = strictTokenCount(value.invalid_events);
+  const duplicateEvents = strictTokenCount(value.duplicate_events);
+  const byError = strictCountMap(value.by_error, (key) => PROVIDER_RETRY_ERROR_CATEGORIES.has(key));
+  const byStatus = strictCountMap(value.by_status, (key) => key === 'none' || /^(?:[1-5]\d\d)$/.test(key));
+  const mapSum = (mapping) => strictTokenSum(Object.values(mapping));
+  const expectedRetained = count === null ? null : Math.min(count, 256);
+  const expectedTruncated = count !== null && count > events.length;
+  const observedBreakdown = strictTokenSum([count ?? -1, invalidEvents ?? -1, duplicateEvents ?? -1]);
+  if (
+    count === null || maxAttempt === null || declaredMaxRetries === null
+    || observedEvents === null || invalidEvents === null || duplicateEvents === null
+    || observedBreakdown === null || observedEvents !== observedBreakdown
+    || events.length !== expectedRetained
+    || value.truncated !== expectedTruncated
+    || mapSum(byError) !== count || mapSum(byStatus) !== count
+  ) return null;
+  if (!expectedTruncated) {
+    const eventDelay = strictTokenSum(events.map((event) => event.retry_delay_ms));
+    const eventMaxAttempt = events.reduce((current, event) => Math.max(current, event.attempt), 0);
+    const eventMaxRetries = events.reduce((current, event) => Math.max(current, event.max_retries), 0);
+    if (totalDelayMs !== eventDelay || maxAttempt !== eventMaxAttempt || declaredMaxRetries !== eventMaxRetries) return null;
+  }
+  return {
+    count,
+    total_delay_ms: totalDelayMs,
+    max_attempt: maxAttempt,
+    declared_max_retries: declaredMaxRetries,
+    by_error: byError,
+    by_status: byStatus,
+    events,
+    truncated: value.truncated === true,
+    observed_events: observedEvents,
+    invalid_events: invalidEvents,
+    duplicate_events: duplicateEvents,
+  };
+}
+
+function zeroProviderPermissionDenials() {
+  return { retained: [], count: 0, observed: 0, invalid: 0, truncated: false, byTool: {} };
+}
+
+export function normalizeProviderPermissionDenials(value, modelInvocation) {
+  if (modelInvocation === false) return zeroProviderPermissionDenials();
+  if (modelInvocation !== true || !value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const retained = [];
+  const ids = new Set();
+  for (const row of Array.isArray(value.retained) ? value.retained.slice(0, 256) : []) {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) return null;
+    const toolName = strictBoundedString(row.tool_name, 160);
+    const idHash = typeof row.tool_use_id_hash === 'string' && /^[0-9a-f]{64}$/.test(row.tool_use_id_hash)
+      ? row.tool_use_id_hash : null;
+    if (!toolName || !idHash || ids.has(idHash)) return null;
+    ids.add(idHash);
+    retained.push({ tool_name: toolName, tool_use_id_hash: idHash });
+  }
+  const count = strictTokenCount(value.count);
+  const observed = strictTokenCount(value.observed);
+  const invalid = strictTokenCount(value.invalid);
+  const byTool = strictCountMap(value.byTool, (key) => strictBoundedString(key, 160) === key.trim());
+  const observedBreakdown = strictTokenSum([count ?? -1, invalid ?? -1]);
+  if (count === null || observed === null || invalid === null
+    || observedBreakdown === null || observed !== observedBreakdown || retained.length !== Math.min(count, 256)
+    || value.truncated !== (count > retained.length)
+    || strictTokenSum(Object.values(byTool)) !== count) return null;
+  if (!value.truncated) {
+    const retainedByTool = Object.create(null);
+    for (const row of retained) retainedByTool[row.tool_name] = (retainedByTool[row.tool_name] || 0) + 1;
+    if (JSON.stringify(Object.entries(retainedByTool).sort()) !== JSON.stringify(Object.entries(byTool).sort())) return null;
+  }
+  return { retained, count, observed, invalid, truncated: value.truncated, byTool };
+}
+
 function sanitizeProviderResponse(response) {
   const stdout = clip(response.stdout || '', 24000);
   const stderr = clip(response.stderr || '', 4000);
+  const modelInvocation = response.model_invocation === false ? false
+    : response.model_invocation === null ? null : true;
+  const rawFailureClass = strictBoundedString(response.failureClass);
+  const terminalReason = strictBoundedString(response.provider_terminal_reason);
+  const apiErrorStatusCandidate = response.provider_api_error_status === null
+    || response.provider_api_error_status === undefined ? null
+    : strictTokenCount(response.provider_api_error_status);
   return {
     kind: response.kind,
     route: response.route || {},
@@ -554,6 +819,26 @@ function sanitizeProviderResponse(response) {
     authFailed: !!response.auth_failed,
     permissionDenied: !!response.permission_denied,
     timedOut: !!response.timed_out,
+    cancelled: !!response.cancelled,
+    modelInvocation,
+    failureClass: PROVIDER_FAILURE_CLASSES.has(rawFailureClass) ? rawFailureClass : null,
+    resultSubtype: strictBoundedString(response.result_subtype),
+    providerStopReason: strictBoundedString(response.provider_stop_reason),
+    providerTerminalReason: PROVIDER_TERMINAL_REASONS.has(terminalReason) ? terminalReason : null,
+    providerApiErrorStatus: apiErrorStatusCandidate !== null
+      && apiErrorStatusCandidate >= 100 && apiErrorStatusCandidate <= 599 ? apiErrorStatusCandidate : null,
+    providerPermissionDenials: normalizeProviderPermissionDenials(response.provider_permission_denials, modelInvocation),
+    providerNumTurns: strictTokenCount(response.provider_num_turns),
+    providerDurationMs: strictTokenCount(response.provider_duration_ms),
+    providerApiDurationMs: strictTokenCount(response.provider_api_duration_ms),
+    providerErrorCount: strictTokenCount(response.provider_error_count),
+    providerErrorObserved: strictTokenCount(response.provider_error_observed),
+    providerErrorInvalid: strictTokenCount(response.provider_error_invalid),
+    providerErrorDiagnosticTruncated: response.provider_error_diagnostic_truncated === true,
+    transportOutputChars: strictTokenCount(response.transport_output_chars),
+    transportOutputHash: typeof response.transport_output_hash === 'string'
+      && /^[0-9a-f]{64}$/.test(response.transport_output_hash) ? response.transport_output_hash : null,
+    providerRetries: normalizeProviderRetries(response.provider_retries, modelInvocation),
     stdout: stdout.text,
     stderr: stderr.text,
     stdoutChars: stdout.originalChars,
@@ -562,7 +847,7 @@ function sanitizeProviderResponse(response) {
     stderrSha256: stableHash(response.stderr || ''),
     outputTruncated: stdout.truncated,
     stderrTruncated: stderr.truncated,
-    usage: response.usage || null,
+    usage: normalizeProviderUsage(response.usage, modelInvocation),
   };
 }
 
@@ -575,6 +860,7 @@ function providerSucceeded(response) {
     !response.authFailed &&
     !response.permissionDenied &&
     !response.timedOut &&
+    !response.cancelled &&
     !!String(response.stdout || '').trim();
 }
 
@@ -589,6 +875,7 @@ async function callProvider({
   purpose = 'ask_provider',
   signal,
 }) {
+  const requestId = `mcp:${crypto.randomUUID()}`;
   const classification = classifyTask(prompt);
   const ttl = cacheTtlFor(classification, cacheTtlMs);
   const configFingerprint = stableHash({
@@ -610,7 +897,27 @@ async function callProvider({
         inputHash: stableHash(prompt),
         inputChars: prompt.length,
         estimatedInputTokens: estimateTokens(prompt),
+        estimatedOutputTokens: estimateTokens(cached.value?.stdout || ''),
+        estimatedTotalTokens: estimateTokens(prompt) + estimateTokens(cached.value?.stdout || ''),
         cacheHit: true,
+        modelInvocation: false,
+        tokenUsageSource: 'not_invoked',
+        providerRetryCount: 0,
+        providerRetryDelayMs: 0,
+        providerRetryEvents: [],
+        providerPermissionDenialCount: 0,
+        providerPermissionDenialObserved: 0,
+        providerPermissionDenialInvalid: 0,
+        providerPermissionDenialsTruncated: false,
+        providerPermissionDenialsByTool: {},
+        providerPermissionDenials: [],
+        resultSubtype: null,
+        providerStopReason: null,
+        providerTerminalReason: null,
+        providerApiErrorStatus: null,
+        requestId,
+        invocationId: parentReceiptId || requestId,
+        attemptId: requestId,
         durationMs: 0,
         status: 'cached',
         sourceReceiptId: cached.value?.receiptId || null,
@@ -620,6 +927,27 @@ async function callProvider({
       return {
         ...cached.value,
         cacheHit: true,
+        modelInvocation: false,
+        usage: null,
+        failureClass: null,
+        resultSubtype: null,
+        providerStopReason: null,
+        providerTerminalReason: null,
+        providerApiErrorStatus: null,
+        providerPermissionDenials: zeroProviderPermissionDenials(),
+        providerNumTurns: null,
+        providerDurationMs: null,
+        providerApiDurationMs: null,
+        providerErrorCount: null,
+        providerErrorObserved: null,
+        providerErrorInvalid: null,
+        providerErrorDiagnosticTruncated: false,
+        transportOutputChars: null,
+        transportOutputHash: null,
+        providerRetries: zeroProviderRetries(),
+        transportReceiptId: null,
+        transportReceiptPersisted: null,
+        transportReceiptPersistenceError: null,
         sourceReceiptId: cached.value?.receiptId || null,
         cacheCreatedAt: cached.createdAt,
         cacheKeyHash,
@@ -638,6 +966,7 @@ async function callProvider({
         kind,
         prompt,
         cwd,
+        requestId,
         timeoutMs: TIMEOUT_POLICY.normalizeOneShotTimeoutMs(timeoutMs),
         dangerous: false,
       },
@@ -645,8 +974,17 @@ async function callProvider({
       signal,
     });
     sanitized = sanitizeProviderResponse(response);
-    status = providerSucceeded(sanitized) ? 'completed' : 'dropped';
+    status = providerSucceeded(sanitized) ? 'completed'
+      : sanitized.cancelled ? 'cancelled'
+        : sanitized.timedOut ? 'timed_out' : 'dropped';
   } catch (error) {
+    const bridgeStatus = error instanceof BridgeError && Number.isInteger(error.status)
+      ? error.status : null;
+    const deterministicPreflightRejection = bridgeStatus !== null
+      && bridgeStatus >= 400 && bridgeStatus < 500;
+    const authRequired = error instanceof BridgeError && error.detail?.auth_required === true;
+    const transportTimedOut = !signal?.aborted && error instanceof BridgeError
+      && (error.cause?.name === 'TimeoutError' || error.cause?.cause?.name === 'TimeoutError');
     sanitized = {
       kind,
       exitCode: -1,
@@ -655,9 +993,12 @@ async function callProvider({
       stderr: error.message,
       route: {},
       cancelled: !!signal?.aborted,
-      admissionLimited: error instanceof BridgeError && error.status === 429,
+      timedOut: transportTimedOut,
+      authFailed: authRequired,
+      admissionLimited: bridgeStatus === 429,
+      modelInvocation: deterministicPreflightRejection ? false : null,
     };
-    status = signal?.aborted ? 'cancelled' : 'failed';
+    status = signal?.aborted ? 'cancelled' : transportTimedOut ? 'timed_out' : 'failed';
   }
 
   const receipt = appendReceipt({
@@ -668,21 +1009,68 @@ async function callProvider({
     inputHash: stableHash(prompt),
     inputChars: prompt.length,
     estimatedInputTokens: estimateTokens(prompt),
+    estimatedOutputTokens: estimateTokens(sanitized.stdout || ''),
+    estimatedTotalTokens: estimateTokens(prompt) + estimateTokens(sanitized.stdout || ''),
     actualInputTokens: sanitized.usage?.input_tokens ?? null,
     actualOutputTokens: sanitized.usage?.output_tokens ?? null,
+    actualCacheReadInputTokens: sanitized.usage?.cache_read_input_tokens ?? null,
+    actualCacheCreationInputTokens: sanitized.usage?.cache_creation_input_tokens ?? null,
+    actualTotalTokens: sanitized.usage?.total_tokens ?? null,
+    actualThinkingTokens: sanitized.usage?.thinking_tokens ?? null,
+    provider_reported_cost_usd: sanitized.usage?.cost_usd ?? null,
+    modelUsage: sanitized.usage?.model_usage ?? [],
+    providerRetryCount: sanitized.providerRetries?.count ?? null,
+    providerRetryDelayMs: sanitized.providerRetries?.total_delay_ms ?? null,
+    providerRetryMaxAttempt: sanitized.providerRetries?.max_attempt ?? null,
+    providerDeclaredMaxRetries: sanitized.providerRetries?.declared_max_retries ?? null,
+    providerRetryByError: sanitized.providerRetries?.by_error ?? {},
+    providerRetryByStatus: sanitized.providerRetries?.by_status ?? {},
+    providerRetryEvents: sanitized.providerRetries?.events ?? [],
+    providerRetryEventsTruncated: sanitized.providerRetries?.truncated ?? false,
+    providerRetryObservedEvents: sanitized.providerRetries?.observed_events ?? null,
+    providerRetryInvalidEvents: sanitized.providerRetries?.invalid_events ?? null,
+    providerRetryDuplicateEvents: sanitized.providerRetries?.duplicate_events ?? null,
+    resultSubtype: sanitized.resultSubtype ?? null,
+    providerStopReason: sanitized.providerStopReason ?? null,
+    providerTerminalReason: sanitized.providerTerminalReason ?? null,
+    providerApiErrorStatus: sanitized.providerApiErrorStatus ?? null,
+    providerPermissionDenialCount: sanitized.providerPermissionDenials?.count ?? null,
+    providerPermissionDenialObserved: sanitized.providerPermissionDenials?.observed ?? null,
+    providerPermissionDenialInvalid: sanitized.providerPermissionDenials?.invalid ?? null,
+    providerPermissionDenialsTruncated: sanitized.providerPermissionDenials?.truncated ?? false,
+    providerPermissionDenialsByTool: sanitized.providerPermissionDenials?.byTool ?? {},
+    providerPermissionDenials: sanitized.providerPermissionDenials?.retained ?? [],
+    providerNumTurns: sanitized.providerNumTurns ?? null,
+    providerDurationMs: sanitized.providerDurationMs ?? null,
+    providerApiDurationMs: sanitized.providerApiDurationMs ?? null,
+    providerErrorCount: sanitized.providerErrorCount ?? null,
+    providerErrorObserved: sanitized.providerErrorObserved ?? null,
+    providerErrorInvalid: sanitized.providerErrorInvalid ?? null,
+    providerErrorDiagnosticTruncated: sanitized.providerErrorDiagnosticTruncated ?? false,
+    transportOutputChars: sanitized.transportOutputChars ?? null,
+    transportOutputHash: sanitized.transportOutputHash ?? null,
+    modelInvocation: sanitized.modelInvocation ?? null,
+    tokenUsageSource: sanitized.usage?.token_source
+      || (sanitized.modelInvocation === false ? 'not_invoked'
+        : sanitized.modelInvocation === null ? 'unknown' : 'chars_div_4'),
+    requestId,
+    invocationId: parentReceiptId || requestId,
+    attemptId: requestId,
+    transportReceiptId: sanitized.transportReceiptId || null,
+    model: sanitized.route?.resolved_model_identity || sanitized.route?.requested_model || null,
     cacheHit: false,
     durationMs: Date.now() - startedAt,
     status,
     route: sanitized.route,
     exitCode: sanitized.exitCode,
-    failureClass: sanitized.rateLimited ? 'rate_limit'
+    failureClass: sanitized.cancelled ? 'cancelled'
+      : sanitized.failureClass || (sanitized.rateLimited ? 'rate_limit'
       : sanitized.budgetExceeded ? 'budget'
         : sanitized.authFailed ? 'auth'
           : sanitized.timedOut ? 'timeout'
             : sanitized.permissionDenied ? 'policy'
-              : sanitized.cancelled ? 'cancelled'
-                : sanitized.admissionLimited ? 'admission_limit'
-                 : status === 'completed' ? null : 'provider_error',
+              : sanitized.admissionLimited ? 'admission_limit'
+                : status === 'completed' ? null : 'provider_error'),
     cacheKeyHash,
   });
   const output = {

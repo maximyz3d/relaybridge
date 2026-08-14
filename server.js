@@ -383,23 +383,98 @@ function listAgentActivity(limit = 12) {
 }
 
 function appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt }) {
+  const usage = payload.usage && typeof payload.usage === 'object' ? payload.usage : null;
+  const modelInvocation = payload.model_invocation === false ? false
+    : payload.model_invocation === null ? null : true;
+  const estimatedInputTokens = estimateTokenCount(prompt);
+  const estimatedOutputTokens = estimateTokenCount(payload.stdout || '');
+  const actualInputTokens = nonnegativeUsageNumber(usage?.input_tokens);
+  const actualOutputTokens = nonnegativeUsageNumber(usage?.output_tokens);
+  const actualCacheReadTokens = nonnegativeUsageNumber(usage?.cache_read_input_tokens);
+  const actualCacheCreationTokens = nonnegativeUsageNumber(usage?.cache_creation_input_tokens);
+  const reportedTotalTokens = nonnegativeUsageNumber(usage?.total_tokens);
+  const computedTotalTokens = actualInputTokens !== null && actualOutputTokens !== null
+    ? safeTokenSum([
+        actualInputTokens,
+        actualOutputTokens,
+        actualCacheReadTokens || 0,
+        actualCacheCreationTokens || 0,
+      ])
+    : null;
+  const actualTotalTokens = computedTotalTokens ?? reportedTotalTokens;
+  const tokenUsageSource = modelInvocation === false ? 'not_invoked'
+    : modelInvocation === null ? 'unknown'
+    : actualTotalTokens !== null || actualInputTokens !== null || actualOutputTokens !== null
+      ? 'provider_reported' : 'chars_div_4';
   const receipt = {
     receiptId: `rcpt_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 8)}`,
     timestamp: new Date().toISOString(),
     event: 'bridge_provider_call',
-    status: payload.exitCode === 0 && !payload.dropped_out ? 'completed' : (payload.timed_out ? 'timed_out' : 'dropped'),
+    status: payload.cancelled ? 'cancelled'
+      : payload.exitCode === 0 && !payload.dropped_out ? 'completed'
+        : payload.timed_out ? 'timed_out' : 'dropped',
     provider: kind,
     inputHash: crypto.createHash('sha256').update(String(prompt || '')).digest('hex'),
     inputChars: String(prompt || '').length,
+    estimatedInputTokens,
     outputHash: crypto.createHash('sha256').update(String(payload.stdout || '')).digest('hex'),
     outputChars: String(payload.stdout || '').length,
+    estimatedOutputTokens,
+    estimatedTotalTokens: estimatedInputTokens + estimatedOutputTokens,
+    actualInputTokens,
+    actualOutputTokens,
+    actualCacheReadInputTokens: actualCacheReadTokens,
+    actualCacheCreationInputTokens: actualCacheCreationTokens,
+    actualTotalTokens,
+    actualThinkingTokens: nonnegativeUsageNumber(usage?.thinking_tokens),
+    provider_reported_cost_usd: nonnegativeCostNumber(usage?.cost_usd),
+    tokenUsageSource,
+    tokenEstimateScope: tokenUsageSource === 'chars_div_4'
+      ? (estimatedOutputTokens > 0 ? 'request_and_response_chars_only' : 'request_chars_only') : null,
+    modelInvocation,
+    requestId: route?.request_id || null,
+    modelUsage: Array.isArray(usage?.model_usage) ? usage.model_usage : [],
+    providerRetryCount: nonnegativeUsageNumber(payload.provider_retries?.count),
+    providerRetryDelayMs: nonnegativeUsageNumber(payload.provider_retries?.total_delay_ms),
+    providerRetryMaxAttempt: nonnegativeUsageNumber(payload.provider_retries?.max_attempt),
+    providerDeclaredMaxRetries: nonnegativeUsageNumber(payload.provider_retries?.declared_max_retries),
+    providerRetryByError: payload.provider_retries?.by_error || {},
+    providerRetryByStatus: payload.provider_retries?.by_status || {},
+    providerRetryEvents: Array.isArray(payload.provider_retries?.events) ? payload.provider_retries.events : [],
+    providerRetryEventsTruncated: payload.provider_retries?.truncated === true,
+    providerRetryObservedEvents: nonnegativeUsageNumber(payload.provider_retries?.observed_events),
+    providerRetryInvalidEvents: nonnegativeUsageNumber(payload.provider_retries?.invalid_events),
+    providerRetryDuplicateEvents: nonnegativeUsageNumber(payload.provider_retries?.duplicate_events),
+    resultSubtype: normalizeClaudeResultString(payload.result_subtype),
+    providerStopReason: normalizeClaudeResultString(payload.provider_stop_reason),
+    providerTerminalReason: normalizeClaudeResultString(payload.provider_terminal_reason),
+    providerApiErrorStatus: nonnegativeUsageNumber(payload.provider_api_error_status),
+    providerNumTurns: nonnegativeUsageNumber(payload.provider_num_turns),
+    providerDurationMs: nonnegativeUsageNumber(payload.provider_duration_ms),
+    providerApiDurationMs: nonnegativeUsageNumber(payload.provider_api_duration_ms),
+    providerErrorCount: nonnegativeUsageNumber(payload.provider_error_count),
+    providerErrorObserved: nonnegativeUsageNumber(payload.provider_error_observed),
+    providerErrorInvalid: nonnegativeUsageNumber(payload.provider_error_invalid),
+    providerErrorDiagnosticTruncated: payload.provider_error_diagnostic_truncated === true,
+    providerErrorHash: payload.provider_error_diagnostic
+      ? crypto.createHash('sha256').update(String(payload.provider_error_diagnostic)).digest('hex') : null,
+    providerPermissionDenialCount: nonnegativeUsageNumber(payload.provider_permission_denials?.count),
+    providerPermissionDenialObserved: nonnegativeUsageNumber(payload.provider_permission_denials?.observed),
+    providerPermissionDenialInvalid: nonnegativeUsageNumber(payload.provider_permission_denials?.invalid),
+    providerPermissionDenialsTruncated: payload.provider_permission_denials?.truncated === true,
+    providerPermissionDenialsByTool: payload.provider_permission_denials?.byTool || {},
+    providerPermissionDenials: Array.isArray(payload.provider_permission_denials?.retained)
+      ? payload.provider_permission_denials.retained : [],
+    transportOutputChars: nonnegativeUsageNumber(payload.transport_output_chars),
+    transportOutputHash: normalizeClaudeResultString(payload.transport_output_hash, 64),
     durationMs: Date.now() - startedAt,
-    failureClass: payload.rate_limited ? 'rate_limit'
-      : payload.budget_exceeded ? 'budget'
-        : payload.auth_failed ? 'auth'
-          : payload.permission_denied ? 'policy'
+    failureClass: payload.cancelled ? 'cancelled'
+      : payload.failureClass || (payload.rate_limited ? 'rate_limit'
+        : payload.budget_exceeded ? 'budget'
+          : payload.auth_failed ? 'auth'
             : payload.timed_out ? 'timeout'
-              : payload.exitCode === 0 && !payload.dropped_out ? null : 'provider_error',
+              : payload.permission_denied ? 'policy'
+                : payload.exitCode === 0 && !payload.dropped_out ? null : 'provider_error'),
     route,
   };
   const filePath = path.join(RECEIPTS_DIR, `${receipt.timestamp.slice(0, 10)}.jsonl`);
@@ -415,6 +490,7 @@ function sendOneShotResult(res, payload, meta) {
   if (res.writableEnded || res.destroyed) return;
   try {
     const receipt = appendBridgeProviderReceipt({ ...meta, payload });
+    res._relayReceiptPersisted = receipt.receiptId;
     res.json({ ...payload, receiptId: receipt.receiptId, receiptPersisted: true });
   } catch (error) {
     res.json({ ...payload, receiptId: `rcpt_unpersisted_${Date.now().toString(36)}`, receiptPersisted: false, receiptPersistenceError: error.message });
@@ -539,6 +615,432 @@ function cleanOutput(s) {
   return t.replace(/\n{3,}/g, '\n\n').trim();
 }
 
+function nonnegativeUsageNumber(value) {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+    ? value : null;
+}
+
+function nonnegativeCostNumber(value) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+    ? value : null;
+}
+
+function safeTokenSum(values) {
+  let total = 0;
+  for (const value of values) {
+    if (!Number.isSafeInteger(value) || value < 0) return null;
+    total += value;
+    if (!Number.isSafeInteger(total)) return null;
+  }
+  return total;
+}
+
+function estimateTokenCount(text) {
+  const chars = String(text || '').length;
+  return chars ? Math.ceil(chars / 4) : 0;
+}
+
+// Claude Code's JSON result contains the subscription session's complete usage,
+// including cache reads/creation and helper-model calls.  Counting only the
+// top-level input/output pair can understate a real call by tens of thousands
+// of tokens, so prefer the per-model census when it is present and retain the
+// cache dimensions separately. Thinking tokens are a subset of output tokens
+// and are never added to total_tokens a second time.
+function normalizeClaudeJsonUsage(document) {
+  const rows = [];
+  let modelUsageComplete = true;
+  if (document?.modelUsage && typeof document.modelUsage === 'object' && !Array.isArray(document.modelUsage)) {
+    for (const [model, value] of Object.entries(document.modelUsage)) {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        modelUsageComplete = false;
+        continue;
+      }
+      const inputTokens = nonnegativeUsageNumber(value.inputTokens ?? value.input_tokens);
+      const outputTokens = nonnegativeUsageNumber(value.outputTokens ?? value.output_tokens);
+      const cacheReadTokens = nonnegativeUsageNumber(value.cacheReadInputTokens ?? value.cache_read_input_tokens);
+      const cacheCreationTokens = nonnegativeUsageNumber(value.cacheCreationInputTokens ?? value.cache_creation_input_tokens);
+      if ([inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens]
+        .some((tokenCount) => tokenCount === null)) {
+        modelUsageComplete = false;
+        continue;
+      }
+      const canonicalModel = typeof value.canonicalModel === 'string'
+        ? value.canonicalModel.trim() : '';
+      const modelKey = String(model).trim();
+      const modelName = canonicalModel || modelKey;
+      if (!modelName) {
+        modelUsageComplete = false;
+        continue;
+      }
+      rows.push({
+        model: modelName.slice(0, 160),
+        provider: typeof value.provider === 'string' ? value.provider.trim().slice(0, 80) : '',
+        input_tokens: inputTokens ?? 0,
+        output_tokens: outputTokens ?? 0,
+        cache_read_input_tokens: cacheReadTokens ?? 0,
+        cache_creation_input_tokens: cacheCreationTokens ?? 0,
+        cost_usd: nonnegativeCostNumber(value.costUSD ?? value.cost_usd),
+      });
+    }
+  }
+  const top = document?.usage && typeof document.usage === 'object' && !Array.isArray(document.usage)
+    ? document.usage : {};
+  const sum = (name) => safeTokenSum(rows.map((row) => row[name]));
+  let fromModels = modelUsageComplete && rows.length > 0;
+  const modelTotals = fromModels ? {
+    input: sum('input_tokens'),
+    output: sum('output_tokens'),
+    cacheRead: sum('cache_read_input_tokens'),
+    cacheCreation: sum('cache_creation_input_tokens'),
+  } : null;
+  if (fromModels && Object.values(modelTotals).some((value) => value === null)) fromModels = false;
+  const topHas = (name) => Object.prototype.hasOwnProperty.call(top, name);
+  const inputTokens = fromModels ? modelTotals.input : nonnegativeUsageNumber(top.input_tokens);
+  const outputTokens = fromModels ? modelTotals.output : nonnegativeUsageNumber(top.output_tokens);
+  const cacheReadTokens = fromModels ? modelTotals.cacheRead
+    : topHas('cache_read_input_tokens') ? nonnegativeUsageNumber(top.cache_read_input_tokens) : 0;
+  const cacheCreationTokens = fromModels ? modelTotals.cacheCreation
+    : topHas('cache_creation_input_tokens') ? nonnegativeUsageNumber(top.cache_creation_input_tokens) : 0;
+  if (!fromModels && (inputTokens === null || outputTokens === null
+    || cacheReadTokens === null || cacheCreationTokens === null)) return null;
+  const thinkingCandidate = nonnegativeUsageNumber(top.output_tokens_details?.thinking_tokens);
+  const thinkingLimit = topHas('output_tokens')
+    ? nonnegativeUsageNumber(top.output_tokens) : outputTokens;
+  const thinkingTokens = thinkingCandidate !== null
+    && thinkingLimit !== null && thinkingCandidate <= thinkingLimit ? thinkingCandidate : null;
+  const known = [inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens]
+    .some((value) => value !== null);
+  if (!known) return null;
+  const totalTokens = safeTokenSum([
+    inputTokens || 0,
+    outputTokens || 0,
+    cacheReadTokens || 0,
+    cacheCreationTokens || 0,
+  ]);
+  if (totalTokens === null) return null;
+  const modelCostsComplete = fromModels && rows.every((row) => row.cost_usd !== null);
+  const providerCost = nonnegativeCostNumber(document?.total_cost_usd) !== null
+    ? nonnegativeCostNumber(document.total_cost_usd)
+    : modelCostsComplete
+      ? nonnegativeCostNumber(rows.reduce((total, row) => total + Number(row.cost_usd || 0), 0))
+      : null;
+  return {
+    input_tokens: inputTokens ?? 0,
+    output_tokens: outputTokens ?? 0,
+    cache_read_input_tokens: cacheReadTokens ?? 0,
+    cache_creation_input_tokens: cacheCreationTokens ?? 0,
+    total_tokens: totalTokens,
+    thinking_tokens: thinkingTokens,
+    cost_usd: providerCost,
+    token_source: 'provider_reported',
+    model_usage: fromModels
+      ? rows.map((row) => ({ ...row, cost_usd: modelCostsComplete ? row.cost_usd : null }))
+      : [],
+  };
+}
+
+const CLAUDE_RETRY_ERROR_CATEGORIES = new Set([
+  'authentication_failed',
+  'oauth_org_not_allowed',
+  'billing_error',
+  'rate_limit',
+  'overloaded',
+  'invalid_request',
+  'model_not_found',
+  'server_error',
+  'max_output_tokens',
+  'unknown',
+]);
+
+const CLAUDE_TERMINAL_REASONS = new Set([
+  'completed', 'max_turns', 'tool_deferred', 'aborted_streaming', 'aborted_tools',
+  'hook_stopped', 'stop_hook_prevented', 'blocking_limit', 'rapid_refill_breaker',
+  'prompt_too_long', 'image_error', 'model_error',
+]);
+
+function normalizeClaudeRetryEvents(events) {
+  const retained = [];
+  const seenIds = new Set();
+  let totalEvents = 0;
+  let invalidEvents = 0;
+  let duplicateEvents = 0;
+  let validCount = 0;
+  let delayTotalMs = 0;
+  let delayOverflow = false;
+  let maxAttempt = 0;
+  let declaredMaxRetries = 0;
+  const byError = {};
+  const byStatus = {};
+  for (const event of events) {
+    if (!event || event.type !== 'system' || event.subtype !== 'api_retry') continue;
+    totalEvents += 1;
+    const eventId = typeof event.uuid === 'string' ? event.uuid.trim().slice(0, 200) : '';
+    if (!eventId) {
+      invalidEvents += 1;
+      continue;
+    }
+    if (seenIds.has(eventId)) {
+      duplicateEvents += 1;
+      continue;
+    }
+    seenIds.add(eventId);
+    const attempt = nonnegativeUsageNumber(event.attempt);
+    const maxRetries = nonnegativeUsageNumber(event.max_retries);
+    const retryDelayMs = nonnegativeUsageNumber(event.retry_delay_ms);
+    if (attempt === null || attempt < 1 || maxRetries === null || retryDelayMs === null) {
+      invalidEvents += 1;
+      continue;
+    }
+    const statusAbsent = event.error_status === null || event.error_status === undefined;
+    const status = statusAbsent ? null : nonnegativeUsageNumber(event.error_status);
+    if (!statusAbsent && (status === null || status < 100 || status > 599)) {
+      invalidEvents += 1;
+      continue;
+    }
+    const errorStatus = status;
+    const rawCategory = typeof event.error === 'string' ? event.error.trim().toLowerCase() : '';
+    const errorCategory = CLAUDE_RETRY_ERROR_CATEGORIES.has(rawCategory) ? rawCategory : 'unknown';
+    const normalized = {
+      event_id_hash: crypto.createHash('sha256').update(eventId).digest('hex'),
+      attempt,
+      max_retries: maxRetries,
+      retry_delay_ms: retryDelayMs,
+      error_status: errorStatus,
+      error: errorCategory,
+    };
+    validCount += 1;
+    const nextDelay = delayTotalMs + retryDelayMs;
+    if (!Number.isSafeInteger(nextDelay)) delayOverflow = true;
+    else if (!delayOverflow) delayTotalMs = nextDelay;
+    maxAttempt = Math.max(maxAttempt, attempt);
+    declaredMaxRetries = Math.max(declaredMaxRetries, maxRetries);
+    byError[errorCategory] = (byError[errorCategory] || 0) + 1;
+    const statusKey = errorStatus === null ? 'none' : String(errorStatus);
+    byStatus[statusKey] = (byStatus[statusKey] || 0) + 1;
+    if (retained.length < 256) retained.push(normalized);
+  }
+  return {
+    count: validCount,
+    total_delay_ms: delayOverflow ? null : delayTotalMs,
+    max_attempt: maxAttempt,
+    declared_max_retries: declaredMaxRetries,
+    by_error: Object.fromEntries(Object.entries(byError).sort(([a], [b]) => a.localeCompare(b))),
+    by_status: Object.fromEntries(Object.entries(byStatus).sort(([a], [b]) => a.localeCompare(b))),
+    events: retained,
+    truncated: validCount > retained.length,
+    observed_events: totalEvents,
+    invalid_events: invalidEvents,
+    duplicate_events: duplicateEvents,
+  };
+}
+
+function claudeResultFailureClass(subtype) {
+  if (subtype === 'error_max_budget_usd') return 'budget';
+  if (subtype === 'error_max_turns') return 'max_turns';
+  if (subtype === 'error_max_structured_output_retries') return 'structured_output_retry_exhausted';
+  if (subtype === 'error_during_execution') return 'provider_error';
+  return /^error_/.test(subtype) ? 'provider_error' : null;
+}
+
+function claudeTerminalReasonFailureClass(reason) {
+  if (!reason || reason === 'completed') return null;
+  if (reason === 'rapid_refill_breaker') return 'rate_limit';
+  if (reason === 'image_error' || reason === 'model_error') return 'provider_error';
+  return reason;
+}
+
+function claudeApiStatusFailureClass(status) {
+  if (status === 401 || status === 403) return 'auth';
+  if (status === 408 || status === 504) return 'timeout';
+  if (status === 429) return 'rate_limit';
+  if (status === 402) return 'budget';
+  return status === null ? null : 'provider_error';
+}
+
+function normalizeClaudeResultString(value, maxChars = 128) {
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim();
+  return normalized ? normalized.slice(0, maxChars) : null;
+}
+
+function normalizeClaudeResultErrors(value) {
+  if (!Array.isArray(value)) {
+    return { retained: [], count: 0, observed: 0, invalid: 0, truncated: false };
+  }
+  const retained = [];
+  let retainedChars = 0;
+  let count = 0;
+  let invalid = 0;
+  let clipped = false;
+  for (const item of value) {
+    if (typeof item !== 'string' || !item.trim()) {
+      invalid += 1;
+      continue;
+    }
+    const raw = item.trim();
+    if (raw.length > 1000) clipped = true;
+    const normalized = raw.slice(0, 1000);
+    count += 1;
+    const remaining = 4000 - retainedChars;
+    if (remaining <= 0 || retained.length >= 20) continue;
+    const retainedError = normalized.slice(0, remaining);
+    if (retainedError.length < normalized.length) clipped = true;
+    retained.push(retainedError);
+    retainedChars += retainedError.length;
+  }
+  return {
+    retained,
+    count,
+    observed: value.length,
+    invalid,
+    truncated: clipped || count > retained.length,
+  };
+}
+
+function normalizeClaudePermissionDenials(value) {
+  if (!Array.isArray(value)) {
+    return { retained: [], count: 0, observed: 0, invalid: 0, truncated: false, byTool: {} };
+  }
+  const retained = [];
+  const byTool = Object.create(null);
+  let count = 0;
+  let invalid = 0;
+  for (const item of value) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      invalid += 1;
+      continue;
+    }
+    const toolName = normalizeClaudeResultString(item.tool_name, 160);
+    const toolUseId = normalizeClaudeResultString(item.tool_use_id, 200);
+    if (!toolName || !toolUseId) {
+      invalid += 1;
+      continue;
+    }
+    count += 1;
+    byTool[toolName] = (byTool[toolName] || 0) + 1;
+    if (retained.length < 256) {
+      retained.push({
+        tool_name: toolName,
+        tool_use_id_hash: crypto.createHash('sha256').update(toolUseId).digest('hex'),
+      });
+    }
+  }
+  return {
+    retained,
+    count,
+    observed: value.length,
+    invalid,
+    truncated: count > retained.length,
+    byTool: Object.fromEntries(Object.entries(byTool).sort(([left], [right]) => left.localeCompare(right))),
+  };
+}
+
+function claudeStopReasonFailureClass(stopReason) {
+  if (stopReason === 'max_tokens') return 'max_tokens';
+  if (stopReason === 'refusal') return 'refusal';
+  if (stopReason === 'tool_deferred') return 'tool_deferred';
+  return null;
+}
+
+function parseConfiguredOneShotOutput(entry, rawOutput) {
+  const parser = String(entry?.oneshot_output_parser || 'text');
+  if (parser === 'text') {
+    return {
+      output: cleanOutput(rawOutput), usage: null, isError: false,
+      resultSubtype: null, failureClass: null, retries: normalizeClaudeRetryEvents([]),
+      diagnostic: '', errorCount: 0, providerStopReason: null,
+      errorObserved: 0, errorInvalid: 0, errorDiagnosticTruncated: false,
+      terminalReason: null, apiErrorStatus: null,
+      permissionDenials: normalizeClaudePermissionDenials([]),
+      numTurns: null, providerDurationMs: null, providerApiDurationMs: null,
+      parseError: null,
+    };
+  }
+  if (parser !== 'claude_json') {
+    return {
+      output: '', usage: null, isError: true,
+      resultSubtype: null, failureClass: 'provider_error', retries: normalizeClaudeRetryEvents([]),
+      diagnostic: '', errorCount: 0, providerStopReason: null,
+      errorObserved: 0, errorInvalid: 0, errorDiagnosticTruncated: false,
+      terminalReason: null, apiErrorStatus: null,
+      permissionDenials: normalizeClaudePermissionDenials([]),
+      numTurns: null, providerDurationMs: null, providerApiDurationMs: null,
+      parseError: `unsupported oneshot output parser: ${parser}`,
+    };
+  }
+  let events = [];
+  try {
+    const text = String(rawOutput || '').trim();
+    let document;
+    try {
+      document = JSON.parse(text);
+      events = document && typeof document === 'object' && !Array.isArray(document) ? [document] : [];
+    } catch {
+      events = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
+        .map((line) => {
+          try { return JSON.parse(line); } catch { return null; }
+        }).filter((value) => value && typeof value === 'object' && !Array.isArray(value));
+      document = [...events].reverse().find((value) => value.type === 'result') || null;
+    }
+    if (!document || typeof document !== 'object' || Array.isArray(document)) throw new Error('result is not an object');
+    if (document.type !== 'result') throw new Error('document type is not result');
+    const subtype = (normalizeClaudeResultString(document.subtype) || '').toLowerCase();
+    if (subtype !== 'success' && !/^error_/.test(subtype)) throw new Error('result subtype is unsupported');
+    if (typeof document.is_error !== 'boolean') throw new Error('result is_error is not boolean');
+    if (document.is_error !== (subtype !== 'success')) throw new Error('result subtype and is_error disagree');
+    const providerStopReason = (normalizeClaudeResultString(document.stop_reason) || '').toLowerCase() || null;
+    const terminalReasonRaw = (normalizeClaudeResultString(document.terminal_reason) || '').toLowerCase() || null;
+    if (terminalReasonRaw && !CLAUDE_TERMINAL_REASONS.has(terminalReasonRaw)) {
+      throw new Error('result terminal_reason is unsupported');
+    }
+    const apiStatusAbsent = document.api_error_status === null || document.api_error_status === undefined;
+    const apiErrorStatus = apiStatusAbsent ? null : nonnegativeUsageNumber(document.api_error_status);
+    if (!apiStatusAbsent && (apiErrorStatus === null || apiErrorStatus < 100 || apiErrorStatus > 599)) {
+      throw new Error('result api_error_status is invalid');
+    }
+    const isError = document.is_error;
+    const errors = normalizeClaudeResultErrors(document.errors);
+    const permissionDenials = normalizeClaudePermissionDenials(document.permission_denials);
+    return {
+      output: cleanOutput(!isError && typeof document.result === 'string' ? document.result : ''),
+      usage: normalizeClaudeJsonUsage(document),
+      isError,
+      resultSubtype: subtype || null,
+      failureClass: subtype === 'error_max_budget_usd' ? 'budget'
+        : claudeApiStatusFailureClass(apiErrorStatus)
+        || claudeStopReasonFailureClass(providerStopReason)
+        || claudeTerminalReasonFailureClass(terminalReasonRaw)
+        || claudeResultFailureClass(subtype),
+      retries: normalizeClaudeRetryEvents(events),
+      diagnostic: cleanOutput(errors.retained.join('\n')),
+      errorCount: errors.count,
+      errorObserved: errors.observed,
+      errorInvalid: errors.invalid,
+      errorDiagnosticTruncated: errors.truncated,
+      providerStopReason,
+      terminalReason: terminalReasonRaw,
+      apiErrorStatus,
+      permissionDenials,
+      numTurns: nonnegativeUsageNumber(document.num_turns),
+      providerDurationMs: nonnegativeUsageNumber(document.duration_ms),
+      providerApiDurationMs: nonnegativeUsageNumber(document.duration_api_ms),
+      parseError: null,
+    };
+  } catch (error) {
+    return {
+      output: '', usage: null, isError: true,
+      resultSubtype: null, failureClass: 'provider_error',
+      diagnostic: '', errorCount: 0, providerStopReason: null,
+      errorObserved: 0, errorInvalid: 0, errorDiagnosticTruncated: false,
+      terminalReason: null, apiErrorStatus: null,
+      permissionDenials: normalizeClaudePermissionDenials([]),
+      numTurns: null, providerDurationMs: null, providerApiDurationMs: null,
+      retries: normalizeClaudeRetryEvents(events),
+      parseError: `claude_json parse failed: ${error.message}`,
+    };
+  }
+}
+
 function ollamaManifestIdentity(entry) {
   if (entry?.transport !== 'local:ollama' || !entry.model || !process.env.USERPROFILE) return null;
   const match = /^([A-Za-z0-9._-]+)(?::([A-Za-z0-9._-]+))?$/.exec(String(entry.model));
@@ -601,6 +1103,15 @@ function hostedApiKey(entry) {
   throw new Error(`hosted provider key is not set; define ${names[0] || 'the configured API key environment variable'}`);
 }
 
+function rejectedHttpModelInvocation(status) {
+  return new Set([400, 401, 403, 404, 409, 422, 429]).has(Number(status))
+    ? false : null;
+}
+
+function isUpstreamTimeoutStatus(status) {
+  return Number(status) === 408 || Number(status) === 504;
+}
+
 async function runOpenAIChatOneShot({ entry, prompt, timeoutMs, res, route, startedAt }) {
   const bounded = capPrompt(prompt, Number(entry.prompt_max_chars || 12000));
   route.prompt_transport = 'hosted_openai_compatible';
@@ -612,6 +1123,18 @@ async function runOpenAIChatOneShot({ entry, prompt, timeoutMs, res, route, star
   const controller = new AbortController();
   let timedOut = false;
   let clientGone = false;
+  let requestStarted = false;
+  res._relayCancellationPayload = () => ({
+    kind: route.provider,
+    route,
+    exitCode: -1,
+    stdout: '',
+    stderr: '',
+    cancelled: !timedOut,
+    timed_out: timedOut,
+    dropped_out: true,
+    model_invocation: requestStarted ? null : false,
+  });
   const timer = setTimeout(() => {
     timedOut = true;
     controller.abort(new Error('hosted provider request timed out'));
@@ -628,6 +1151,7 @@ async function runOpenAIChatOneShot({ entry, prompt, timeoutMs, res, route, star
     const key = hostedApiKey(entry);
     route.endpoint_host = url.hostname;
     route.api_key_env = key.name;
+    requestStarted = true;
     const response = await fetch(url, {
       method: 'POST',
       headers: {
@@ -663,19 +1187,33 @@ async function runOpenAIChatOneShot({ entry, prompt, timeoutMs, res, route, star
           rate_limited: response.status === 429,
           budget_exceeded: /budget|credit|quota/i.test(detail),
           auth_failed: response.status === 401 || response.status === 403,
-          timed_out: false,
+          timed_out: isUpstreamTimeoutStatus(response.status),
           dropped_out: true,
+          model_invocation: rejectedHttpModelInvocation(response.status),
         }, { kind: route.provider, prompt, route, startedAt });
       }
       return;
     }
     const stdout = cleanOutput(payload.choices?.[0]?.message?.content || payload.output_text || '');
-    route.resolved_model = payload.model || entry.model;
-    const usage = payload.usage ? {
-      input_tokens: Number.isFinite(Number(payload.usage.prompt_tokens)) ? Number(payload.usage.prompt_tokens) : null,
-      output_tokens: Number.isFinite(Number(payload.usage.completion_tokens)) ? Number(payload.usage.completion_tokens) : null,
-      total_tokens: Number.isFinite(Number(payload.usage.total_tokens)) ? Number(payload.usage.total_tokens) : null,
-    } : null;
+    const providerModel = typeof payload.model === 'string' ? payload.model.trim().slice(0, 160) : '';
+    const configuredModel = typeof entry.model === 'string' ? entry.model.trim().slice(0, 160) : '';
+    const existingIdentity = typeof route.resolved_model_identity === 'string'
+      ? route.resolved_model_identity.trim().slice(0, 160) : '';
+    route.resolved_model = providerModel || configuredModel || null;
+    route.resolved_model_identity = providerModel || existingIdentity || configuredModel || null;
+    route.resolved_model_source = providerModel ? 'provider_response'
+      : existingIdentity ? route.resolved_model_source : configuredModel ? 'configured_model' : null;
+    const usage = payload.usage ? (() => {
+      const inputTokens = nonnegativeUsageNumber(payload.usage.prompt_tokens);
+      const outputTokens = nonnegativeUsageNumber(payload.usage.completion_tokens);
+      const computedTotal = inputTokens !== null && outputTokens !== null
+        ? safeTokenSum([inputTokens, outputTokens]) : null;
+      return {
+        input_tokens: inputTokens,
+        output_tokens: outputTokens,
+        total_tokens: computedTotal ?? nonnegativeUsageNumber(payload.usage.total_tokens),
+      };
+    })() : null;
     if (!clientGone && !res.writableEnded) {
       sendOneShotResult(res, {
         kind: route.provider,
@@ -690,6 +1228,7 @@ async function runOpenAIChatOneShot({ entry, prompt, timeoutMs, res, route, star
         permission_denied: false,
         timed_out: false,
         dropped_out: !stdout,
+        model_invocation: true,
       }, { kind: route.provider, prompt, route, startedAt });
     }
   } catch (error) {
@@ -703,6 +1242,7 @@ async function runOpenAIChatOneShot({ entry, prompt, timeoutMs, res, route, star
         auth_failed: /key is not set|401|403/i.test(error?.message || ''),
         timed_out: timedOut,
         dropped_out: true,
+        model_invocation: requestStarted ? null : false,
       }, { kind: route.provider, prompt, route, startedAt });
     }
   } finally {
@@ -717,6 +1257,18 @@ async function runOllamaApiOneShot({ entry, prompt, timeoutMs, res, route, start
   const controller = new AbortController();
   let timedOut = false;
   let clientGone = false;
+  let requestStarted = false;
+  res._relayCancellationPayload = () => ({
+    kind: route.provider,
+    route,
+    exitCode: -1,
+    stdout: '',
+    stderr: '',
+    cancelled: !timedOut,
+    timed_out: timedOut,
+    dropped_out: true,
+    model_invocation: requestStarted ? null : false,
+  });
   const timer = setTimeout(() => {
     timedOut = true;
     controller.abort(new Error('local Ollama request timed out'));
@@ -729,7 +1281,9 @@ async function runOllamaApiOneShot({ entry, prompt, timeoutMs, res, route, start
   });
 
   try {
-    const response = await fetch(localOllamaUrl(), {
+    const url = localOllamaUrl();
+    requestStarted = true;
+    const response = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -755,8 +1309,9 @@ async function runOllamaApiOneShot({ entry, prompt, timeoutMs, res, route, start
           exitCode: response.status,
           stdout: '',
           stderr: detail,
-          timed_out: false,
+          timed_out: isUpstreamTimeoutStatus(response.status),
           dropped_out: true,
+          model_invocation: rejectedHttpModelInvocation(response.status),
         }, { kind: route.provider, prompt, route, startedAt });
       }
       return;
@@ -768,10 +1323,16 @@ async function runOllamaApiOneShot({ entry, prompt, timeoutMs, res, route, start
       if (closeTag >= 0) rawOutput = String(rawOutput).slice(closeTag + '</think>'.length);
     }
     const stdout = cleanOutput(rawOutput);
-    route.resolved_model = payload.model || entry.model;
+    const providerModel = typeof payload.model === 'string' ? payload.model.trim().slice(0, 160) : '';
+    const configuredModel = typeof entry.model === 'string' ? entry.model.trim().slice(0, 160) : '';
+    route.resolved_model = providerModel || configuredModel || null;
+    const inputTokens = nonnegativeUsageNumber(payload.prompt_eval_count);
+    const outputTokens = nonnegativeUsageNumber(payload.eval_count);
     const usage = {
-      input_tokens: Number.isFinite(Number(payload.prompt_eval_count)) ? Number(payload.prompt_eval_count) : null,
-      output_tokens: Number.isFinite(Number(payload.eval_count)) ? Number(payload.eval_count) : null,
+      input_tokens: inputTokens,
+      output_tokens: outputTokens,
+      total_tokens: inputTokens !== null && outputTokens !== null
+        ? safeTokenSum([inputTokens, outputTokens]) : null,
       total_duration_ns: Number.isFinite(Number(payload.total_duration)) ? Number(payload.total_duration) : null,
       load_duration_ns: Number.isFinite(Number(payload.load_duration)) ? Number(payload.load_duration) : null,
       done_reason: payload.done_reason || null,
@@ -790,6 +1351,7 @@ async function runOllamaApiOneShot({ entry, prompt, timeoutMs, res, route, start
         permission_denied: false,
         timed_out: false,
         dropped_out: !stdout,
+        model_invocation: true,
       }, { kind: route.provider, prompt, route, startedAt });
     }
   } catch (error) {
@@ -802,6 +1364,7 @@ async function runOllamaApiOneShot({ entry, prompt, timeoutMs, res, route, start
         stderr: cleanOutput(error?.message || String(error)),
         timed_out: timedOut,
         dropped_out: true,
+        model_invocation: requestStarted ? null : false,
       }, { kind: route.provider, prompt, route, startedAt });
     }
   } finally {
@@ -1839,6 +2402,9 @@ app.post('/api/exec', (req, res) => {
 async function executeOneShot(body, res) {
   const startedAt = Date.now();
   const { kind, prompt, timeoutMs, cwd, dangerous } = body || {};
+  const suppliedRequestId = String(body?.requestId || '');
+  const requestId = /^[A-Za-z0-9._:-]{8,160}$/.test(suppliedRequestId)
+    ? suppliedRequestId : `oneshot:${crypto.randomUUID()}`;
   // Two timeout regimes compose here. The timeout policy bounds any EXPLICIT
   // caller timeout, so a caller can neither starve a run nor exceed the
   // transport ceiling the MCP client allows. When the caller sends nothing, no
@@ -1981,7 +2547,34 @@ async function executeOneShot(body, res) {
     effective_timeout_ms: explicitTimeout,
     timeout_clamped: explicitTimeout != null && Math.trunc(Number(timeoutMs)) !== explicitTimeout,
     environment_overrides: Object.keys(oneShotEnv).sort(),
+    request_id: requestId,
   };
+  // Persist a terminal cancellation even when the HTTP client is already
+  // gone. Previously the provider was killed but its token/time attempt
+  // disappeared because sendOneShotResult refuses to write to a dead socket.
+  res.once('close', () => {
+    if (res.writableEnded || res._relayReceiptPersisted) return;
+    const payload = typeof res._relayCancellationPayload === 'function'
+      ? res._relayCancellationPayload()
+      : {
+          kind,
+          route,
+          exitCode: -1,
+          stdout: '',
+          stderr: '',
+          cancelled: true,
+          timed_out: false,
+          dropped_out: true,
+          model_invocation: true,
+        };
+    try {
+      const receipt = appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt });
+      res._relayReceiptPersisted = receipt.receiptId;
+    } catch (error) {
+      res._relayReceiptPersisted = `rcpt_unpersisted_${Date.now().toString(36)}`;
+      console.error(`[RelayBridge] cancellation receipt persistence failed: ${error.message}`);
+    }
+  });
   if (entry.oneshot_adapter === 'ollama_api') {
     cleanupPromptFile();
     return runOllamaApiOneShot({ entry, prompt, timeoutMs: adapterTimeoutMs, res, route, startedAt });
@@ -2012,13 +2605,45 @@ async function executeOneShot(body, res) {
     proc = trackChild(spawn(spawnBin, spawnArgs, spawnOpts));
   } catch (err) {
     cleanupPromptFile();
-    return sendOneShotResult(res, { kind, route, exitCode: -1, stdout: '', stderr: err.message, error: 'spawn failed', dropped_out: true }, { kind, prompt, route, startedAt });
+    return sendOneShotResult(res, { kind, route, exitCode: -1, stdout: '', stderr: err.message, error: 'spawn failed', dropped_out: true, model_invocation: false }, { kind, prompt, route, startedAt });
   }
   let stdout = '';
   let stderr = '';
   let timedOut = false;
   let clientGone = false;
   let settled = false;
+  res._relayCancellationPayload = () => {
+    const parsedOutput = parseConfiguredOneShotOutput(entry, stdout);
+    return {
+      kind,
+      route,
+      exitCode: -1,
+      stdout: parsedOutput.output,
+      stderr: cleanOutput([stderr, parsedOutput.diagnostic, parsedOutput.parseError].filter(Boolean).join('\n')),
+      usage: parsedOutput.usage,
+      failureClass: parsedOutput.failureClass,
+      result_subtype: parsedOutput.resultSubtype,
+      provider_retries: parsedOutput.retries,
+      provider_stop_reason: parsedOutput.providerStopReason,
+      provider_terminal_reason: parsedOutput.terminalReason,
+      provider_api_error_status: parsedOutput.apiErrorStatus,
+      provider_permission_denials: parsedOutput.permissionDenials,
+      provider_num_turns: parsedOutput.numTurns,
+      provider_duration_ms: parsedOutput.providerDurationMs,
+      provider_api_duration_ms: parsedOutput.providerApiDurationMs,
+      provider_error_count: parsedOutput.errorCount,
+      provider_error_observed: parsedOutput.errorObserved,
+      provider_error_invalid: parsedOutput.errorInvalid,
+      provider_error_diagnostic_truncated: parsedOutput.errorDiagnosticTruncated,
+      provider_error_diagnostic: parsedOutput.diagnostic,
+      transport_output_chars: String(stdout).length,
+      transport_output_hash: crypto.createHash('sha256').update(String(stdout)).digest('hex'),
+      cancelled: !timedOut,
+      timed_out: timedOut,
+      dropped_out: true,
+      model_invocation: true,
+    };
+  };
 
   // Progress-based supervision instead of a single kill clock. A run that keeps
   // emitting new content is left alone to finish; one that goes silent or
@@ -2094,42 +2719,100 @@ async function executeOneShot(body, res) {
     finishSupervision();
     cleanupPromptFile();
     if (clientGone || res.writableEnded) return;
-    const cleanedStdout = cleanOutput(stdout);
+    const parsedOutput = parseConfiguredOneShotOutput(entry, stdout);
+    const cleanedStdout = parsedOutput.output;
+    if (Array.isArray(parsedOutput.usage?.model_usage) && parsedOutput.usage.model_usage.length) {
+      const dominant = [...parsedOutput.usage.model_usage].sort((left, right) =>
+        Number(right.cost_usd || 0) - Number(left.cost_usd || 0)
+        || (Number(right.output_tokens || 0) + Number(right.input_tokens || 0)
+          + Number(right.cache_read_input_tokens || 0) + Number(right.cache_creation_input_tokens || 0))
+          - (Number(left.output_tokens || 0) + Number(left.input_tokens || 0)
+            + Number(left.cache_read_input_tokens || 0) + Number(left.cache_creation_input_tokens || 0))
+      )[0];
+      if (dominant?.model) {
+        route.resolved_model_identity = dominant.model;
+        route.resolved_model_source = 'provider_reported_model_usage';
+      }
+    }
     // Treat model prose on stdout as content when the provider exited zero and
     // returned a usable answer. Failure phrases are authoritative on stderr,
     // or in stdout only when the process itself failed / returned no answer.
     // This prevents an audit discussing "rate limit" or HTTP 429 handling from
     // being misclassified as a provider failure.
-    const failureBlob = (stderr + ((code !== 0 || !cleanedStdout) ? ('\n' + stdout) : '')).toLowerCase();
-    const rate_signals = ['rate limit','rate-limit','too many requests','quota exceeded','usage limit reached','hit your usage limit','hit your limit','upgrade to pro','429','credit balance is too low','usage limit','out of credits'];
+    const failureBlob = (stderr + ((code !== 0 || !cleanedStdout || parsedOutput.isError || parsedOutput.parseError)
+      ? ('\n' + stdout) : '') + ('\n' + (parsedOutput.diagnostic || ''))).toLowerCase();
+    const rate_signals = [
+      'rate limit', 'rate-limit', 'too many requests', 'quota exceeded', 'usage limit reached',
+      'hit your usage limit', 'hit your limit', "you've hit your session limit",
+      "you've hit your weekly limit", 'server is temporarily limiting requests',
+      'upgrade to pro', '429', 'credit balance is too low', 'usage limit', 'out of credits',
+    ];
     const budget_signals = ['exceeded usd budget','exceeded the usd budget','max-budget-usd','budget exceeded','budget cap reached'];
     // Word boundaries avoid false positives such as "deSIGN INtent" in a
     // perfectly valid model response.
     const auth_signals = [
       /\benoent\b/,
       /\bnot authenticated\b/,
+      /\bnot logged in\b/,
       /\bplease log in\b/,
+      /\bplease run \/login\b/,
       /\bsign in\b/,
       /\blogin required\b/,
       /\bauthentication required\b/,
+      /\binvalid api key\b/,
+      /\bauthentication[_ ]error\b/,
+      /\boauth\b.{0,40}\b(?:revoked|expired)\b/,
     ];
-    const rate_limited = rate_signals.some(s => failureBlob.includes(s));
-    const budget_exceeded = budget_signals.some(s => failureBlob.includes(s));
+    const authoritativeApiFailure = claudeApiStatusFailureClass(parsedOutput.apiErrorStatus);
+    const rate_limited = parsedOutput.resultSubtype !== 'error_max_budget_usd'
+      && (authoritativeApiFailure === 'rate_limit' || rate_signals.some(s => failureBlob.includes(s)));
+    const budget_exceeded = parsedOutput.resultSubtype === 'error_max_budget_usd'
+      || authoritativeApiFailure === 'budget'
+      || budget_signals.some(s => failureBlob.includes(s));
     // Some CLIs report unrelated MCP authentication warnings on stderr even
     // after the selected provider completed successfully. Only classify the
     // provider route as unauthenticated when the command failed or produced no
     // usable answer.
-    const auth_failed = auth_signals.some((pattern) => pattern.test(failureBlob))
-      && (code !== 0 || !cleanedStdout);
+    const auth_failed = authoritativeApiFailure === 'auth'
+      || (auth_signals.some((pattern) => pattern.test(failureBlob))
+        && (code !== 0 || !cleanedStdout || parsedOutput.isError));
     const permission_signals = ['headless mode cannot prompt', 'auto-denied', 'no output produced'];
     const permission_denied = permission_signals.some((signal) => failureBlob.includes(signal));
-    const dropped_out = timedOut || code !== 0 || permission_denied || rate_limited || budget_exceeded || auth_failed || !cleanedStdout;
+    const providerTimedOut = timedOut || authoritativeApiFailure === 'timeout';
+    const finalFailureClass = parsedOutput.resultSubtype === 'error_max_budget_usd' ? 'budget'
+      : authoritativeApiFailure || (rate_limited ? 'rate_limit'
+      : budget_exceeded ? 'budget'
+        : auth_failed ? 'auth'
+          : providerTimedOut ? 'timeout'
+            : permission_denied ? 'policy'
+              : parsedOutput.failureClass);
+    const dropped_out = providerTimedOut || code !== 0 || permission_denied || rate_limited || budget_exceeded
+      || auth_failed || parsedOutput.isError || !!parsedOutput.failureClass
+      || !!parsedOutput.parseError || !cleanedStdout;
     sendOneShotResult(res, {
       kind,
       route,
       exitCode: code,
       stdout: cleanedStdout,
-      stderr: cleanOutput(stderr),
+      stderr: cleanOutput([stderr, parsedOutput.diagnostic, parsedOutput.parseError].filter(Boolean).join('\n')),
+      usage: parsedOutput.usage,
+      failureClass: finalFailureClass,
+      result_subtype: parsedOutput.resultSubtype,
+      provider_retries: parsedOutput.retries,
+      provider_stop_reason: parsedOutput.providerStopReason,
+      provider_terminal_reason: parsedOutput.terminalReason,
+      provider_api_error_status: parsedOutput.apiErrorStatus,
+      provider_permission_denials: parsedOutput.permissionDenials,
+      provider_num_turns: parsedOutput.numTurns,
+      provider_duration_ms: parsedOutput.providerDurationMs,
+      provider_api_duration_ms: parsedOutput.providerApiDurationMs,
+      provider_error_count: parsedOutput.errorCount,
+      provider_error_observed: parsedOutput.errorObserved,
+      provider_error_invalid: parsedOutput.errorInvalid,
+      provider_error_diagnostic_truncated: parsedOutput.errorDiagnosticTruncated,
+      provider_error_diagnostic: parsedOutput.diagnostic,
+      transport_output_chars: String(stdout).length,
+      transport_output_hash: crypto.createHash('sha256').update(String(stdout)).digest('hex'),
       rate_limited,
       budget_exceeded,
       auth_failed,
@@ -2137,10 +2820,12 @@ async function executeOneShot(body, res) {
       model: modelChoice.model,
       model_tier: modelChoice.modelTier,
       stop_reason: stopReason,
+      supervisor_stop_reason: stopReason,
       stop_detail: stopDetail,
       progress: supervisor.snapshot(),
-      timed_out: timedOut,
+      timed_out: providerTimedOut,
       dropped_out,
+      model_invocation: true,
     }, { kind, prompt, route, startedAt });
   });
   // Providers without a placeholder (Claude/Codex/Perplexity wrapper) read
