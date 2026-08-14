@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { McpServer } from '@modelcontextprotocol/server';
 import { serveStdio } from '@modelcontextprotocol/server/stdio';
 import { z } from 'zod';
+import TIMEOUT_POLICY from '../timeout-policy.cjs';
 import {
   BASE_URL,
   BRIDGE_ROOT,
@@ -581,7 +582,7 @@ async function callProvider({
   kind,
   prompt,
   cwd,
-  timeoutMs = 180000,
+  timeoutMs = TIMEOUT_POLICY.oneShotDefaultMs,
   useCache = true,
   cacheTtlMs,
   parentReceiptId,
@@ -637,10 +638,10 @@ async function callProvider({
         kind,
         prompt,
         cwd,
-        timeoutMs: Math.max(1000, Math.min(Number(timeoutMs) || 180000, 300000)),
+        timeoutMs: TIMEOUT_POLICY.normalizeOneShotTimeoutMs(timeoutMs),
         dangerous: false,
       },
-      timeoutMs: Math.max(5000, Math.min(Number(timeoutMs) + 15000, 330000)),
+      timeoutMs: TIMEOUT_POLICY.transportTimeoutMs(timeoutMs),
       signal,
     });
     sanitized = sanitizeProviderResponse(response);
@@ -833,6 +834,36 @@ export function buildServer() {
       status: 'previewed',
     });
     return result({ ...route, receiptId: receipt.receiptId });
+  }));
+
+  server.registerTool('list_models', {
+    title: 'List discovered models per provider',
+    description: 'Model registry discovered from each CLI at boot: models a provider can actually run, each with a weight tier and a best-at note, plus warnings for configured pins the account no longer offers. Set refresh to re-probe after installing or upgrading a CLI.',
+    inputSchema: z.object({ refresh: z.boolean().default(false) }),
+    annotations: READ_ONLY,
+  }, safeHandler(async ({ refresh }) => {
+    const registry = await bridgeRequest(refresh ? '/api/models?refresh=1' : '/api/models', { timeoutMs: refresh ? 60000 : 15000 });
+    return result(registry);
+  }));
+
+  server.registerTool('list_active_runs', {
+    title: 'Inspect live provider runs',
+    description: 'Supervision snapshots for in-flight provider calls: phase (streaming/working/quiet/suspect_loop), idle time, CPU evidence, and which limit fires next. Use this to tell a long-thinking run from a wedged one instead of cancelling on suspicion.',
+    inputSchema: z.object({}),
+    annotations: READ_ONLY,
+  }, safeHandler(async () => {
+    const runs = await bridgeRequest('/api/runs/active', { timeoutMs: 10000 });
+    return result(runs);
+  }));
+
+  server.registerTool('bridge_activity', {
+    title: 'Read bridge activity telemetry',
+    description: 'Recent bridge API calls from every client (dashboard UI and this MCP server), with method, path, status, duration, and provider kind. The same log the dashboard Activity panel shows — both sides see the same picture.',
+    inputSchema: z.object({ limit: z.number().int().min(1).max(500).default(120), sinceId: z.number().int().min(0).default(0) }),
+    annotations: READ_ONLY,
+  }, safeHandler(async ({ limit, sinceId }) => {
+    const activity = await bridgeRequest(`/api/telemetry?limit=${limit}&sinceId=${sinceId}`, { timeoutMs: 10000 });
+    return result(activity);
   }));
 
   server.registerTool('list_sessions', {
@@ -1081,7 +1112,7 @@ export function buildServer() {
       kind: z.string().min(1).max(64),
       prompt: z.string().min(1).max(100000),
       cwd: z.string().max(1000).optional(),
-      timeoutMs: z.number().int().min(1000).max(300000).default(180000),
+      timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).max(TIMEOUT_POLICY.oneShotMaxMs).default(TIMEOUT_POLICY.oneShotDefaultMs),
       useCache: z.boolean().default(true),
       cacheTtlMs: z.number().int().min(0).max(86400000).optional(),
       acknowledgeHumanGate: z.boolean().default(false),
@@ -1113,7 +1144,7 @@ export function buildServer() {
       excludedProviders: z.array(z.string()).max(8).default([]),
       localOnly: z.boolean().default(false),
       maxEscalations: z.number().int().min(0).max(3).default(2),
-      timeoutMs: z.number().int().min(1000).max(300000).default(180000),
+      timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).max(TIMEOUT_POLICY.oneShotMaxMs).default(TIMEOUT_POLICY.oneShotDefaultMs),
       useCache: z.boolean().default(true),
       acknowledgeHumanGate: z.boolean().default(false),
       allowModelForDeterministic: z.boolean().default(false),
@@ -1244,7 +1275,7 @@ export function buildServer() {
       mode: z.enum(['advisory', 'consensus']).default(loadRoutingData().policy.committee.defaultMode),
       maxProviders: z.number().int().min(1).max(4).default(3),
       localOnly: z.boolean().default(false),
-      timeoutMs: z.number().int().min(1000).max(300000).default(180000),
+      timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).max(TIMEOUT_POLICY.oneShotMaxMs).default(TIMEOUT_POLICY.oneShotDefaultMs),
       useCache: z.boolean().default(true),
       synthesisProvider: z.string().max(64).optional(),
       acknowledgeHumanGate: z.boolean().default(false),
@@ -1493,14 +1524,14 @@ export function buildServer() {
       providers: z.array(z.string()).max(16).default([]),
       all: z.boolean().default(false),
       cwd: z.string().max(1000).optional(),
-      timeoutMs: z.number().int().min(1000).max(300000).default(180000),
+      timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).max(TIMEOUT_POLICY.oneShotMaxMs).default(TIMEOUT_POLICY.oneShotDefaultMs),
     }),
     annotations: { ...ACTION, openWorldHint: true },
   }, safeHandler(async ({ prompt, tag, providers, all, cwd, timeoutMs }, context) => {
     const response = await bridgeRequest('/api/broadcast', {
       method: 'POST',
       body: { prompt, tag, providers, all, cwd, timeoutMs, dangerous: false },
-      timeoutMs: Math.max(30000, timeoutMs + 330000),
+      timeoutMs: TIMEOUT_POLICY.transportTimeoutMs(timeoutMs),
       signal: context?.mcpReq?.signal,
     });
     const results = (response.results || []).map((member) => {

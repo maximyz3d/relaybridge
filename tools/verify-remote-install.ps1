@@ -16,7 +16,7 @@ try {
   Invoke-WebRequest -Uri $InstallUrl -OutFile $installerPath -UseBasicParsing
   & $installerPath -NoStart -InstallDir $installDir
 
-  foreach ($required in @('server.js', 'README.md', 'install-mcp.ps1', 'mcp/server.mjs')) {
+  foreach ($required in @('server.js', 'timeout-policy.cjs', 'config/timeout-policy.json', 'README.md', 'install-mcp.ps1', 'mcp/server.mjs')) {
     $path = Join-Path $installDir $required
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
       throw "Missing installed file: $required"

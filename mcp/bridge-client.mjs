@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import TIMEOUT_POLICY from '../timeout-policy.cjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const BRIDGE_ROOT = path.resolve(HERE, '..');
@@ -26,6 +27,13 @@ const TOKEN_FILE = path.resolve(envFirst('RELAYBRIDGE_TOKEN_FILE', 'PS_BRIDGE_TO
 const START_LOCK = path.join(BRIDGE_ROOT, '.mcp-start.lock');
 const OUT_LOG = path.join(BRIDGE_ROOT, 'bridge.mcp.out.log');
 const ERR_LOG = path.join(BRIDGE_ROOT, 'bridge.mcp.err.log');
+const MAX_BRIDGE_REQUEST_TIMEOUT_MS = TIMEOUT_POLICY.oneShotMaxMs + TIMEOUT_POLICY.transportGraceMs;
+
+function boundedBridgeRequestTimeoutMs(value) {
+  const parsed = Number(value);
+  const selected = Number.isFinite(parsed) && parsed > 0 ? Math.trunc(parsed) : 30000;
+  return Math.max(TIMEOUT_POLICY.minimumMs, Math.min(selected, MAX_BRIDGE_REQUEST_TIMEOUT_MS));
+}
 
 function validatedBaseUrl(value) {
   const url = new URL(value || 'http://127.0.0.1:8787');
@@ -97,7 +105,9 @@ export async function bridgeRequest(route, {
     throw new BridgeError('RelayBridge capability token is unavailable; restart the hardened bridge', { route });
   }
 
-  const headers = { Accept: 'application/json' };
+  // Tags every MCP-originated call so bridge telemetry can attribute it; the
+  // dashboard shows these alongside its own calls.
+  const headers = { Accept: 'application/json', 'X-RelayBridge-Client': 'mcp' };
   if (body !== undefined) headers['Content-Type'] = 'application/json';
   if (token) headers['X-RelayBridge-Token'] = token;
   let response;
@@ -108,8 +118,8 @@ export async function bridgeRequest(route, {
       body: body === undefined ? undefined : JSON.stringify(body),
       redirect: 'error',
       signal: signal
-        ? AbortSignal.any([signal, AbortSignal.timeout(Math.max(1000, Math.min(Number(timeoutMs) || 30000, 600000)))])
-        : AbortSignal.timeout(Math.max(1000, Math.min(Number(timeoutMs) || 30000, 600000))),
+        ? AbortSignal.any([signal, AbortSignal.timeout(boundedBridgeRequestTimeoutMs(timeoutMs))])
+        : AbortSignal.timeout(boundedBridgeRequestTimeoutMs(timeoutMs)),
     });
   } catch (error) {
     throw new BridgeError(`RelayBridge request failed: ${error.message}`, { route, cause: error });

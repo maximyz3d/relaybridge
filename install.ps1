@@ -550,8 +550,13 @@ try {
   }
 
   if ($RegisterMcp) {
-    & (Join-Path $InstallDir 'install-mcp.ps1')
-    if ($LASTEXITCODE -ne 0) { throw 'MCP registration failed' }
+    # install-mcp.ps1 is a PowerShell script and throws on registration or
+    # verification failure.  Do not inspect a global native-process code here:
+    # native probes inside the child script may legitimately leave a stale
+    # non-zero native exit code even after the script has verified both MCP
+    # registrations and returned normally.
+    try { & (Join-Path $InstallDir 'install-mcp.ps1') }
+    catch { throw "MCP registration failed: $($_.Exception.Message)" }
   }
 
   if (-not $SkipProviderSetup) {

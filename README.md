@@ -107,6 +107,17 @@ Agentic one-shot providers use bounded multi-turn budgets. Grok receives up to
 answer; the bridge deadline, process-tree cancellation, read-only sandbox, and
 no-subagent rules remain the hard safety limits.
 
+Provider prompts default to a 10-minute deadline and accept an explicit
+`timeoutMs` up to 20 minutes. `ask_provider`, routed calls, committees,
+broadcasts, the REST one-shot path, and the MCP transport all use
+`config/timeout-policy.json`; direct REST values above the cap are clamped and
+reported as `route.effective_timeout_ms`. Routed work still shares one overall
+tier deadline, and caller cancellation still terminates the provider process
+tree. Rerun `install-mcp.ps1` after changing this policy so Codex receives a
+host-side tool timeout long enough to cover the provider cap and transport
+grace. These longer deadlines do not change `dangerous:false`, advisory-only
+committee behavior, or any human gate.
+
 Common setup commands:
 
 ```powershell

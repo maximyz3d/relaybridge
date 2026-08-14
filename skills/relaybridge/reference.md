@@ -62,6 +62,12 @@ Discovered model registry: per provider, the models it can run, each with a
 any configured pin the provider no longer offers, and `staleness` for the
 config's own verification date. `?refresh=1` re-probes.
 
+### `GET /api/telemetry`
+Ring-buffered log of recent bridge API calls with `client` (`ui`/`mcp`),
+method, path, status, duration, and provider kind. `?limit=` and `?sinceId=`
+for incremental polling. The dashboard Activity panel and the `bridge_activity`
+MCP tool read the same log, so both sides see the same picture.
+
 ### `POST /api/models/refresh`
 Forces re-discovery. Run it after installing or upgrading a CLI.
 

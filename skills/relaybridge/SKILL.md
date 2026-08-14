@@ -146,6 +146,21 @@ the flag, and lets the account default answer instead of failing the call.
 command (Copilot, Grok) are left alone rather than second-guessed — only a
 positive probe result can veto a pin.
 
+### Seeing what other agents and the dashboard are doing
+
+Every bridge API call is logged with its origin — the dashboard tags as `ui`,
+this MCP path tags as `mcp`. Read it before assuming you are the only actor:
+
+```bash
+curl -s -H "X-RelayBridge-Token: $TOKEN" "http://127.0.0.1:8787/api/telemetry?limit=50"
+```
+
+Over MCP the same picture comes from three read-only tools: `bridge_activity`
+(this log), `list_models` (the discovered model registry), and
+`list_active_runs` (supervision snapshots for in-flight calls). If
+`list_active_runs` shows another client's run in `streaming` or `working`,
+leave it alone — do not launch a duplicate of the same task.
+
 ## Reading the result
 
 Check `stop_reason` before trusting `stdout`:

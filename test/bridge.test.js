@@ -11,10 +11,38 @@ const { spawn, spawnSync } = require('child_process');
 
 const ROOT = path.resolve(__dirname, '..');
 const CONFIG = path.join(ROOT, 'cli-config.json');
+const TIMEOUT_POLICY = require('../timeout-policy.cjs');
 
 function readConfig() {
   return JSON.parse(fs.readFileSync(CONFIG, 'utf8'));
 }
+
+test('one-shot timeout policy is centralized: 10 min default, ceiling equals the supervisor hard cap', () => {
+  assert.equal(TIMEOUT_POLICY.oneShotDefaultMs, 600000);
+  // The explicit-timeout ceiling matches _supervisor.hardCapMs (45 min) so the
+  // MCP transport bound (max + grace) covers everything supervision permits —
+  // otherwise the client aborts the HTTP request under a still-healthy run.
+  assert.equal(TIMEOUT_POLICY.oneShotMaxMs, 2700000);
+  assert.equal(TIMEOUT_POLICY.broadcastQueueWaitMs, 2700000);
+  assert.equal(TIMEOUT_POLICY.normalizeOneShotTimeoutMs(600001), 600001);
+  assert.equal(TIMEOUT_POLICY.normalizeOneShotTimeoutMs(3000000), 2700000);
+  assert.equal(TIMEOUT_POLICY.transportTimeoutMs(2700000), 2715000);
+  const supervisorCfg = readConfig()._supervisor;
+  assert.equal(TIMEOUT_POLICY.oneShotMaxMs, supervisorCfg.hardCapMs, 'transport ceiling must cover the supervisor hard cap');
+  const routing = JSON.parse(fs.readFileSync(path.join(ROOT, 'config', 'routing-policy.json'), 'utf8'));
+  assert.deepEqual(
+    Object.fromEntries(Object.entries(routing.tiers).map(([tier, policy]) => [tier, policy.defaultTimeoutMs])),
+    { utility: 600000, standard: 600000, complex: 900000, critical: 1200000 },
+  );
+});
+
+test('transactional installer does not mistake a stale native exit code for MCP registration failure', () => {
+  const install = fs.readFileSync(path.join(ROOT, 'install.ps1'), 'utf8');
+  const registrationBlock = install.match(/if \(\$RegisterMcp\) \{([\s\S]*?)\n  \}/);
+  assert.ok(registrationBlock, 'RegisterMcp cutover block is present');
+  assert.match(registrationBlock[1], /try \{ & \(Join-Path \$InstallDir 'install-mcp\.ps1'\) \}/);
+  assert.doesNotMatch(registrationBlock[1], /LASTEXITCODE/);
+});
 
 test('provider config uses the installed subscription CLIs and safe headless modes', () => {
   const config = readConfig();
@@ -24,6 +52,8 @@ test('provider config uses the installed subscription CLIs and safe headless mod
   assert.ok(config.claude.strip_env.includes('ANTHROPIC_API_KEY'));
   assert.equal(config.claude.safe[config.claude.safe.indexOf('--model') + 1], 'opus');
   assert.equal(config.claude_fable.safe[config.claude_fable.safe.indexOf('--model') + 1], 'fable');
+  assert.equal(config.claude_fable.safe[config.claude_fable.safe.indexOf('--effort') + 1], 'max');
+  assert.equal(config.claude_fable.oneshot_safe[config.claude_fable.oneshot_safe.indexOf('--effort') + 1], 'max');
   assert.equal(config.claude_fable.model, 'claude-fable-5');
   assert.deepEqual(config.claude_fable.probe, ['claude', 'auth', 'status']);
   assert.ok(config.claude_fable.strip_env.includes('ANTHROPIC_API_KEY'));
@@ -50,7 +80,7 @@ test('provider config uses the installed subscription CLIs and safe headless mod
   assert.equal(config.gemini.npm_package, undefined);
 
   assert.equal(config.grok.npm_package, '@xai-official/grok');
-  assert.equal(config.grok.model, 'grok-4.5');
+  assert.equal(config.grok.model, 'grok-4.6');
   assert.ok(config.grok.dangerous.includes('--always-approve'));
   assert.ok(config.grok.oneshot_safe.includes('{prompt_file}'));
   assert.equal(config.grok.oneshot_safe[config.grok.oneshot_safe.indexOf('--permission-mode') + 1], 'dontAsk');
@@ -148,6 +178,7 @@ test('server, MCP adapter, Perplexity wrapper, and inline browser script parse',
     path.join('mcp', 'bridge-client.mjs'),
     path.join('mcp', 'router.mjs'),
     path.join('mcp', 'receipts.mjs'),
+    'timeout-policy.cjs',
   ]) {
     const result = spawnSync(process.execPath, ['--check', path.join(ROOT, file)], { encoding: 'utf8' });
     assert.equal(result.status, 0, result.stderr || result.stdout);
@@ -351,10 +382,13 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.match(dashboard.headers.get('content-security-policy') || '', /script-src-attr 'none'/);
   const dashboardHtml = await dashboard.text();
   assert.match(dashboardHtml, /<script nonce="[A-Za-z0-9+/=]+">\s*const API/);
+  assert.match(dashboardHtml, /const ONE_SHOT_DEFAULT_TIMEOUT_MS = 600000;/);
+  assert.doesNotMatch(dashboardHtml, /__ONE_SHOT_DEFAULT_TIMEOUT_MS__/);
   const runningHealth = await (await fetch(baseUrl + '/api/health')).json();
   assert.equal(runningHealth.fullPermissions, false);
   assert.equal(runningHealth.buildId, '2.0.1');
   assert.equal(runningHealth.stickyDangerousEnabled, false);
+  assert.deepEqual(runningHealth.oneShotTimeoutPolicy, { minimumMs: 1000, defaultMs: 600000, maxMs: 2700000 });
   assert.ok(Object.prototype.hasOwnProperty.call(runningHealth, 'tokenAcl'));
   if (process.platform === 'win32') {
     assert.equal(runningHealth.tokenAcl.applicable, true);
@@ -374,7 +408,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   const response = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST',
     headers: jsonAuth,
-    body: JSON.stringify({ kind: 'echo', prompt, dangerous: false }),
+    body: JSON.stringify({ kind: 'echo', prompt, timeoutMs: 600001, dangerous: false }),
   });
   assert.equal(response.status, 200);
   const result = await response.json();
@@ -382,7 +416,46 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(result.stdout, prompt.trim());
   assert.equal(result.route.prompt_transport, 'file');
   assert.equal(result.route.prompt_truncated, false);
+  assert.equal(result.route.requested_timeout_ms, 600001);
+  assert.equal(result.route.effective_timeout_ms, 600001);
+  assert.equal(result.route.timeout_clamped, false);
   assert.deepEqual(fs.readdirSync(promptTemp), []);
+
+  const cappedTimeoutResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST',
+    headers: jsonAuth,
+    body: JSON.stringify({ kind: 'echo', prompt: 'timeout cap', timeoutMs: 1500000, dangerous: false }),
+  });
+  assert.equal(cappedTimeoutResponse.status, 200);
+  const cappedTimeoutResult = await cappedTimeoutResponse.json();
+  assert.equal(cappedTimeoutResult.route.requested_timeout_ms, 1500000);
+  // 1.5M ms sits under the raised ceiling (2.7M), so it passes through unclamped.
+  assert.equal(cappedTimeoutResult.route.effective_timeout_ms, 1500000);
+  assert.equal(cappedTimeoutResult.route.timeout_clamped, false);
+
+  // Above the ceiling the policy clamps; an OMITTED timeout arms no clock at
+  // all (effective is null) — supervision governs instead.
+  const overCapResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST',
+    headers: jsonAuth,
+    body: JSON.stringify({ kind: 'echo', prompt: 'over the cap', timeoutMs: 9000000, dangerous: false }),
+  });
+  assert.equal(overCapResponse.status, 200);
+  const overCapResult = await overCapResponse.json();
+  assert.equal(overCapResult.route.effective_timeout_ms, 2700000);
+  assert.equal(overCapResult.route.timeout_clamped, true);
+
+  const noTimeoutResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST',
+    headers: jsonAuth,
+    body: JSON.stringify({ kind: 'echo', prompt: 'supervision governs', dangerous: false }),
+  });
+  assert.equal(noTimeoutResponse.status, 200);
+  const noTimeoutResult = await noTimeoutResponse.json();
+  assert.equal(noTimeoutResult.route.requested_timeout_ms, null);
+  assert.equal(noTimeoutResult.route.effective_timeout_ms, null);
+  assert.equal(noTimeoutResult.route.timeout_clamped, false);
+  assert.equal(noTimeoutResult.stop_reason, null);
 
   const envResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST',
@@ -649,6 +722,7 @@ test('agents listing, tag updates, and broadcast fan-out respect auth, autoRoute
     alpha_two: provider('Alpha Two', { tags: ['alpha', 'beta'] }, ['--delay', '250']),
     beta_only: provider('Beta Only', { tags: ['beta'] }, ['--delay', '250']),
     optin: provider('Opt-in Quota Seat', { tags: ['alpha'], autoRoute: false }, ['--delay', '250']),
+    slow_cancel: provider('Slow Cancellation Seat', { tags: ['slow'], autoRoute: false }, ['--delay', '10000']),
     broken: provider('Broken', { tags: ['beta'] }, ['--exit', '5']),
     shell: {
       label: 'Interactive Shell',
@@ -702,7 +776,7 @@ test('agents listing, tag updates, and broadcast fan-out respect auth, autoRoute
   // Listing excludes interactive-only shells and reports autoRoute + tags.
   const listed = await (await fetch(baseUrl + '/api/agents', { headers: jsonAuth })).json();
   const ids = listed.agents.map((agent) => agent.id).sort();
-  assert.deepEqual(ids, ['alpha_one', 'alpha_two', 'beta_only', 'broken', 'optin']);
+  assert.deepEqual(ids, ['alpha_one', 'alpha_two', 'beta_only', 'broken', 'optin', 'slow_cancel']);
   const optin = listed.agents.find((agent) => agent.id === 'optin');
   assert.equal(optin.autoRoute, false);
   assert.deepEqual(optin.tags, ['alpha']);
@@ -736,8 +810,8 @@ test('agents listing, tag updates, and broadcast fan-out respect auth, autoRoute
   assert.deepEqual(JSON.parse(persistedText).alpha_one.tags, ['alpha', 'gamma']);
 
   // Target resolution: tag match skips autoRoute:false unless named explicitly.
-  const broadcast = (body) => fetch(baseUrl + '/api/broadcast', {
-    method: 'POST', headers: jsonAuth, body: JSON.stringify(body),
+  const broadcast = (body, { signal } = {}) => fetch(baseUrl + '/api/broadcast', {
+    method: 'POST', headers: jsonAuth, body: JSON.stringify(body), signal,
   });
   assert.equal((await broadcast({ prompt: '   ' })).status, 400);
   assert.equal((await broadcast({ prompt: 'x', tag: 'no-such-tag' })).status, 400);
@@ -751,6 +825,24 @@ test('agents listing, tag updates, and broadcast fan-out respect auth, autoRoute
   const explicit = await (await broadcast({ prompt: 'explicit opt-in', providers: ['optin', 'beta_only'] })).json();
   assert.deepEqual(explicit.targets, ['optin', 'beta_only']);
   assert.ok(explicit.results.find((member) => member.provider === 'optin').ok);
+
+  const broadcastController = new AbortController();
+  const cancelledBroadcast = broadcast({
+    prompt: 'cancel this broadcast',
+    providers: ['slow_cancel'],
+    timeoutMs: 600001,
+  }, { signal: broadcastController.signal });
+  setTimeout(() => broadcastController.abort(new Error('broadcast cancellation test')), 150);
+  await assert.rejects(cancelledBroadcast);
+  const cancellationDeadline = Date.now() + 5000;
+  let cancellationHealth;
+  while (Date.now() < cancellationDeadline) {
+    cancellationHealth = await (await fetch(baseUrl + '/api/health')).json();
+    if (cancellationHealth.activeTaskCount === 0 && cancellationHealth.activeOneShotCount === 0) break;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  assert.equal(cancellationHealth.activeTaskCount, 0, 'cancelled broadcast provider must not outlive its caller');
+  assert.equal(cancellationHealth.activeOneShotCount, 0, 'cancelled broadcast must release its admission slot');
 
   // all:true fans out to every AI provider except opt-in seats, queues past the
   // global cap of 2, and reports per-member failures without failing the run.

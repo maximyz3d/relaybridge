@@ -2,6 +2,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
+import TIMEOUT_POLICY from '../timeout-policy.cjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
@@ -16,7 +17,7 @@ const transport = new StdioClientTransport({
   stderr: 'pipe',
 });
 const client = new Client({ name: 'ps-bridge-smoke', version: '2.0.0' });
-const call = (name, args, timeout = 180000) => client.callTool(
+const call = (name, args, timeout = TIMEOUT_POLICY.oneShotDefaultMs + TIMEOUT_POLICY.mcpHostGraceMs) => client.callTool(
   { name, arguments: args },
   { timeout, maxTotalTimeout: timeout },
 );

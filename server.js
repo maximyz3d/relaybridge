@@ -13,6 +13,7 @@ const { resolveModelArgs, applyModelArgs, modelConfigStaleness, modelTierForTask
 const { buildRegistry, parseModelList, pinIsRetired } = require('./lib/model-registry');
 const { WebSocketServer } = require('ws');
 const { spawn, spawnSync } = require('child_process');
+const TIMEOUT_POLICY = require('./timeout-policy.cjs');
 const ROOT = __dirname;
 const BRIDGE_VERSION = require('./package.json').version;
 function loadBuildId() {
@@ -614,7 +615,7 @@ async function runOpenAIChatOneShot({ entry, prompt, timeoutMs, res, route, star
   const timer = setTimeout(() => {
     timedOut = true;
     controller.abort(new Error('hosted provider request timed out'));
-  }, Math.max(1000, Math.min(Number(timeoutMs) || 180000, 300000)));
+  }, TIMEOUT_POLICY.normalizeOneShotTimeoutMs(timeoutMs));
   res.on('close', () => {
     if (!res.writableEnded) {
       clientGone = true;
@@ -719,7 +720,7 @@ async function runOllamaApiOneShot({ entry, prompt, timeoutMs, res, route, start
   const timer = setTimeout(() => {
     timedOut = true;
     controller.abort(new Error('local Ollama request timed out'));
-  }, Math.max(1000, Math.min(Number(timeoutMs) || 180000, 300000)));
+  }, TIMEOUT_POLICY.normalizeOneShotTimeoutMs(timeoutMs));
   res.on('close', () => {
     if (!res.writableEnded) {
       clientGone = true;
@@ -1168,7 +1169,8 @@ app.get(['/', '/index.html'], (req, res) => {
   const nonce = crypto.randomBytes(18).toString('base64');
   const html = INDEX_TEMPLATE
     .replace('<style>', `<style nonce="${nonce}">`)
-    .replace('<script>', `<script nonce="${nonce}">`);
+    .replace('<script>', `<script nonce="${nonce}">`)
+    .replace('__ONE_SHOT_DEFAULT_TIMEOUT_MS__', String(TIMEOUT_POLICY.oneShotDefaultMs));
   res.setHeader('Cache-Control', 'no-store');
   res.setHeader('Content-Security-Policy', [
     "default-src 'none'",
@@ -1197,6 +1199,11 @@ app.get('/api/health', (req, res) => {
     activeTaskCount: activeChildren.size,
     activeOneShotCount,
     maxActiveOneShots: MAX_ACTIVE_ONESHOTS,
+    oneShotTimeoutPolicy: {
+      minimumMs: TIMEOUT_POLICY.minimumMs,
+      defaultMs: TIMEOUT_POLICY.oneShotDefaultMs,
+      maxMs: TIMEOUT_POLICY.oneShotMaxMs,
+    },
     version: BRIDGE_VERSION,
     buildId: BRIDGE_BUILD_ID,
     capabilityAuth: true,
@@ -1216,7 +1223,42 @@ app.get('/api/capability', (req, res) => {
   res.json({ token: CAPABILITY_TOKEN, header: 'X-RelayBridge-Token', legacyHeader: 'X-PS-Bridge-Token' });
 });
 
+// ---- request telemetry ----
+// Every /api call is recorded with its origin so the dashboard can show what
+// the MCP server is doing and MCP agents can see what the dashboard did.
+// The MCP client tags itself with X-RelayBridge-Client: mcp; everything else
+// counts as the UI. Ring-buffered in memory; /api/telemetry reads it.
+const TELEMETRY_MAX = 500;
+const telemetryLog = [];
+const telemetryTotals = { ui: 0, mcp: 0, other: 0 };
+let telemetrySeq = 0;
+function recordTelemetry(entry) {
+  telemetryLog.push(entry);
+  if (telemetryLog.length > TELEMETRY_MAX) telemetryLog.shift();
+  const bucket = entry.client === 'mcp' ? 'mcp' : entry.client === 'ui' ? 'ui' : 'other';
+  telemetryTotals[bucket] += 1;
+}
+
 app.use('/api', (req, res, next) => {
+  // Reading the log must not pollute the log.
+  if (req.path !== '/telemetry') {
+    const startedAt = Date.now();
+    const rawClient = String(req.get('x-relaybridge-client') || 'ui').toLowerCase().slice(0, 16);
+    res.on('finish', () => {
+      let kind = null;
+      try { if (req.body && typeof req.body.kind === 'string') kind = req.body.kind.slice(0, 32); } catch { /* body may be absent */ }
+      recordTelemetry({
+        id: ++telemetrySeq,
+        ts: new Date(startedAt).toISOString(),
+        client: rawClient,
+        method: req.method,
+        path: (req.originalUrl || req.url).split('?')[0],
+        status: res.statusCode,
+        ms: Date.now() - startedAt,
+        kind,
+      });
+    });
+  }
   const providedToken = req.headers['x-relaybridge-token'] || req.headers['x-ps-bridge-token'];
   if (!tokenMatches(providedToken)) {
     return res.status(401).json({ error: 'valid X-RelayBridge-Token required' });
@@ -1384,6 +1426,15 @@ class CapturedOneShotResponse extends require('events').EventEmitter {
     this._resolve({ statusCode: this.statusCode, body: payload });
     return this;
   }
+  cancel(reason = 'broadcast client disconnected') {
+    if (this.writableEnded) return;
+    this.destroyed = true;
+    // Emit before marking writableEnded so executeOneShot observes a genuine
+    // caller disconnect and terminates the provider process tree.
+    this.emit('close');
+    this.writableEnded = true;
+    this._resolve({ statusCode: 499, body: { error: reason, dropped_out: true, cancelled: true } });
+  }
 }
 
 function writeBroadcastRun(run) {
@@ -1408,6 +1459,15 @@ function writeBroadcastRun(run) {
 // Resolve the real provider dependency and optionally run its non-mutating
 // readiness probe. In particular, Perplexity must prove pwm authentication;
 // merely finding node.exe is not an operational signal.
+// Activity log: what the UI and the MCP server have each been asking the
+// bridge to do. sinceId supports incremental polling.
+app.get('/api/telemetry', (req, res) => {
+  const limit = Math.max(1, Math.min(Number(req.query.limit) || 120, TELEMETRY_MAX));
+  const sinceId = Number(req.query.sinceId) || 0;
+  const calls = (sinceId > 0 ? telemetryLog.filter((c) => c.id > sinceId) : telemetryLog).slice(-limit);
+  res.json({ ok: true, totals: { ...telemetryTotals }, lastId: telemetrySeq, calls: calls.slice().reverse() });
+});
+
 // Vetting endpoint: is that quiet run working, or is it stuck? Returns the
 // evidence rather than a guess.
 app.get('/api/runs/active', (req, res) => {
@@ -1676,10 +1736,17 @@ app.post('/api/exec', (req, res) => {
 async function executeOneShot(body, res) {
   const startedAt = Date.now();
   const { kind, prompt, timeoutMs, cwd, dangerous } = body || {};
-  // timeoutMs no longer means "kill at T". It is an optional hard ceiling; the
-  // supervisor decides when a run is actually stuck. Callers that never set it
-  // get the generous default cap rather than the old 3 minute guillotine.
-  const explicitTimeout = Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0 ? Number(timeoutMs) : null;
+  // Two timeout regimes compose here. The timeout policy bounds any EXPLICIT
+  // caller timeout, so a caller can neither starve a run nor exceed the
+  // transport ceiling the MCP client allows. When the caller sends nothing, no
+  // clock is armed for CLI runs at all — the progress-based supervisor decides
+  // when a run is actually stuck (lib/run-supervisor.js). The hosted adapter
+  // paths (Ollama/OpenAI-compatible HTTP) are not supervised and keep a fixed
+  // clock: the caller's bounded value, or the policy default.
+  const explicitTimeout = Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
+    ? TIMEOUT_POLICY.normalizeOneShotTimeoutMs(timeoutMs)
+    : null;
+  const adapterTimeoutMs = explicitTimeout ?? TIMEOUT_POLICY.oneShotDefaultMs;
   if (!kind || typeof prompt !== 'string' || !prompt.trim()) {
     return res.status(400).json({ error: 'kind + non-empty prompt required' });
   }
@@ -1786,15 +1853,21 @@ async function executeOneShot(body, res) {
     dangerous: useDanger,
     prompt_transport: promptTransport,
     prompt_truncated: promptTruncated,
+    requested_timeout_ms: Number.isFinite(Number(timeoutMs)) ? Math.trunc(Number(timeoutMs)) : null,
+    // With no explicit timeout the CLI path is governed by supervision, so the
+    // effective ceiling is resolved after the supervisor is constructed below;
+    // this records the caller-facing view.
+    effective_timeout_ms: explicitTimeout,
+    timeout_clamped: explicitTimeout != null && Math.trunc(Number(timeoutMs)) !== explicitTimeout,
     environment_overrides: Object.keys(oneShotEnv).sort(),
   };
   if (entry.oneshot_adapter === 'ollama_api') {
     cleanupPromptFile();
-    return runOllamaApiOneShot({ entry, prompt, timeoutMs, res, route, startedAt });
+    return runOllamaApiOneShot({ entry, prompt, timeoutMs: adapterTimeoutMs, res, route, startedAt });
   }
   if (entry.oneshot_adapter === 'openai_chat_api') {
     cleanupPromptFile();
-    return runOpenAIChatOneShot({ entry, prompt, timeoutMs, res, route, startedAt });
+    return runOpenAIChatOneShot({ entry, prompt, timeoutMs: adapterTimeoutMs, res, route, startedAt });
   }
   const isWindows = process.platform === 'win32';
   let proc;
@@ -1870,6 +1943,7 @@ async function executeOneShot(body, res) {
     applyVerdict();
   }, 5000);
   if (typeof tick.unref === 'function') tick.unref();
+
 
   res.on('close', () => {
     if (!res.writableEnded) {
@@ -1996,9 +2070,9 @@ app.post('/api/agents/:id/tags', (req, res) => {
 // admission caps, per-provider limits, receipts, and output cleaning behave
 // exactly like /api/oneshot. Members that hit the global concurrency cap are
 // queued (bounded retry on admission_limit) instead of failing.
-const BROADCAST_QUEUE_WAIT_MS = 300000;
 app.post('/api/broadcast', async (req, res) => {
-  const { prompt, tag, providers, all, dangerous, timeoutMs = 180000, cwd } = req.body || {};
+  const { prompt, tag, providers, all, dangerous, timeoutMs = TIMEOUT_POLICY.oneShotDefaultMs, cwd } = req.body || {};
+  const effectiveTimeoutMs = TIMEOUT_POLICY.normalizeOneShotTimeoutMs(timeoutMs);
   if (typeof prompt !== 'string' || !prompt.trim()) {
     return res.status(400).json({ error: 'non-empty prompt required' });
   }
@@ -2016,7 +2090,15 @@ app.post('/api/broadcast', async (req, res) => {
     });
   }
   const startedAt = Date.now();
-  const queueDeadline = startedAt + BROADCAST_QUEUE_WAIT_MS;
+  const deadlineAt = startedAt + effectiveTimeoutMs;
+  const queueDeadline = Math.min(deadlineAt, startedAt + TIMEOUT_POLICY.broadcastQueueWaitMs);
+  const activeCaptured = new Set();
+  let clientGone = false;
+  res.once('close', () => {
+    if (res.writableEnded) return;
+    clientGone = true;
+    for (const captured of activeCaptured) captured.cancel();
+  });
   let run = writeBroadcastRun({
     mode: 'broadcast',
     status: 'running',
@@ -2025,12 +2107,23 @@ app.post('/api/broadcast', async (req, res) => {
     selection: { tag: typeof tag === 'string' ? tag : null, all: all === true, explicitProviders: Array.isArray(providers) ? providers : [] },
     targets,
     members: [],
+    deadlineAt: new Date(deadlineAt).toISOString(),
+    timeoutMs: effectiveTimeoutMs,
   });
   const callOnce = async (kind) => {
+    if (clientGone || res.destroyed) {
+      return { statusCode: 499, body: { error: 'broadcast client disconnected', dropped_out: true, cancelled: true } };
+    }
+    const remainingMs = deadlineAt - Date.now();
+    if (remainingMs < TIMEOUT_POLICY.minimumMs) {
+      return { statusCode: 408, body: { error: 'broadcast deadline exceeded', dropped_out: true, timed_out: true } };
+    }
     const captured = new CapturedOneShotResponse();
-    executeOneShot({ kind, prompt, timeoutMs, cwd, dangerous }, captured)
+    activeCaptured.add(captured);
+    executeOneShot({ kind, prompt, timeoutMs: remainingMs, cwd, dangerous }, captured)
       .catch((err) => captured.status(500).json({ error: err.message, dropped_out: true }));
-    return captured.done;
+    try { return await captured.done; }
+    finally { activeCaptured.delete(captured); }
   };
   const results = await Promise.all(targets.map(async (kind) => {
     const memberStartedAt = Date.now();
@@ -2039,6 +2132,8 @@ app.post('/api/broadcast', async (req, res) => {
       response.statusCode === 429 &&
       response.body?.failureClass === 'admission_limit' &&
       Date.now() < queueDeadline &&
+      Date.now() < deadlineAt &&
+      !clientGone &&
       !res.destroyed
     ) {
       await new Promise((resolve) => setTimeout(resolve, 400 + Math.floor(Math.random() * 400)));
@@ -2060,12 +2155,22 @@ app.post('/api/broadcast', async (req, res) => {
   }));
   run = writeBroadcastRun({
     ...run,
-    status: results.every((member) => member.ok) ? 'completed' : results.some((member) => member.ok) ? 'partial' : 'failed',
+    status: clientGone ? 'cancelled'
+      : results.every((member) => member.ok) ? 'completed'
+        : results.some((member) => member.ok) ? 'partial'
+          : results.some((member) => member.timedOut) ? 'timed_out' : 'failed',
     members: results.map((member) => ({ kind: member.provider, role: 'broadcast', exitCode: member.exitCode, droppedOut: !member.ok, durationMs: member.durationMs, receiptId: member.receiptId })),
     durationMs: Date.now() - startedAt,
   });
   if (res.writableEnded || res.destroyed) return;
-  res.json({ targets, results, runId: run.runId, status: run.status });
+  res.json({
+    targets,
+    results,
+    runId: run.runId,
+    status: run.status,
+    timeoutMs: effectiveTimeoutMs,
+    deadlineAt: new Date(deadlineAt).toISOString(),
+  });
 });
 
 

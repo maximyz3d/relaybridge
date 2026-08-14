@@ -303,6 +303,7 @@
     <span class="label">Full Permissions: OFF</span>
   </button>
   <button class="btn" id="diag-btn" title="Check which CLIs are installed and on PATH">🔍 Check installs</button>
+  <button class="btn" id="activity-btn" title="Every bridge API call from the dashboard and the MCP server">📈 Activity</button>
   <button class="btn" id="broadcast-btn" title="Send one prompt to several AI providers at once">📡 Broadcast</button>
   <button class="btn" id="agents-btn" title="View AI providers, readiness, and edit routing tags">🧩 Agents</button>
   <button class="btn" id="restart-btn" title="Restart the RelayBridge server; all terminal sessions close">⟳ Restart</button>
@@ -317,6 +318,16 @@
   <div class="dlg-foot">
     <button class="btn collab" id="install-go-btn">Install all missing</button>
   </div>
+</dialog>
+
+<dialog id="activity-dialog">
+  <div class="dlg-head"><strong>Bridge activity</strong>
+    <span style="margin-left:auto; display:flex; gap:10px; align-items:center;">
+      <label style="font-size:11px; color:var(--muted); display:flex; gap:4px; align-items:center;"><input type="checkbox" id="activity-hide-health" checked> hide health polls</label>
+      <button class="btn" id="activity-close-btn">Close</button>
+    </span>
+  </div>
+  <div class="dlg-body" id="activity-body" style="font-family:ui-monospace, monospace; font-size:11px; max-height:60vh; overflow:auto;">Loading…</div>
 </dialog>
 
 <dialog id="quick-install-dialog">
@@ -428,6 +439,8 @@
   <span id="status-workspace" class="status-pill">cwd: …</span>
   <span id="status-providers" class="status-pill">providers: not checked</span>
   <span id="status-work" class="status-pill">active calls: …</span>
+  <span id="status-liveness" class="status-pill" title="Live progress of the longest-quiet provider run">no active calls</span>
+  <span id="status-activity" class="status-pill" title="API calls this session: dashboard vs MCP server">ui 0 · mcp 0</span>
   <span id="status-version" class="status-pill">bridge: …</span>
   <span class="spacer"></span>
   <span>API: <a href="/api/health" target="_blank" style="color:var(--muted)">/api/health</a></span>
@@ -439,6 +452,7 @@
 <script src="/vendor/xterm-addon-fit/lib/addon-fit.js"></script>
 <script>
 const API = location.origin;
+const ONE_SHOT_DEFAULT_TIMEOUT_MS = __ONE_SHOT_DEFAULT_TIMEOUT_MS__;
 const WS_BASE = location.origin.replace(/^http/, 'ws');
 
 const state = {
@@ -559,6 +573,34 @@ async function refreshHealthStatus() {
   $('#status-work').textContent = `provider calls: ${providerCalls}`;
   $('#status-work').title = `${childProcesses} total managed child process${childProcesses === 1 ? '' : 'es'}`;
   $('#status-work').className = 'status-pill ' + (providerCalls ? 'warn' : 'ok');
+  // Liveness readout: whether the longest-quiet running call is producing new
+  // content or has gone silent, so a long task can be told apart from a wedged
+  // one at a glance instead of being killed on suspicion.
+  try {
+    if (providerCalls) {
+      const liveRuns = await api('/api/runs/active');
+      const runs = liveRuns.runs || [];
+      if (runs.length) {
+        const worst = runs.slice().sort((a, b) => b.idleMs - a.idleMs)[0];
+        const secs = Math.round(worst.idleMs / 1000);
+        const kb = (worst.bytes / 1024).toFixed(1);
+        const label = worst.phase === 'streaming' ? `streaming ${kb} KB`
+          : worst.phase === 'suspect_loop' ? `repeating — ${worst.repeatPeak}x line`
+            : `quiet ${secs}s${worst.cpuMs != null ? ' (CPU active)' : ''}`;
+        const el = $('#status-liveness');
+        el.textContent = `${worst.kind}: ${label}`;
+        el.title = `${worst.assessment}\nlines: ${worst.lines} | stops in ${Math.round(Math.min(worst.idleBudgetMs, worst.hardCapRemainingMs) / 1000)}s if nothing changes`;
+        el.className = 'status-pill ' + (worst.phase === 'streaming' || worst.phase === 'working' ? 'ok' : 'warn');
+      }
+    } else {
+      const el = $('#status-liveness');
+      el.textContent = 'no active calls';
+      el.className = 'status-pill';
+    }
+    const tele = await api('/api/telemetry?limit=1');
+    $('#status-activity').textContent = `ui ${tele.totals.ui} · mcp ${tele.totals.mcp}`;
+    $('#status-activity').className = 'status-pill ' + (tele.totals.mcp > 0 ? 'ok' : '');
+  } catch { /* pills are cosmetic; never break the poll */ }
   $('#status-version').textContent = `bridge: v${live.version || '?'}`;
   $('#status-version').className = 'status-pill ' + (live.capabilityAuth ? 'ok' : 'warn');
   return live;
@@ -1919,7 +1961,7 @@ function buildTranscriptText(collab) {
     }).join('\n\n');
 }
 
-async function callOneshot(kind, prompt, timeoutMs = 180000, signal) {
+async function callOneshot(kind, prompt, timeoutMs = ONE_SHOT_DEFAULT_TIMEOUT_MS, signal) {
   try {
     const r = await bridgeFetch('/api/oneshot', {
       method: 'POST',
@@ -1958,7 +2000,7 @@ async function runTurn(c, targets, phaseLabel, promptFor) {
     const jobs = targets.map(async (kind) => {
       let response;
       try {
-        response = await callOneshot(kind, promptFor(kind), 180000, signal);
+        response = await callOneshot(kind, promptFor(kind), ONE_SHOT_DEFAULT_TIMEOUT_MS, signal);
       } catch (error) {
         response = { kind, exitCode: -1, stdout: '', stderr: error.message, dropped_out: true, cancelled: signal.aborted };
       }
@@ -2312,6 +2354,53 @@ installGoBtn.onclick = async () => {
 };
 
 $('#install-close-btn').onclick = () => { try { installDialog.close(); } catch { installDialog.removeAttribute('open'); } };
+
+// ============= bridge activity (telemetry) =============
+// One shared log of every API call, attributed to the dashboard or the MCP
+// server, so what MCP agents do is visible here and vice versa.
+const activityDialog = document.getElementById('activity-dialog');
+const activityBody = document.getElementById('activity-body');
+let activityTimer = null;
+
+function fmtActivityRow(c) {
+  const badgeColor = c.client === 'mcp' ? '#b48cff' : c.client === 'ui' ? '#6ea8fe' : '#999';
+  const statusColor = c.status >= 500 ? '#ff6b6b' : c.status >= 400 ? '#ffb454' : 'var(--muted)';
+  const t = c.ts.slice(11, 19);
+  return `<div style="display:flex; gap:8px; padding:2px 0; border-bottom:1px solid rgba(255,255,255,0.05);">
+    <span style="color:var(--muted); flex:0 0 58px;">${t}</span>
+    <span style="flex:0 0 38px; color:${badgeColor}; font-weight:600;">${escapeHtml(c.client)}</span>
+    <span style="flex:0 0 44px;">${escapeHtml(c.method)}</span>
+    <span style="flex:1 1 auto; overflow:hidden; text-overflow:ellipsis;">${escapeHtml(c.path)}${c.kind ? ' <span style="color:#7cc6ff">[' + escapeHtml(c.kind) + ']</span>' : ''}</span>
+    <span style="flex:0 0 34px; color:${statusColor};">${c.status}</span>
+    <span style="flex:0 0 58px; text-align:right; color:var(--muted);">${c.ms} ms</span>
+  </div>`;
+}
+
+async function refreshActivity() {
+  try {
+    const data = await api('/api/telemetry?limit=200');
+    const hideHealth = document.getElementById('activity-hide-health').checked;
+    const calls = (data.calls || []).filter((c) => !hideHealth || (c.path !== '/api/health' && !(c.method === 'GET' && c.path === '/api/sessions') && c.path !== '/api/runs/active'));
+    activityBody.innerHTML = `
+      <div style="margin-bottom:6px; color:var(--muted);">totals — ui: ${data.totals.ui} · mcp: ${data.totals.mcp}${data.totals.other ? ' · other: ' + data.totals.other : ''}</div>
+      ${calls.length ? calls.map(fmtActivityRow).join('') : '<div style="color:var(--muted)">No calls recorded yet (health polls hidden).</div>'}`;
+  } catch (err) {
+    activityBody.innerHTML = `<div style="color:#ff6b6b">Failed to load activity: ${escapeHtml(err.message)}</div>`;
+  }
+}
+
+$('#activity-btn').onclick = () => {
+  if (typeof activityDialog.showModal === 'function') activityDialog.showModal(); else activityDialog.setAttribute('open', 'true');
+  refreshActivity();
+  activityTimer = setInterval(refreshActivity, 2500);
+};
+function closeActivity() {
+  if (activityTimer) { clearInterval(activityTimer); activityTimer = null; }
+  try { activityDialog.close(); } catch { activityDialog.removeAttribute('open'); }
+}
+$('#activity-close-btn').onclick = closeActivity;
+activityDialog.addEventListener('cancel', () => { if (activityTimer) { clearInterval(activityTimer); activityTimer = null; } });
+document.getElementById('activity-hide-health').onchange = refreshActivity;
 
 // ============= per-provider quick install =============
 const quickInstallDialog = document.getElementById('quick-install-dialog');

@@ -38,9 +38,10 @@ args = []
   [IO.File]::WriteAllText($claudeConfig, (($claude | ConvertTo-Json -Depth 10) + "`n"), [Text.UTF8Encoding]::new($false))
 }
 
-New-Item -ItemType Directory -Path (Join-Path $bridgeRoot 'mcp'), (Split-Path -Parent $codexConfig), $fakeBin -Force | Out-Null
+New-Item -ItemType Directory -Path (Join-Path $bridgeRoot 'mcp'), (Join-Path $bridgeRoot 'config'), (Split-Path -Parent $codexConfig), $fakeBin -Force | Out-Null
 try {
   Copy-Item -LiteralPath (Join-Path $repoRoot 'install-mcp.ps1') -Destination (Join-Path $bridgeRoot 'install-mcp.ps1')
+  Copy-Item -LiteralPath (Join-Path $repoRoot 'config\timeout-policy.json') -Destination (Join-Path $bridgeRoot 'config\timeout-policy.json')
   [IO.File]::WriteAllText((Join-Path $bridgeRoot 'mcp\server.mjs'), "// fake MCP entrypoint`n", [Text.UTF8Encoding]::new($false))
   $nodePath = (Get-Command node.exe -ErrorAction Stop).Source
   $fakeClient = Join-Path $repoRoot 'test\fake-mcp-client.js'
@@ -59,6 +60,7 @@ try {
     $codexAfter = Get-Content -LiteralPath $codexConfig -Raw
     $claudeAfter = Get-Content -LiteralPath $claudeConfig -Raw | ConvertFrom-Json
     Assert-True ($codexAfter -match '\[mcp_servers\.relaybridge\]') 'Codex canonical registration must be created'
+    Assert-True ($codexAfter -match 'tool_timeout_sec = 1245') 'Codex MCP timeout must cover the 20-minute provider cap plus transport and host grace'
     Assert-True ($codexAfter -notmatch '\[mcp_servers\.ps_bridge\]') 'recognized Codex ps_bridge registration must be removed after promotion'
     Assert-True ($codexAfter -match '\[mcp_servers\.ps-bridge\]') 'non-RelayBridge lookalike registration must not be removed'
     Assert-True ($codexAfter -match '\[mcp_servers\.unrelated\]') 'unrelated Codex registration must be preserved'

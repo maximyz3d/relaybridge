@@ -126,8 +126,13 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
 
   const listedTools = await client.listTools();
   const toolNames = new Set(listedTools.tools.map((tool) => tool.name));
-  for (const expected of ['bridge_status', 'list_providers', 'get_context_bundle', 'route_preview', 'ask_provider', 'run_committee', 'get_receipt', 'restart_bridge', 'list_agents', 'set_agent_tags', 'broadcast']) {
+  for (const expected of ['bridge_status', 'list_providers', 'get_context_bundle', 'route_preview', 'ask_provider', 'route_and_ask', 'run_committee', 'get_receipt', 'restart_bridge', 'list_agents', 'set_agent_tags', 'broadcast']) {
     assert.ok(toolNames.has(expected), `missing MCP tool ${expected}`);
+  }
+  for (const toolName of ['ask_provider', 'route_and_ask', 'run_committee', 'broadcast']) {
+    const timeoutSchema = listedTools.tools.find((tool) => tool.name === toolName).inputSchema.properties.timeoutMs;
+    assert.equal(timeoutSchema.default, 600000, `${toolName} uses the centralized 10-minute default`);
+    assert.equal(timeoutSchema.maximum, 2700000, `${toolName} accepts up to the transport ceiling (supervisor hard cap)`);
   }
   assert.ok(!toolNames.has('exec'), 'raw command execution must not be exposed over MCP');
   assert.ok(!toolNames.has('set_full_permissions'), 'the sticky dangerous toggle must not be exposed over MCP');
@@ -139,6 +144,7 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   const healthPayload = JSON.parse(healthResource.contents[0].text);
   assert.equal(healthPayload.version, '2.0.1');
   assert.equal(healthPayload.capabilityAuth, true);
+  assert.deepEqual(healthPayload.oneShotTimeoutPolicy, { minimumMs: 1000, defaultMs: 600000, maxMs: 2700000 });
 
   const capability = await (await fetch(`${baseUrl}/api/capability`)).json();
   const collabHeaders = { 'X-PS-Bridge-Token': capability.token, 'Content-Type': 'application/json' };
@@ -212,23 +218,40 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
 
   const broadcastReply = await client.callTool({
     name: 'broadcast',
-    arguments: { prompt: 'broadcast smoke', tag: 'utility' },
+    arguments: { prompt: 'broadcast smoke', tag: 'utility', timeoutMs: 600002 },
   });
   assert.equal(broadcastReply.isError, undefined, JSON.stringify(broadcastReply.structuredContent));
   assert.deepEqual(broadcastReply.structuredContent.targets, ['echo']);
   assert.equal(broadcastReply.structuredContent.results[0].ok, true);
   assert.equal(broadcastReply.structuredContent.results[0].output, 'broadcast smoke');
   assert.match(broadcastReply.structuredContent.runId, /^run_/);
+  assert.equal(broadcastReply.structuredContent.timeoutMs, 600002);
 
   const prompt = 'MCP_SAFE_MARKER_42';
   const provider = await client.callTool({
     name: 'ask_provider',
-    arguments: { kind: 'echo', prompt, useCache: false, timeoutMs: 5000 },
+    arguments: { kind: 'echo', prompt, useCache: false, timeoutMs: 600001 },
   });
   assert.equal(provider.isError, undefined, JSON.stringify(provider.structuredContent));
   assert.equal(provider.structuredContent.stdout, prompt);
   assert.equal(provider.structuredContent.route.dangerous, false);
+  assert.equal(provider.structuredContent.route.requested_timeout_ms, 600001);
+  assert.equal(provider.structuredContent.route.effective_timeout_ms, 600001);
   assert.match(provider.structuredContent.receiptId, /^rcpt_/);
+
+  const routedProvider = await client.callTool({
+    name: 'route_and_ask',
+    arguments: {
+      task: 'Review this JavaScript function for a simple bug.',
+      preferredProviders: ['codex'],
+      maxEscalations: 0,
+      useCache: false,
+      timeoutMs: 600004,
+    },
+  });
+  assert.equal(routedProvider.isError, undefined, JSON.stringify(routedProvider.structuredContent));
+  assert.equal(routedProvider.structuredContent.winner.kind, 'codex');
+  assert.ok(routedProvider.structuredContent.winner.route.effective_timeout_ms > 300000);
 
   const gated = await client.callTool({
     name: 'ask_provider',
@@ -247,11 +270,12 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
       maxProviders: 3,
       mode: 'advisory',
       useCache: false,
-      timeoutMs: 5000,
+      timeoutMs: 600003,
     },
   });
   assert.equal(strictCommittee.isError, undefined, JSON.stringify(strictCommittee.structuredContent));
   assert.deepEqual(strictCommittee.structuredContent.members.map((member) => member.kind), ['codex']);
+  assert.ok(strictCommittee.structuredContent.members[0].route.effective_timeout_ms > 300000);
 
   const localConsensus = await client.callTool({
     name: 'run_committee',

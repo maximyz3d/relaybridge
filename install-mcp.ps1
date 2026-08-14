@@ -16,6 +16,7 @@ $ErrorActionPreference = 'Stop'
 $bridgeRoot = (Resolve-Path -LiteralPath $PSScriptRoot).Path
 $mcpServer = Join-Path $bridgeRoot 'mcp\server.mjs'
 $tokenFile = Join-Path $bridgeRoot '.bridge-token'
+$timeoutPolicyPath = Join-Path $bridgeRoot 'config\timeout-policy.json'
 $nodePath = (Get-Command node.exe -ErrorAction Stop).Source
 $codexConfigPath = Join-Path $env:USERPROFILE '.codex\config.toml'
 $claudeConfigPath = Join-Path $env:USERPROFILE '.claude.json'
@@ -68,6 +69,16 @@ function Test-LegacyRelayBridgeRegistration([ValidateSet('codex', 'claude')] [st
 if (-not (Test-Path -LiteralPath $mcpServer -PathType Leaf)) {
   throw "MCP server not found: $mcpServer"
 }
+if (-not (Test-Path -LiteralPath $timeoutPolicyPath -PathType Leaf)) {
+  throw "Timeout policy not found: $timeoutPolicyPath"
+}
+$timeoutPolicy = Get-Content -LiteralPath $timeoutPolicyPath -Raw | ConvertFrom-Json
+$mcpToolTimeoutSec = [int][Math]::Ceiling((
+  [double]$timeoutPolicy.oneShotMaxMs +
+  [double]$timeoutPolicy.transportGraceMs +
+  [double]$timeoutPolicy.mcpHostGraceMs
+) / 1000)
+if ($mcpToolTimeoutSec -lt 1) { throw "Invalid timeout policy: $timeoutPolicyPath" }
 $tokenCreated = $false
 if (-not (Test-Path -LiteralPath $tokenFile -PathType Leaf)) {
   Write-Host '[RelayBridge] Creating the local capability token...' -ForegroundColor Cyan
@@ -132,7 +143,7 @@ if (-not $SkipCodex) {
   $toolList = ($toolNames | ForEach-Object { '"' + $_ + '"' }) -join ', '
   $settings = @(
     'startup_timeout_sec = 15',
-    'tool_timeout_sec = 360',
+    "tool_timeout_sec = $mcpToolTimeoutSec",
     'required = false',
     'default_tools_approval_mode = "writes"',
     "enabled_tools = [$toolList]"
