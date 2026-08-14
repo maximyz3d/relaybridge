@@ -60,7 +60,7 @@ try {
     $codexAfter = Get-Content -LiteralPath $codexConfig -Raw
     $claudeAfter = Get-Content -LiteralPath $claudeConfig -Raw | ConvertFrom-Json
     Assert-True ($codexAfter -match '\[mcp_servers\.relaybridge\]') 'Codex canonical registration must be created'
-    Assert-True ($codexAfter -match 'tool_timeout_sec = 1245') 'Codex MCP timeout must cover the 20-minute provider cap plus transport and host grace'
+    Assert-True ($codexAfter -match 'tool_timeout_sec = 2745') 'Codex MCP timeout must cover the 45-minute provider cap plus transport and host grace'
     Assert-True ($codexAfter -notmatch '\[mcp_servers\.ps_bridge\]') 'recognized Codex ps_bridge registration must be removed after promotion'
     Assert-True ($codexAfter -match '\[mcp_servers\.ps-bridge\]') 'non-RelayBridge lookalike registration must not be removed'
     Assert-True ($codexAfter -match '\[mcp_servers\.unrelated\]') 'unrelated Codex registration must be preserved'

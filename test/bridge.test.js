@@ -17,8 +17,8 @@ function readConfig() {
   return JSON.parse(fs.readFileSync(CONFIG, 'utf8'));
 }
 
-test('one-shot timeout policy is centralized: 10 min default, ceiling equals the supervisor hard cap', () => {
-  assert.equal(TIMEOUT_POLICY.oneShotDefaultMs, 600000);
+test('one-shot timeout policy is centralized: 20 min default, ceiling equals the supervisor hard cap', () => {
+  assert.equal(TIMEOUT_POLICY.oneShotDefaultMs, 1200000);
   // The explicit-timeout ceiling matches _supervisor.hardCapMs (45 min) so the
   // MCP transport bound (max + grace) covers everything supervision permits —
   // otherwise the client aborts the HTTP request under a still-healthy run.
@@ -29,10 +29,12 @@ test('one-shot timeout policy is centralized: 10 min default, ceiling equals the
   assert.equal(TIMEOUT_POLICY.transportTimeoutMs(2700000), 2715000);
   const supervisorCfg = readConfig()._supervisor;
   assert.equal(TIMEOUT_POLICY.oneShotMaxMs, supervisorCfg.hardCapMs, 'transport ceiling must cover the supervisor hard cap');
+  assert.equal(supervisorCfg.idleMs, 1200000, 'buffered providers get the full default window before idle-stall');
+  assert.ok(supervisorCfg.idleMs >= TIMEOUT_POLICY.oneShotDefaultMs);
   const routing = JSON.parse(fs.readFileSync(path.join(ROOT, 'config', 'routing-policy.json'), 'utf8'));
   assert.deepEqual(
     Object.fromEntries(Object.entries(routing.tiers).map(([tier, policy]) => [tier, policy.defaultTimeoutMs])),
-    { utility: 600000, standard: 600000, complex: 900000, critical: 1200000 },
+    { utility: 1200000, standard: 1200000, complex: 1200000, critical: 1200000 },
   );
 });
 
@@ -382,13 +384,13 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.match(dashboard.headers.get('content-security-policy') || '', /script-src-attr 'none'/);
   const dashboardHtml = await dashboard.text();
   assert.match(dashboardHtml, /<script nonce="[A-Za-z0-9+/=]+">\s*const API/);
-  assert.match(dashboardHtml, /const ONE_SHOT_DEFAULT_TIMEOUT_MS = 600000;/);
+  assert.match(dashboardHtml, /const ONE_SHOT_DEFAULT_TIMEOUT_MS = 1200000;/);
   assert.doesNotMatch(dashboardHtml, /__ONE_SHOT_DEFAULT_TIMEOUT_MS__/);
   const runningHealth = await (await fetch(baseUrl + '/api/health')).json();
   assert.equal(runningHealth.fullPermissions, false);
   assert.equal(runningHealth.buildId, '2.0.1');
   assert.equal(runningHealth.stickyDangerousEnabled, false);
-  assert.deepEqual(runningHealth.oneShotTimeoutPolicy, { minimumMs: 1000, defaultMs: 600000, maxMs: 2700000 });
+  assert.deepEqual(runningHealth.oneShotTimeoutPolicy, { minimumMs: 1000, defaultMs: 1200000, maxMs: 2700000 });
   assert.ok(Object.prototype.hasOwnProperty.call(runningHealth, 'tokenAcl'));
   if (process.platform === 'win32') {
     assert.equal(runningHealth.tokenAcl.applicable, true);

@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "minimumMs": 1000,
-  "oneShotDefaultMs": 600000,
+  "oneShotDefaultMs": 1200000,
   "oneShotMaxMs": 2700000,
   "transportGraceMs": 15000,
   "mcpHostGraceMs": 30000,

@@ -107,8 +107,11 @@ Agentic one-shot providers use bounded multi-turn budgets. Grok receives up to
 answer; the bridge deadline, process-tree cancellation, read-only sandbox, and
 no-subagent rules remain the hard safety limits.
 
-Provider prompts default to a 10-minute deadline and accept an explicit
-`timeoutMs` up to 20 minutes. `ask_provider`, routed calls, committees,
+Provider prompts default to a 20-minute deadline and accept an explicit
+`timeoutMs` up to 45 minutes. The liveness supervisor also grants buffered
+print-mode CLIs the full 20-minute default silence window, so a healthy Claude
+response is not killed by the earlier six-minute idle heuristic.
+`ask_provider`, routed calls, committees,
 broadcasts, the REST one-shot path, and the MCP transport all use
 `config/timeout-policy.json`; direct REST values above the cap are clamped and
 reported as `route.effective_timeout_ms`. Routed work still shares one overall

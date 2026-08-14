@@ -131,7 +131,7 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   }
   for (const toolName of ['ask_provider', 'route_and_ask', 'run_committee', 'broadcast']) {
     const timeoutSchema = listedTools.tools.find((tool) => tool.name === toolName).inputSchema.properties.timeoutMs;
-    assert.equal(timeoutSchema.default, 600000, `${toolName} uses the centralized 10-minute default`);
+    assert.equal(timeoutSchema.default, 1200000, `${toolName} uses the centralized 20-minute default`);
     assert.equal(timeoutSchema.maximum, 2700000, `${toolName} accepts up to the transport ceiling (supervisor hard cap)`);
   }
   assert.ok(!toolNames.has('exec'), 'raw command execution must not be exposed over MCP');
@@ -144,7 +144,7 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   const healthPayload = JSON.parse(healthResource.contents[0].text);
   assert.equal(healthPayload.version, '2.0.1');
   assert.equal(healthPayload.capabilityAuth, true);
-  assert.deepEqual(healthPayload.oneShotTimeoutPolicy, { minimumMs: 1000, defaultMs: 600000, maxMs: 2700000 });
+  assert.deepEqual(healthPayload.oneShotTimeoutPolicy, { minimumMs: 1000, defaultMs: 1200000, maxMs: 2700000 });
 
   const capability = await (await fetch(`${baseUrl}/api/capability`)).json();
   const collabHeaders = { 'X-PS-Bridge-Token': capability.token, 'Content-Type': 'application/json' };

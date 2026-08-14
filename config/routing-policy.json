@@ -15,21 +15,21 @@
       "maxInputChars": 3000,
       "maxProviders": 1,
       "maxEscalations": 1,
-      "defaultTimeoutMs": 600000,
+      "defaultTimeoutMs": 1200000,
       "description": "Status, lookup, classification, short explanation, or deterministic inspection."
     },
     "standard": {
       "maxInputChars": 9000,
       "maxProviders": 2,
       "maxEscalations": 1,
-      "defaultTimeoutMs": 600000,
+      "defaultTimeoutMs": 1200000,
       "description": "Normal coding, review, research, or reasoning with bounded context."
     },
     "complex": {
       "maxInputChars": 18000,
       "maxProviders": 3,
       "maxEscalations": 2,
-      "defaultTimeoutMs": 900000,
+      "defaultTimeoutMs": 1200000,
       "description": "Multi-part, long-context, cross-domain, architectural, or difficult debugging work."
     },
     "critical": {

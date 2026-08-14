@@ -2,7 +2,7 @@
   "_comment": "Per-CLI config. 'safe'/'dangerous' launch interactive sessions. 'oneshot_safe'/'oneshot_dangerous' power Collab Mode. Use {prompt} for a bounded inline prompt, {prompt_file} when the CLI supports a file, or no placeholder to pipe stdin. 'oneshot_env' applies validated string environment overrides only to one-shot children. 'probe' is a non-mutating readiness check. Edit freely.",
   "_supervisor": {
     "_note": "Liveness policy for provider runs. Runs are judged by progress, not by the clock: while new content keeps arriving a run is left alone to finish, and it is stopped early with a reason when it goes silent or starts repeating. idleMs is generous because print-mode CLIs buffer their whole answer and emit nothing until the end. Any provider entry may override these with its own \"supervisor\" object.",
-    "idleMs": 360000,
+    "idleMs": 1200000,
     "hardCapMs": 2700000,
     "graceExtensions": 3,
     "loopRepeatThreshold": 12,

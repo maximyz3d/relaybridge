@@ -34,6 +34,14 @@ test('silence past the idle window with no CPU advance is called a stall', () =>
   assert.match(verdict.detail, /no output for \d+s/);
 });
 
+test('buffered providers survive the retired six-minute idle cutoff by default', () => {
+  const s = make();
+  const verdict = s.evaluate(T0 + 361000);
+  assert.equal(verdict.action, 'continue');
+  assert.equal(verdict.reason, 'starting');
+  assert.equal(s.snapshot(T0 + 361000).idleBudgetMs, DEFAULTS.idleMs - 361000);
+});
+
 test('CPU advance while silent buys grace, so a quietly thinking CLI survives', () => {
   const s = make({ idleMs: 60000, cpuActiveMs: 500, graceExtensions: 3 });
   s.recordOutput('thinking\n', T0 + 1000);
