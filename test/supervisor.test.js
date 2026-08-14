@@ -1,4 +1,4 @@
-'use strict';
+﻿'use strict';
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -14,7 +14,7 @@ function make(overrides = {}) {
 test('a run that keeps producing new content is never stopped mid-task', () => {
   const s = make({ idleMs: 60000, hardCapMs: 3600000 });
   let now = T0;
-  // Twenty minutes of steady, varied output — well past the old 3 min cap.
+  // Twenty minutes of steady, varied output â€” well past the old 3 min cap.
   for (let i = 0; i < 240; i++) {
     now += 5000;
     s.recordOutput(`step ${i}: editing module number ${i} and running its checks\n`, now);
@@ -170,7 +170,8 @@ test('unverifiable idle follows the configured policy', () => {
   const kill = make({ idleMs: 60000, onUnverifiableIdle: 'kill' });
   kill.recordOutput('x'.repeat(40) + '\n', T0 + 1000);
   kill.recordCpuSample(null, T0 + 40000);
-  assert.equal(kill.evaluate(T0 + 90000).action, 'kill');
+  assert.equal(kill.evaluate(T0 + 90000).action, 'continue', 'still inside the widened unverified-idle window');
+  assert.equal(kill.evaluate(T0 + 260000).action, 'kill', 'past the widened window it stops');
 
   const wait = make({ idleMs: 60000, onUnverifiableIdle: 'continue' });
   wait.recordOutput('y'.repeat(40) + '\n', T0 + 1000);

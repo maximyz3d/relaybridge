@@ -1,4 +1,4 @@
-'use strict';
+﻿'use strict';
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -54,9 +54,9 @@ test('model args are injected after a subcommand and before the prompt', () => {
   assert.equal(slot[slot.length - 1], '{prompt}', 'the prompt placeholder must stay last');
 });
 
-test('an existing model pin in the slot is never doubled', () => {
+test('a routed tier replaces a model already pinned in the slot', () => {
   const slot = applyModelArgs(['--model', 'already', '{prompt}'], ['--model', 'other'], {});
-  assert.deepEqual(slot, ['--model', 'already', '{prompt}']);
+  assert.deepEqual(slot, ['--model', 'other', '{prompt}'], 'the routed tier replaces a pinned default instead of being silently dropped');
 });
 
 test('no model args leaves the slot untouched', () => {

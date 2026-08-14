@@ -1,4 +1,4 @@
-// RelayBridge - local PowerShell + multi-AI-CLI bridge
+﻿// RelayBridge - local PowerShell + multi-AI-CLI bridge
 // Runs on 127.0.0.1 only. Spawns real PTYs (node-pty) when available,
 // falls back to child_process pipes otherwise.
 
@@ -48,7 +48,7 @@ const INSTANCE_ID = crypto.randomUUID();
 // with extra local/sandbox accounts can mean a long list of principals holding
 // Modify on the bridge's capability token. Harden the DACL for that one file:
 // remove inheritance, keep the current user, SYSTEM, and Administrators. This is
-// deliberately best-effort — a failure is reported loudly and never causes the
+// deliberately best-effort â€” a failure is reported loudly and never causes the
 // token to be deleted or rotated, because that would lock out live clients.
 const TOKEN_ACL_SKIPPED = /^(1|true|yes)$/i.test(envFirst('RELAYBRIDGE_SKIP_TOKEN_ACL', 'PS_BRIDGE_SKIP_TOKEN_ACL'));
 const SID_SYSTEM = 'S-1-5-18';
@@ -142,7 +142,7 @@ function loadOrCreateCapabilityToken() {
   try { TOKEN_ACL = hardenTokenFileAcl(TOKEN_FILE); }
   catch (err) { TOKEN_ACL = { applicable: true, hardened: false, detail: `token ACL hardening threw: ${err.message}` }; }
   if (TOKEN_ACL.applicable && TOKEN_ACL.hardened === false) {
-    console.warn(`[RelayBridge] WARNING: the capability token file is not ACL-protected — ${TOKEN_ACL.detail}`);
+    console.warn(`[RelayBridge] WARNING: the capability token file is not ACL-protected â€” ${TOKEN_ACL.detail}`);
     console.warn(`[RelayBridge]          ${TOKEN_FILE}`);
     console.warn('[RelayBridge]          Any account that can read it holds full bridge control. The token was NOT rotated or deleted.');
   }
@@ -219,7 +219,7 @@ let ptyMode = process.env.PTY_MODE || 'auto';
 if (ptyMode !== 'none') {
   try {
     pty = require('node-pty');
-    console.log('[RelayBridge] node-pty loaded — using real PTY mode');
+    console.log('[RelayBridge] node-pty loaded â€” using real PTY mode');
   } catch (err) {
     console.warn('[RelayBridge] node-pty unavailable, falling back to pipe mode.');
     console.warn('           ' + err.message);
@@ -878,11 +878,11 @@ const MODEL_REGISTRY_FILE = path.join(DATA_DIR, 'model-registry.json');
 
 // Cumulative CPU milliseconds for a process tree. This separates "the model is
 // thinking and has not printed yet" from "the stage is wedged": print-mode CLIs
-// buffer their whole answer, so silence alone proves nothing. Best effort —
+// buffer their whole answer, so silence alone proves nothing. Best effort â€”
 // resolves null when it cannot be read.
 function sampleTreeCpuMs(rootPid) {
   return new Promise((resolve) => {
-    if (!isWindows || !rootPid) return resolve(null);
+    if (process.platform !== 'win32' || !rootPid) return resolve(null);
     const script = [
       "$ErrorActionPreference='SilentlyContinue';",
       `$root=${Number(rootPid)};`,
@@ -924,13 +924,14 @@ async function discoverModels() {
     const probeResults = {};
     for (const kind of Object.keys(cfg).filter((k) => !k.startsWith('_') && k !== 'powershell')) {
       const entry = cfg[kind];
+      if (!entry || typeof entry !== "object") continue;
       if (Array.isArray(entry.models_static) && entry.models_static.length) {
         probeResults[kind] = { models: entry.models_static.slice() };
         continue;
       }
       if (!Array.isArray(entry.models_probe) || !entry.models_probe.length) continue;
       try {
-        const result = await runProbe(entry.models_probe, timeoutMs, entry.strip_env || []);
+        const result = await Promise.race([runProbe(entry.models_probe, timeoutMs, entry.strip_env || []), new Promise((r) => setTimeout(() => r({ exitCode: -1, stdout: "", stderr: "probe timeout" }), timeoutMs + 5000))]);
         if (result.exitCode === 0) {
           const models = parseModelList(result.stdout, entry);
           probeResults[kind] = models.length ? { models } : { error: 'probe returned no recognizable model ids' };
@@ -988,7 +989,7 @@ class Session {
     if (pty) {
       try {
         // On Windows, ConPTY (used by node-pty) can't resolve .cmd / .bat / .ps1
-        // shims directly — pty.spawn('claude', ...) fails because the shim isn't
+        // shims directly â€” pty.spawn('claude', ...) fails because the shim isn't
         // a real .exe. Wrap any non-.exe command with `cmd.exe /c` so the shim
         // resolves through cmd.exe's path search. PowerShell.exe etc. skip this.
         let spawnCmd = resolvedCommand;
@@ -1015,7 +1016,7 @@ class Session {
     // pipe fallback
     // On Windows, npm-installed CLIs are usually .cmd shims (claude.cmd,
     // codex.cmd, gemini.cmd). spawn('claude', ...) with shell:false won't
-    // resolve those — you get ENOENT. Setting shell:true lets cmd.exe
+    // resolve those â€” you get ENOENT. Setting shell:true lets cmd.exe
     // look up the command and find the shim. (Localhost-only server with
     // user-controlled cli-config.json, so no injection surface.)
     const isWindowsShim = process.platform === 'win32' && !/\.exe$/i.test(resolvedCommand);
@@ -1479,11 +1480,11 @@ app.get('/api/runs/active', (req, res) => {
       runId: run.runId, kind: run.kind, route: run.route, pid: run.pid,
       startedAt: new Date(run.startedAt).toISOString(),
       ...snap,
-      assessment: snap.phase === 'streaming' ? 'producing output right now — leave it alone'
-        : snap.phase === 'working' ? 'recently active — still working'
-          : snap.phase === 'suspect_loop' ? 'repeating itself — watch this one'
+      assessment: snap.phase === 'streaming' ? 'producing output right now â€” leave it alone'
+        : snap.phase === 'working' ? 'recently active â€” still working'
+          : snap.phase === 'suspect_loop' ? 'repeating itself â€” watch this one'
             : snap.phase === 'quiet' || snap.phase === 'quiet_start'
-              ? (snap.cpuMs != null ? 'silent but burning CPU — thinking, not stuck' : 'silent, liveness unverified')
+              ? (snap.cpuMs != null ? 'silent but burning CPU â€” thinking, not stuck' : 'silent, liveness unverified')
               : 'starting up',
     });
   }
@@ -1505,7 +1506,7 @@ app.post('/api/models/refresh', async (req, res) => {
 });
 
 // Delegation: classify a task, rank providers by tier, and pick the model
-// weight class inside each. Advisory — it returns a plan, it does not dispatch.
+// weight class inside each. Advisory â€” it returns a plan, it does not dispatch.
 app.post('/api/route', async (req, res) => {
   const { task, diagnostics: supplied, preferKinds, excludeKinds } = req.body || {};
   if (!task || typeof task !== 'string' || !task.trim()) {
@@ -1686,7 +1687,7 @@ app.get('/api/sessions/:id/buffer', (req, res) => {
   });
 });
 
-// One-shot exec — for Cowork to run a PowerShell command and get output back.
+// One-shot exec â€” for Cowork to run a PowerShell command and get output back.
 app.post('/api/exec', (req, res) => {
   const { command, shell = 'powershell', timeoutMs = 60000, cwd } = req.body || {};
   if (!command || typeof command !== 'string') {
@@ -1723,7 +1724,7 @@ app.post('/api/exec', (req, res) => {
 });
 
 
-// One-shot AI invocation — used by Collab Mode. Spawns the configured CLI in
+// One-shot AI invocation â€” used by Collab Mode. Spawns the configured CLI in
 // non-interactive mode, transports the prompt by stdin/argument/temp file as
 // declared in config, and captures full output. Returns
 // stdout/stderr/exitCode + heuristic flags (rate_limited, budget_exceeded) so
@@ -1739,7 +1740,7 @@ async function executeOneShot(body, res) {
   // Two timeout regimes compose here. The timeout policy bounds any EXPLICIT
   // caller timeout, so a caller can neither starve a run nor exceed the
   // transport ceiling the MCP client allows. When the caller sends nothing, no
-  // clock is armed for CLI runs at all — the progress-based supervisor decides
+  // clock is armed for CLI runs at all â€” the progress-based supervisor decides
   // when a run is actually stuck (lib/run-supervisor.js). The hosted adapter
   // paths (Ollama/OpenAI-compatible HTTP) are not supervised and keep a fixed
   // clock: the caller's bounded value, or the policy default.
@@ -1759,14 +1760,14 @@ async function executeOneShot(body, res) {
   } catch (err) {
     return res.status(500).json({ error: `invalid oneshot environment for ${kind}: ${err.message}` });
   }
-  // Collab Mode is a discussion, not an agentic task — it passes dangerous:false
+  // Collab Mode is a discussion, not an agentic task â€” it passes dangerous:false
   // so CLIs run non-agentically (no auto tool/command execution). When the
   // caller doesn't specify, fall back to the global Full Permissions toggle.
   const useDanger = (typeof dangerous === 'boolean') ? dangerous : state.fullPermissions;
   const slotRaw = useDanger ? entry.oneshot_dangerous : entry.oneshot_safe;
   if (!slotRaw || !slotRaw.length) return res.status(400).json({ error: 'no oneshot config for ' + kind });
   // Model selection inside the provider: taskTier/modelTier picks the weight
-  // class. A pin discovery proved is retired is dropped rather than sent — a
+  // class. A pin discovery proved is retired is dropped rather than sent â€” a
   // missing flag runs on the account default, a dead id fails every call.
   let modelChoice = resolveModelArgs({
     entry,
@@ -1774,7 +1775,7 @@ async function executeOneShot(body, res) {
     modelTier: typeof body?.modelTier === 'string' ? body.modelTier : undefined,
   });
   if (modelChoice.model && pinIsRetired(modelRegistry, kind, modelChoice.model)) {
-    console.warn(`[RelayBridge] ${kind}: pinned model "${modelChoice.model}" is not in this account's model list — falling back to the account default`);
+    console.warn(`[RelayBridge] ${kind}: pinned model "${modelChoice.model}" is not in this account's model list â€” falling back to the account default`);
     modelChoice = { ...modelChoice, args: [], model: null, source: 'account_default_retired_pin' };
   }
   const slot = applyModelArgs(resolveSlot(slotRaw), modelChoice.args, entry);
@@ -1956,7 +1957,7 @@ async function executeOneShot(body, res) {
   proc.stdout.setEncoding('utf8');
   proc.stderr.setEncoding('utf8');
   // recordOutput returns false once the output cap is reached, which stops the
-  // buffer growing before the kill lands — a runaway CLI cannot OOM the bridge.
+  // buffer growing before the kill lands â€” a runaway CLI cannot OOM the bridge.
   proc.stdout.on('data', (d) => { if (supervisor.recordOutput(d)) stdout += d; });
   proc.stderr.on('data', (d) => { if (supervisor.recordOutput(d)) stderr += d; });
   proc.on('error', (err) => {
@@ -2237,7 +2238,7 @@ app.post('/api/install', (req, res) => {
 
 
 // Open a URL in the user's default browser. Used by the Collab pane's
-// "Ask Perplexity (browser)" button — lets you use your existing Perplexity
+// "Ask Perplexity (browser)" button â€” lets you use your existing Perplexity
 // session/Pro subscription without spending API credits. The browser tab
 // shows the answer; you copy it into the Collab's Shared Context box.
 // Localhost-only server, only http(s) URLs allowed.
@@ -2249,7 +2250,7 @@ app.post('/api/open-url', (req, res) => {
   const isMac = process.platform === 'darwin';
   try {
     if (isWindows) {
-      // 'start "" "url"' — the "" is an empty title arg required by start when the url is quoted
+      // 'start "" "url"' â€” the "" is an empty title arg required by start when the url is quoted
       spawn('explorer.exe', [url], { windowsHide: true, detached: true, stdio: 'ignore' }).unref();
     } else if (isMac) {
       spawn('open', [url], { detached: true }).unref();
@@ -2406,7 +2407,7 @@ let shuttingDown = false;
 function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
-  console.log('\n[RelayBridge] shutting down…');
+  console.log('\n[RelayBridge] shutting downâ€¦');
   for (const s of sessions.values()) s.kill();
   for (const proc of activeChildren) killProcessTree(proc);
   for (const client of wss.clients) {
