@@ -1,9 +1,13 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
   # Where this repo lives; defaults to the folder containing this script.
   [string]$SourceDir = $(if ($PSScriptRoot) { Join-Path $PSScriptRoot 'skills\relaybridge' } else { Join-Path (Get-Location) 'skills\relaybridge' }),
   [switch]$ClaudeOnly,
-  [switch]$CodexOnly
+  [switch]$CodexOnly,
+  # Skip writing the always-loaded primer into agent memory files.
+  [switch]$NoMemory,
+  # Also register the RelayBridge MCP server with Claude Code and Codex.
+  [switch]$RegisterMcp
 )
 
 $ErrorActionPreference = 'Stop'
@@ -12,51 +16,95 @@ if (-not (Test-Path -LiteralPath $SourceDir)) {
   throw "Skill source not found at $SourceDir"
 }
 
-# Claude Code reads personal skills from ~/.claude/skills/<name>/SKILL.md.
+$begin = '<!-- BEGIN relaybridge-primer -->'
+$end   = '<!-- END relaybridge-primer -->'
+
+# A skill is loaded on demand; an agent only reads it once it decides the task
+# looks relevant. Memory files are loaded on EVERY session, which is what makes
+# the bridge impossible to forget. The primer is deliberately short for exactly
+# that reason and points at the full skill for detail.
+function Write-MemoryBlock {
+  param([string]$File, [string]$Body, [string]$Label)
+
+  $block = "$begin`r`n$Body`r`n$end"
+  $dir = Split-Path -Parent $File
+  if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+
+  if (Test-Path -LiteralPath $File) {
+    $existing = Get-Content -Raw -LiteralPath $File
+    if ($existing -match [regex]::Escape($begin)) {
+      # Refresh in place: re-running must never duplicate the block, and must
+      # never disturb instructions the user wrote themselves.
+      $pattern = [regex]::Escape($begin) + '[\s\S]*?' + [regex]::Escape($end)
+      $updated = [regex]::Replace($existing, $pattern, { param($m) $block })
+      [IO.File]::WriteAllText($File, $updated)
+      Write-Host "[RelayBridge] refreshed primer in $Label ($File)" -ForegroundColor Green
+    } else {
+      [IO.File]::WriteAllText($File, ($existing.TrimEnd() + "`r`n`r`n" + $block + "`r`n"))
+      Write-Host "[RelayBridge] appended primer to $Label ($File)" -ForegroundColor Green
+    }
+  } else {
+    [IO.File]::WriteAllText($File, $block + "`r`n")
+    Write-Host "[RelayBridge] created $Label ($File)" -ForegroundColor Green
+  }
+}
+
+$primerPath = Join-Path $SourceDir 'PRIMER.md'
+if (-not (Test-Path -LiteralPath $primerPath)) { throw "PRIMER.md not found in $SourceDir" }
+$primer = Get-Content -Raw -LiteralPath $primerPath
+
+# --- Claude Code: skill folder (on demand) + CLAUDE.md (every session) --------
 if (-not $CodexOnly) {
   $claudeTarget = Join-Path $env:USERPROFILE '.claude\skills\relaybridge'
   New-Item -ItemType Directory -Path $claudeTarget -Force | Out-Null
   Copy-Item -Path (Join-Path $SourceDir '*') -Destination $claudeTarget -Recurse -Force
   Write-Host "[RelayBridge] Claude skill installed to $claudeTarget" -ForegroundColor Green
-  Write-Host '  Claude Code picks it up on next start; ask it to "use the relaybridge skill" to confirm.' -ForegroundColor Gray
+
+  if (-not $NoMemory) {
+    $body = $primer + "`r`n`r`nFull skill: $claudeTarget\SKILL.md"
+    Write-MemoryBlock -File (Join-Path $env:USERPROFILE '.claude\CLAUDE.md') -Body $body -Label 'Claude Code user memory'
+  }
 }
 
-# Codex reads AGENTS.md. We keep our copy in its own folder and reference it
-# from the global file with idempotent markers, so a re-run never duplicates
-# the block and the user's own instructions are left intact.
+# --- Codex: guide folder + AGENTS.md (loaded every session) -------------------
 if (-not $ClaudeOnly) {
   $codexDir = Join-Path $env:USERPROFILE '.codex\relaybridge'
   New-Item -ItemType Directory -Path $codexDir -Force | Out-Null
   Copy-Item -Path (Join-Path $SourceDir '*') -Destination $codexDir -Recurse -Force
-
-  $globalAgents = Join-Path $env:USERPROFILE '.codex\AGENTS.md'
-  $begin = '<!-- BEGIN relaybridge-skill -->'
-  $end   = '<!-- END relaybridge-skill -->'
-  $block = @"
-$begin
-## RelayBridge
-
-This machine runs RelayBridge, a local control plane on http://127.0.0.1:8787
-for delegating work to other AI CLIs and matching the model to task difficulty.
-Read $codexDir\AGENTS.md before delegating, and follow its routing ladder.
-$end
-"@
-
-  if (Test-Path -LiteralPath $globalAgents) {
-    $existing = Get-Content -Raw -LiteralPath $globalAgents
-    if ($existing -match [regex]::Escape($begin)) {
-      $pattern = [regex]::Escape($begin) + '[\s\S]*?' + [regex]::Escape($end)
-      $updated = [regex]::Replace($existing, $pattern, [System.Text.RegularExpressions.MatchEvaluator]{ param($m) $block })
-      Set-Content -LiteralPath $globalAgents -Value $updated -Encoding UTF8
-      Write-Host "[RelayBridge] Refreshed the existing block in $globalAgents" -ForegroundColor Green
-    } else {
-      Add-Content -LiteralPath $globalAgents -Value "`n$block" -Encoding UTF8
-      Write-Host "[RelayBridge] Appended pointer to $globalAgents" -ForegroundColor Green
-    }
-  } else {
-    Set-Content -LiteralPath $globalAgents -Value $block -Encoding UTF8
-    Write-Host "[RelayBridge] Created $globalAgents" -ForegroundColor Green
-  }
   Write-Host "[RelayBridge] Codex guide installed to $codexDir" -ForegroundColor Green
+
+  if (-not $NoMemory) {
+    $body = $primer + "`r`n`r`nFull guide: $codexDir\AGENTS.md"
+    Write-MemoryBlock -File (Join-Path $env:USERPROFILE '.codex\AGENTS.md') -Body $body -Label 'Codex global instructions'
+  }
 }
 
+# --- Other agents on this machine --------------------------------------------
+# Each reads a different always-loaded file. Writing the same primer everywhere
+# means whichever agent the user opens already knows the bridge exists.
+if (-not $NoMemory -and -not $ClaudeOnly -and -not $CodexOnly) {
+  $shared = Join-Path $env:USERPROFILE '.claude\skills\relaybridge'
+  $body = $primer + "`r`n`r`nFull reference: $shared\SKILL.md and $shared\reference.md"
+
+  Write-MemoryBlock -File (Join-Path $env:USERPROFILE '.gemini\GEMINI.md') -Body $body -Label 'Gemini CLI memory'
+  # Cursor reads user rules from ~/.cursor/rules/*.mdc in current builds; if this
+  # version does not, the file is inert rather than harmful.
+  Write-MemoryBlock -File (Join-Path $env:USERPROFILE '.cursor\rules\relaybridge.mdc') -Body $body -Label 'Cursor user rules'
+  Write-MemoryBlock -File (Join-Path $env:USERPROFILE '.config\relaybridge\AGENTS.md') -Body $body -Label 'generic agent instructions'
+}
+
+# --- MCP registration ---------------------------------------------------------
+if ($RegisterMcp) {
+  $mcpScript = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'install-mcp.ps1' } else { Join-Path (Get-Location) 'install-mcp.ps1' }
+  if (Test-Path -LiteralPath $mcpScript) {
+    Write-Host '[RelayBridge] registering the MCP server with Claude Code and Codex...' -ForegroundColor Cyan
+    & $mcpScript
+  } else {
+    Write-Host "[RelayBridge] install-mcp.ps1 not found next to this script; run it from the repo root to register MCP." -ForegroundColor Yellow
+  }
+} else {
+  Write-Host '[RelayBridge] Tip: re-run with -RegisterMcp to also register the MCP server (tools instead of raw HTTP).' -ForegroundColor Gray
+}
+
+Write-Host ''
+Write-Host '[RelayBridge] Done. Agents load the primer every session; the full skill is read on demand.' -ForegroundColor Green
