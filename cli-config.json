@@ -1,5 +1,31 @@
 {
   "_comment": "Per-CLI config. 'safe'/'dangerous' launch interactive sessions. 'oneshot_safe'/'oneshot_dangerous' power Collab Mode. Use {prompt} for a bounded inline prompt, {prompt_file} when the CLI supports a file, or no placeholder to pipe stdin. 'oneshot_env' applies validated string environment overrides only to one-shot children. 'probe' is a non-mutating readiness check. Edit freely.",
+  "_supervisor": {
+    "_note": "Liveness policy for provider runs. Runs are judged by progress, not by the clock: while new content keeps arriving a run is left alone to finish, and it is stopped early with a reason when it goes silent or starts repeating. idleMs is generous because print-mode CLIs buffer their whole answer and emit nothing until the end. Any provider entry may override these with its own \"supervisor\" object.",
+    "idleMs": 360000,
+    "hardCapMs": 2700000,
+    "graceExtensions": 3,
+    "loopRepeatThreshold": 12,
+    "noNewContentMs": 240000,
+    "maxOutputBytes": 12582912,
+    "onUnverifiableIdle": "kill"
+  },
+  "_models": {
+    "_note": "Model selection inside a provider. Routing tiers map to weight classes: utility->light, standard->standard, complex/critical->heavy. Provider lineups change on weeks-long cycles, so prefer stable aliases (claude opus/sonnet/haiku) over versioned ids, and leave model_tiers unset where the account decides which models exist (cursor, copilot, grok) — a missing flag runs, a retired one fails every call. Discovery at boot reconciles these pins against each CLI's own model list.",
+    "modelsCheckedAt": "2026-08-14",
+    "staleAfterDays": 45,
+    "discoverOnBoot": true,
+    "discoveryTimeoutMs": 20000,
+    "discoveryMaxAgeMs": 86400000,
+    "verifyCommands": {
+      "claude": "claude --help (aliases: opus, sonnet, haiku)",
+      "codex": "codex --help; see developers.openai.com/codex/models",
+      "cursor": "agent models",
+      "gemini": "gemini /model or --list-models",
+      "copilot": "copilot --help (org model policy applies)",
+      "grok": "grok --help"
+    }
+  },
   "powershell": {
     "label": "PowerShell",
     "tags": [],
@@ -18,6 +44,12 @@
   },
   "claude": {
     "label": "Claude Code",
+    "models_static": ["opus", "sonnet", "haiku"],
+    "model_tiers": {
+      "light": { "args": ["--model", "haiku"], "model": "haiku", "note": "cheap pass: lookups, short explanations" },
+      "standard": { "args": ["--model", "sonnet"], "model": "sonnet", "note": "everyday coding and review" },
+      "heavy": { "args": ["--model", "opus"], "model": "opus", "note": "architecture, hard debugging, long context" }
+    },
     "tags": ["coding", "audit", "delegation", "general"],
     "company": "Anthropic",
     "transport": "subscription:anthropic",
@@ -81,6 +113,7 @@
   },
   "claude_fable": {
     "label": "Claude Fable 5",
+    "models_static": ["fable"],
     "tags": ["coding", "audit", "reasoning", "general"],
     "company": "Anthropic",
     "transport": "subscription:anthropic",
@@ -146,6 +179,11 @@
   },
   "codex": {
     "label": "Codex",
+    "model_tiers": {
+      "light": { "args": ["--model", "gpt-5.6-luna"], "model": "gpt-5.6-luna", "note": "fast subagent tier; replaced gpt-5.4-mini" },
+      "standard": { "args": ["--model", "gpt-5.6-terra"], "model": "gpt-5.6-terra", "note": "everyday coding; replaced gpt-5.4" },
+      "heavy": { "args": ["--model", "gpt-5.6-sol"], "model": "gpt-5.6-sol", "note": "current recommended default for hard work" }
+    },
     "tags": ["coding", "delegation"],
     "company": "OpenAI",
     "transport": "subscription:chatgpt",
@@ -243,6 +281,7 @@
   },
   "cursor": {
     "label": "Cursor Agent",
+    "models_probe": ["agent", "models"],
     "tags": ["coding", "delegation"],
     "company": "Cursor (Anysphere)",
     "transport": "subscription:cursor",
@@ -310,6 +349,11 @@
   },
   "gemini": {
     "label": "Gemini (Antigravity)",
+    "model_tiers": {
+      "light": { "args": ["--model", "gemini-3.5-flash-lite"], "model": "gemini-3.5-flash-lite", "note": "high-volume, low latency" },
+      "standard": { "args": ["--model", "gemini-3.6-flash"], "model": "gemini-3.6-flash", "note": "GA flash tier" },
+      "heavy": { "args": ["--model", "auto"], "model": "auto", "note": "let the CLI pick; avoids pinning a Pro id that gets renamed" }
+    },
     "tags": ["coding", "search", "general"],
     "company": "Google",
     "transport": "subscription:antigravity",
@@ -529,6 +573,8 @@
   },
   "ollama_fast": {
     "label": "Local Qwen 2.5 1.5B (Fast)",
+    "models_probe": ["ollama", "list"],
+    "models_parse": "^([A-Za-z0-9][A-Za-z0-9._-]*(?::[A-Za-z0-9._-]+)?)\\s",
     "tags": ["local", "utility"],
     "company": "Ollama / Qwen",
     "transport": "local:ollama",
@@ -552,6 +598,8 @@
   },
   "ollama_llama": {
     "label": "Local Meta Llama 3.2 3B",
+    "models_probe": ["ollama", "list"],
+    "models_parse": "^([A-Za-z0-9][A-Za-z0-9._-]*(?::[A-Za-z0-9._-]+)?)\\s",
     "tags": ["local", "general"],
     "company": "Ollama / Meta",
     "transport": "local:ollama",
@@ -575,6 +623,8 @@
   },
   "ollama": {
     "label": "Local Qwen3 4B",
+    "models_probe": ["ollama", "list"],
+    "models_parse": "^([A-Za-z0-9][A-Za-z0-9._-]*(?::[A-Za-z0-9._-]+)?)\\s",
     "tags": ["local", "general"],
     "company": "Ollama / Qwen",
     "transport": "local:ollama",
@@ -622,6 +672,8 @@
   },
   "ollama_coder": {
     "label": "Local Qwen Coder 7B",
+    "models_probe": ["ollama", "list"],
+    "models_parse": "^([A-Za-z0-9][A-Za-z0-9._-]*(?::[A-Za-z0-9._-]+)?)\\s",
     "tags": ["local", "coding"],
     "company": "Ollama / Qwen",
     "transport": "local:ollama",

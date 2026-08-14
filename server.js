@@ -8,6 +8,9 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
+const { RunSupervisor, resolveSupervisorOptions } = require('./lib/run-supervisor');
+const { resolveModelArgs, applyModelArgs, modelConfigStaleness, modelTierForTaskTier } = require('./lib/model-tiers');
+const { buildRegistry, parseModelList, pinIsRetired } = require('./lib/model-registry');
 const { WebSocketServer } = require('ws');
 const { spawn, spawnSync } = require('child_process');
 const ROOT = __dirname;
@@ -859,6 +862,105 @@ function killProcessTree(proc) {
 
 // ---- session management ----
 const sessions = new Map(); // id -> Session
+
+// Live provider runs, keyed by runId, so a human (or the dashboard) can vet
+// whether a quiet run is working or wedged instead of guessing.
+const activeRuns = new Map();
+
+
+// What each provider can actually run, discovered at boot. Configured pins rot,
+// and a retired pin fails every call to that provider, so the bridge asks each
+// CLI for its own list and reports pins that no longer appear in it.
+let modelRegistry = null;
+let discoveryInFlight = null;
+const MODEL_REGISTRY_FILE = path.join(DATA_DIR, 'model-registry.json');
+
+// Cumulative CPU milliseconds for a process tree. This separates "the model is
+// thinking and has not printed yet" from "the stage is wedged": print-mode CLIs
+// buffer their whole answer, so silence alone proves nothing. Best effort —
+// resolves null when it cannot be read.
+function sampleTreeCpuMs(rootPid) {
+  return new Promise((resolve) => {
+    if (!isWindows || !rootPid) return resolve(null);
+    const script = [
+      "$ErrorActionPreference='SilentlyContinue';",
+      `$root=${Number(rootPid)};`,
+      '$all=Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,KernelModeTime,UserModeTime;',
+      'if(-not $all){exit 0};',
+      '$byId=@{};foreach($p in $all){$byId[[int]$p.ProcessId]=$p};',
+      '$kids=@{};foreach($p in $all){$k=[int]$p.ParentProcessId;if(-not $kids.ContainsKey($k)){$kids[$k]=@()};$kids[$k]+=[int]$p.ProcessId};',
+      '$stack=New-Object System.Collections.Stack;$stack.Push($root);$seen=@{};$total=0.0;',
+      'while($stack.Count -gt 0){$cur=[int]$stack.Pop();if($seen.ContainsKey($cur)){continue};$seen[$cur]=$true;',
+      '$proc=$byId[$cur];if($proc){$total+=([double]$proc.KernelModeTime+[double]$proc.UserModeTime)/10000.0};',
+      'if($kids.ContainsKey($cur)){foreach($c in $kids[$cur]){$stack.Push($c)}}};',
+      '[math]::Round($total)',
+    ].join('');
+    let done = false;
+    let out = '';
+    let child;
+    const finish = (value) => { if (done) return; done = true; try { child?.kill(); } catch {} resolve(value); };
+    try {
+      child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script], { windowsHide: true });
+    } catch { return resolve(null); }
+    const guard = setTimeout(() => finish(null), 8000);
+    if (typeof guard.unref === 'function') guard.unref();
+    child.stdout.on('data', (d) => { out += d.toString(); });
+    child.on('error', () => { clearTimeout(guard); finish(null); });
+    child.on('close', () => {
+      clearTimeout(guard);
+      const parsed = Number(String(out).trim());
+      finish(Number.isFinite(parsed) ? parsed : null);
+    });
+  });
+}
+
+async function discoverModels() {
+  if (discoveryInFlight) return discoveryInFlight;
+  const cfg = loadConfig();
+  const globals = cfg._models || {};
+  const timeoutMs = Number(globals.discoveryTimeoutMs) > 0 ? Number(globals.discoveryTimeoutMs) : 20000;
+  discoveryInFlight = (async () => {
+    const probeResults = {};
+    for (const kind of Object.keys(cfg).filter((k) => !k.startsWith('_') && k !== 'powershell')) {
+      const entry = cfg[kind];
+      if (Array.isArray(entry.models_static) && entry.models_static.length) {
+        probeResults[kind] = { models: entry.models_static.slice() };
+        continue;
+      }
+      if (!Array.isArray(entry.models_probe) || !entry.models_probe.length) continue;
+      try {
+        const result = await runProbe(entry.models_probe, timeoutMs, entry.strip_env || []);
+        if (result.exitCode === 0) {
+          const models = parseModelList(result.stdout, entry);
+          probeResults[kind] = models.length ? { models } : { error: 'probe returned no recognizable model ids' };
+        } else {
+          probeResults[kind] = { error: (result.stderr || 'probe failed').split('\n')[0].slice(0, 200) };
+        }
+      } catch (err) {
+        probeResults[kind] = { error: err.message };
+      }
+    }
+    const registry = buildRegistry({ probeResults, config: cfg });
+    modelRegistry = registry;
+    try {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+      fs.writeFileSync(MODEL_REGISTRY_FILE, JSON.stringify(registry, null, 2), 'utf8');
+    } catch { /* cache write is best effort */ }
+    for (const warning of registry.warnings) console.warn('[RelayBridge] ' + warning);
+    if (registry.totalModels) {
+      console.log(`[RelayBridge] model discovery: ${registry.totalModels} models across ${registry.probedCount} provider(s)`);
+    }
+    return registry;
+  })().finally(() => { discoveryInFlight = null; });
+  return discoveryInFlight;
+}
+
+function loadCachedRegistry() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(MODEL_REGISTRY_FILE, 'utf8'));
+    if (parsed && parsed.providers) modelRegistry = parsed;
+  } catch { /* no cache yet */ }
+}
 let nextId = 1;
 
 class Session {
@@ -1306,6 +1408,90 @@ function writeBroadcastRun(run) {
 // Resolve the real provider dependency and optionally run its non-mutating
 // readiness probe. In particular, Perplexity must prove pwm authentication;
 // merely finding node.exe is not an operational signal.
+// Vetting endpoint: is that quiet run working, or is it stuck? Returns the
+// evidence rather than a guess.
+app.get('/api/runs/active', (req, res) => {
+  const now = Date.now();
+  const runs = [];
+  for (const run of activeRuns.values()) {
+    const snap = run.supervisor.snapshot(now);
+    runs.push({
+      runId: run.runId, kind: run.kind, route: run.route, pid: run.pid,
+      startedAt: new Date(run.startedAt).toISOString(),
+      ...snap,
+      assessment: snap.phase === 'streaming' ? 'producing output right now — leave it alone'
+        : snap.phase === 'working' ? 'recently active — still working'
+          : snap.phase === 'suspect_loop' ? 'repeating itself — watch this one'
+            : snap.phase === 'quiet' || snap.phase === 'quiet_start'
+              ? (snap.cpuMs != null ? 'silent but burning CPU — thinking, not stuck' : 'silent, liveness unverified')
+              : 'starting up',
+    });
+  }
+  res.json({ ok: true, count: runs.length, runs });
+});
+
+// What models each provider can actually run, plus what each is best at.
+app.get('/api/models', async (req, res) => {
+  if (req.query.refresh === '1' || !modelRegistry) {
+    try { await discoverModels(); } catch (err) { return res.status(500).json({ ok: false, error: err.message }); }
+  }
+  const cfg = loadConfig();
+  res.json({ ok: true, ...(modelRegistry || { providers: {}, warnings: [] }), staleness: modelConfigStaleness(cfg._models || {}) });
+});
+
+app.post('/api/models/refresh', async (req, res) => {
+  try { res.json({ ok: true, ...(await discoverModels()) }); }
+  catch (err) { res.status(500).json({ ok: false, error: err.message }); }
+});
+
+// Delegation: classify a task, rank providers by tier, and pick the model
+// weight class inside each. Advisory — it returns a plan, it does not dispatch.
+app.post('/api/route', async (req, res) => {
+  const { task, diagnostics: supplied, preferKinds, excludeKinds } = req.body || {};
+  if (!task || typeof task !== 'string' || !task.trim()) {
+    return res.status(400).json({ error: 'task (non-empty string) required' });
+  }
+  try {
+    const router = await import('./mcp/router.mjs');
+    const cfg = loadConfig();
+    let diagnostics = supplied && typeof supplied === 'object' ? supplied : (lastDiagnostics?.results || null);
+    if (!diagnostics) {
+      const env = buildEnv();
+      diagnostics = {};
+      for (const kind of Object.keys(cfg).filter((k) => !k.startsWith('_'))) {
+        const entry = cfg[kind];
+        let found = false;
+        try {
+          const probeBin = (entry.version_probe || entry.probe || entry.safe || [])[0];
+          found = !!(probeBin && resolveExecutable(probeBin, env));
+        } catch { found = false; }
+        diagnostics[kind] = { found, ready: found, detail: 'path-only check; run /api/diag for auth status' };
+      }
+    }
+    const route = router.routeTask({
+      task, diagnostics,
+      preferKinds: Array.isArray(preferKinds) ? preferKinds : undefined,
+      excludeKinds: Array.isArray(excludeKinds) ? excludeKinds : undefined,
+    });
+    const taskTier = route.classification?.tier;
+    const selected = (route.selected || []).map((pick) => {
+      const resolved = resolveModelArgs({ entry: cfg[pick.kind] || {}, taskTier });
+      const retired = resolved.model ? pinIsRetired(modelRegistry, pick.kind, resolved.model) : false;
+      return {
+        ...pick,
+        modelTier: resolved.modelTier,
+        model: retired ? null : resolved.model,
+        modelArgs: retired ? [] : resolved.args,
+        modelSource: retired ? 'account_default_retired_pin' : resolved.source,
+        modelNote: retired ? `configured model "${resolved.model}" is no longer offered by this account` : resolved.note,
+      };
+    });
+    res.json({ ok: true, ...route, selected, modelTier: modelTierForTaskTier(taskTier), modelConfig: modelConfigStaleness(cfg._models || {}) });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 app.get('/api/diag', async (req, res) => {
   const controller = new AbortController();
   let clientGone = false;
@@ -1489,7 +1675,11 @@ app.post('/api/exec', (req, res) => {
 // writableEnded/destroyed), so broadcast passes a captured stand-in.
 async function executeOneShot(body, res) {
   const startedAt = Date.now();
-  const { kind, prompt, timeoutMs = 180000, cwd, dangerous } = body || {};
+  const { kind, prompt, timeoutMs, cwd, dangerous } = body || {};
+  // timeoutMs no longer means "kill at T". It is an optional hard ceiling; the
+  // supervisor decides when a run is actually stuck. Callers that never set it
+  // get the generous default cap rather than the old 3 minute guillotine.
+  const explicitTimeout = Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0 ? Number(timeoutMs) : null;
   if (!kind || typeof prompt !== 'string' || !prompt.trim()) {
     return res.status(400).json({ error: 'kind + non-empty prompt required' });
   }
@@ -1508,7 +1698,19 @@ async function executeOneShot(body, res) {
   const useDanger = (typeof dangerous === 'boolean') ? dangerous : state.fullPermissions;
   const slotRaw = useDanger ? entry.oneshot_dangerous : entry.oneshot_safe;
   if (!slotRaw || !slotRaw.length) return res.status(400).json({ error: 'no oneshot config for ' + kind });
-  const slot = resolveSlot(slotRaw);
+  // Model selection inside the provider: taskTier/modelTier picks the weight
+  // class. A pin discovery proved is retired is dropped rather than sent — a
+  // missing flag runs on the account default, a dead id fails every call.
+  let modelChoice = resolveModelArgs({
+    entry,
+    taskTier: typeof body?.taskTier === 'string' ? body.taskTier : undefined,
+    modelTier: typeof body?.modelTier === 'string' ? body.modelTier : undefined,
+  });
+  if (modelChoice.model && pinIsRetired(modelRegistry, kind, modelChoice.model)) {
+    console.warn(`[RelayBridge] ${kind}: pinned model "${modelChoice.model}" is not in this account's model list — falling back to the account default`);
+    modelChoice = { ...modelChoice, args: [], model: null, source: 'account_default_retired_pin' };
+  }
+  const slot = applyModelArgs(resolveSlot(slotRaw), modelChoice.args, entry);
   const hasInlinePrompt = slot.some((a) => typeof a === 'string' && a.includes('{prompt}'));
   const hasPromptFile = slot.some((a) => typeof a === 'string' && a.includes('{prompt_file}'));
   if (hasInlinePrompt && hasPromptFile) {
@@ -1623,25 +1825,70 @@ async function executeOneShot(body, res) {
   let timedOut = false;
   let clientGone = false;
   let settled = false;
-  const t = setTimeout(() => {
-    timedOut = true;
-    killProcessTree(proc);
-  }, timeoutMs);
+
+  // Progress-based supervision instead of a single kill clock. A run that keeps
+  // emitting new content is left alone to finish; one that goes silent or
+  // starts repeating itself is stopped early with a reason, so tokens are not
+  // spent on a wedged or looping stage. See lib/run-supervisor.js.
+  const supervisor = new RunSupervisor(resolveSupervisorOptions({
+    entry,
+    globals: cfg._supervisor || {},
+    hardCapMs: explicitTimeout,
+    startedAt,
+  }));
+  const runId = `run_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 8)}`;
+  activeRuns.set(runId, { runId, kind, route, startedAt, supervisor, pid: proc.pid });
+  let stopReason = null;
+  let stopDetail = '';
+  let sampling = false;
+
+  const finishSupervision = () => {
+    clearInterval(tick);
+    activeRuns.delete(runId);
+  };
+  const tick = setInterval(() => {
+    if (settled) return finishSupervision();
+    const applyVerdict = () => {
+      const verdict = supervisor.evaluate();
+      if (verdict.action !== 'kill') return;
+      stopReason = verdict.reason;
+      stopDetail = verdict.detail;
+      timedOut = true;
+      killProcessTree(proc);
+    };
+    // CPU is only sampled once a run has gone quiet, so healthy runs never pay
+    // for the probe. It is what distinguishes a model thinking in silence from
+    // a process that is genuinely wedged.
+    if (!sampling && supervisor.needsCpuSample()) {
+      sampling = true;
+      sampleTreeCpuMs(proc.pid)
+        .then((cpuMs) => { supervisor.recordCpuSample(cpuMs); })
+        .catch(() => { supervisor.recordCpuSample(null); })
+        .finally(() => { sampling = false; if (!settled) applyVerdict(); });
+      return;
+    }
+    applyVerdict();
+  }, 5000);
+  if (typeof tick.unref === 'function') tick.unref();
+
   res.on('close', () => {
     if (!res.writableEnded) {
       clientGone = true;
+      finishSupervision();
       killProcessTree(proc);
       cleanupPromptFile();
     }
   });
   proc.stdout.setEncoding('utf8');
   proc.stderr.setEncoding('utf8');
-  proc.stdout.on('data', (d) => { stdout += d; });
-  proc.stderr.on('data', (d) => { stderr += d; });
+  // recordOutput returns false once the output cap is reached, which stops the
+  // buffer growing before the kill lands — a runaway CLI cannot OOM the bridge.
+  proc.stdout.on('data', (d) => { if (supervisor.recordOutput(d)) stdout += d; });
+  proc.stderr.on('data', (d) => { if (supervisor.recordOutput(d)) stderr += d; });
   proc.on('error', (err) => {
     if (settled) return;
     settled = true;
-    clearTimeout(t);
+    finishSupervision();
     cleanupPromptFile();
     if (clientGone || res.writableEnded) return;
     sendOneShotResult(res, { kind, route, exitCode: -1, stdout, stderr: stderr + '\n' + err.message, error: err.message, dropped_out: true }, { kind, prompt, route, startedAt });
@@ -1649,7 +1896,7 @@ async function executeOneShot(body, res) {
   proc.on('close', (code) => {
     if (settled) return;
     settled = true;
-    clearTimeout(t);
+    finishSupervision();
     cleanupPromptFile();
     if (clientGone || res.writableEnded) return;
     const cleanedStdout = cleanOutput(stdout);
@@ -1692,6 +1939,11 @@ async function executeOneShot(body, res) {
       budget_exceeded,
       auth_failed,
       permission_denied,
+      model: modelChoice.model,
+      model_tier: modelChoice.modelTier,
+      stop_reason: stopReason,
+      stop_detail: stopDetail,
+      progress: supervisor.snapshot(),
       timed_out: timedOut,
       dropped_out,
     }, { kind, prompt, route, startedAt });
@@ -2031,6 +2283,18 @@ server.listen(PORT, HOST, () => {
   console.log(`[RelayBridge] listening on http://${HOST}:${PORT}`);
   console.log(`[RelayBridge] open the URL above in Chrome.`);
   console.log(`[RelayBridge] full permissions: ${state.fullPermissions ? 'ON' : 'off'} (toggle in UI)`);
+  // Model discovery runs after listen and never blocks it.
+  loadCachedRegistry();
+  const modelGlobals = loadConfig()._models || {};
+  if (modelGlobals.discoverOnBoot !== false) {
+    const maxAge = Number(modelGlobals.discoveryMaxAgeMs) > 0 ? Number(modelGlobals.discoveryMaxAgeMs) : 86400000;
+    const cachedAge = modelRegistry?.generatedAt ? Date.now() - Date.parse(modelRegistry.generatedAt) : Infinity;
+    if (!(cachedAge < maxAge)) {
+      discoverModels().catch((err) => console.warn('[RelayBridge] model discovery failed: ' + err.message));
+    } else {
+      console.log(`[RelayBridge] model registry loaded from cache (${Math.round(cachedAge / 3600000)}h old)`);
+    }
+  }
 });
 
 let shuttingDown = false;
