@@ -31,7 +31,7 @@ function Write-MemoryBlock {
   if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
 
   if (Test-Path -LiteralPath $File) {
-    $existing = Get-Content -Raw -LiteralPath $File
+    $existing = [IO.File]::ReadAllText($File)
     if ($existing -match [regex]::Escape($begin)) {
       # Refresh in place: re-running must never duplicate the block, and must
       # never disturb instructions the user wrote themselves.

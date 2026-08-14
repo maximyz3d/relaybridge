@@ -53,6 +53,8 @@ test('the installer writes into every agent memory file, not just the skill fold
 test('the installer is idempotent and preserves user-authored instructions', () => {
   assert.match(installer, /BEGIN relaybridge-primer/, 'blocks need markers to be replaceable');
   assert.match(installer, /regex\]::Replace/, 'a second run must refresh in place, never duplicate');
+  assert.match(installer, /\[IO\.File\]::ReadAllText\(\$File\)/,
+    'empty existing memory files must read as an empty string, not PowerShell null');
   assert.ok(!/Set-Content .* -Value \$block\b(?![\s\S]*existing)/.test(installer),
     'the installer must not clobber a file that already has user content');
 });
