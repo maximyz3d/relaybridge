@@ -44,6 +44,7 @@
   },
   "claude": {
     "label": "Claude Code",
+    "login_command": ["claude", "/login"],
     "models_static": ["opus", "sonnet", "haiku"],
     "model_tiers": {
       "light": { "args": ["--model", "haiku"], "model": "haiku", "note": "cheap pass: lookups, short explanations" },
@@ -113,6 +114,7 @@
   },
   "claude_fable": {
     "label": "Claude Fable 5",
+    "login_command": ["claude", "/login"],
     "models_static": ["fable"],
     "tags": ["coding", "audit", "reasoning", "general"],
     "company": "Anthropic",
@@ -179,6 +181,7 @@
   },
   "codex": {
     "label": "Codex",
+    "login_command": ["codex", "login"],
     "model_tiers": {
       "light": { "args": ["--model", "gpt-5.6-luna"], "model": "gpt-5.6-luna", "note": "fast subagent tier; replaced gpt-5.4-mini" },
       "standard": { "args": ["--model", "gpt-5.6-terra"], "model": "gpt-5.6-terra", "note": "everyday coding; replaced gpt-5.4" },
@@ -232,6 +235,7 @@
   },
   "copilot": {
     "label": "GitHub Copilot CLI",
+    "login_command": ["copilot", "/login"],
     "tags": ["coding"],
     "company": "GitHub",
     "transport": "subscription:github-copilot",
@@ -281,6 +285,7 @@
   },
   "cursor": {
     "label": "Cursor Agent",
+    "login_command": ["agent", "login"],
     "models_probe": ["agent", "models"],
     "model_tiers": {
       "light": { "args": ["--model", "gpt-5.6-luna-low"], "model": "gpt-5.6-luna-low", "note": "fast tier on the Cursor seat; verified present by discovery" },
@@ -354,6 +359,7 @@
   },
   "gemini": {
     "label": "Gemini (Antigravity)",
+    "login_command": ["gemini", "/auth"],
     "model_tiers": {
       "light": { "args": ["--model", "gemini-3.5-flash-lite"], "model": "gemini-3.5-flash-lite", "note": "high-volume, low latency" },
       "standard": { "args": ["--model", "gemini-3.6-flash"], "model": "gemini-3.6-flash", "note": "GA flash tier" },
@@ -444,6 +450,7 @@
   },
   "grok": {
     "label": "Grok Build",
+    "login_command": ["grok", "/login"],
     "tags": ["search", "general", "coding"],
     "company": "xAI",
     "transport": "subscription:grok-build",

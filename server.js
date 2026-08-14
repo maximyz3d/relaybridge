@@ -1115,6 +1115,20 @@ function createSessionFromKind(kind, opts = {}) {
   const entry = cfg[kind];
   if (!entry) throw new Error(`unknown CLI kind: ${kind}`);
   const useDanger = typeof opts.dangerous === 'boolean' ? opts.dangerous : state.fullPermissions;
+  // Sign-in mode runs the provider's own interactive login flow in a real PTY.
+  // These CLIs authenticate through a browser or device code and have no
+  // headless path, so the only honest option is to hand the user a terminal.
+  // Never dangerous: signing in must not also grant filesystem authority.
+  if (opts.mode === 'login') {
+    const loginRaw = entry.login_command;
+    if (!loginRaw || !loginRaw.length) throw new Error(`no login_command configured for kind=${kind}; sign in manually in a terminal`);
+    const loginSlot = resolveSlot(loginRaw);
+    const [loginCommand, ...loginArgs] = loginSlot;
+    const loginId = String(nextId++);
+    const loginSession = new Session(loginId, kind, `${entry.label} — sign in`, loginCommand, loginArgs, resolveAllowedCwd(opts.cwd));
+    sessions.set(loginId, loginSession);
+    return loginSession;
+  }
   const slotRaw = useDanger ? entry.dangerous : entry.safe;
   if (!slotRaw || !slotRaw.length) throw new Error(`no command configured for kind=${kind}`);
   const slot = resolveSlot(slotRaw);
@@ -1311,6 +1325,11 @@ function runProbe(slotRaw, timeoutMs = 15000, stripEnv = [], signal) {
     const timer = setTimeout(() => {
       timedOut = true;
       killProcessTree(proc);
+      // Resolve on a grace delay even if the child never emits close: killing
+      // the tree is not a guarantee of an exit event, and a pending probe would
+      // otherwise wedge readiness checks and model discovery forever.
+      const graceful = setTimeout(() => finish(-1, new Error('probe timed out and did not exit')), 2000);
+      if (typeof graceful.unref === 'function') graceful.unref();
     }, timeoutMs);
     abortHandler = () => {
       killProcessTree(proc);
@@ -1553,6 +1572,89 @@ app.post('/api/route', async (req, res) => {
   }
 });
 
+// Which providers are installed but not signed in. "found && !ready" is exactly
+// that state: the CLI resolves on PATH but its own probe reports no session.
+// Returns the interactive login command so the UI can offer a sign-in terminal
+// instead of letting the next call fail.
+function signedOutProviders(diagnostics, cfg) {
+  const results = diagnostics?.results || diagnostics || {};
+  const out = [];
+  for (const [kind, info] of Object.entries(results)) {
+    if (!info || !info.found || info.ready) continue;
+    const entry = cfg[kind];
+    if (!entry) continue;
+    out.push({
+      kind,
+      label: entry.label || kind,
+      detail: info.detail || '',
+      loginCommand: Array.isArray(entry.login_command) ? entry.login_command : null,
+      canSignIn: Array.isArray(entry.login_command) && entry.login_command.length > 0,
+    });
+  }
+  return out;
+}
+
+app.get('/api/auth/status', async (req, res) => {
+  const cfg = loadConfig();
+  let diagnostics = lastDiagnostics;
+  // Only probe when asked or when nothing has been checked yet: a readiness
+  // sweep spawns one process per provider and should not run on every poll.
+  if (req.query.refresh === '1' || !diagnostics) {
+    try {
+      const env = buildEnv();
+      const kinds = Object.keys(cfg).filter((k) => !k.startsWith('_') && k !== 'powershell');
+      const pairs = await Promise.all(kinds.map(async (kind) => {
+        const entry = cfg[kind];
+        if (!entry || !Array.isArray(entry.probe) || !entry.probe.length) return [kind, null];
+        let found = false;
+        try {
+          const probeBin = (entry.version_probe || entry.probe || entry.safe || [])[0];
+          found = !!(probeBin && resolveExecutable(probeBin, env));
+        } catch { found = false; }
+        if (!found) return [kind, { found: false, ready: false, detail: 'not installed' }];
+        const result = await runProbe(entry.probe, Number(entry.probe_timeout_ms || 30000), entry.strip_env || []);
+        return [kind, { found: true, ready: result.exitCode === 0, detail: result.exitCode === 0 ? 'authenticated' : (result.stderr || '').split('\n')[0].slice(0, 160) }];
+      }));
+      diagnostics = { at: Date.now(), results: Object.fromEntries(pairs.filter(([, v]) => v)) };
+      lastDiagnostics = diagnostics;
+    } catch (err) {
+      return res.status(500).json({ ok: false, error: err.message });
+    }
+  }
+  const signedOut = signedOutProviders(diagnostics, cfg);
+  // Credential-location diagnostics. Repeated "please sign in" almost always
+  // means the CLI is reading a different profile than the one you logged into —
+  // typically because the bridge was started elevated once and unelevated
+  // another time, which changes USERPROFILE and therefore the credential path.
+  // Reporting what the bridge's children actually see turns that into a
+  // checkable fact instead of a guess.
+  const childEnv = buildEnv();
+  const homeDir = childEnv.USERPROFILE || childEnv.HOME || '';
+  const credentialPaths = {
+    claude: path.join(homeDir, '.claude', '.credentials.json'),
+    codex: path.join(homeDir, '.codex', 'auth.json'),
+    cursor: path.join(homeDir, '.cursor', 'cli-config.json'),
+  };
+  const credentials = {};
+  for (const [kind, file] of Object.entries(credentialPaths)) {
+    let exists = false;
+    try { exists = fs.existsSync(file); } catch { exists = false; }
+    credentials[kind] = { path: file, exists };
+  }
+  res.json({
+    ok: true,
+    checkedAt: diagnostics?.at ? new Date(diagnostics.at).toISOString() : null,
+    signedOutCount: signedOut.length,
+    signedOut,
+    credentialHome: homeDir,
+    bridgeHome: process.env.USERPROFILE || process.env.HOME || '',
+    // When these differ, children look for credentials somewhere the sign-in
+    // never wrote, and every call will report signed-out however often you log in.
+    homeMismatch: (process.env.USERPROFILE || process.env.HOME || '') !== homeDir,
+    credentials,
+  });
+});
+
 app.get('/api/diag', async (req, res) => {
   const controller = new AbortController();
   let clientGone = false;
@@ -1653,9 +1755,9 @@ app.get('/api/sessions', (req, res) => {
 
 app.post('/api/sessions', (req, res) => {
   try {
-    const { kind, label, cwd, dangerous } = req.body || {};
+    const { kind, label, cwd, dangerous, mode } = req.body || {};
     if (!kind) return res.status(400).json({ error: 'kind required' });
-    const s = createSessionFromKind(kind, { label, cwd, dangerous });
+    const s = createSessionFromKind(kind, { label, cwd, dangerous, mode });
     res.json(s.meta());
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -1754,6 +1856,24 @@ async function executeOneShot(body, res) {
   const cfg = loadConfig();
   const entry = cfg[kind];
   if (!entry) return res.status(400).json({ error: 'unknown kind: ' + kind });
+  // Pre-flight auth gate. If the last readiness sweep saw this CLI installed but
+  // signed out, the call would fail with an opaque provider error and the prompt
+  // would be wasted. Report it as an actionable auth_required instead, so the
+  // caller can open a sign-in terminal and retry. Only a *positive* signed-out
+  // observation blocks: an unprobed provider is attempted as before.
+  const readiness = lastDiagnostics?.results?.[kind];
+  if (readiness && readiness.found && readiness.ready === false && Array.isArray(entry.login_command)) {
+    return res.status(409).json({
+      ok: false,
+      auth_required: true,
+      kind,
+      label: entry.label || kind,
+      login_command: entry.login_command,
+      detail: readiness.detail || 'the provider CLI reports no active session',
+      error: `${entry.label || kind} is installed but not signed in`,
+      dropped_out: true,
+    });
+  }
   let oneShotEnv;
   try {
     oneShotEnv = normalizeEnvOverrides(entry.oneshot_env);

@@ -320,6 +320,11 @@
   </div>
 </dialog>
 
+<dialog id="signin-dialog">
+  <div class="dlg-head"><strong id="signin-title">Sign in required</strong><button class="btn" id="signin-close">Close</button></div>
+  <div class="dlg-body" id="signin-body">Checking…</div>
+</dialog>
+
 <dialog id="activity-dialog">
   <div class="dlg-head"><strong>Bridge activity</strong>
     <span style="margin-left:auto; display:flex; gap:10px; align-items:center;">
@@ -1061,6 +1066,7 @@ $('#reload-btn').onclick = async () => {
     const [, , , , diag] = await Promise.all([loadConfig(), loadPermissions(), loadWorkspacePolicy(), refreshSessions(), api('/api/diag')]);
     updateProviderFooter(diag.results || {});
     await refreshHealthStatus();
+    maybePromptSignIn(diag.results || {});
   } catch (error) { toast('Refresh failed: ' + error.message, 'error'); }
   finally { button.disabled = false; button.textContent = 'Reload'; }
 };
@@ -1970,6 +1976,15 @@ async function callOneshot(kind, prompt, timeoutMs = ONE_SHOT_DEFAULT_TIMEOUT_MS
       body: JSON.stringify({ kind, prompt, timeoutMs, dangerous: false }),
       signal,
     });
+    if (r.status === 409) {
+      // Installed but signed out: the call was never sent, so nothing was spent.
+      // Offer the sign-in terminal instead of reporting an opaque failure.
+      const payload = await r.json().catch(() => ({}));
+      if (payload.auth_required) {
+        promptSignInFor(payload);
+        return { kind, exitCode: -1, stdout: '', stderr: payload.error || 'not signed in', dropped_out: true, auth_required: true };
+      }
+    }
     if (!r.ok) {
       const t = await r.text().catch(() => '');
       return { kind, exitCode: -1, stdout: '', stderr: t || (r.status + ' ' + r.statusText), dropped_out: true };
@@ -2354,6 +2369,89 @@ installGoBtn.onclick = async () => {
 };
 
 $('#install-close-btn').onclick = () => { try { installDialog.close(); } catch { installDialog.removeAttribute('open'); } };
+
+// ============= provider sign-in =============
+// Boot check. Uses the readiness sweep the dashboard already performs, so this
+// costs no extra probes; it only raises the dialog when something installed is
+// actually signed out and can be fixed from here.
+function maybePromptSignIn(results) {
+  try {
+    const cfg = state.config || {};
+    const list = Object.entries(results || {})
+      .filter(([kind, info]) => info && info.found && info.ready === false && Array.isArray(cfg[kind]?.login_command))
+      .map(([kind]) => kind);
+    if (!list.length) return;
+    document.getElementById('signin-title').textContent = list.length === 1
+      ? `${cfg[list[0]]?.label || list[0]} is not signed in`
+      : `${list.length} providers are not signed in`;
+    openSignin({ note: 'These CLIs are installed but have no active session, so calls to them would fail. Signing in opens their own login flow in a terminal.' });
+  } catch { /* the prompt is a convenience; never break startup */ }
+}
+
+// These CLIs authenticate through an interactive browser or device flow, so
+// there is no headless sign-in. When one is installed but signed out, open a
+// real terminal running its own login command rather than failing the call.
+const signinDialog = document.getElementById('signin-dialog');
+const signinBody = document.getElementById('signin-body');
+let signinRetry = null;
+
+function renderSignin(list, note) {
+  if (!list.length) {
+    signinBody.innerHTML = '<div style="color:var(--safe)">Every installed provider is signed in.</div>';
+    return;
+  }
+  signinBody.innerHTML = (note ? `<p style="margin:0 0 10px;font-size:13px;">${escapeHtml(note)}</p>` : '')
+    + list.map((p) => `
+      <div style="display:flex;gap:10px;align-items:center;padding:8px 0;border-bottom:1px solid var(--border);">
+        <div style="flex:1 1 auto;min-width:0;">
+          <div><strong>${escapeHtml(p.label)}</strong></div>
+          <div style="color:var(--muted);font-size:11px;overflow:hidden;text-overflow:ellipsis;">${escapeHtml(p.detail || 'not signed in')}</div>
+        </div>
+        ${p.canSignIn
+          ? `<button class="btn collab" data-signin="${escapeHtml(p.kind)}">Sign in</button>`
+          : '<span style="color:var(--muted);font-size:11px;">sign in manually in a terminal</span>'}
+      </div>`).join('');
+  signinBody.querySelectorAll('[data-signin]').forEach((btn) => {
+    btn.onclick = () => startSignin(btn.getAttribute('data-signin'));
+  });
+}
+
+async function startSignin(kind) {
+  try {
+    // A real PTY session: the vendor flow prints a URL or code the user must act on.
+    const meta = await api('/api/sessions', { method: 'POST', body: JSON.stringify({ kind, mode: 'login', dangerous: false }) });
+    attachSession(meta);
+    setActive('session:' + meta.id);
+    closeSignin();
+    toast('Complete the sign-in in the terminal that just opened, then click Check installs.', 'ok', 9000);
+  } catch (err) {
+    toast('Could not open a sign-in terminal: ' + err.message, 'error');
+  }
+}
+
+function closeSignin() {
+  try { signinDialog.close(); } catch { signinDialog.removeAttribute('open'); }
+}
+$('#signin-close').onclick = closeSignin;
+
+async function openSignin({ refresh = false, note = '', only = null } = {}) {
+  signinBody.innerHTML = 'Checking which providers are signed in…';
+  if (typeof signinDialog.showModal === 'function') signinDialog.showModal(); else signinDialog.setAttribute('open', 'true');
+  try {
+    const data = await api('/api/auth/status' + (refresh ? '?refresh=1' : ''));
+    const list = only ? (data.signedOut || []).filter((p) => p.kind === only) : (data.signedOut || []);
+    renderSignin(list, note);
+  } catch (err) {
+    signinBody.innerHTML = `<div style="color:#ff6b6b">Could not check sign-in status: ${escapeHtml(err.message)}</div>`;
+  }
+}
+
+// Called when a provider call comes back 409 auth_required.
+function promptSignInFor(payload, retryFn) {
+  signinRetry = retryFn || null;
+  document.getElementById('signin-title').textContent = `${payload.label || payload.kind} is not signed in`;
+  openSignin({ only: payload.kind, note: 'The call was not sent, so no quota was used. Sign in, then run it again.' });
+}
 
 // ============= bridge activity (telemetry) =============
 // One shared log of every API call, attributed to the dashboard or the MCP
