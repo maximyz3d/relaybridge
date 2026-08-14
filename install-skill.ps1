@@ -1,7 +1,7 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
   # Where this repo lives; defaults to the folder containing this script.
-  [string]$SourceDir = (Join-Path $PSScriptRoot 'skills\relaybridge'),
+  [string]$SourceDir = $(if ($PSScriptRoot) { Join-Path $PSScriptRoot 'skills\relaybridge' } else { Join-Path (Get-Location) 'skills\relaybridge' }),
   [switch]$ClaudeOnly,
   [switch]$CodexOnly
 )
@@ -59,3 +59,4 @@ $end
   }
   Write-Host "[RelayBridge] Codex guide installed to $codexDir" -ForegroundColor Green
 }
+
