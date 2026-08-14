@@ -1,4 +1,4 @@
-﻿// RelayBridge - local PowerShell + multi-AI-CLI bridge
+// RelayBridge - local PowerShell + multi-AI-CLI bridge
 // Runs on 127.0.0.1 only. Spawns real PTYs (node-pty) when available,
 // falls back to child_process pipes otherwise.
 

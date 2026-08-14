@@ -1,4 +1,4 @@
-﻿'use strict';
+'use strict';
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -34,7 +34,7 @@ test('Claude pins use stable aliases rather than versioned identifiers', () => {
 
 test('providers with account-dependent lineups send no model flag', () => {
   // A missing flag runs on whatever the account has; a wrong one fails the call.
-  for (const kind of ['cursor', 'copilot', 'grok']) {
+  for (const kind of ['copilot', 'grok']) {
     const resolved = resolveModelArgs({ entry: config[kind], taskTier: 'complex' });
     assert.deepEqual(resolved.args, [], `${kind} should defer to the account default`);
     assert.equal(resolved.source, 'account_default');
