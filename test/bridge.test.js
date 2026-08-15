@@ -342,6 +342,22 @@ test('prompt-file transport preserves long special-character prompts and cleans 
       oneshot_dangerous: [...baseSlot, '--claude-json-error-result'],
       oneshot_output_parser: 'claude_json',
     },
+    usage_json_success_error_disagreement: {
+      label: 'Structured Claude Success Subtype With Error Flag',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--claude-json-success-error-disagreement'],
+      oneshot_dangerous: [...baseSlot, '--claude-json-success-error-disagreement'],
+      oneshot_output_parser: 'claude_json',
+    },
+    usage_json_error_success_flag_disagreement: {
+      label: 'Structured Claude Error Subtype With Success Flag',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--claude-json-error-success-flag-disagreement'],
+      oneshot_dangerous: [...baseSlot, '--claude-json-error-success-flag-disagreement'],
+      oneshot_output_parser: 'claude_json',
+    },
     usage_json_invalid_result: {
       label: 'Malformed Structured Claude Result',
       safe: [process.execPath, helper, '--version'],
@@ -632,6 +648,73 @@ test('prompt-file transport preserves long special-character prompts and cleans 
     .trim().split(/\r?\n/).map((line) => JSON.parse(line));
   const errorReceipt = errorLedger.find((row) => row.receiptId === errorResult.receiptId);
   assert.equal(errorReceipt.failureClass, 'rate_limit');
+
+  const successErrorDisagreementResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({
+      kind: 'usage_json_success_error_disagreement',
+      prompt: 'retain metrics when success subtype carries an error flag',
+      dangerous: false,
+    }),
+  });
+  assert.equal(successErrorDisagreementResponse.status, 200);
+  const successErrorDisagreement = await successErrorDisagreementResponse.json();
+  assert.equal(successErrorDisagreement.exitCode, 0);
+  assert.equal(successErrorDisagreement.stdout, '');
+  assert.doesNotMatch(successErrorDisagreement.stderr, /subtype and is_error disagree/);
+  assert.match(successErrorDisagreement.stderr, /weekly limit/);
+  assert.equal(successErrorDisagreement.result_subtype, 'success');
+  assert.equal(successErrorDisagreement.result_schema_disagreement, true);
+  assert.equal(successErrorDisagreement.failureClass, 'rate_limit');
+  assert.equal(successErrorDisagreement.rate_limited, true);
+  assert.equal(successErrorDisagreement.dropped_out, true);
+  assert.equal(successErrorDisagreement.usage.total_tokens, 36);
+  assert.equal(successErrorDisagreement.provider_error_count, 1);
+  assert.equal(successErrorDisagreement.provider_retries.count, 1);
+  assert.deepEqual(successErrorDisagreement.provider_retries.by_status, { 429: 1 });
+  const successErrorDisagreementReceipt = fs.readFileSync(
+    path.join(tempRoot, 'data', 'receipts', new Date().toISOString().slice(0, 10) + '.jsonl'),
+    'utf8',
+  ).trim().split(/\r?\n/).map((line) => JSON.parse(line))
+    .find((row) => row.receiptId === successErrorDisagreement.receiptId);
+  assert.equal(successErrorDisagreementReceipt.resultSchemaDisagreement, true);
+  assert.equal(successErrorDisagreementReceipt.actualTotalTokens, 36);
+  assert.equal(successErrorDisagreementReceipt.tokenUsageSource, 'provider_reported');
+  assert.equal(successErrorDisagreementReceipt.providerRetryCount, 1);
+  assert.equal(successErrorDisagreementReceipt.providerApiErrorStatus, 429);
+
+  const errorSuccessFlagDisagreementResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({
+      kind: 'usage_json_error_success_flag_disagreement',
+      prompt: 'retain metrics when an error subtype carries a false error flag',
+      dangerous: false,
+    }),
+  });
+  assert.equal(errorSuccessFlagDisagreementResponse.status, 200);
+  const errorSuccessFlagDisagreement = await errorSuccessFlagDisagreementResponse.json();
+  assert.equal(errorSuccessFlagDisagreement.exitCode, 0);
+  assert.equal(errorSuccessFlagDisagreement.stdout, '');
+  assert.doesNotMatch(errorSuccessFlagDisagreement.stderr, /subtype and is_error disagree/);
+  assert.match(errorSuccessFlagDisagreement.stderr, /temporarily limiting requests/);
+  assert.equal(errorSuccessFlagDisagreement.result_subtype, 'error_during_execution');
+  assert.equal(errorSuccessFlagDisagreement.result_schema_disagreement, true);
+  assert.equal(errorSuccessFlagDisagreement.failureClass, 'rate_limit');
+  assert.equal(errorSuccessFlagDisagreement.rate_limited, true);
+  assert.equal(errorSuccessFlagDisagreement.dropped_out, true);
+  assert.equal(errorSuccessFlagDisagreement.usage.total_tokens, 43);
+  assert.equal(errorSuccessFlagDisagreement.provider_error_count, 1);
+  assert.equal(errorSuccessFlagDisagreement.provider_retries.count, 0);
+  const errorSuccessFlagDisagreementReceipt = fs.readFileSync(
+    path.join(tempRoot, 'data', 'receipts', new Date().toISOString().slice(0, 10) + '.jsonl'),
+    'utf8',
+  ).trim().split(/\r?\n/).map((line) => JSON.parse(line))
+    .find((row) => row.receiptId === errorSuccessFlagDisagreement.receiptId);
+  assert.equal(errorSuccessFlagDisagreementReceipt.resultSchemaDisagreement, true);
+  assert.equal(errorSuccessFlagDisagreementReceipt.actualTotalTokens, 43);
+  assert.equal(errorSuccessFlagDisagreementReceipt.tokenUsageSource, 'provider_reported');
+  assert.equal(errorSuccessFlagDisagreementReceipt.providerErrorCount, 1);
+  assert.equal(errorSuccessFlagDisagreementReceipt.providerApiErrorStatus, 429);
 
   const invalidResultResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST', headers: jsonAuth,
