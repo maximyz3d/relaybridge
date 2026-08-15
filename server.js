@@ -11,12 +11,15 @@ const crypto = require('crypto');
 const { RunSupervisor, resolveSupervisorOptions } = require('./lib/run-supervisor');
 const { resolveModelArgs, applyModelArgs, modelConfigStaleness, modelTierForTaskTier } = require('./lib/model-tiers');
 const { buildRegistry, parseModelList, pinIsRetired } = require('./lib/model-registry');
+const { receiptStoreIdentity } = require('./lib/receipt-store-identity.cjs');
 const { WebSocketServer } = require('ws');
 const { spawn, spawnSync } = require('child_process');
 const TIMEOUT_POLICY = require('./timeout-policy.cjs');
 const ROOT = __dirname;
 const BRIDGE_VERSION = require('./package.json').version;
 function loadBuildId() {
+  const testValue = process.env.NODE_ENV === 'test' ? process.env.RELAYBRIDGE_TEST_BUILD_ID : '';
+  if (/^[A-Za-z0-9._+-]{1,128}$/.test(String(testValue || ''))) return String(testValue);
   try {
     const value = JSON.parse(fs.readFileSync(path.join(ROOT, 'build-info.json'), 'utf8')).buildId;
     if (/^[A-Za-z0-9._+-]{1,128}$/.test(String(value || ''))) return String(value);
@@ -249,6 +252,7 @@ const COLLABS_DIR = path.join(DATA_DIR, 'collabs');
 const RUNS_DIR = path.join(DATA_DIR, 'runs');
 const RECEIPTS_DIR = path.join(DATA_DIR, 'receipts');
 const PROJECTS_FILE = path.join(DATA_DIR, 'projects.json');
+const RECEIPT_STORE_IDENTITY = receiptStoreIdentity(DATA_DIR);
 const COLLAB_ID_RE = /^c_[a-z0-9]+_[a-z0-9]+$/;
 for (const dir of [COLLABS_DIR, RUNS_DIR, RECEIPTS_DIR]) fs.mkdirSync(dir, { recursive: true });
 if (!fs.existsSync(PROJECTS_FILE)) fs.writeFileSync(PROJECTS_FILE, JSON.stringify([], null, 2));
@@ -410,6 +414,8 @@ function appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt }
     receiptId: `rcpt_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 8)}`,
     timestamp: new Date().toISOString(),
     event: 'bridge_provider_call',
+    bridgeBuildId: BRIDGE_BUILD_ID,
+    receiptStoreId: RECEIPT_STORE_IDENTITY.id,
     status: payload.cancelled ? 'cancelled'
       : payload.exitCode === 0 && !payload.dropped_out ? 'completed'
         : payload.timed_out ? 'timed_out' : 'dropped',
@@ -1733,7 +1739,7 @@ app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Vary', 'Origin');
   }
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-RelayBridge-Token, X-PS-Bridge-Token');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-RelayBridge-Token, X-PS-Bridge-Token, X-RelayBridge-Expected-Build-Id, X-RelayBridge-Expected-Receipt-Store-Id');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
   if (origin) res.setHeader('Access-Control-Allow-Private-Network', 'true');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
@@ -1784,6 +1790,8 @@ app.get('/api/health', (req, res) => {
     },
     version: BRIDGE_VERSION,
     buildId: BRIDGE_BUILD_ID,
+    receiptStoreId: RECEIPT_STORE_IDENTITY.id,
+    receiptStoreIdentityReady: RECEIPT_STORE_IDENTITY.ready,
     capabilityAuth: true,
     tokenAcl: TOKEN_ACL,
     stickyDangerousEnabled: envFirst('RELAYBRIDGE_ALLOW_STICKY_DANGEROUS', 'PS_BRIDGE_ALLOW_STICKY_DANGEROUS') === '1',
@@ -1842,6 +1850,60 @@ app.use('/api', (req, res, next) => {
     return res.status(401).json({ error: 'valid X-RelayBridge-Token required' });
   }
   next();
+});
+
+const ZERO_PROVIDER_RETRIES = Object.freeze({
+  count: 0,
+  total_delay_ms: 0,
+  max_attempt: 0,
+  declared_max_retries: 0,
+  by_error: {},
+  by_status: {},
+  events: [],
+  truncated: false,
+  observed_events: 0,
+  invalid_events: 0,
+  duplicate_events: 0,
+});
+
+function requiresMcpActionIdentity(req) {
+  if (String(req.get('x-relaybridge-client') || '').toLowerCase() !== 'mcp') return false;
+  if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return false;
+  // Lifecycle endpoints are the recovery path for replacing a stale build.
+  return req.path !== '/admin/shutdown' && req.path !== '/admin/restart';
+}
+
+// A stale MCP process can otherwise submit work to a newer REST process that
+// writes transport receipts into a different store. Require the MCP's expected
+// build and receipt-store hashes on every mutating call. Current MCP clients
+// also perform a health preflight; this server-side check closes the restart
+// race and rejects older clients that do not send identity headers.
+app.use('/api', (req, res, next) => {
+  if (!requiresMcpActionIdentity(req)) return next();
+  const expectedBuildId = String(req.get('x-relaybridge-expected-build-id') || '');
+  const expectedReceiptStoreId = String(req.get('x-relaybridge-expected-receipt-store-id') || '');
+  const buildMatches = expectedBuildId !== '' && expectedBuildId === BRIDGE_BUILD_ID;
+  const receiptStoreMatches = expectedReceiptStoreId !== ''
+    && RECEIPT_STORE_IDENTITY.ready
+    && expectedReceiptStoreId === RECEIPT_STORE_IDENTITY.id;
+  if (buildMatches && receiptStoreMatches) return next();
+  return res.status(409).json({
+    error: 'MCP action identity preflight failed; restart/reinstall RelayBridge so MCP and REST use the same build and receipt store',
+    failureClass: 'bridge_identity_mismatch',
+    model_invocation: false,
+    token_usage_source: 'not_invoked',
+    transport_retry_count: 0,
+    provider_retries: ZERO_PROVIDER_RETRIES,
+    actionPreflight: {
+      ok: false,
+      expectedBuildId: expectedBuildId || null,
+      currentBuildId: BRIDGE_BUILD_ID,
+      expectedReceiptStoreId: expectedReceiptStoreId || null,
+      currentReceiptStoreId: RECEIPT_STORE_IDENTITY.id,
+      buildMatches,
+      receiptStoreMatches,
+    },
+  });
 });
 
 app.get('/api/config', (req, res) => {
