@@ -135,6 +135,39 @@ setTimeout(() => {
     }));
     return;
   }
+  if (process.argv.includes('--claude-json-success-error-disagreement')) {
+    process.stdout.write(JSON.stringify({
+      type: 'system', subtype: 'api_retry', uuid: 'schema-disagreement-retry',
+      attempt: 1, max_retries: 3, retry_delay_ms: 125,
+      error_status: 429, error: 'rate_limit',
+    }) + '\n');
+    process.stdout.write(JSON.stringify({
+      type: 'result', is_error: true, subtype: 'success', result: 'MUST_NOT_ESCAPE',
+      errors: ["You've hit your weekly limit after a provider retry."],
+      api_error_status: 429, terminal_reason: 'rapid_refill_breaker',
+      stop_reason: 'end_turn', num_turns: 2, duration_ms: 765, duration_api_ms: 654,
+      usage: {
+        input_tokens: 21, output_tokens: 4,
+        cache_read_input_tokens: 5, cache_creation_input_tokens: 6,
+        output_tokens_details: { thinking_tokens: 1 },
+      },
+    }));
+    return;
+  }
+  if (process.argv.includes('--claude-json-error-success-flag-disagreement')) {
+    process.stdout.write(JSON.stringify({
+      type: 'result', is_error: false, subtype: 'error_during_execution', result: 'MUST_NOT_ESCAPE',
+      errors: ['Server is temporarily limiting requests despite a false is_error flag.'],
+      api_error_status: 429, terminal_reason: 'rapid_refill_breaker',
+      stop_reason: 'end_turn', num_turns: 1, duration_ms: 432, duration_api_ms: 321,
+      usage: {
+        input_tokens: 31, output_tokens: 2,
+        cache_read_input_tokens: 7, cache_creation_input_tokens: 3,
+        output_tokens_details: { thinking_tokens: 1 },
+      },
+    }));
+    return;
+  }
   if (process.argv.includes('--claude-json-invalid-result')) {
     process.stdout.write(JSON.stringify({
       type: 'assistant', is_error: false, subtype: 'success', result: 'FAKE',

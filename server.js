@@ -453,6 +453,7 @@ function appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt }
     providerRetryInvalidEvents: nonnegativeUsageNumber(payload.provider_retries?.invalid_events),
     providerRetryDuplicateEvents: nonnegativeUsageNumber(payload.provider_retries?.duplicate_events),
     resultSubtype: normalizeClaudeResultString(payload.result_subtype),
+    resultSchemaDisagreement: payload.result_schema_disagreement === true,
     providerStopReason: normalizeClaudeResultString(payload.provider_stop_reason),
     providerTerminalReason: normalizeClaudeResultString(payload.provider_terminal_reason),
     providerApiErrorStatus: nonnegativeUsageNumber(payload.provider_api_error_status),
@@ -960,6 +961,7 @@ function parseConfiguredOneShotOutput(entry, rawOutput) {
       terminalReason: null, apiErrorStatus: null,
       permissionDenials: normalizeClaudePermissionDenials([]),
       numTurns: null, providerDurationMs: null, providerApiDurationMs: null,
+      resultSchemaDisagreement: false,
       parseError: null,
     };
   }
@@ -972,6 +974,7 @@ function parseConfiguredOneShotOutput(entry, rawOutput) {
       terminalReason: null, apiErrorStatus: null,
       permissionDenials: normalizeClaudePermissionDenials([]),
       numTurns: null, providerDurationMs: null, providerApiDurationMs: null,
+      resultSchemaDisagreement: false,
       parseError: `unsupported oneshot output parser: ${parser}`,
     };
   }
@@ -994,7 +997,8 @@ function parseConfiguredOneShotOutput(entry, rawOutput) {
     const subtype = (normalizeClaudeResultString(document.subtype) || '').toLowerCase();
     if (subtype !== 'success' && !/^error_/.test(subtype)) throw new Error('result subtype is unsupported');
     if (typeof document.is_error !== 'boolean') throw new Error('result is_error is not boolean');
-    if (document.is_error !== (subtype !== 'success')) throw new Error('result subtype and is_error disagree');
+    const subtypeIndicatesError = /^error_/.test(subtype);
+    const resultSchemaDisagreement = document.is_error !== subtypeIndicatesError;
     const providerStopReason = (normalizeClaudeResultString(document.stop_reason) || '').toLowerCase() || null;
     const terminalReasonRaw = (normalizeClaudeResultString(document.terminal_reason) || '').toLowerCase() || null;
     if (terminalReasonRaw && !CLAUDE_TERMINAL_REASONS.has(terminalReasonRaw)) {
@@ -1005,7 +1009,13 @@ function parseConfiguredOneShotOutput(entry, rawOutput) {
     if (!apiStatusAbsent && (apiErrorStatus === null || apiErrorStatus < 100 || apiErrorStatus > 599)) {
       throw new Error('result api_error_status is invalid');
     }
-    const isError = document.is_error;
+    // Claude CLI versions have emitted terminal result documents where
+    // `subtype` and `is_error` disagree. Treat either error signal as
+    // authoritative and never expose result content unless both fields form
+    // the canonical success pair. The disagreement remains observable rather
+    // than turning the entire document into a parse failure that discards
+    // provider-reported usage, errors, and retry events.
+    const isError = subtypeIndicatesError || document.is_error === true;
     const errors = normalizeClaudeResultErrors(document.errors);
     const permissionDenials = normalizeClaudePermissionDenials(document.permission_denials);
     return {
@@ -1017,7 +1027,8 @@ function parseConfiguredOneShotOutput(entry, rawOutput) {
         : claudeApiStatusFailureClass(apiErrorStatus)
         || claudeStopReasonFailureClass(providerStopReason)
         || claudeTerminalReasonFailureClass(terminalReasonRaw)
-        || claudeResultFailureClass(subtype),
+        || claudeResultFailureClass(subtype)
+        || (isError ? 'provider_error' : null),
       retries: normalizeClaudeRetryEvents(events),
       diagnostic: cleanOutput(errors.retained.join('\n')),
       errorCount: errors.count,
@@ -1031,6 +1042,7 @@ function parseConfiguredOneShotOutput(entry, rawOutput) {
       numTurns: nonnegativeUsageNumber(document.num_turns),
       providerDurationMs: nonnegativeUsageNumber(document.duration_ms),
       providerApiDurationMs: nonnegativeUsageNumber(document.duration_api_ms),
+      resultSchemaDisagreement,
       parseError: null,
     };
   } catch (error) {
@@ -1042,6 +1054,7 @@ function parseConfiguredOneShotOutput(entry, rawOutput) {
       terminalReason: null, apiErrorStatus: null,
       permissionDenials: normalizeClaudePermissionDenials([]),
       numTurns: null, providerDurationMs: null, providerApiDurationMs: null,
+      resultSchemaDisagreement: false,
       retries: normalizeClaudeRetryEvents(events),
       parseError: `claude_json parse failed: ${error.message}`,
     };
@@ -2739,6 +2752,7 @@ async function executeOneShot(body, res) {
       usage: parsedOutput.usage,
       failureClass: parsedOutput.failureClass,
       result_subtype: parsedOutput.resultSubtype,
+      result_schema_disagreement: parsedOutput.resultSchemaDisagreement,
       provider_retries: parsedOutput.retries,
       provider_stop_reason: parsedOutput.providerStopReason,
       provider_terminal_reason: parsedOutput.terminalReason,
@@ -2914,6 +2928,7 @@ async function executeOneShot(body, res) {
       usage: parsedOutput.usage,
       failureClass: finalFailureClass,
       result_subtype: parsedOutput.resultSubtype,
+      result_schema_disagreement: parsedOutput.resultSchemaDisagreement,
       provider_retries: parsedOutput.retries,
       provider_stop_reason: parsedOutput.providerStopReason,
       provider_terminal_reason: parsedOutput.terminalReason,

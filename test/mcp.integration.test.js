@@ -101,6 +101,15 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
       oneshot_safe: [process.execPath, helper, '--prompt-file', '{prompt_file}', '--claude-json'],
       oneshot_output_parser: 'claude_json',
     },
+    schema_disagreement: {
+      ...echoProvider,
+      label: 'Structured Claude schema disagreement fixture',
+      oneshot_safe: [
+        process.execPath, helper, '--prompt-file', '{prompt_file}',
+        '--claude-json-success-error-disagreement',
+      ],
+      oneshot_output_parser: 'claude_json',
+    },
     retry_json: {
       ...echoProvider,
       label: 'Structured Claude retry fixture',
@@ -449,6 +458,18 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   assert.equal(usageProvider.structuredContent.modelInvocation, true);
   assert.equal(usageProvider.structuredContent.usage.total_tokens, 35453);
 
+  const disagreementProvider = await client.callTool({
+    name: 'ask_provider',
+    arguments: { kind: 'schema_disagreement', prompt: 'MCP_SCHEMA_DISAGREEMENT_MARKER', useCache: false },
+  });
+  assert.equal(disagreementProvider.structuredContent.modelInvocation, true);
+  assert.equal(disagreementProvider.structuredContent.stdout, '');
+  assert.equal(disagreementProvider.structuredContent.resultSubtype, 'success');
+  assert.equal(disagreementProvider.structuredContent.resultSchemaDisagreement, true);
+  assert.equal(disagreementProvider.structuredContent.failureClass, 'rate_limit');
+  assert.equal(disagreementProvider.structuredContent.usage.total_tokens, 36);
+  assert.equal(disagreementProvider.structuredContent.providerRetries.count, 1);
+
   const retryPrompt = 'MCP_RETRY_ACCOUNTING_MARKER';
   const retryProvider = await client.callTool({
     name: 'ask_provider',
@@ -664,6 +685,16 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   });
   assert.equal(usageTransport.structuredContent.receipt.actualTotalTokens, usageOuterReceipt.actualTotalTokens);
   assert.equal(usageTransport.structuredContent.receipt.requestId, usageOuterReceipt.requestId);
+  const disagreementOuterReceipt = receipts.structuredContent.receipts.find((receipt) =>
+    receipt.receiptId === disagreementProvider.structuredContent.receiptId);
+  assert.equal(disagreementOuterReceipt.resultSchemaDisagreement, true);
+  assert.equal(disagreementOuterReceipt.actualTotalTokens, 36);
+  assert.match(disagreementOuterReceipt.transportReceiptId, /^rcpt_/);
+  const disagreementTransport = await client.callTool({
+    name: 'get_receipt', arguments: { receiptId: disagreementOuterReceipt.transportReceiptId },
+  });
+  assert.equal(disagreementTransport.structuredContent.receipt.resultSchemaDisagreement, true);
+  assert.equal(disagreementTransport.structuredContent.receipt.actualTotalTokens, 36);
   const retryOuterReceipt = receipts.structuredContent.receipts.find((receipt) => receipt.receiptId === retryProvider.structuredContent.receiptId);
   assert.equal(retryOuterReceipt.providerRetryCount, 2);
   assert.equal(retryOuterReceipt.providerRetryDelayMs, 300);
