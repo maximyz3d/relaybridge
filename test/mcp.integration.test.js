@@ -75,7 +75,9 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ps-bridge-mcp-test-'));
   const tokenPath = path.join(tempRoot, 'capability.token');
   const dataDir = path.join(tempRoot, 'data');
+  const staleDataDir = path.join(tempRoot, 'stale-mcp-data');
   const configPath = path.join(tempRoot, 'config.json');
+  const invocationMarker = path.join(tempRoot, 'identity-provider-invocations.txt');
   const helper = path.join(ROOT, 'test', 'prompt-file-cli.js');
   const echoProvider = {
       label: 'Echo',
@@ -105,6 +107,11 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
       oneshot_safe: [process.execPath, helper, '--prompt-file', '{prompt_file}', '--claude-json-retries'],
       oneshot_output_parser: 'claude_json',
     },
+    identity_guard: {
+      ...echoProvider,
+      label: 'Identity preflight fixture',
+      oneshot_safe: [process.execPath, helper, '--prompt-file', '{prompt_file}', '--invocation-marker', invocationMarker],
+    },
     slow: {
       ...echoProvider,
       label: 'Slow cancellable provider',
@@ -123,6 +130,8 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
       PS_BRIDGE_CONFIG_FILE: configPath,
       PS_BRIDGE_TOKEN_FILE: tokenPath,
       PS_BRIDGE_DATA_DIR: dataDir,
+      NODE_ENV: 'test',
+      RELAYBRIDGE_TEST_BUILD_ID: 'integration-current',
     },
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -133,7 +142,11 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
 
   let client;
   let transport;
+  let staleClient;
+  let staleTransport;
   t.after(async () => {
+    try { await staleClient?.close(); } catch {}
+    try { await staleTransport?.close(); } catch {}
     try { await client?.close(); } catch {}
     try { await transport?.close(); } catch {}
     if (bridge.exitCode === null) bridge.kill('SIGTERM');
@@ -161,6 +174,8 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
       PS_BRIDGE_TOKEN_FILE: tokenPath,
       PS_BRIDGE_DATA_DIR: dataDir,
       PS_BRIDGE_CONFIG_FILE: configPath,
+      NODE_ENV: 'test',
+      RELAYBRIDGE_TEST_BUILD_ID: 'integration-current',
     },
     stderr: 'pipe',
   });
@@ -192,11 +207,69 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   const healthResource = await client.readResource({ uri: 'psbridge://health' });
   const healthPayload = JSON.parse(healthResource.contents[0].text);
   assert.equal(healthPayload.version, '2.0.1');
+  assert.equal(healthPayload.buildId, 'integration-current');
+  assert.match(healthPayload.receiptStoreId, /^[0-9a-f]{64}$/);
+  assert.equal(healthPayload.receiptStoreIdentityReady, true);
+  assert.ok(!JSON.stringify(healthPayload).includes(dataDir));
+  const storedIdentitySeed = fs.readFileSync(path.join(dataDir, '.receipt-store-id'), 'utf8').trim();
+  assert.match(storedIdentitySeed, /^[0-9a-f]{64}$/);
+  assert.notEqual(storedIdentitySeed, healthPayload.receiptStoreId, 'the exposed identity must bind the seed to its canonical store without exposing either');
   assert.equal(healthPayload.capabilityAuth, true);
   assert.deepEqual(healthPayload.oneShotTimeoutPolicy, { minimumMs: 1000, defaultMs: 1200000, maxMs: 2700000 });
 
   const capability = await (await fetch(`${baseUrl}/api/capability`)).json();
   const collabHeaders = { 'X-PS-Bridge-Token': capability.token, 'Content-Type': 'application/json' };
+  const oldMcpResponse = await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST',
+    headers: {
+      ...collabHeaders,
+      'X-RelayBridge-Client': 'mcp',
+    },
+    body: JSON.stringify({ kind: 'identity_guard', prompt: 'OLD_MCP_MUST_NOT_INVOKE', dangerous: false }),
+  });
+  assert.equal(oldMcpResponse.status, 409);
+  const oldMcpRejected = await oldMcpResponse.json();
+  assert.equal(oldMcpRejected.failureClass, 'bridge_identity_mismatch');
+  assert.equal(oldMcpRejected.model_invocation, false);
+  assert.equal(oldMcpRejected.token_usage_source, 'not_invoked');
+  assert.equal(oldMcpRejected.transport_retry_count, 0);
+  assert.equal(oldMcpRejected.provider_retries.count, 0);
+  assert.equal(oldMcpRejected.actionPreflight.expectedBuildId, null);
+  assert.equal(fs.existsSync(invocationMarker), false, 'an old MCP without identity headers must not start a provider process');
+  const racedStoreResponse = await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST',
+    headers: {
+      ...collabHeaders,
+      'X-RelayBridge-Client': 'mcp',
+      'X-RelayBridge-Expected-Build-Id': 'integration-current',
+      'X-RelayBridge-Expected-Receipt-Store-Id': '0'.repeat(64),
+    },
+    body: JSON.stringify({ kind: 'identity_guard', prompt: 'RACED_STORE_MUST_NOT_INVOKE', dangerous: false }),
+  });
+  assert.equal(racedStoreResponse.status, 409);
+  const racedStoreRejected = await racedStoreResponse.json();
+  assert.equal(racedStoreRejected.actionPreflight.buildMatches, true);
+  assert.equal(racedStoreRejected.actionPreflight.receiptStoreMatches, false);
+  assert.equal(racedStoreRejected.model_invocation, false);
+  assert.equal(racedStoreRejected.provider_retries.count, 0);
+  assert.equal(fs.existsSync(invocationMarker), false, 'the server-side race check must run before provider admission');
+  const racedBuildResponse = await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST',
+    headers: {
+      ...collabHeaders,
+      'X-RelayBridge-Client': 'mcp',
+      'X-RelayBridge-Expected-Build-Id': 'integration-stale',
+      'X-RelayBridge-Expected-Receipt-Store-Id': healthPayload.receiptStoreId,
+    },
+    body: JSON.stringify({ kind: 'identity_guard', prompt: 'RACED_BUILD_MUST_NOT_INVOKE', dangerous: false }),
+  });
+  assert.equal(racedBuildResponse.status, 409);
+  const racedBuildRejected = await racedBuildResponse.json();
+  assert.equal(racedBuildRejected.actionPreflight.buildMatches, false);
+  assert.equal(racedBuildRejected.actionPreflight.receiptStoreMatches, true);
+  assert.equal(racedBuildRejected.model_invocation, false);
+  assert.equal(racedBuildRejected.provider_retries.count, 0);
+  assert.equal(fs.existsSync(invocationMarker), false, 'a build-only mismatch must fail before provider admission');
   const collab = await (await fetch(`${baseUrl}/api/collabs`, {
     method: 'POST',
     headers: collabHeaders,
@@ -287,6 +360,87 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   assert.equal(provider.structuredContent.route.requested_timeout_ms, 600001);
   assert.equal(provider.structuredContent.route.effective_timeout_ms, 600001);
   assert.match(provider.structuredContent.receiptId, /^rcpt_/);
+
+  const identitySuccess = await client.callTool({
+    name: 'ask_provider',
+    arguments: { kind: 'identity_guard', prompt: 'SAME_STORE_IDENTITY_OK', useCache: false },
+  });
+  assert.equal(identitySuccess.isError, undefined, JSON.stringify(identitySuccess.structuredContent));
+  assert.equal(identitySuccess.structuredContent.modelInvocation, true);
+  assert.equal(identitySuccess.structuredContent.stdout, 'SAME_STORE_IDENTITY_OK');
+  assert.equal(identitySuccess.structuredContent.actionPreflight.ok, true);
+  assert.equal(identitySuccess.structuredContent.actionPreflight.expectedBuildId, 'integration-current');
+  assert.equal(identitySuccess.structuredContent.actionPreflight.currentBuildId, 'integration-current');
+  assert.equal(identitySuccess.structuredContent.actionPreflight.expectedReceiptStoreId, healthPayload.receiptStoreId);
+  assert.equal(identitySuccess.structuredContent.actionPreflight.currentReceiptStoreId, healthPayload.receiptStoreId);
+  assert.equal(fs.readFileSync(invocationMarker, 'utf8').trim(), 'SAME_STORE_IDENTITY_OK');
+
+  staleTransport = new StdioClientTransport({
+    command: process.execPath,
+    args: [path.join(ROOT, 'mcp', 'server.mjs')],
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      PS_BRIDGE_URL: baseUrl,
+      PS_BRIDGE_TOKEN_FILE: tokenPath,
+      PS_BRIDGE_DATA_DIR: staleDataDir,
+      PS_BRIDGE_CONFIG_FILE: configPath,
+      NODE_ENV: 'test',
+      RELAYBRIDGE_TEST_BUILD_ID: 'integration-stale',
+    },
+    stderr: 'pipe',
+  });
+  let staleMcpStderr = '';
+  staleTransport.stderr.on('data', (chunk) => { staleMcpStderr += chunk; });
+  staleClient = new Client({ name: 'ps-bridge-stale-mcp-test', version: '1.0.0' });
+  try {
+    await staleClient.connect(staleTransport);
+  } catch (error) {
+    throw new Error(`${error.message}\n${staleMcpStderr}`);
+  }
+  const staleStatus = await staleClient.callTool({
+    name: 'bridge_status',
+    arguments: { includeDiagnostics: false },
+  });
+  assert.equal(staleStatus.isError, undefined, JSON.stringify(staleStatus.structuredContent));
+  assert.equal(staleStatus.structuredContent.health.buildId, 'integration-current');
+  assert.equal(staleStatus.structuredContent.health.receiptStoreId, healthPayload.receiptStoreId);
+
+  const staleProvider = await staleClient.callTool({
+    name: 'ask_provider',
+    arguments: { kind: 'identity_guard', prompt: 'STALE_MCP_MUST_NOT_INVOKE', useCache: false },
+  });
+  assert.equal(staleProvider.isError, undefined, JSON.stringify(staleProvider.structuredContent));
+  assert.equal(staleProvider.structuredContent.modelInvocation, false);
+  assert.equal(staleProvider.structuredContent.tokenUsageSource, 'not_invoked');
+  assert.equal(staleProvider.structuredContent.transportRetryCount, 0);
+  assert.equal(staleProvider.structuredContent.providerRetries.count, 0);
+  assert.equal(staleProvider.structuredContent.transportReceiptId, null);
+  assert.equal(staleProvider.structuredContent.failureClass, 'bridge_identity_mismatch');
+  assert.equal(staleProvider.structuredContent.actionPreflight.expectedBuildId, 'integration-stale');
+  assert.equal(staleProvider.structuredContent.actionPreflight.currentBuildId, 'integration-current');
+  assert.equal(staleProvider.structuredContent.actionPreflight.buildMatches, false);
+  assert.equal(staleProvider.structuredContent.actionPreflight.receiptStoreMatches, false);
+  assert.match(staleProvider.structuredContent.actionPreflight.expectedReceiptStoreId, /^[0-9a-f]{64}$/);
+  assert.match(staleProvider.structuredContent.actionPreflight.currentReceiptStoreId, /^[0-9a-f]{64}$/);
+  assert.notEqual(
+    staleProvider.structuredContent.actionPreflight.expectedReceiptStoreId,
+    staleProvider.structuredContent.actionPreflight.currentReceiptStoreId,
+  );
+  assert.ok(!JSON.stringify(staleProvider.structuredContent).includes(staleDataDir));
+  assert.ok(!JSON.stringify(staleProvider.structuredContent).includes(dataDir));
+  assert.equal(fs.readFileSync(invocationMarker, 'utf8').trim(), 'SAME_STORE_IDENTITY_OK');
+
+  const staleReceipts = await staleClient.callTool({ name: 'list_receipts', arguments: { limit: 20 } });
+  const staleOuterReceipt = staleReceipts.structuredContent.receipts.find((receipt) =>
+    receipt.receiptId === staleProvider.structuredContent.receiptId);
+  assert.ok(staleOuterReceipt, 'the failed preflight must still have an outer MCP receipt');
+  assert.equal(staleOuterReceipt.modelInvocation, false);
+  assert.equal(staleOuterReceipt.tokenUsageSource, 'not_invoked');
+  assert.equal(staleOuterReceipt.providerRetryCount, 0);
+  assert.equal(staleOuterReceipt.transportRetryCount, 0);
+  assert.equal(staleOuterReceipt.transportReceiptId, null);
+  assert.equal(staleOuterReceipt.receiptStoreId, staleProvider.structuredContent.actionPreflight.expectedReceiptStoreId);
 
   const usageProvider = await client.callTool({
     name: 'ask_provider',
@@ -562,6 +716,20 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
     arguments: { receiptId: dereferencedReceipt.structuredContent.receipt.transportReceiptId },
   });
   assert.equal(transportReceipt.structuredContent.receipt.requestId, dereferencedReceipt.structuredContent.receipt.requestId);
+  const identityOuterReceipt = receipts.structuredContent.receipts.find((receipt) =>
+    receipt.receiptId === identitySuccess.structuredContent.receiptId);
+  assert.ok(identityOuterReceipt, 'same-store provider result must persist an outer receipt');
+  assert.match(identityOuterReceipt.transportReceiptId, /^rcpt_/);
+  assert.equal(identityOuterReceipt.receiptStoreId, healthPayload.receiptStoreId);
+  assert.equal(identityOuterReceipt.actionPreflight.ok, true);
+  const identityTransportReceipt = await client.callTool({
+    name: 'get_receipt',
+    arguments: { receiptId: identityOuterReceipt.transportReceiptId },
+  });
+  assert.equal(identityTransportReceipt.isError, undefined, JSON.stringify(identityTransportReceipt.structuredContent));
+  assert.equal(identityTransportReceipt.structuredContent.receipt.requestId, identityOuterReceipt.requestId);
+  assert.equal(identityTransportReceipt.structuredContent.receipt.bridgeBuildId, 'integration-current');
+  assert.equal(identityTransportReceipt.structuredContent.receipt.receiptStoreId, identityOuterReceipt.receiptStoreId);
   assert.ok(Array.isArray(dereferencedReceipt.structuredContent.chain));
   assert.ok(fs.existsSync(path.join(dataDir, 'receipts')));
 });

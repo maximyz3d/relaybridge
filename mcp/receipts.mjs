@@ -2,6 +2,9 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import receiptStoreIdentityModule from '../lib/receipt-store-identity.cjs';
+
+const { receiptStoreIdentity } = receiptStoreIdentityModule;
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
@@ -19,6 +22,7 @@ const RUNS_DIR = path.join(DATA_DIR, 'runs');
 const CACHE_DIR = path.join(DATA_DIR, 'cache');
 
 for (const dir of [RECEIPTS_DIR, RUNS_DIR, CACHE_DIR]) fs.mkdirSync(dir, { recursive: true });
+const RECEIPT_STORE_IDENTITY = receiptStoreIdentity(DATA_DIR);
 
 function dateToken(date = new Date()) {
   return date.toISOString().slice(0, 10);
@@ -50,6 +54,7 @@ export function appendReceipt(event) {
     receiptId: event.receiptId || `rcpt_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 8)}`,
     timestamp: event.timestamp || new Date().toISOString(),
     ...event,
+    receiptStoreId: RECEIPT_STORE_IDENTITY.id,
   };
   const filePath = path.join(RECEIPTS_DIR, `${dateToken(new Date(receipt.timestamp))}.jsonl`);
   const handle = fs.openSync(filePath, 'a');

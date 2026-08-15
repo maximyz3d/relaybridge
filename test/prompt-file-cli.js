@@ -15,6 +15,10 @@ if (fileIndex < 0 || !process.argv[fileIndex + 1]) {
 }
 
 const prompt = fs.readFileSync(process.argv[fileIndex + 1], 'utf8');
+const markerIndex = process.argv.indexOf('--invocation-marker');
+if (markerIndex >= 0 && process.argv[markerIndex + 1]) {
+  fs.appendFileSync(process.argv[markerIndex + 1], `${prompt}\n`, 'utf8');
+}
 const delayIndex = process.argv.indexOf('--delay');
 const delayMs = delayIndex >= 0 ? Math.max(0, Number(process.argv[delayIndex + 1] || 0)) : 0;
 

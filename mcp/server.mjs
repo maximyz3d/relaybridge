@@ -644,7 +644,7 @@ const PROVIDER_FAILURE_CLASSES = new Set([
   'max_tokens', 'refusal', 'max_turns', 'structured_output_retry_exhausted',
   'tool_deferred', 'aborted_streaming', 'aborted_tools', 'hook_stopped',
   'stop_hook_prevented', 'blocking_limit', 'prompt_too_long',
-  'provider_error', 'admission_limit',
+  'provider_error', 'admission_limit', 'bridge_identity_mismatch',
 ]);
 
 const PROVIDER_TERMINAL_REASONS = new Set([
@@ -812,6 +812,8 @@ function sanitizeProviderResponse(response) {
     transportReceiptId: response.receiptId || null,
     transportReceiptPersisted: response.receiptPersisted ?? null,
     transportReceiptPersistenceError: response.receiptPersistenceError || null,
+    actionPreflight: response.actionPreflight || null,
+    transportRetryCount: 0,
     exitCode: response.exitCode,
     droppedOut: !!response.dropped_out,
     rateLimited: !!response.rate_limited,
@@ -972,6 +974,7 @@ async function callProvider({
       },
       timeoutMs: TIMEOUT_POLICY.transportTimeoutMs(timeoutMs),
       signal,
+      actionIdentity: true,
     });
     sanitized = sanitizeProviderResponse(response);
     status = providerSucceeded(sanitized) ? 'completed'
@@ -997,6 +1000,15 @@ async function callProvider({
       authFailed: authRequired,
       admissionLimited: bridgeStatus === 429,
       modelInvocation: deterministicPreflightRejection ? false : null,
+      tokenUsageSource: deterministicPreflightRejection ? 'not_invoked' : 'unknown',
+      transportRetryCount: 0,
+      providerRetries: deterministicPreflightRejection ? zeroProviderRetries() : null,
+      transportReceiptId: null,
+      transportReceiptPersisted: null,
+      transportReceiptPersistenceError: null,
+      failureClass: deterministicPreflightRejection
+        ? (error.detail?.failureClass || 'policy') : null,
+      actionPreflight: error.detail?.actionPreflight || null,
     };
     status = signal?.aborted ? 'cancelled' : transportTimedOut ? 'timed_out' : 'failed';
   }
@@ -1030,6 +1042,7 @@ async function callProvider({
     providerRetryObservedEvents: sanitized.providerRetries?.observed_events ?? null,
     providerRetryInvalidEvents: sanitized.providerRetries?.invalid_events ?? null,
     providerRetryDuplicateEvents: sanitized.providerRetries?.duplicate_events ?? null,
+    transportRetryCount: sanitized.transportRetryCount ?? 0,
     resultSubtype: sanitized.resultSubtype ?? null,
     providerStopReason: sanitized.providerStopReason ?? null,
     providerTerminalReason: sanitized.providerTerminalReason ?? null,
@@ -1050,7 +1063,7 @@ async function callProvider({
     transportOutputChars: sanitized.transportOutputChars ?? null,
     transportOutputHash: sanitized.transportOutputHash ?? null,
     modelInvocation: sanitized.modelInvocation ?? null,
-    tokenUsageSource: sanitized.usage?.token_source
+    tokenUsageSource: sanitized.tokenUsageSource || sanitized.usage?.token_source
       || (sanitized.modelInvocation === false ? 'not_invoked'
         : sanitized.modelInvocation === null ? 'unknown' : 'chars_div_4'),
     requestId,
@@ -1062,6 +1075,7 @@ async function callProvider({
     durationMs: Date.now() - startedAt,
     status,
     route: sanitized.route,
+    actionPreflight: sanitized.actionPreflight || null,
     exitCode: sanitized.exitCode,
     failureClass: sanitized.cancelled ? 'cancelled'
       : sanitized.failureClass || (sanitized.rateLimited ? 'rate_limit'
@@ -1483,7 +1497,7 @@ export function buildServer() {
     inputSchema: z.object({ kind: z.string().min(1).max(64), cwd: z.string().max(1000).optional(), label: z.string().max(100).optional() }),
     annotations: { ...ACTION, openWorldHint: true },
   }, safeHandler(async ({ kind, cwd, label }) => {
-    const session = await bridgeRequest('/api/sessions', { method: 'POST', body: { kind, cwd, label, dangerous: false } });
+    const session = await bridgeRequest('/api/sessions', { method: 'POST', body: { kind, cwd, label, dangerous: false }, actionIdentity: true });
     const receipt = appendReceipt({ event: 'session_start', sessionId: session.id, provider: kind, cwd: session.cwd, dangerous: false, status: 'started' });
     return result({ session, receiptId: receipt.receiptId });
   }));
@@ -1495,7 +1509,7 @@ export function buildServer() {
     annotations: { ...DESTRUCTIVE, openWorldHint: true },
   }, safeHandler(async ({ sessionId, data, appendNewline }) => {
     const sent = data + (appendNewline ? '\r' : '');
-    const response = await bridgeRequest(`/api/sessions/${encodeURIComponent(sessionId)}/input`, { method: 'POST', body: { data: sent } });
+    const response = await bridgeRequest(`/api/sessions/${encodeURIComponent(sessionId)}/input`, { method: 'POST', body: { data: sent }, actionIdentity: true });
     const receipt = appendReceipt({ event: 'session_input', sessionId, inputHash: stableHash(data), inputChars: data.length, appendNewline, status: response.ok ? 'sent' : 'rejected' });
     return result({ ...response, sessionId, receiptId: receipt.receiptId });
   }));
@@ -1506,7 +1520,7 @@ export function buildServer() {
     inputSchema: z.object({ sessionId: z.string().min(1).max(64) }),
     annotations: { ...DESTRUCTIVE, idempotentHint: true },
   }, safeHandler(async ({ sessionId }) => {
-    const response = await bridgeRequest(`/api/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' });
+    const response = await bridgeRequest(`/api/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE', actionIdentity: true });
     const receipt = appendReceipt({ event: 'session_stop', sessionId, status: 'stopped' });
     return result({ ...response, sessionId, receiptId: receipt.receiptId });
   }));
@@ -1916,6 +1930,7 @@ export function buildServer() {
     const response = await bridgeRequest(`/api/agents/${encodeURIComponent(providerId)}/tags`, {
       method: 'POST',
       body: { tags },
+      actionIdentity: true,
     });
     const receipt = appendReceipt({ event: 'agent_tags_update', provider: providerId, tags: response.tags, status: 'updated' });
     return result({ ...response, receiptId: receipt.receiptId });
@@ -1939,6 +1954,7 @@ export function buildServer() {
       body: { prompt, tag, providers, all, cwd, timeoutMs, dangerous: false },
       timeoutMs: TIMEOUT_POLICY.transportTimeoutMs(timeoutMs),
       signal: context?.mcpReq?.signal,
+      actionIdentity: true,
     });
     const results = (response.results || []).map((member) => {
       const output = clip(member.output || '', 16000);
