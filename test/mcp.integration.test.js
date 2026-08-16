@@ -641,7 +641,9 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   while (Date.now() < runningRunDeadline && !runningRunObserved) {
     for (const name of fs.readdirSync(runsDir)) {
       if (runsBeforeCancellation.has(name)) continue;
-      const candidate = JSON.parse(fs.readFileSync(path.join(runsDir, name), 'utf8'));
+      let candidate;
+      try { candidate = JSON.parse(fs.readFileSync(path.join(runsDir, name), 'utf8')); }
+      catch { continue; }
       if (candidate.mode === 'committee:advisory' && candidate.status === 'running') {
         runningRunObserved = true;
         break;
@@ -652,12 +654,18 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   assert.equal(runningRunObserved, true, 'committee should checkpoint a running record before cancellation');
   committeeController.abort(new Error('committee cancellation test'));
   await assert.rejects(cancelledCommittee);
-  const committeeCancellationDeadline = Date.now() + 5000;
+  // On loaded Windows hosts the MCP cancellation can take longer than five
+  // seconds to traverse stdio, abort both HTTP seats, persist their receipts,
+  // and atomically replace the run checkpoint. The provider helpers remain at
+  // ten seconds, so this still fails if cancellation is not propagated.
+  const committeeCancellationDeadline = Date.now() + 15000;
   let cancelledRun = null;
   while (Date.now() < committeeCancellationDeadline && !cancelledRun) {
     for (const name of fs.readdirSync(runsDir)) {
       if (runsBeforeCancellation.has(name)) continue;
-      const candidate = JSON.parse(fs.readFileSync(path.join(runsDir, name), 'utf8'));
+      let candidate;
+      try { candidate = JSON.parse(fs.readFileSync(path.join(runsDir, name), 'utf8')); }
+      catch { continue; }
       if (candidate.mode === 'committee:advisory' && candidate.status === 'cancelled') {
         cancelledRun = candidate;
         break;
