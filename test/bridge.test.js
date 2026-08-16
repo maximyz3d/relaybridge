@@ -422,6 +422,14 @@ test('prompt-file transport preserves long special-character prompts and cleans 
       oneshot_dangerous: [...baseSlot, '--claude-json-tool-deferred'],
       oneshot_output_parser: 'claude_json',
     },
+    usage_json_terminal_from_prompt: {
+      label: 'Structured Claude New Terminal Reason',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--claude-json-terminal-from-prompt'],
+      oneshot_dangerous: [...baseSlot, '--claude-json-terminal-from-prompt'],
+      oneshot_output_parser: 'claude_json',
+    },
     retry_hang: {
       label: 'Structured Retry Then Hang',
       safe: [process.execPath, helper, '--version'],
@@ -844,6 +852,31 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(deferred.failureClass, 'tool_deferred');
   assert.equal(deferred.dropped_out, true);
 
+  const expandedTerminalReasons = new Map([
+    ['malformed_tool_use_exhausted', 'malformed_tool_use_exhausted'],
+    ['budget_exhausted', 'budget'],
+    ['structured_output_retry_exhausted', 'structured_output_retry_exhausted'],
+    ['api_error', 'rate_limit'],
+    ['background_requested', 'background_requested'],
+    ['turn_setup_failed', 'turn_setup_failed'],
+    ['tool_deferred_unavailable', 'tool_deferred_unavailable'],
+  ]);
+  for (const [terminalReason, failureClass] of expandedTerminalReasons) {
+    const response = await fetch(baseUrl + '/api/oneshot', {
+      method: 'POST', headers: jsonAuth,
+      body: JSON.stringify({
+        kind: 'usage_json_terminal_from_prompt', prompt: terminalReason, dangerous: false,
+      }),
+    });
+    assert.equal(response.status, 200);
+    const result = await response.json();
+    assert.doesNotMatch(result.stderr, /terminal_reason is unsupported/);
+    assert.equal(result.provider_terminal_reason, terminalReason);
+    assert.equal(result.failureClass, failureClass);
+    assert.equal(result.dropped_out, true);
+    assert.equal(result.usage.total_tokens, 4);
+  }
+
   const cappedTimeoutResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST',
     headers: jsonAuth,
@@ -992,7 +1025,11 @@ test('prompt-file transport preserves long special-character prompts and cleans 
     body: JSON.stringify({ kind: 'retry_hang', prompt: 'preserve retry metrics on cancellation', dangerous: false }),
     signal: retryHangController.signal,
   });
-  await new Promise((resolve) => setTimeout(resolve, 250));
+  // Windows process startup can exceed 250 ms after the expanded structured
+  // result fixture census. Give the helper enough time to emit the retry event
+  // before cancelling; the assertion below still proves cancellation preserves
+  // that already-observed event rather than manufacturing one.
+  await new Promise((resolve) => setTimeout(resolve, 1000));
   retryHangController.abort();
   await retryHang.catch(() => {});
   const retryHangDeadline = Date.now() + 5000;

@@ -764,6 +764,13 @@ const CLAUDE_TERMINAL_REASONS = new Set([
   'completed', 'max_turns', 'tool_deferred', 'aborted_streaming', 'aborted_tools',
   'hook_stopped', 'stop_hook_prevented', 'blocking_limit', 'rapid_refill_breaker',
   'prompt_too_long', 'image_error', 'model_error',
+  // Claude Code 2.1.229 expanded TerminalReason beyond the currently
+  // published SDK reference. Keep this census explicit and fail closed on
+  // unknown future values, but accept the values emitted by the installed
+  // subscription CLI so a valid result does not lose usage/error telemetry.
+  'malformed_tool_use_exhausted', 'budget_exhausted',
+  'structured_output_retry_exhausted', 'api_error', 'background_requested',
+  'turn_setup_failed', 'tool_deferred_unavailable',
 ]);
 
 function normalizeClaudeRetryEvents(events) {
@@ -853,6 +860,7 @@ function claudeResultFailureClass(subtype) {
 function claudeTerminalReasonFailureClass(reason) {
   if (!reason || reason === 'completed') return null;
   if (reason === 'rapid_refill_breaker') return 'rate_limit';
+  if (reason === 'budget_exhausted') return 'budget';
   if (reason === 'image_error' || reason === 'model_error') return 'provider_error';
   return reason;
 }

@@ -252,6 +252,18 @@ setTimeout(() => {
     }));
     return;
   }
+  if (process.argv.includes('--claude-json-terminal-from-prompt')) {
+    const terminalReason = String(prompt || '').trim();
+    process.stdout.write(JSON.stringify({
+      type: 'result', is_error: true, subtype: 'error_during_execution',
+      errors: [`terminal reason ${terminalReason}`],
+      api_error_status: terminalReason === 'api_error' ? 429 : null,
+      terminal_reason: terminalReason, permission_denials: [],
+      num_turns: 1, duration_ms: 25, duration_api_ms: 20,
+      usage: { input_tokens: 3, output_tokens: 1 },
+    }));
+    return;
+  }
   if (process.argv.includes('--claude-json-retry-hang')) {
     process.stdout.write(JSON.stringify({
       type: 'system', subtype: 'api_retry', uuid: 'retry-before-cancel',
