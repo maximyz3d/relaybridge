@@ -41,6 +41,14 @@ function findToken() {
   return null;
 }
 
+async function bridgeVersion() {
+  try {
+    const res = await fetch(BASE + '/api/health');
+    const body = await res.json();
+    return body.version || 'unknown';
+  } catch { return 'unknown'; }
+}
+
 async function call(pathname, { method = 'GET', body = null } = {}) {
   const token = findToken();
   if (!token) {
@@ -61,6 +69,10 @@ async function call(pathname, { method = 'GET', body = null } = {}) {
     const err = new Error(`${payload.label || payload.kind} is not signed in. Run: relaybridge login ${payload.kind}`);
     err.authRequired = payload;
     throw err;
+  }
+  if (res.status === 404) {
+    throw new Error(`${pathname} is not available on the running bridge (v${await bridgeVersion()}). `
+      + 'The process is older than this endpoint — restart RelayBridge after syncing the install directory.');
   }
   if (!res.ok) throw new Error(payload.error || `${res.status} ${res.statusText}`);
   return payload;
@@ -273,9 +285,20 @@ async function main() {
 }
 
 if (require.main === module) {
-  main().then((code) => process.exit(code)).catch((err) => {
+  // Set exitCode and let the loop drain instead of calling process.exit().
+  // Exiting while the HTTP socket is still closing trips a libuv assertion on
+  // Windows (UV_HANDLE_CLOSING) and prints a crash after otherwise-good output.
+  const finish = (code) => {
+    process.exitCode = code;
+    // fetch keeps sockets alive briefly. This timer is unref'd, so it cannot
+    // hold the process open by itself, but it will fire and force a clean exit
+    // if a lingering keep-alive socket is the only thing left running.
+    const bail = setTimeout(() => process.exit(process.exitCode || 0), 1500);
+    if (typeof bail.unref === 'function') bail.unref();
+  };
+  main().then(finish).catch((err) => {
     console.error(`relaybridge: ${err.message}`);
-    process.exit(1);
+    finish(1);
   });
 }
 

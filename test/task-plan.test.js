@@ -121,3 +121,20 @@ test('the CLI exposes plan before ask and documents effort', () => {
   assert.match(USAGE, /minimal\|low\|medium\|high\|max/);
   assert.ok(USAGE.indexOf('plan') < USAGE.indexOf('ask'), 'plan should be presented before ask');
 });
+
+test('the CLI never force-exits while sockets are in flight', () => {
+  // process.exit() with a closing HTTP handle trips a libuv assertion on
+  // Windows and prints a crash after otherwise-correct output.
+  const cli = fs.readFileSync(path.join(__dirname, '..', 'bin', 'relaybridge.js'), 'utf8');
+  const tail = cli.slice(cli.indexOf('require.main === module'));
+  assert.ok(!/main\(\)\.then\(\(code\) => process\.exit\(code\)\)/.test(tail),
+    'set process.exitCode and let the loop drain instead');
+  assert.match(tail, /process\.exitCode = code/);
+  assert.match(tail, /unref/, 'the safety timer must not hold the process open by itself');
+});
+
+test('a 404 is explained as a stale bridge rather than a CLI fault', () => {
+  const cli = fs.readFileSync(path.join(__dirname, '..', 'bin', 'relaybridge.js'), 'utf8');
+  assert.match(cli, /not available on the running bridge/);
+  assert.match(cli, /restart RelayBridge after syncing/);
+});
