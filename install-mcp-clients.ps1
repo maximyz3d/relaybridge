@@ -28,10 +28,16 @@ $nodePath = $nodeCmd.Source
 # MCP client speaks the same stdio protocol, they just disagree about where the
 # config lives and what the top-level key is called.
 function New-ServerEntry {
+  # RELAYBRIDGE_URL is the variable mcp/bridge-client.mjs actually reads.
+  # RELAYBRIDGE_PORT is ignored by it, so writing only that would leave every
+  # client silently pointed at the default port no matter what was configured.
   @{
     command = $nodePath
     args    = @($serverPath)
-    env     = @{ RELAYBRIDGE_PORT = "$Port" }
+    env     = @{
+      RELAYBRIDGE_URL  = "http://127.0.0.1:$Port"
+      RELAYBRIDGE_PORT = "$Port"
+    }
   }
 }
 

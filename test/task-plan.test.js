@@ -138,3 +138,11 @@ test('a 404 is explained as a stale bridge rather than a CLI fault', () => {
   assert.match(cli, /not available on the running bridge/);
   assert.match(cli, /restart RelayBridge after syncing/);
 });
+
+test('a plan with no ready provider explains itself instead of returning silence', () => {
+  // An agent that receives primary: null with no guidance has nothing to act on.
+  const plan = buildTaskPlan({ route: { classification: { tier: 'standard' }, selected: [] }, config, resolveModelArgs });
+  assert.equal(plan.primary, null);
+  assert.ok(plan.guidance.some((g) => /installed and signed in/i.test(g)),
+    'the plan must say why there is no provider and what would fix it');
+});

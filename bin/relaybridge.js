@@ -17,7 +17,9 @@ const path = require('path');
 
 const DEFAULT_PORT = process.env.RELAYBRIDGE_PORT || process.env.PS_BRIDGE_PORT || '8787';
 const DEFAULT_HOST = process.env.RELAYBRIDGE_HOST || '127.0.0.1';
-const BASE = `http://${DEFAULT_HOST}:${DEFAULT_PORT}`;
+// RELAYBRIDGE_URL wins so the CLI, the MCP server and the client configs all
+// resolve the bridge the same way; the PORT/HOST pair remains as a fallback.
+const BASE = (process.env.RELAYBRIDGE_URL || process.env.PS_BRIDGE_URL || `http://${DEFAULT_HOST}:${DEFAULT_PORT}`).replace(/\/+$/, '');
 
 // The token lives beside the install. Checked in the same order the installer
 // uses, so the CLI works from anywhere without configuration.
