@@ -1,7 +1,15 @@
 [CmdletBinding()]
 param(
-  # Repo/install root containing mcp\server.mjs
-  [string]$Root = $(if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }),
+  # Root containing mcp\server.mjs. Defaults to the INSTALLED bridge rather than
+  # this script's folder: MCP clients spawn the server months later, long after a
+  # working clone may have been moved or deleted, so they must point at the copy
+  # that start.ps1 actually runs. Pass -Root explicitly to override.
+  [string]$Root = $(
+    $installed = Join-Path $env:LOCALAPPDATA 'RelayBridge'
+    if (Test-Path -LiteralPath (Join-Path $installed 'mcp\server.mjs')) { $installed }
+    elseif ($PSScriptRoot) { $PSScriptRoot }
+    else { (Get-Location).Path }
+  ),
   [int]$Port = 8787,
   # Print what would be written without touching anything.
   [switch]$WhatIfOnly
@@ -97,6 +105,22 @@ $portable = Join-Path $Root 'mcp-config.json'
 if (-not $WhatIfOnly) {
   [IO.File]::WriteAllText($portable, (@{ mcpServers = @{ relaybridge = (New-ServerEntry) } } | ConvertTo-Json -Depth 12))
   Write-Host "[RelayBridge] portable config written to $portable" -ForegroundColor Green
+}
+
+# Registration that points at a server which cannot start is worse than none:
+# every client will show a broken tool provider and the cause is invisible.
+Write-Host ''
+Write-Host '[RelayBridge] verifying the MCP server starts...' -ForegroundColor Cyan
+try {
+  $probe = & $nodePath --check $serverPath 2>&1
+  if ($LASTEXITCODE -eq 0) {
+    Write-Host "[RelayBridge] MCP server OK: $serverPath" -ForegroundColor Green
+  } else {
+    Write-Host "[RelayBridge] MCP server FAILED to parse: $probe" -ForegroundColor Red
+    Write-Host '[RelayBridge] clients were registered but will not be able to start it.' -ForegroundColor Red
+  }
+} catch {
+  Write-Host "[RelayBridge] could not verify the MCP server: $($_.Exception.Message)" -ForegroundColor Yellow
 }
 
 Write-Host ''
