@@ -58,3 +58,30 @@ test('the installer is idempotent and preserves user-authored instructions', () 
   assert.ok(!/Set-Content .* -Value \$block\b(?![\s\S]*existing)/.test(installer),
     'the installer must not clobber a file that already has user content');
 });
+
+test('the client restart script force-stops survivors rather than trusting a window close', () => {
+  // Electron apps leave tray/GPU/renderer helpers running after the window
+  // closes, and those survivors hold the OLD mcp config in memory. Closing
+  // alone therefore does not reload anything.
+  const script = fs.readFileSync(path.join(ROOT, 'restart-ai-clients.ps1'), 'utf8');
+  assert.match(script, /CloseMainWindow/, 'ask nicely first so unsaved-work prompts appear');
+  assert.match(script, /Stop-Process -Id \$p\.Id -Force/, 'then force whatever survived');
+  assert.match(script, /\$exe = /, 'the exe path must be captured before killing, or relaunch is impossible');
+});
+
+test('the restart script never force-kills by wildcard', () => {
+  // This script force-terminates; matching "Code*" or "Claude*" could take out
+  // unrelated processes.
+  const script = fs.readFileSync(path.join(ROOT, 'restart-ai-clients.ps1'), 'utf8');
+  assert.ok(!/Get-Process -Name .*\*/.test(script), 'exact process names only');
+  for (const name of ['Claude', 'Cursor', 'Antigravity']) {
+    assert.ok(script.includes(`'${name}'`), `${name} should be listed explicitly`);
+  }
+});
+
+test('the restart script leaves the bridge and browsers alone', () => {
+  const script = fs.readFileSync(path.join(ROOT, 'restart-ai-clients.ps1'), 'utf8');
+  for (const forbidden of ["'node'", "'chrome'", "'powershell'", "'msedge'"]) {
+    assert.ok(!script.includes(forbidden), `must not target ${forbidden} — that would kill the bridge or the UI`);
+  }
+});
