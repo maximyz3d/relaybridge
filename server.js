@@ -1884,6 +1884,11 @@ app.post('/api/exec', (req, res) => {
 async function executeOneShot(body, res) {
   const startedAt = Date.now();
   const { kind, prompt, timeoutMs, cwd, dangerous } = body || {};
+  // Run association for the GitHub tracker: who did this, and any
+  // explicit intent. Falls back to the OS account so checkpoint commits
+  // are always attributed (maximyz3d / sover / 3DCPAI machines differ).
+  const runUser = typeof body?.user === 'string' && body.user.trim() ? body.user.trim() : os.userInfo().username;
+  const runIntent = typeof body?.intent === 'string' ? body.intent : null;
   // Two timeout regimes compose here. The timeout policy bounds any EXPLICIT
   // caller timeout, so a caller can neither starve a run nor exceed the
   // transport ceiling the MCP client allows. When the caller sends nothing, no
@@ -2187,6 +2192,11 @@ async function executeOneShot(body, res) {
       timed_out: timedOut,
       dropped_out,
     }, { kind, prompt, route, startedAt });
+    // GitHub middleware: only successful runs checkpoint — a dropped-out run
+    // may have left half-applied edits, which the human should triage first.
+    if (!dropped_out) {
+      trackRunAfterResponse({ runId, kind, user: runUser, prompt, cwd: resolvedCwd, intent: runIntent });
+    }
   });
   // Providers without a placeholder (Claude/Codex/Perplexity wrapper) read
   // stdin. Antigravity consumes {prompt}; Grok consumes {prompt_file}.
@@ -2198,6 +2208,72 @@ async function executeOneShot(body, res) {
 }
 
 app.post('/api/oneshot', (req, res) => executeOneShot(req.body, res));
+
+// ---- GitHub integration (lib/github-tracker.js) --------------------------
+// Fire-and-forget middleware on the run-completion path. Activates only for
+// runs whose cwd sits inside an enrolled repo (config/github-repos.json);
+// strict no-op otherwise. It commits/documents/labels as side effects of a
+// run — the provider response is never delayed or failed by tracking.
+const githubTracker = require('./lib/github-tracker');
+const githubOnboard = require('./lib/github-onboard');
+githubTracker.setActivityFile(path.join(DATA_DIR, 'github-activity.jsonl'));
+
+function trackRunAfterResponse(meta) {
+  // setImmediate so the one-shot response is already on the wire.
+  setImmediate(() => {
+    githubTracker.trackRun(meta).catch((err) => {
+      githubTracker.logActivity({ action: 'track_run', runId: meta.runId, tracked: false, reason: 'unhandled tracker error', detail: err.message });
+    });
+  });
+}
+
+app.get('/api/github/activity', (req, res) => {
+  res.json({ activity: githubTracker.recentActivity(Number(req.query.limit) || 50) });
+});
+
+app.get('/api/github/repos', (req, res) => {
+  try { res.json(githubTracker.loadRegistry()); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/github/versions', async (req, res) => {
+  try { res.json({ repo: String(req.query.repo || ''), versions: await githubTracker.listVersions(String(req.query.repo || '')) }); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+app.get('/api/github/versions/show', async (req, res) => {
+  try { res.json(await githubTracker.showVersion(String(req.query.repo || ''), String(req.query.tag || ''))); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// Rollback convenience: NEW branch from a tag — never a force-reset.
+app.post('/api/github/checkout-version', async (req, res) => {
+  try { res.json(await githubTracker.checkoutVersion(String(req.body?.repo || ''), String(req.body?.tag || ''))); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// Manual tracking trigger for a working directory (dashboard button / MCP).
+app.post('/api/github/track', async (req, res) => {
+  const { runId, kind, user, prompt, cwd, intent } = req.body || {};
+  try {
+    res.json(await githubTracker.trackRun({
+      runId: runId || `manual_${Date.now().toString(36)}`,
+      kind: kind || 'manual', user: user || null,
+      prompt: prompt || intent || '', cwd, intent,
+    }));
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// Provision the full automation stack into a repo in one action (draft PR).
+app.post('/api/github/onboard', async (req, res) => {
+  try { res.json(await githubOnboard.onboardRepo({ name: req.body?.name, path: req.body?.path })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+app.post('/api/github/upgrade-repos', async (req, res) => {
+  try { res.json(await githubOnboard.upgradeRepos()); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
 
 
 // ---- Agent registry (AI providers with routing tags) -------------------
