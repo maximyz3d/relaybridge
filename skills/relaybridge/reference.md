@@ -138,3 +138,20 @@ actually delivered.
   queued indefinitely.
 - Do not resubmit a prompt that came back `loop_detected` — change the prompt or
   the provider.
+
+## GitHub integration endpoints
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/github/activity` | Recent tracking activity (commits, PRs, labels, dry-run plans, skipped secrets) |
+| GET | `/api/github/repos` | Enrolled repo registry |
+| GET | `/api/github/versions?repo=o/r` | Version history mirrored from the repo's GitHub tags |
+| GET | `/api/github/versions/show?repo=o/r&tag=vX.Y.Z` | One version's commit/diffstat |
+| POST | `/api/github/checkout-version` | New branch from a tag (safe rollback) |
+| POST | `/api/github/track` | Manual tracking pass for a cwd |
+| POST | `/api/github/onboard` | One-action repo provisioning (draft PR) |
+| POST | `/api/github/upgrade-repos` | Re-provision repos with stale rb-template versions |
+
+Run-association tags in prompts: `#123` / `issue:123`, `bump:patch|minor|major`,
+`version:X.Y.Z`. Oneshot body extras: `user`, `intent`. Only successful runs
+track; failures log to `data/github-activity.jsonl`, never into the response.

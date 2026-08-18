@@ -262,3 +262,21 @@ analysis, fan in for the decision.
   `config/routing-policy.json` (tiers, priorities).
 - Every call writes a receipt to `data/receipts/YYYY-MM-DD.jsonl` with hashes,
   duration, and failure class — read those to see what a session actually cost.
+
+## GitHub tracking (enrolled repos)
+
+If the run's working directory is inside a repo enrolled in
+`config/github-repos.json`, RelayBridge automatically checkpoints the work
+after each successful run: commit → DEVLOG → (opt-in) push → draft PR → bump
+label. Associate work by tagging the prompt:
+
+- `#123` / `issue:123` — link the issue (drives assignment + duplicate-work
+  warnings via the repo's `claim-on-start.yml`)
+- `bump:patch|minor|major` or `version:X.Y.Z` — dictates the PR label that the
+  repo's `version-on-merge.yml` turns into a real `vX.Y.Z` tag on merge
+
+MCP tools: `github_repo_activity`, `github_track_run`, `github_list_versions`,
+`github_show_version`, `github_checkout_version` (rollback = new branch from a
+tag, never a reset), `github_onboard_repo` (provision a new repo in one
+action). Full contract: `docs/GITHUB-INTEGRATION.md`. RelayBridge never writes
+tags or version numbers — GitHub owns the version.
