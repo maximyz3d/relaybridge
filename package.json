@@ -29,5 +29,8 @@
   },
   "devDependencies": {
     "@modelcontextprotocol/client": "^2.0.0"
+  },
+  "bin": {
+    "relaybridge": "bin/relaybridge.js"
   }
 }

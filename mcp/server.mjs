@@ -836,6 +836,24 @@ export function buildServer() {
     return result({ ...route, receiptId: receipt.receiptId });
   }));
 
+  server.registerTool('plan_task', {
+    title: 'Plan a task: company, model, and effort',
+    description: 'Given a task description, returns the cheapest capable execution plan: which company/provider, which model inside it, and how much reasoning effort — plus fallbacks and why. Call this BEFORE delegating anything you are unsure about. It exists to stop frontier seats being spent on mechanical edits and max-effort reasoning being spent on arithmetic.',
+    inputSchema: z.object({
+      task: z.string().min(1).describe('what needs doing, in a sentence or two'),
+      effort: z.enum(['minimal', 'low', 'medium', 'high', 'max']).optional().describe('override the effort the tier would pick'),
+      kind: z.string().optional().describe('force a specific provider and plan around it'),
+    }),
+    annotations: READ_ONLY,
+  }, safeHandler(async ({ task, effort, kind }) => {
+    const plan = await bridgeRequest('/api/plan', {
+      method: 'POST',
+      body: { task, effort: effort ?? null, kind: kind ?? null },
+      timeoutMs: 20000,
+    });
+    return result(plan);
+  }));
+
   server.registerTool('list_models', {
     title: 'List discovered models per provider',
     description: 'Model registry discovered from each CLI at boot: models a provider can actually run, each with a weight tier and a best-at note, plus warnings for configured pins the account no longer offers. Set refresh to re-probe after installing or upgrading a CLI.',

@@ -181,6 +181,13 @@
   },
   "codex": {
     "label": "Codex",
+    "effort_flags": {
+      "minimal": ["--config", "model_reasoning_effort=minimal"],
+      "low": ["--config", "model_reasoning_effort=low"],
+      "medium": ["--config", "model_reasoning_effort=medium"],
+      "high": ["--config", "model_reasoning_effort=high"],
+      "max": ["--config", "model_reasoning_effort=high"]
+    },
     "login_command": ["codex", "login"],
     "model_tiers": {
       "light": { "args": ["--model", "gpt-5.6-luna"], "model": "gpt-5.6-luna", "note": "fast subagent tier; replaced gpt-5.4-mini" },

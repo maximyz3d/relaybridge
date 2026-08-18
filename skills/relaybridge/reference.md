@@ -71,6 +71,13 @@ MCP tool read the same log, so both sides see the same picture.
 ### `POST /api/models/refresh`
 Forces re-discovery. Run it after installing or upgrading a CLI.
 
+### `POST /api/plan`
+Body `{ "task": "...", "effort": "low|medium|high|max"?, "kind": "..."? }`.
+Returns the full execution plan: `tier`, `effort`, `primary` (company, kind,
+model, modelTier, effort, effortMethod, args, costClass), `alternates`,
+`cheapestCapable`, `humanGate`, and `guidance` explaining the choice. Prefer this
+over `/api/route` when you also need the model and effort, which is usually.
+
 ### `POST /api/route`
 Body `{ "task": "..." }`. Returns the classification (`tier`, tags), the primary
 task tag, and a ranked, readiness-filtered provider list. Prefer this over

@@ -11,6 +11,7 @@ const crypto = require('crypto');
 const { RunSupervisor, resolveSupervisorOptions } = require('./lib/run-supervisor');
 const { resolveModelArgs, applyModelArgs, modelConfigStaleness, modelTierForTaskTier } = require('./lib/model-tiers');
 const { buildRegistry, parseModelList, pinIsRetired } = require('./lib/model-registry');
+const { buildTaskPlan, EFFORT_ORDER } = require('./lib/task-plan');
 const { WebSocketServer } = require('ws');
 const { spawn, spawnSync } = require('child_process');
 const TIMEOUT_POLICY = require('./timeout-policy.cjs');
@@ -1522,6 +1523,50 @@ app.get('/api/models', async (req, res) => {
 app.post('/api/models/refresh', async (req, res) => {
   try { res.json({ ok: true, ...(await discoverModels()) }); }
   catch (err) { res.status(500).json({ ok: false, error: err.message }); }
+});
+
+// Full execution plan for a task: company, model, AND effort together.
+// Routing alone answers "which CLI"; that is not enough to avoid waste. Sending
+// a CSS tweak to a frontier seat, or arithmetic to a max-effort reasoning model,
+// costs real money for no gain. This returns the cheapest capable combination
+// and says why, so callers do not have to guess.
+app.post('/api/plan', async (req, res) => {
+  const { task, effort, kind } = req.body || {};
+  if (!task || typeof task !== 'string' || !task.trim()) {
+    return res.status(400).json({ error: 'task (non-empty string) required' });
+  }
+  if (effort && !EFFORT_ORDER.includes(String(effort).toLowerCase())) {
+    return res.status(400).json({ error: `effort must be one of: ${EFFORT_ORDER.join(', ')}` });
+  }
+  try {
+    const router = await import('./mcp/router.mjs');
+    const cfg = loadConfig();
+    let diagnostics = lastDiagnostics?.results || null;
+    if (!diagnostics) {
+      const env = buildEnv();
+      diagnostics = {};
+      for (const k of Object.keys(cfg).filter((x) => !x.startsWith('_'))) {
+        let found = false;
+        try {
+          const probeBin = (cfg[k].version_probe || cfg[k].probe || cfg[k].safe || [])[0];
+          found = !!(probeBin && resolveExecutable(probeBin, env));
+        } catch { found = false; }
+        diagnostics[k] = { found, ready: found, detail: 'path-only check' };
+      }
+    }
+    const route = router.routeTask({ task, diagnostics });
+    const plan = buildTaskPlan({
+      route,
+      config: cfg,
+      registry: modelRegistry,
+      resolveModelArgs,
+      requestedEffort: effort || null,
+      requestedKind: kind || null,
+    });
+    res.json({ ok: true, task: task.slice(0, 400), ...plan });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
 });
 
 // Delegation: classify a task, rank providers by tier, and pick the model

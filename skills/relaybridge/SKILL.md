@@ -161,6 +161,60 @@ Over MCP the same picture comes from three read-only tools: `bridge_activity`
 `list_active_runs` shows another client's run in `streaming` or `working`,
 leave it alone — do not launch a duplicate of the same task.
 
+## Plan before you delegate: company, model, effort
+
+Routing answers "which CLI". That is not the whole decision. Three things have to
+be chosen together, and each one wastes money independently:
+
+- **company** — whose seat pays (or none, for local and deterministic work)
+- **model** — which weight class inside that vendor
+- **effort** — how hard that model is told to think
+
+Ask for all three at once:
+
+```bash
+relaybridge plan "refactor the auth middleware and add regression tests"
+```
+
+or over MCP, `plan_task`. Either returns the tier, the chosen company/model/
+effort, the exact args, the **cheapest capable alternative**, and fallbacks.
+
+Effort by tier: utility → `low`, standard → `medium`, complex/critical → `high`.
+`max` is never automatic; it costs far more for a usually marginal gain.
+
+Providers express effort three different ways, and the plan resolves whichever
+applies — do not hand-build these:
+
+| Provider | How effort works |
+|---|---|
+| Codex | a flag: `--config model_reasoning_effort=high` |
+| Cursor | a model variant: `gpt-5.6-sol-low` … `-high` … `-max` |
+| Claude, Gemini | no knob — the model choice *is* the effort |
+
+The cost classes the plan reports: `none` (a shell command, no model), `local`
+(free, on this machine), `subscription` (a seat you already pay for), `metered`
+(billed per call). An unknown transport is treated as metered on purpose, so an
+unclassified provider is never quietly preferred over one known to be free.
+
+## Using it from a terminal
+
+The CLI is the third surface, for agents and scripts with no MCP support:
+
+```bash
+relaybridge status                 # bridge health + who is signed in
+relaybridge plan "<task>"          # company, model, effort
+relaybridge ask "<task>"           # plan it, then run it
+relaybridge ask --kind claude "…"  # force a provider
+relaybridge models --refresh       # what each provider can run, by tier
+relaybridge runs                   # live runs: streaming, quiet, looping
+relaybridge activity               # recent calls from every client
+relaybridge auth                   # who is installed but signed out
+relaybridge mcp-config             # MCP JSON for any client
+```
+
+`ask` refuses critical-tier tasks unless given `--force`, because those are
+advisory-only by policy.
+
 ## Reading the result
 
 Check `stop_reason` before trusting `stdout`:
