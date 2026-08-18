@@ -1592,6 +1592,86 @@ export function buildServer() {
   resource('collabs', 'psbridge://collabs', 'Saved collaborations', 'Saved collaboration room summaries.', () => bridgeRequest('/api/collabs'));
   resource('runs', 'psbridge://runs', 'Recent MCP runs', 'Recent routing and committee run summaries.', () => ({ runs: listRuns(50) }));
 
+  // ---- GitHub integration tools ------------------------------------------
+  // Thin clients over /api/github/*. RelayBridge dictates the bump label and
+  // reads history; the project repo's version-on-merge.yml Action owns the
+  // actual tags/CHANGELOG/Releases. Nothing here can delete or move a tag.
+
+  server.registerTool('github_repo_activity', {
+    title: 'GitHub tracking activity',
+    description: 'Recent GitHub-integration activity for enrolled repos: checkpoint commits, devlog entries, pushes, draft PRs, bump labels, skipped secrets, and dry-run plans, newest first.',
+    inputSchema: z.object({ limit: z.number().int().min(1).max(200).default(50) }),
+    annotations: READ_ONLY,
+  }, safeHandler(async ({ limit }) => result(await bridgeRequest(`/api/github/activity?limit=${limit}`))));
+
+  server.registerTool('github_list_versions', {
+    title: 'List repo versions',
+    description: 'Read the append-only version history of an enrolled repo from its GitHub tags (vX.Y.Z). GitHub is the source of truth; RelayBridge only mirrors it.',
+    inputSchema: z.object({ repo: z.string().regex(/^[\w.-]+\/[\w.-]+$/) }),
+    annotations: EXTERNAL_READ,
+  }, safeHandler(async ({ repo }) => result(await bridgeRequest(`/api/github/versions?repo=${encodeURIComponent(repo)}`))));
+
+  server.registerTool('github_show_version', {
+    title: 'Show one version',
+    description: 'Show commit, author, date, and diffstat for one vX.Y.Z tag of an enrolled repo.',
+    inputSchema: z.object({ repo: z.string().regex(/^[\w.-]+\/[\w.-]+$/), tag: z.string().regex(/^v\d+\.\d+\.\d+$/) }),
+    annotations: EXTERNAL_READ,
+  }, safeHandler(async ({ repo, tag }) => result(await bridgeRequest(`/api/github/versions/show?repo=${encodeURIComponent(repo)}&tag=${encodeURIComponent(tag)}`))));
+
+  server.registerTool('github_checkout_version', {
+    title: 'Roll back to a version (new branch)',
+    description: 'Create a NEW local branch from a vX.Y.Z tag in an enrolled repo — the safe rollback path. Never force-resets, never deletes or moves tags.',
+    inputSchema: z.object({ repo: z.string().regex(/^[\w.-]+\/[\w.-]+$/), tag: z.string().regex(/^v\d+\.\d+\.\d+$/) }),
+    annotations: ACTION,
+  }, safeHandler(async ({ repo, tag }) => {
+    const response = await bridgeRequest('/api/github/checkout-version', { method: 'POST', body: { repo, tag } });
+    const receipt = appendReceipt({ event: 'github_checkout_version', status: 'branched', repo, tag, branch: response.branch });
+    return result({ ...response, receiptId: receipt.receiptId });
+  }));
+
+  server.registerTool('github_track_run', {
+    title: 'Track a working directory now',
+    description: 'Manually run the GitHub tracking pass (checkpoint commit, devlog, optional push/draft-PR/label) for an enrolled repo working directory. Honors the repo\'s dryRun and autoPush settings; refuses to commit on the default branch. Tag the prompt/intent with #<issue> and bump:patch|minor|major to associate work.',
+    inputSchema: z.object({
+      cwd: z.string().min(1).max(1024),
+      intent: z.string().max(4000).optional(),
+      user: z.string().max(64).optional(),
+    }),
+    annotations: ACTION,
+  }, safeHandler(async ({ cwd, intent, user }) => {
+    const response = await bridgeRequest('/api/github/track', { method: 'POST', body: { cwd, intent, user } });
+    const receipt = appendReceipt({ event: 'github_track_run', status: response.tracked ? 'tracked' : 'skipped', detail: response.reason || null });
+    return result({ ...response, receiptId: receipt.receiptId });
+  }));
+
+  server.registerTool('github_link_issue', {
+    title: 'How to link a run to an issue',
+    description: 'Explains run-association tags. Include "#123" or "issue:123" in a prompt to link the run; "bump:patch|minor|major" or "version:X.Y.Z" to dictate the PR bump label that version-on-merge.yml turns into a real tag on merge.',
+    inputSchema: z.object({}),
+    annotations: READ_ONLY,
+  }, safeHandler(async () => result({
+    tags: {
+      issue: 'Put #123 or issue:123 anywhere in the prompt/intent.',
+      bump: 'bump:patch (default) | bump:minor | bump:major — applied as a PR label.',
+      setVersion: 'version:1.4.0 — applied as a set-version:1.4.0 PR label.',
+    },
+    contract: 'RelayBridge labels the PR; the project repo\'s version-on-merge.yml computes and tags the version on merge. Tags are append-only.',
+  })));
+
+  server.registerTool('github_onboard_repo', {
+    title: 'Onboard a repo (one action)',
+    description: 'Provision the full automation stack into a repo from the canonical templates: claim-on-start.yml, version-on-merge.yml, PR template, CONTRIBUTING snippet, bump labels, and RelayBridge enrollment with safe defaults (autoPush:false). Operates on a branch and opens a DRAFT PR — never merges, never changes branch protection.',
+    inputSchema: z.object({
+      name: z.string().regex(/^[\w.-]+\/[\w.-]+$/),
+      path: z.string().max(1024).optional(),
+    }),
+    annotations: ACTION,
+  }, safeHandler(async ({ name, path: localPath }) => {
+    const response = await bridgeRequest('/api/github/onboard', { method: 'POST', body: { name, path: localPath } });
+    const receipt = appendReceipt({ event: 'github_onboard_repo', status: 'draft_pr_opened', repo: name, prNumber: response.prNumber ?? null });
+    return result({ ...response, receiptId: receipt.receiptId });
+  }));
+
   return server;
 }
 
