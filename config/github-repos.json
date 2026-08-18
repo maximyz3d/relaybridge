@@ -1,0 +1,17 @@
+{
+  "repos": [
+    {
+      "name": "maximyz3d/relaybridge",
+      "path": "C:\\Users\\sover\\projects\\relaybridge",
+      "autoCommit": true,
+      "autoPush": false,
+      "dryRun": true,
+      "trackingMode": "checkpoint-on-branch",
+      "branchPrefix": "relaybridge/",
+      "devlogPath": "docs/DEVLOG.md",
+      "openDraftPr": true,
+      "summaryProvider": "copilot",
+      "versioning": { "dictateBump": true, "defaultBump": "patch", "mirrorFromGitHub": true }
+    }
+  ]
+}
