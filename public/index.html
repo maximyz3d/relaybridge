@@ -306,6 +306,7 @@
   <button class="btn" id="activity-btn" title="Every bridge API call from the dashboard and the MCP server">📈 Activity</button>
   <button class="btn" id="broadcast-btn" title="Send one prompt to several AI providers at once">📡 Broadcast</button>
   <button class="btn" id="agents-btn" title="View AI providers, readiness, and edit routing tags">🧩 Agents</button>
+  <button class="btn" id="github-btn" title="Live per-repo development activity and the version archive">🐙 GitHub</button>
   <button class="btn" id="restart-btn" title="Restart the RelayBridge server; all terminal sessions close">⟳ Restart</button>
   <button class="btn" id="stop-btn" title="Stop the RelayBridge server">⏻ Stop</button>
   <button class="btn" id="install-all-btn" title="npm install -g for every AI CLI configured with an npm_package">📦 Install all</button>
@@ -371,6 +372,22 @@
 <dialog id="agents-dialog" style="min-width:min(780px,92vw);">
   <div class="dlg-head"><strong>🧩 Agents &amp; routing tags</strong><button class="btn" id="agents-close-btn">Close</button></div>
   <div class="dlg-body" id="agents-body" style="max-height:65vh; overflow:auto;">Loading…</div>
+</dialog>
+
+<dialog id="github-dialog" style="min-width:min(860px,94vw);">
+  <div class="dlg-head"><strong>🐙 GitHub — development &amp; versions</strong><button class="btn" id="github-close-btn">Close</button></div>
+  <div class="dlg-body" style="max-height:70vh; overflow:auto;">
+    <div class="muted" style="margin-bottom:8px;">Versions live on GitHub (tags/Releases created by <code>version-on-merge.yml</code> on merge). RelayBridge dictates the bump label and mirrors history — it never writes tags. Rollback creates a <em>new branch</em> from a tag.</div>
+    <h4 style="margin:8px 0 4px;">Development — live per-repo activity</h4>
+    <div id="github-activity">Loading…</div>
+    <h4 style="margin:14px 0 4px;">Versions — archive &amp; rollback</h4>
+    <div style="display:flex; gap:8px; align-items:center; margin-bottom:6px;">
+      <select id="github-repo-select"></select>
+      <button class="btn" id="github-versions-refresh">Refresh</button>
+      <button class="btn" id="github-onboard-btn" title="Provision the full automation stack into a repo via a draft PR">＋ Onboard repo</button>
+    </div>
+    <div id="github-versions">Pick a repo.</div>
+  </div>
 </dialog>
 
 <dialog id="team-status-dialog" style="min-width:min(760px,90vw);">
@@ -801,6 +818,7 @@ function paletteCommands() {
     { title: 'Check Installs', detail: 'probe provider CLIs and login readiness', run: () => $('#diag-btn')?.click() },
     { title: 'Broadcast Prompt', detail: 'send one prompt to several providers', run: () => $('#broadcast-btn')?.click() },
     { title: 'Agents & Tags', detail: 'view providers and edit routing tags', run: () => $('#agents-btn')?.click() },
+    { title: 'GitHub Development & Versions', detail: 'live repo activity, version archive, rollback', run: () => $('#github-btn')?.click() },
     { title: 'Restart Bridge', detail: 'restart the RelayBridge server', run: () => $('#restart-btn')?.click() },
     { title: 'Stop Bridge', detail: 'stop the RelayBridge server', run: () => $('#stop-btn')?.click() },
     { title: 'Install Providers', detail: 'run configured provider installers', run: () => $('#install-all-btn')?.click() },
@@ -2498,6 +2516,66 @@ function closeActivity() {
 }
 $('#activity-close-btn').onclick = closeActivity;
 activityDialog.addEventListener('cancel', () => { if (activityTimer) { clearInterval(activityTimer); activityTimer = null; } });
+
+// ---- GitHub panel (Development + Versions) --------------------------------
+const githubDialog = $('#github-dialog');
+let githubTimer = null;
+function esc(t){ const d=document.createElement('div'); d.textContent=String(t??''); return d.innerHTML; }
+async function refreshGithubActivity(){
+  try {
+    const { activity } = await api('/api/github/activity?limit=40');
+    $('#github-activity').innerHTML = activity.length ? '<table style="width:100%; font-size:12px;">' +
+      '<tr class="muted"><th align="left">when</th><th align="left">repo</th><th align="left">who / provider</th><th align="left">what</th></tr>' +
+      activity.map(a => `<tr><td>${esc((a.ts||'').replace('T',' ').slice(0,19))}</td><td>${esc(a.repo||'')}</td><td>${esc(a.user||'')} · ${esc(a.provider||a.action||'')}</td><td>${
+        a.tracked ? `✅ ${a.dryRun?'<b>dry-run</b> ':''}${a.commit?`commit <code>${esc(a.commit)}</code>`:''}${a.branch?` on <code>${esc(a.branch)}</code>`:''}${a.pr?` · PR #${a.pr}`:''}${a.label?` · label <code>${esc(a.label)}</code>`:''}${a.pushed?' · pushed':''}${a.secretsSkipped?` · ⚠️ skipped secrets: ${esc(a.secretsSkipped.join(', '))}`:''}` :
+        `⏭️ ${esc(a.reason||a.action||'')}`}</td></tr>`).join('') + '</table>'
+      : '<div class="muted">No tracked runs yet. Runs in an enrolled repo working directory appear here automatically.</div>';
+  } catch (err) { $('#github-activity').innerHTML = '<div class="muted">'+esc(err.message)+'</div>'; }
+}
+async function refreshGithubVersions(){
+  const repo = $('#github-repo-select').value;
+  if (!repo) { $('#github-versions').textContent = 'No enrolled repos — use ＋ Onboard repo.'; return; }
+  $('#github-versions').textContent = 'Loading tags from GitHub…';
+  try {
+    const { versions } = await api('/api/github/versions?repo=' + encodeURIComponent(repo));
+    $('#github-versions').innerHTML = versions.length ? '<table style="width:100%; font-size:12px;">' +
+      versions.map(v => `<tr><td><code>${esc(v.tag)}</code></td><td>${esc((v.date||'').slice(0,10))}</td><td>${esc(v.subject)}</td><td><button class="btn" data-rb-tag="${esc(v.tag)}">↩ Roll back (new branch)</button></td></tr>`).join('') + '</table>'
+      : '<div class="muted">No vX.Y.Z tags yet — versions appear after the first labeled PR merges (version-on-merge.yml).</div>';
+    $('#github-versions').querySelectorAll('[data-rb-tag]').forEach(btn => btn.addEventListener('click', async () => {
+      const tag = btn.getAttribute('data-rb-tag');
+      if (!confirm(`Create a NEW local branch from ${tag} in ${repo}?\nNothing is reset or deleted.`)) return;
+      btn.disabled = true;
+      try { const r = await api('/api/github/checkout-version', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ repo, tag }) });
+        alert(`Branched ${r.branch} from ${r.tag}.`); }
+      catch (err) { alert('Rollback failed: ' + err.message); }
+      finally { btn.disabled = false; }
+    }));
+  } catch (err) { $('#github-versions').innerHTML = '<div class="muted">'+esc(err.message)+'</div>'; }
+}
+async function openGithubPanel(){
+  if (typeof githubDialog.showModal === 'function') githubDialog.showModal(); else githubDialog.setAttribute('open','true');
+  try {
+    const { repos } = await api('/api/github/repos');
+    const sel = $('#github-repo-select');
+    sel.innerHTML = repos.map(r => `<option value="${esc(r.name)}">${esc(r.name)}${r.dryRun?' (dry-run)':''}</option>`).join('');
+  } catch {}
+  refreshGithubActivity(); refreshGithubVersions();
+  githubTimer = setInterval(refreshGithubActivity, 5000);
+}
+$('#github-btn')?.addEventListener('click', openGithubPanel);
+$('#github-close-btn')?.addEventListener('click', () => { githubDialog.close(); if (githubTimer){clearInterval(githubTimer); githubTimer=null;} });
+githubDialog?.addEventListener('cancel', () => { if (githubTimer){clearInterval(githubTimer); githubTimer=null;} });
+$('#github-versions-refresh')?.addEventListener('click', refreshGithubVersions);
+$('#github-repo-select')?.addEventListener('change', refreshGithubVersions);
+$('#github-onboard-btn')?.addEventListener('click', async () => {
+  const name = prompt('Repo to onboard (owner/repo):'); if (!name) return;
+  const localPath = prompt('Local clone path (blank = clone to temp):') || undefined;
+  $('#github-versions').textContent = 'Onboarding ' + name + '… (opens a draft PR; nothing merges)';
+  try { const r = await api('/api/github/onboard', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ name, path: localPath }) });
+    alert(`Onboarded ${name} (rb-template v${r.templateVersion}).\nDraft PR: ${r.prUrl || '#'+(r.prNumber??'none — repo already current')}\nManual steps:\n- ${(r.manual||[]).join('\n- ')}`);
+    openGithubPanel();
+  } catch (err) { alert('Onboarding failed: ' + err.message); }
+});
 document.getElementById('activity-hide-health').onchange = refreshActivity;
 
 // ============= per-provider quick install =============
