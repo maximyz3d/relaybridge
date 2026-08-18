@@ -1,0 +1,86 @@
+# rb-template v1
+# .github/workflows/claim-on-start.yml
+#
+# Solves the "two people on the same issue" problem.
+# The moment someone opens a PR (open a DRAFT PR the instant you start work),
+# the issue it's linked to gets:
+#   1. the PR author assigned to it
+#   2. a comment saying who's now working on it + the branch name
+#   3. a ⚠️ warning if the issue was ALREADY assigned to someone else
+#
+# Requires no secrets — uses the built-in GITHUB_TOKEN.
+# Linking: either use the "Create a branch" link in the issue's Development
+# sidebar, or put "Fixes #123" in the PR description.
+
+name: Claim issue on PR open
+
+on:
+  pull_request:
+    types: [opened, ready_for_review, reopened]
+
+permissions:
+  issues: write
+  pull-requests: write
+  contents: read
+
+jobs:
+  claim:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Assign linked issues and announce ownership
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const author = pr.user.login;
+
+            // Find every issue this PR is linked to close (keyword- or sidebar-linked)
+            const query = `
+              query($owner:String!, $repo:String!, $number:Int!) {
+                repository(owner:$owner, name:$repo) {
+                  pullRequest(number:$number) {
+                    closingIssuesReferences(first:10) { nodes { number } }
+                  }
+                }
+              }`;
+            const result = await github.graphql(query, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              number: pr.number
+            });
+
+            const issues = result.repository.pullRequest.closingIssuesReferences.nodes;
+            if (issues.length === 0) {
+              core.info('No linked issue. Tip: create the branch from the issue, or add "Fixes #123" to the PR body.');
+              return;
+            }
+
+            for (const issue of issues) {
+              // Who's already on this issue BEFORE we add ourselves?
+              const { data: before } = await github.rest.issues.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number
+              });
+              const others = before.assignees.map(a => a.login).filter(l => l !== author);
+
+              // Claim it
+              await github.rest.issues.addAssignees({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                assignees: [author]
+              });
+
+              let body = `🔒 **@${author} is now working on this** — PR #${pr.number} (\`${pr.head.ref}\`).`;
+              if (others.length > 0) {
+                body += `\n\n⚠️ **Possible duplicate work** — this issue is *also* assigned to ${others.map(o => '@' + o).join(', ')}. Sync up before you both build the same thing.`;
+              }
+
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body
+              });
+            }

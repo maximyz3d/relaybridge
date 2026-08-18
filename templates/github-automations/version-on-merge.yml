@@ -1,0 +1,111 @@
+# rb-template v1
+# .github/workflows/version-on-merge.yml
+#
+# GitHub-native version tracking. This is the SOURCE OF TRUTH for versions —
+# it runs on GitHub for every merged PR, whether or not RelayBridge was involved.
+#
+# How the version is decided: the PR's label.
+#   - no label            -> patch bump   (small fixes: 0.0.X)
+#   - label "bump:minor"  -> minor bump   (features:    0.X.0)
+#   - label "bump:major"  -> major bump   (big release: X.0.0)
+#   - label "set-version:1.4.0" -> set exactly to 1.4.0
+# RelayBridge applies that label automatically; you can also add it by hand.
+#
+# On merge it: computes the next version, writes VERSION + CHANGELOG.md on the
+# default branch, and creates an annotated tag vX.Y.Z (your archive / rollback
+# point). Set repo variable CREATE_RELEASE=true to also cut a GitHub Release.
+#
+# NOTE: if your default branch is protected against direct pushes, allow the
+# github-actions bot to bypass it, or swap GITHUB_TOKEN for a PAT with repo scope.
+
+name: Version on merge
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          fetch-depth: 0        # need full history + tags
+
+      - name: Decide the bump from PR labels
+        id: bump
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const labels = context.payload.pull_request.labels.map(l => l.name);
+            const setLabel = labels.find(l => l.startsWith('set-version:'));
+            let bump = 'patch', setVersion = '';
+            if (setLabel) setVersion = setLabel.split(':')[1].trim();
+            else if (labels.includes('bump:major')) bump = 'major';
+            else if (labels.includes('bump:minor')) bump = 'minor';
+            core.setOutput('bump', bump);
+            core.setOutput('set_version', setVersion);
+
+      - name: Compute, write, tag
+        env:
+          BUMP: ${{ steps.bump.outputs.bump }}
+          SET_VERSION: ${{ steps.bump.outputs.set_version }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+
+          # current version: latest semver tag, else VERSION file, else 0.1.0
+          CUR=$(git tag --list 'v*' --sort=-v:refname | head -n1 | sed 's/^v//')
+          if [ -z "$CUR" ] && [ -f VERSION ]; then CUR=$(tr -d ' \n' < VERSION); fi
+          CUR=${CUR:-0.1.0}
+
+          if [ -n "$SET_VERSION" ]; then
+            NEW="$SET_VERSION"
+          else
+            IFS='.' read -r MA MI PA <<< "$CUR"
+            case "$BUMP" in
+              major) MA=$((MA+1)); MI=0; PA=0 ;;
+              minor) MI=$((MI+1)); PA=0 ;;
+              patch) PA=$((PA+1)) ;;
+            esac
+            NEW="$MA.$MI.$PA"
+          fi
+          echo "Version: $CUR -> $NEW (bump=$BUMP set=$SET_VERSION)"
+
+          # guard: never overwrite an existing tag
+          if git rev-parse "v$NEW" >/dev/null 2>&1; then
+            echo "Tag v$NEW already exists — aborting to keep history append-only." >&2
+            exit 1
+          fi
+
+          echo "$NEW" > VERSION
+          DATE=$(date +%Y-%m-%d)
+          TMP=$(mktemp)
+          { echo "## v$NEW - $DATE"; echo "- #$PR_NUMBER $PR_TITLE"; echo ""; \
+            [ -f CHANGELOG.md ] && cat CHANGELOG.md; } > "$TMP"
+          mv "$TMP" CHANGELOG.md
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add VERSION CHANGELOG.md
+          git commit -m "chore(release): v$NEW [skip ci]"
+          git tag -a "v$NEW" -m "v$NEW"
+          git push origin "HEAD:$BASE_REF"
+          git push origin "v$NEW"
+          echo "NEW_VERSION=$NEW" >> "$GITHUB_ENV"
+
+      - name: Cut a GitHub Release (optional)
+        if: vars.CREATE_RELEASE == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v$NEW_VERSION" \
+            --title "v$NEW_VERSION" \
+            --notes "Auto-release for #${{ github.event.pull_request.number }}: ${{ github.event.pull_request.title }}"
