@@ -62,7 +62,10 @@ human should triage). In the enrolled repo:
 1. `git status --porcelain`; nothing changed → no-op.
 2. Stage changes, honoring `.gitignore` **plus a hard secret skip-list**
    (`.env*`, `*.pem`, `*.key`, `id_rsa*`, `credentials*`, tokens…) that applies
-   even to files that are *not* gitignored.
+   even to files that are *not* gitignored. Status is read with `-uall -z` so
+   that a secret inside a **newly created directory** is seen and skipped
+   individually rather than swept in as part of the directory, and so paths
+   with spaces or non-ASCII characters stage correctly.
 3. Checkpoint commit: `relaybridge(run <id>): <intent> [#<issue>]`, body lists
    files, provider, user. Refuses to commit on the default branch
    (`mirror-branch` mode moves to `relaybridge/<user>/<issue>` instead).
@@ -82,8 +85,9 @@ plain git, or through RelayBridge:
 
 - `github_list_versions` / `GET /api/github/versions?repo=o/r`
 - `github_show_version`
-- `github_checkout_version` — creates a **new** branch from the tag; never a
-  force-reset.
+- `github_checkout_version` — creates a **new** branch from the tag and leaves
+  your working tree exactly where it is (it returns the branch name; you check
+  it out when ready). Never a force-reset.
 
 ## Guardrails
 

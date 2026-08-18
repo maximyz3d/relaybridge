@@ -1620,7 +1620,7 @@ export function buildServer() {
 
   server.registerTool('github_checkout_version', {
     title: 'Roll back to a version (new branch)',
-    description: 'Create a NEW local branch from a vX.Y.Z tag in an enrolled repo — the safe rollback path. Never force-resets, never deletes or moves tags.',
+    description: 'Create a NEW local branch from a vX.Y.Z tag in an enrolled repo — the safe rollback path. Does NOT switch the working tree (returns the branch name to check out when ready), never force-resets, never deletes or moves tags.',
     inputSchema: z.object({ repo: z.string().regex(/^[\w.-]+\/[\w.-]+$/), tag: z.string().regex(/^v\d+\.\d+\.\d+$/) }),
     annotations: ACTION,
   }, safeHandler(async ({ repo, tag }) => {

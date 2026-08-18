@@ -131,3 +131,82 @@ test('labels.json provides every label the workflows key off', () => {
   const names = labels.map((l) => l.name);
   for (const need of ['bump:patch', 'bump:minor', 'bump:major']) assert.ok(names.includes(need), need);
 });
+
+// ---- regression: secret skip-list vs untracked directories -----------------
+// `git status --porcelain` collapses an untracked directory to one "newdir/"
+// entry. The skip-list would see a directory name (never a secret) and
+// `git add newdir/` would then stage newdir/.env. -uall lists files
+// individually, which is what makes the guarantee real.
+
+const { execFileSync } = require('child_process');
+
+function tempRepo() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rbgit-'));
+  const g = (...a) => execFileSync('git', a, { cwd: dir, stdio: 'pipe' });
+  g('init', '-q');
+  g('config', 'user.email', 't@example.com');
+  g('config', 'user.name', 'test');
+  fs.writeFileSync(path.join(dir, 'README.md'), 'x');
+  g('add', '-A'); g('commit', '-qm', 'init');
+  return { dir, g };
+}
+
+test('secrets inside a NEW directory are still caught (the -uall guarantee)', () => {
+  const { dir, g } = tempRepo();
+  fs.mkdirSync(path.join(dir, 'feature'));
+  fs.writeFileSync(path.join(dir, 'feature', 'app.js'), 'code');
+  fs.writeFileSync(path.join(dir, 'feature', '.env'), 'SECRET=hunter2');
+
+  const collapsed = execFileSync('git', ['status', '--porcelain'], { cwd: dir }).toString();
+  assert.match(collapsed, /feature\//, 'precondition: plain porcelain collapses the directory');
+
+  const raw = execFileSync('git', ['status', '--porcelain', '-uall', '-z'], { cwd: dir }).toString();
+  const paths = tracker.parsePorcelainZ(raw);
+  assert.ok(paths.includes('feature/.env'), 'the secret must be listed individually');
+  const { safe, skipped } = tracker.partitionSecretPaths(paths);
+  assert.ok(skipped.includes('feature/.env'), 'the secret must be SKIPPED');
+  assert.ok(safe.includes('feature/app.js'), 'the real work must still be staged');
+  assert.ok(!safe.some((p) => p.endsWith('.env')), 'no .env may reach the staging set');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('paths with spaces and non-ASCII survive parsing (-z, no octal escapes)', () => {
+  const { dir } = tempRepo();
+  fs.mkdirSync(path.join(dir, 'dir with space'));
+  fs.writeFileSync(path.join(dir, 'dir with space', 'café.js'), 'y');
+  const paths = tracker.parsePorcelainZ(
+    execFileSync('git', ['status', '--porcelain', '-uall', '-z'], { cwd: dir }).toString());
+  assert.ok(paths.includes('dir with space/café.js'), `got ${JSON.stringify(paths)}`);
+  assert.ok(!paths.some((p) => p.includes('\\303')), 'octal escapes must not survive into a path');
+  // The parsed path must be usable as-is by git add.
+  execFileSync('git', ['add', '--', ...paths], { cwd: dir });
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('renames yield both new and old paths so the deletion is staged', () => {
+  const raw = 'R  new/name.js\0old/name.js\0M  other.js\0';
+  assert.deepEqual(tracker.parsePorcelainZ(raw), ['new/name.js', 'old/name.js', 'other.js']);
+});
+
+test('rollback creates a branch WITHOUT switching the working tree', async () => {
+  const { dir, g } = tempRepo();
+  g('tag', '-a', 'v1.0.0', '-m', 'v1');
+  g('checkout', '-qb', 'wip');
+  fs.writeFileSync(path.join(dir, 'inprogress.txt'), 'uncommitted work');
+  const registry = { repos: [tracker.defaultRepoEntry({ name: 'o/r', path: dir })] };
+
+  const res = await tracker.checkoutVersion('o/r', 'v1.0.0', registry);
+  assert.match(res.branch, /^restore\/v1\.0\.0-/);
+  assert.equal(res.switched, false);
+  const head = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: dir }).toString().trim();
+  assert.equal(head, 'wip', 'the working branch must be left alone');
+  assert.ok(fs.existsSync(path.join(dir, 'inprogress.txt')), 'uncommitted work must survive');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('rollback refuses a tag that does not exist', async () => {
+  const { dir } = tempRepo();
+  const registry = { repos: [tracker.defaultRepoEntry({ name: 'o/r', path: dir })] };
+  await assert.rejects(() => tracker.checkoutVersion('o/r', 'v9.9.9', registry), /not found/);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
