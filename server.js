@@ -2626,6 +2626,31 @@ wss.on('connection', (ws, req) => {
   ws.on('close', () => session.detach(ws));
 });
 
+// ---- Remote MCP endpoint (connector transport) --------------------------
+// Off unless RELAYBRIDGE_REMOTE_MCP=1. Reuses the stdio adapter's buildServer()
+// so both transports always expose the same tools, minus the terminal/exec
+// tools which are never remotely reachable. See docs/CONNECTOR.md.
+// mcp/server.mjs is ESM. require() of ESM only works on Node >=22.12, and
+// package.json allows >=20.3, so the module is loaded with dynamic import and
+// the route is mounted once it resolves. Express accepts routes added after
+// listen(), so this costs nothing and works on every supported Node.
+let remoteMcpStatus = { enabled: false, reason: 'initializing' };
+(async () => {
+  try {
+    const { mountRemoteMcp } = require('./lib/remote-mcp');
+    const mcpModule = await import('./mcp/server.mjs');
+    remoteMcpStatus = mountRemoteMcp(app, {
+      token: CAPABILITY_TOKEN,
+      buildServer: () => mcpModule.buildServer(),
+      log: (m) => console.log(m),
+    });
+  } catch (err) {
+    remoteMcpStatus = { enabled: false, reason: err.message };
+  }
+})();
+app.get('/api/remote-mcp/status', (req, res) => res.json(remoteMcpStatus));
+
+
 server.listen(PORT, HOST, () => {
   console.log(`[RelayBridge] listening on http://${HOST}:${PORT}`);
   console.log(`[RelayBridge] open the URL above in Chrome.`);
