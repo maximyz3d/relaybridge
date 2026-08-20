@@ -329,6 +329,13 @@ test('prompt-file transport preserves long special-character prompts and cleans 
         },
       },
     },
+    provider_internal_timeout: {
+      label: 'Provider Internal Timeout Fixture',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--stderr', 'Error: timeout waiting for response', '--exit', '1'],
+      oneshot_dangerous: [...baseSlot, '--stderr', 'Error: timeout waiting for response', '--exit', '1'],
+    },
     usage_json: {
       label: 'Structured Claude Usage',
       safe: [process.execPath, helper, '--version'],
@@ -968,6 +975,30 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(noTimeoutResult.route.timeout_clamped, false);
   assert.equal(noTimeoutResult.stop_reason, null);
 
+  const providerTimeoutResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST',
+    headers: jsonAuth,
+    body: JSON.stringify({ kind: 'provider_internal_timeout', prompt: 'provider deadline fixture', dangerous: false }),
+  });
+  assert.equal(providerTimeoutResponse.status, 200);
+  const providerTimeoutResult = await providerTimeoutResponse.json();
+  assert.equal(providerTimeoutResult.dropped_out, true);
+  assert.equal(providerTimeoutResult.timed_out, true);
+  assert.equal(providerTimeoutResult.failureClass, 'timeout');
+  assert.equal(providerTimeoutResult.stop_reason, 'provider_internal_timeout');
+  assert.equal(providerTimeoutResult.supervisor_stop_reason, null);
+  assert.equal(providerTimeoutResult.provider_timeout_source, 'provider_cli_diagnostic');
+  assert.equal(providerTimeoutResult.usage, null);
+  const providerTimeoutLedger = fs.readFileSync(
+    path.join(tempRoot, 'data', 'receipts', new Date().toISOString().slice(0, 10) + '.jsonl'), 'utf8',
+  ).trim().split(/\r?\n/).map((line) => JSON.parse(line));
+  const providerTimeoutReceipt = providerTimeoutLedger.find((row) => row.receiptId === providerTimeoutResult.receiptId);
+  assert.equal(providerTimeoutReceipt.status, 'timed_out');
+  assert.equal(providerTimeoutReceipt.failureClass, 'timeout');
+  assert.equal(providerTimeoutReceipt.stopReason, 'provider_internal_timeout');
+  assert.equal(providerTimeoutReceipt.supervisorStopReason, null);
+  assert.equal(providerTimeoutReceipt.providerTimeoutSource, 'provider_cli_diagnostic');
+
   const envResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST',
     headers: jsonAuth,
@@ -1114,6 +1145,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   const retryTimeout = await retryTimeoutResponse.json();
   assert.equal(retryTimeout.timed_out, true);
   assert.equal(retryTimeout.failureClass, 'timeout');
+  assert.equal(retryTimeout.provider_timeout_source, 'relay_supervisor');
   assert.equal(retryTimeout.provider_retries.count, 1);
   assert.equal(retryTimeout.provider_retries.total_delay_ms, 250);
   assert.equal(retryTimeout.stdout, '');
@@ -1122,6 +1154,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
     .find((row) => row.receiptId === retryTimeout.receiptId);
   assert.equal(retryTimeoutReceipt.status, 'timed_out');
   assert.equal(retryTimeoutReceipt.failureClass, 'timeout');
+  assert.equal(retryTimeoutReceipt.providerTimeoutSource, 'relay_supervisor');
   assert.equal(retryTimeoutReceipt.providerRetryCount, 1);
   assert.equal(retryTimeoutReceipt.estimatedOutputTokens, 0);
 

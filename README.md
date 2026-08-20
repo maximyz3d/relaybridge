@@ -276,6 +276,14 @@ Agent management tools: `list_agents` lists AI providers with tags, autoRoute, a
 
 Every provider call writes receipts where possible. Use `list_runs`, `get_run`, `list_receipts`, and `get_receipt` to recover provenance instead of relying on a chat transcript alone.
 
+Timeout receipts distinguish the causal layer. A Relay liveness stop reports
+`providerTimeoutSource: relay_supervisor`; an upstream HTTP timeout reports
+`provider_api_status`; and a provider CLI that exits with an authoritative
+internal-timeout diagnostic reports `provider_cli_diagnostic`. All three are
+normalized to `timed_out` / `failureClass: timeout`, while `stopReason` and
+`supervisorStopReason` preserve whether Relay itself killed the process. Token
+usage remains unknown when the provider did not report it.
+
 ## License
 
 MIT.

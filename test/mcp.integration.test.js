@@ -110,6 +110,14 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
       ],
       oneshot_output_parser: 'claude_json',
     },
+    provider_internal_timeout: {
+      ...echoProvider,
+      label: 'Provider internal timeout fixture',
+      oneshot_safe: [
+        process.execPath, helper, '--prompt-file', '{prompt_file}',
+        '--stderr', 'Error: timeout waiting for response', '--exit', '1',
+      ],
+    },
     retry_json: {
       ...echoProvider,
       label: 'Structured Claude retry fixture',
@@ -481,6 +489,18 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   assert.equal(disagreementProvider.structuredContent.usage.total_tokens, 36);
   assert.equal(disagreementProvider.structuredContent.providerRetries.count, 1);
 
+  const providerTimeout = await client.callTool({
+    name: 'ask_provider',
+    arguments: { kind: 'provider_internal_timeout', prompt: 'MCP_PROVIDER_TIMEOUT_MARKER', useCache: false },
+  });
+  assert.equal(providerTimeout.structuredContent.modelInvocation, true);
+  assert.equal(providerTimeout.structuredContent.droppedOut, true);
+  assert.equal(providerTimeout.structuredContent.timedOut, true);
+  assert.equal(providerTimeout.structuredContent.failureClass, 'timeout');
+  assert.equal(providerTimeout.structuredContent.stopReason, 'provider_internal_timeout');
+  assert.equal(providerTimeout.structuredContent.supervisorStopReason, null);
+  assert.equal(providerTimeout.structuredContent.providerTimeoutSource, 'provider_cli_diagnostic');
+
   const retryPrompt = 'MCP_RETRY_ACCOUNTING_MARKER';
   const retryProvider = await client.callTool({
     name: 'ask_provider',
@@ -714,6 +734,22 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   });
   assert.equal(disagreementTransport.structuredContent.receipt.resultSchemaDisagreement, true);
   assert.equal(disagreementTransport.structuredContent.receipt.actualTotalTokens, 36);
+  const providerTimeoutOuter = receipts.structuredContent.receipts.find((receipt) =>
+    receipt.receiptId === providerTimeout.structuredContent.receiptId);
+  assert.equal(providerTimeoutOuter.status, 'timed_out');
+  assert.equal(providerTimeoutOuter.failureClass, 'timeout');
+  assert.equal(providerTimeoutOuter.stopReason, 'provider_internal_timeout');
+  assert.equal(providerTimeoutOuter.supervisorStopReason, null);
+  assert.equal(providerTimeoutOuter.providerTimeoutSource, 'provider_cli_diagnostic');
+  assert.match(providerTimeoutOuter.transportReceiptId, /^rcpt_/);
+  const providerTimeoutTransport = await client.callTool({
+    name: 'get_receipt', arguments: { receiptId: providerTimeoutOuter.transportReceiptId },
+  });
+  assert.equal(providerTimeoutTransport.structuredContent.receipt.status, providerTimeoutOuter.status);
+  assert.equal(providerTimeoutTransport.structuredContent.receipt.failureClass, providerTimeoutOuter.failureClass);
+  assert.equal(providerTimeoutTransport.structuredContent.receipt.stopReason, providerTimeoutOuter.stopReason);
+  assert.equal(providerTimeoutTransport.structuredContent.receipt.supervisorStopReason, providerTimeoutOuter.supervisorStopReason);
+  assert.equal(providerTimeoutTransport.structuredContent.receipt.providerTimeoutSource, providerTimeoutOuter.providerTimeoutSource);
   const retryOuterReceipt = receipts.structuredContent.receipts.find((receipt) => receipt.receiptId === retryProvider.structuredContent.receiptId);
   assert.equal(retryOuterReceipt.providerRetryCount, 2);
   assert.equal(retryOuterReceipt.providerRetryDelayMs, 300);
