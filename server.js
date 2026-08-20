@@ -2616,7 +2616,12 @@ async function executeOneShot(body, res) {
     console.warn(`[RelayBridge] ${kind}: pinned model "${modelChoice.model}" is not in this account's model list â€” falling back to the account default`);
     modelChoice = { ...modelChoice, args: [], model: null, source: 'account_default_retired_pin' };
   }
-  const slot = applyModelArgs(resolveSlot(slotRaw), modelChoice.args, entry);
+  const slot = applyModelArgs(
+    resolveSlot(slotRaw),
+    modelChoice.args,
+    entry,
+    modelChoice.suppressFlags,
+  );
   const hasInlinePrompt = slot.some((a) => typeof a === 'string' && a.includes('{prompt}'));
   const hasPromptFile = slot.some((a) => typeof a === 'string' && a.includes('{prompt_file}'));
   if (hasInlinePrompt && hasPromptFile) {

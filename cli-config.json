@@ -388,7 +388,7 @@
     "model_tiers": {
       "light": { "args": ["--model", "gemini-3.5-flash-lite"], "model": "gemini-3.5-flash-lite", "note": "high-volume, low latency" },
       "standard": { "args": ["--model", "gemini-3.6-flash"], "model": "gemini-3.6-flash", "note": "GA flash tier" },
-      "heavy": { "args": ["--model", "auto"], "model": "auto", "note": "let the CLI pick; avoids pinning a Pro id that gets renamed" }
+      "heavy": { "args": ["--model", "auto"], "model": "auto", "suppress_flags": ["--effort"], "note": "let the CLI pick; auto rejects the explicit effort flag" }
     },
     "tags": ["coding", "search", "general"],
     "company": "Google",

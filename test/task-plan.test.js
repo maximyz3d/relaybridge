@@ -6,7 +6,7 @@ const fs = require('fs');
 const path = require('path');
 
 const { buildTaskPlan, resolveEffort, effortForTier, findEffortVariant, costClassFor, EFFORT_ORDER } = require('../lib/task-plan');
-const { resolveModelArgs } = require('../lib/model-tiers');
+const { resolveModelArgs, applyModelArgs } = require('../lib/model-tiers');
 const config = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'cli-config.json'), 'utf8'));
 
 const route = (tier, kinds) => ({ classification: { tier }, selected: kinds.map((kind) => ({ kind })) });
@@ -49,6 +49,26 @@ test('a provider with no effort knob reports that honestly', () => {
   const resolved = resolveEffort({ entry: config.claude, effort: 'high', baseModel: 'opus' });
   assert.equal(resolved.method, 'model_choice');
   assert.deepEqual(resolved.args, [], 'inventing a flag Claude does not accept would fail every call');
+});
+
+test('a model tier can suppress a CLI flag that its selected model rejects', () => {
+  const entry = {
+    model_tiers: {
+      heavy: {
+        args: ['--model', 'auto'],
+        model: 'auto',
+        suppress_flags: ['--effort'],
+      },
+    },
+  };
+  const choice = resolveModelArgs({ entry, taskTier: 'complex' });
+  const args = applyModelArgs(
+    ['agy.exe', '--model', 'concrete', '--effort', 'high', '--print', '{prompt}'],
+    choice.args,
+    entry,
+    choice.suppressFlags,
+  );
+  assert.deepEqual(args, ['agy.exe', '--model', 'auto', '--print', '{prompt}']);
 });
 
 test('cost class distinguishes free, local, subscription and metered', () => {

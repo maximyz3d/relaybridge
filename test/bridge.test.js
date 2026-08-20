@@ -83,6 +83,7 @@ test('provider config uses the installed subscription CLIs and safe headless mod
   assert.equal(config.gemini.oneshot_safe.at(-1), '{prompt}');
   assert.equal(config.gemini.oneshot_safe[config.gemini.oneshot_safe.indexOf('--add-dir') + 1], '{cwd}');
   assert.equal(config.gemini.oneshot_safe[config.gemini.oneshot_safe.indexOf('--effort') + 1], 'high');
+  assert.deepEqual(config.gemini.model_tiers.heavy.suppress_flags, ['--effort']);
   assert.equal(config.gemini.oneshot_safe[config.gemini.oneshot_safe.indexOf('--mode') + 1], 'plan');
   assert.ok(config.gemini.dangerous.includes('--dangerously-skip-permissions'));
   assert.equal(config.gemini.npm_package, undefined);
@@ -301,6 +302,20 @@ test('prompt-file transport preserves long special-character prompts and cleans 
       oneshot_dangerous: baseSlot,
       diagnostic_binary: process.execPath,
       probe: [process.execPath, helper, '--version'],
+    },
+    gemini_auto_compat: {
+      label: 'Gemini Auto Compatibility Fixture',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--model', 'concrete', '--effort', 'high'],
+      oneshot_dangerous: [...baseSlot, '--model', 'concrete', '--effort', 'high'],
+      model_tiers: {
+        heavy: {
+          args: ['--model', 'auto'],
+          model: 'auto',
+          suppress_flags: ['--effort'],
+        },
+      },
     },
     usage_json: {
       label: 'Structured Claude Usage',
@@ -583,6 +598,22 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(result.route.effective_timeout_ms, 600001);
   assert.equal(result.route.timeout_clamped, false);
   assert.deepEqual(fs.readdirSync(promptTemp), []);
+
+  const geminiAutoResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST',
+    headers: jsonAuth,
+    body: JSON.stringify({
+      kind: 'gemini_auto_compat',
+      prompt: 'AUTO_COMPAT_OK',
+      taskTier: 'complex',
+      dangerous: false,
+    }),
+  });
+  assert.equal(geminiAutoResponse.status, 200);
+  const geminiAutoResult = await geminiAutoResponse.json();
+  assert.equal(geminiAutoResult.stdout, 'AUTO_COMPAT_OK');
+  assert.equal(geminiAutoResult.route.requested_model, 'auto');
+  assert.equal(geminiAutoResult.route.requested_effort, null);
 
   const usageResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST',
