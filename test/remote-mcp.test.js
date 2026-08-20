@@ -6,7 +6,9 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const express = require('express');
-const { mountRemoteMcp, profileFilter, NEVER_REMOTE } = require('../lib/remote-mcp');
+const {
+  mountRemoteMcp, profileFilter, isNeverRemote, isNeverRemoteResource, NEVER_REMOTE,
+} = require('../lib/remote-mcp');
 
 const TOKEN = 'a'.repeat(64);
 
@@ -44,6 +46,15 @@ test('terminal and exec tools are unreachable at EVERY profile', () => {
     assert.equal(full(name), false, `${name} must be blocked even in full`);
   }
   assert.ok(NEVER_REMOTE.has('run_powershell'), 'the PowerShell tool must be on the never-remote list');
+  for (const actual of ['list_sessions', 'start_safe_session', 'send_session_input', 'stop_session', 'read_session_output']) {
+    assert.ok(isNeverRemote(actual), `${actual} must match the terminal/session policy`);
+  }
+  assert.ok(isNeverRemote('future_session_control'), 'future session surfaces must fail closed');
+  assert.ok(isNeverRemote('get_context_bundle'), 'the context bundle can expose live terminal output');
+  assert.ok(isNeverRemoteResource('sessions'), 'the session resource must fail closed');
+  assert.ok(isNeverRemoteResource('context'), 'the context resource includes session metadata');
+  assert.ok(isNeverRemoteResource('psbridge://sessions'), 'the live registry is keyed by URI');
+  assert.ok(isNeverRemoteResource('psbridge://context'), 'the context URI must fail closed');
 });
 
 test('the safe profile withholds repo-mutating tools but keeps read and delegation', () => {
@@ -117,5 +128,15 @@ test('the endpoint speaks MCP over HTTP and refuses unauthenticated callers', as
   assert.ok(names.has('github_list_versions'), 'the GitHub read tools must be advertised');
   // The security property that matters: never advertised, so a model never plans around it.
   assert.ok(!names.has('run_powershell'), 'the PowerShell tool must NOT be advertised remotely');
+  for (const terminalTool of ['list_sessions', 'start_safe_session', 'send_session_input', 'stop_session', 'read_session_output']) {
+    assert.ok(!names.has(terminalTool), `${terminalTool} must NOT be advertised remotely`);
+  }
+  assert.ok(!names.has('get_context_bundle'), 'the terminal-capable context bundle must NOT be advertised remotely');
   assert.ok(!names.has('github_onboard_repo'), 'mutating tools must NOT be advertised in safe profile');
+
+  const resources = await fetch(url, { method: 'POST', headers: H2, body: JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'resources/list' }) });
+  assert.equal(resources.status, 200);
+  const resourceBody = await resources.text();
+  assert.doesNotMatch(resourceBody, /psbridge:\/\/sessions/, 'session resources must not be advertised remotely');
+  assert.doesNotMatch(resourceBody, /psbridge:\/\/context/, 'context resources must not be advertised remotely');
 });

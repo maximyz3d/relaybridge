@@ -86,8 +86,10 @@ A public URL fronting a real PowerShell is a serious thing, so the endpoint is
 deliberately narrower than stdio.
 
 **Never remote, at any profile** — not advertised, so a model never plans
-around them: `run_powershell`, `exec`, `open_session`, `send_session_input`,
-`close_session`, `read_session_buffer`, `start_provider_signin`.
+around them: bridge lifecycle controls, `list_sessions`, `start_safe_session`,
+`send_session_input`, `stop_session`, `read_session_output`,
+`get_context_bundle`, and `start_provider_signin`. The session and context MCP
+resources are also withheld; use the local stdio adapter for terminal context.
 
 **`safe` profile (default)** additionally withholds repo-mutating tools:
 `github_track_run`, `github_onboard_repo`, `github_checkout_version`,

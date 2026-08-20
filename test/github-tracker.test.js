@@ -37,7 +37,9 @@ test('bump labels default to patch and honor explicit versions', () => {
 
 test('the secret skip-list blocks credentials even when not gitignored', () => {
   for (const bad of ['.env', '.env.production', 'server.pem', 'deploy.key',
-    'id_rsa', 'credentials.json', '.bridge-token', 'aws-secrets.yaml', 'api_token.txt']) {
+    'id_rsa', 'credentials.json', '.bridge-token', 'aws-secrets.yaml', 'api_token.txt',
+    '.npmrc', '.netrc', 'accesstoken.json', 'refreshcredential.toml', '.pgpass',
+    '.pypirc', '.envrc', 'deploy_key', 'nested/deploy_key', 'prod.env', 'staging.env']) {
     assert.ok(tracker.isSecretPath(bad), `${bad} must be skipped`);
   }
   for (const ok of ['server.js', 'README.md', 'lib/github-tracker.js', 'docs/DEVLOG.md', 'monkey.ts']) {
@@ -46,6 +48,13 @@ test('the secret skip-list blocks credentials even when not gitignored', () => {
   const { safe, skipped } = tracker.partitionSecretPaths(['a.js', '.env', 'b.md']);
   assert.deepEqual(safe, ['a.js', 'b.md']);
   assert.deepEqual(skipped, ['.env']);
+});
+
+test('tracking user attribution is bounded at the library boundary', () => {
+  const bounded = tracker.boundedTrackingUser(`  user\u0000name-${'x'.repeat(200)}  `);
+  assert.equal(bounded.length, 80);
+  assert.doesNotMatch(bounded, /[\u0000-\u001f\u007f]/);
+  assert.equal(tracker.boundedTrackingUser('   '), null);
 });
 
 // ---- registry --------------------------------------------------------------
@@ -122,6 +131,9 @@ test('version-on-merge template keeps history append-only and claim template war
   const vm = fs.readFileSync(path.join(onboard.TEMPLATE_DIR, 'version-on-merge.yml'), 'utf8');
   assert.match(vm, /aborting to keep history append-only/);
   assert.match(vm, /bump:major/);
+  assert.doesNotMatch(vm, /--notes[^\n]*\$\{\{\s*github\.event\.pull_request\.title\s*\}\}/,
+    'untrusted PR titles must not be interpolated directly into a shell script');
+  assert.match(vm, /RELEASE_NOTES:/, 'release notes must cross into the shell through env');
   const claim = fs.readFileSync(path.join(onboard.TEMPLATE_DIR, 'claim-on-start.yml'), 'utf8');
   assert.match(claim, /Possible duplicate work/);
 });

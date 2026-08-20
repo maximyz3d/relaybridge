@@ -105,7 +105,8 @@ jobs:
         if: vars.CREATE_RELEASE == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_NOTES: Auto-release for #${{ github.event.pull_request.number }}: ${{ github.event.pull_request.title }}
         run: |
           gh release create "v$NEW_VERSION" \
             --title "v$NEW_VERSION" \
-            --notes "Auto-release for #${{ github.event.pull_request.number }}: ${{ github.event.pull_request.title }}"
+            --notes "$RELEASE_NOTES"

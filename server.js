@@ -1887,8 +1887,12 @@ async function executeOneShot(body, res) {
   // Run association for the GitHub tracker: who did this, and any
   // explicit intent. Falls back to the OS account so checkpoint commits
   // are always attributed (maximyz3d / sover / 3DCPAI machines differ).
-  const runUser = typeof body?.user === 'string' && body.user.trim() ? body.user.trim() : os.userInfo().username;
-  const runIntent = typeof body?.intent === 'string' ? body.intent : null;
+  const runUser = typeof body?.user === 'string' && body.user.trim()
+    ? body.user.trim().replace(/[^a-zA-Z0-9._-]+/g, '-').slice(0, 80)
+    : os.userInfo().username;
+  const runIntent = typeof body?.intent === 'string'
+    ? body.intent.replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 2000)
+    : null;
   // Two timeout regimes compose here. The timeout policy bounds any EXPLICIT
   // caller timeout, so a caller can neither starve a run nor exceed the
   // transport ceiling the MCP client allows. When the caller sends nothing, no
