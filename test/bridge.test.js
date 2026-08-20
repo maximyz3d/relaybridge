@@ -50,12 +50,18 @@ test('provider config uses the installed subscription CLIs and safe headless mod
   const config = readConfig();
   assert.equal(config.claude.safe[config.claude.safe.indexOf('--permission-mode') + 1], 'plan');
   assert.equal(config.claude.oneshot_safe[config.claude.oneshot_safe.indexOf('--permission-mode') + 1], 'plan');
+  assert.equal(config.claude.oneshot_safe[config.claude.oneshot_safe.indexOf('--output-format') + 1], 'stream-json');
+  assert.ok(config.claude.oneshot_safe.includes('--include-partial-messages'));
+  assert.equal(config.claude.oneshot_output_parser, 'claude_json');
   assert.deepEqual(config.claude.probe, ['claude', 'auth', 'status']);
   assert.ok(config.claude.strip_env.includes('ANTHROPIC_API_KEY'));
   assert.equal(config.claude.safe[config.claude.safe.indexOf('--model') + 1], 'opus');
   assert.equal(config.claude_fable.safe[config.claude_fable.safe.indexOf('--model') + 1], 'fable');
   assert.equal(config.claude_fable.safe[config.claude_fable.safe.indexOf('--effort') + 1], 'max');
   assert.equal(config.claude_fable.oneshot_safe[config.claude_fable.oneshot_safe.indexOf('--effort') + 1], 'max');
+  assert.equal(config.claude_fable.oneshot_safe[config.claude_fable.oneshot_safe.indexOf('--output-format') + 1], 'stream-json');
+  assert.ok(config.claude_fable.oneshot_safe.includes('--include-partial-messages'));
+  assert.equal(config.claude_fable.oneshot_output_parser, 'claude_json');
   assert.equal(config.claude_fable.model, 'claude-fable-5');
   assert.deepEqual(config.claude_fable.probe, ['claude', 'auth', 'status']);
   assert.ok(config.claude_fable.strip_env.includes('ANTHROPIC_API_KEY'));
@@ -296,6 +302,151 @@ test('prompt-file transport preserves long special-character prompts and cleans 
       diagnostic_binary: process.execPath,
       probe: [process.execPath, helper, '--version'],
     },
+    usage_json: {
+      label: 'Structured Claude Usage',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--claude-json'],
+      oneshot_dangerous: [...baseSlot, '--claude-json'],
+      oneshot_output_parser: 'claude_json',
+    },
+    usage_json_malformed_models: {
+      label: 'Structured Claude Usage With Malformed Model Rows',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--claude-json-malformed-model-usage'],
+      oneshot_dangerous: [...baseSlot, '--claude-json-malformed-model-usage'],
+      oneshot_output_parser: 'claude_json',
+    },
+    usage_json_malformed_top: {
+      label: 'Structured Claude Usage With Malformed Top-Level Counts',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--claude-json-malformed-top-usage'],
+      oneshot_dangerous: [...baseSlot, '--claude-json-malformed-top-usage'],
+      oneshot_output_parser: 'claude_json',
+    },
+    usage_json_partial_cost: {
+      label: 'Structured Claude Usage With Partial Model Cost',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--claude-json-partial-cost'],
+      oneshot_dangerous: [...baseSlot, '--claude-json-partial-cost'],
+      oneshot_output_parser: 'claude_json',
+    },
+    usage_json_error: {
+      label: 'Structured Claude Error Result',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--claude-json-error-result'],
+      oneshot_dangerous: [...baseSlot, '--claude-json-error-result'],
+      oneshot_output_parser: 'claude_json',
+    },
+    usage_json_success_error_disagreement: {
+      label: 'Structured Claude Success Subtype With Error Flag',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--claude-json-success-error-disagreement'],
+      oneshot_dangerous: [...baseSlot, '--claude-json-success-error-disagreement'],
+      oneshot_output_parser: 'claude_json',
+    },
+    usage_json_error_success_flag_disagreement: {
+      label: 'Structured Claude Error Subtype With Success Flag',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--claude-json-error-success-flag-disagreement'],
+      oneshot_dangerous: [...baseSlot, '--claude-json-error-success-flag-disagreement'],
+      oneshot_output_parser: 'claude_json',
+    },
+    usage_json_invalid_result: {
+      label: 'Malformed Structured Claude Result',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--claude-json-invalid-result'],
+      oneshot_dangerous: [...baseSlot, '--claude-json-invalid-result'],
+      oneshot_output_parser: 'claude_json',
+    },
+    usage_json_retries: {
+      label: 'Structured Claude Retry Result',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--claude-json-retries'],
+      oneshot_dangerous: [...baseSlot, '--claude-json-retries'],
+      oneshot_output_parser: 'claude_json',
+    },
+    usage_json_budget_error: {
+      label: 'Structured Claude Budget Error',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--claude-json-budget-error'],
+      oneshot_dangerous: [...baseSlot, '--claude-json-budget-error'],
+      oneshot_output_parser: 'claude_json',
+    },
+    usage_json_rate_error: {
+      label: 'Structured Claude Execution Error',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--claude-json-rate-error'],
+      oneshot_dangerous: [...baseSlot, '--claude-json-rate-error'],
+      oneshot_output_parser: 'claude_json',
+    },
+    usage_json_max_tokens: {
+      label: 'Structured Claude Truncation',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--claude-json-max-tokens'],
+      oneshot_dangerous: [...baseSlot, '--claude-json-max-tokens'],
+      oneshot_output_parser: 'claude_json',
+    },
+    usage_json_auth_error: {
+      label: 'Structured Claude Authentication Error',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--claude-json-auth-error'],
+      oneshot_dangerous: [...baseSlot, '--claude-json-auth-error'],
+      oneshot_output_parser: 'claude_json',
+    },
+    usage_json_api_timeout: {
+      label: 'Structured Claude API Timeout',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--claude-json-api-timeout'],
+      oneshot_dangerous: [...baseSlot, '--claude-json-api-timeout'],
+      oneshot_output_parser: 'claude_json',
+    },
+    usage_json_tool_deferred: {
+      label: 'Structured Claude Deferred Tool Result',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--claude-json-tool-deferred'],
+      oneshot_dangerous: [...baseSlot, '--claude-json-tool-deferred'],
+      oneshot_output_parser: 'claude_json',
+    },
+    usage_json_terminal_from_prompt: {
+      label: 'Structured Claude New Terminal Reason',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--claude-json-terminal-from-prompt'],
+      oneshot_dangerous: [...baseSlot, '--claude-json-terminal-from-prompt'],
+      oneshot_output_parser: 'claude_json',
+    },
+    retry_hang: {
+      label: 'Structured Retry Then Hang',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--claude-json-retry-hang'],
+      oneshot_dangerous: [...baseSlot, '--claude-json-retry-hang'],
+      oneshot_output_parser: 'claude_json',
+    },
+    retry_timeout: {
+      label: 'Structured Retry Then Timeout',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--claude-json-retry-hang'],
+      oneshot_dangerous: [...baseSlot, '--claude-json-retry-hang'],
+      oneshot_output_parser: 'claude_json',
+      supervisor: { idleMs: 1000, hardCapMs: 1000, graceExtensions: 0 },
+    },
     fail: {
       label: 'Fail',
       safe: [process.execPath, helper, '--version'],
@@ -402,6 +553,16 @@ test('prompt-file transport preserves long special-character prompts and cleans 
     headers: { Origin: 'https://attacker.example' },
   });
   assert.equal(hostileOrigin.status, 403);
+  const proxiedCapability = await fetch(baseUrl + '/api/capability', {
+    headers: { 'X-Forwarded-For': '203.0.113.9' },
+  });
+  assert.equal(proxiedCapability.status, 403);
+  const proxiedExec = await fetch(baseUrl + '/api/exec', {
+    method: 'POST',
+    headers: { ...auth, 'Content-Type': 'application/json', 'X-Forwarded-For': '203.0.113.9' },
+    body: JSON.stringify({ command: 'Write-Output MUST_NOT_RUN' }),
+  });
+  assert.equal(proxiedExec.status, 403);
   const traversal = await fetch(baseUrl + '/api/collabs/..%2F..%2Fpackage', { headers: auth });
   assert.notEqual(traversal.status, 200);
 
@@ -422,6 +583,309 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(result.route.effective_timeout_ms, 600001);
   assert.equal(result.route.timeout_clamped, false);
   assert.deepEqual(fs.readdirSync(promptTemp), []);
+
+  const usageResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST',
+    headers: jsonAuth,
+    body: JSON.stringify({ kind: 'usage_json', prompt: 'structured token accounting', dangerous: false }),
+  });
+  assert.equal(usageResponse.status, 200);
+  const usageResult = await usageResponse.json();
+  assert.equal(usageResult.stdout, 'STRUCTURED_OK');
+  assert.equal(usageResult.route.resolved_model_identity, 'claude-fable-5');
+  assert.equal(usageResult.route.resolved_model_source, 'provider_reported_model_usage');
+  assert.equal(usageResult.usage.input_tokens, 530);
+  assert.equal(usageResult.usage.output_tokens, 900);
+  assert.equal(usageResult.usage.cache_read_input_tokens, 20937);
+  assert.equal(usageResult.usage.cache_creation_input_tokens, 13086);
+  assert.equal(usageResult.usage.total_tokens, 35453);
+  assert.equal(usageResult.usage.thinking_tokens, 873);
+  assert.equal(usageResult.usage.cost_usd, 0.32762);
+  assert.equal(usageResult.usage.model_usage.length, 2);
+  const usageLedger = fs.readFileSync(path.join(tempRoot, 'data', 'receipts', new Date().toISOString().slice(0, 10) + '.jsonl'), 'utf8')
+    .trim().split(/\r?\n/).map((line) => JSON.parse(line));
+  const usageReceipt = usageLedger.find((row) => row.receiptId === usageResult.receiptId);
+  assert.equal(usageReceipt.actualTotalTokens, 35453);
+  assert.equal(usageReceipt.tokenUsageSource, 'provider_reported');
+  assert.equal(usageReceipt.provider_reported_cost_usd, 0.32762);
+
+  const malformedModelsResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST',
+    headers: jsonAuth,
+    body: JSON.stringify({ kind: 'usage_json_malformed_models', prompt: 'fallback to valid top-level usage', dangerous: false }),
+  });
+  assert.equal(malformedModelsResponse.status, 200);
+  const malformedModelsResult = await malformedModelsResponse.json();
+  assert.equal(malformedModelsResult.stdout, 'TOP_LEVEL_USAGE_OK');
+  assert.deepEqual(malformedModelsResult.usage.model_usage, []);
+  assert.equal(malformedModelsResult.usage.input_tokens, 7);
+  assert.equal(malformedModelsResult.usage.output_tokens, 3);
+  assert.equal(malformedModelsResult.usage.cache_read_input_tokens, 11);
+  assert.equal(malformedModelsResult.usage.cache_creation_input_tokens, 2);
+  assert.equal(malformedModelsResult.usage.total_tokens, 23);
+  assert.equal(malformedModelsResult.usage.cost_usd, null);
+
+  const malformedTopResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST',
+    headers: jsonAuth,
+    body: JSON.stringify({ kind: 'usage_json_malformed_top', prompt: 'reject partial malformed top-level usage', dangerous: false }),
+  });
+  assert.equal(malformedTopResponse.status, 200);
+  const malformedTopResult = await malformedTopResponse.json();
+  assert.equal(malformedTopResult.stdout, 'MALFORMED_TOP_USAGE_ANSWER');
+  assert.equal(malformedTopResult.usage, null);
+  const refreshedUsageLedger = fs.readFileSync(path.join(tempRoot, 'data', 'receipts', new Date().toISOString().slice(0, 10) + '.jsonl'), 'utf8')
+    .trim().split(/\r?\n/).map((line) => JSON.parse(line));
+  const malformedTopReceipt = refreshedUsageLedger.find((row) => row.receiptId === malformedTopResult.receiptId);
+  assert.equal(malformedTopReceipt.actualTotalTokens, null);
+  assert.equal(malformedTopReceipt.tokenUsageSource, 'chars_div_4');
+
+  const partialCostResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST',
+    headers: jsonAuth,
+    body: JSON.stringify({ kind: 'usage_json_partial_cost', prompt: 'reject partial provider cost census', dangerous: false }),
+  });
+  assert.equal(partialCostResponse.status, 200);
+  const partialCostResult = await partialCostResponse.json();
+  assert.equal(partialCostResult.usage.total_tokens, 6);
+  assert.equal(partialCostResult.usage.cost_usd, null);
+  assert.equal(partialCostResult.usage.thinking_tokens, null);
+  assert.equal(partialCostResult.route.resolved_model_identity, 'b');
+
+  const errorResultResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST',
+    headers: jsonAuth,
+    body: JSON.stringify({ kind: 'usage_json_error', prompt: 'classify structured error result', dangerous: false }),
+  });
+  assert.equal(errorResultResponse.status, 200);
+  const errorResult = await errorResultResponse.json();
+  assert.equal(errorResult.exitCode, 0);
+  assert.equal(errorResult.rate_limited, true);
+  assert.equal(errorResult.dropped_out, true);
+  const errorLedger = fs.readFileSync(path.join(tempRoot, 'data', 'receipts', new Date().toISOString().slice(0, 10) + '.jsonl'), 'utf8')
+    .trim().split(/\r?\n/).map((line) => JSON.parse(line));
+  const errorReceipt = errorLedger.find((row) => row.receiptId === errorResult.receiptId);
+  assert.equal(errorReceipt.failureClass, 'rate_limit');
+
+  const successErrorDisagreementResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({
+      kind: 'usage_json_success_error_disagreement',
+      prompt: 'retain metrics when success subtype carries an error flag',
+      dangerous: false,
+    }),
+  });
+  assert.equal(successErrorDisagreementResponse.status, 200);
+  const successErrorDisagreement = await successErrorDisagreementResponse.json();
+  assert.equal(successErrorDisagreement.exitCode, 0);
+  assert.equal(successErrorDisagreement.stdout, '');
+  assert.doesNotMatch(successErrorDisagreement.stderr, /subtype and is_error disagree/);
+  assert.match(successErrorDisagreement.stderr, /weekly limit/);
+  assert.equal(successErrorDisagreement.result_subtype, 'success');
+  assert.equal(successErrorDisagreement.result_schema_disagreement, true);
+  assert.equal(successErrorDisagreement.failureClass, 'rate_limit');
+  assert.equal(successErrorDisagreement.rate_limited, true);
+  assert.equal(successErrorDisagreement.dropped_out, true);
+  assert.equal(successErrorDisagreement.usage.total_tokens, 36);
+  assert.equal(successErrorDisagreement.provider_error_count, 1);
+  assert.equal(successErrorDisagreement.provider_retries.count, 1);
+  assert.deepEqual(successErrorDisagreement.provider_retries.by_status, { 429: 1 });
+  const successErrorDisagreementReceipt = fs.readFileSync(
+    path.join(tempRoot, 'data', 'receipts', new Date().toISOString().slice(0, 10) + '.jsonl'),
+    'utf8',
+  ).trim().split(/\r?\n/).map((line) => JSON.parse(line))
+    .find((row) => row.receiptId === successErrorDisagreement.receiptId);
+  assert.equal(successErrorDisagreementReceipt.resultSchemaDisagreement, true);
+  assert.equal(successErrorDisagreementReceipt.actualTotalTokens, 36);
+  assert.equal(successErrorDisagreementReceipt.tokenUsageSource, 'provider_reported');
+  assert.equal(successErrorDisagreementReceipt.providerRetryCount, 1);
+  assert.equal(successErrorDisagreementReceipt.providerApiErrorStatus, 429);
+
+  const errorSuccessFlagDisagreementResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({
+      kind: 'usage_json_error_success_flag_disagreement',
+      prompt: 'retain metrics when an error subtype carries a false error flag',
+      dangerous: false,
+    }),
+  });
+  assert.equal(errorSuccessFlagDisagreementResponse.status, 200);
+  const errorSuccessFlagDisagreement = await errorSuccessFlagDisagreementResponse.json();
+  assert.equal(errorSuccessFlagDisagreement.exitCode, 0);
+  assert.equal(errorSuccessFlagDisagreement.stdout, '');
+  assert.doesNotMatch(errorSuccessFlagDisagreement.stderr, /subtype and is_error disagree/);
+  assert.match(errorSuccessFlagDisagreement.stderr, /temporarily limiting requests/);
+  assert.equal(errorSuccessFlagDisagreement.result_subtype, 'error_during_execution');
+  assert.equal(errorSuccessFlagDisagreement.result_schema_disagreement, true);
+  assert.equal(errorSuccessFlagDisagreement.failureClass, 'rate_limit');
+  assert.equal(errorSuccessFlagDisagreement.rate_limited, true);
+  assert.equal(errorSuccessFlagDisagreement.dropped_out, true);
+  assert.equal(errorSuccessFlagDisagreement.usage.total_tokens, 43);
+  assert.equal(errorSuccessFlagDisagreement.provider_error_count, 1);
+  assert.equal(errorSuccessFlagDisagreement.provider_retries.count, 0);
+  const errorSuccessFlagDisagreementReceipt = fs.readFileSync(
+    path.join(tempRoot, 'data', 'receipts', new Date().toISOString().slice(0, 10) + '.jsonl'),
+    'utf8',
+  ).trim().split(/\r?\n/).map((line) => JSON.parse(line))
+    .find((row) => row.receiptId === errorSuccessFlagDisagreement.receiptId);
+  assert.equal(errorSuccessFlagDisagreementReceipt.resultSchemaDisagreement, true);
+  assert.equal(errorSuccessFlagDisagreementReceipt.actualTotalTokens, 43);
+  assert.equal(errorSuccessFlagDisagreementReceipt.tokenUsageSource, 'provider_reported');
+  assert.equal(errorSuccessFlagDisagreementReceipt.providerErrorCount, 1);
+  assert.equal(errorSuccessFlagDisagreementReceipt.providerApiErrorStatus, 429);
+
+  const invalidResultResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ kind: 'usage_json_invalid_result', prompt: 'reject non-result JSON', dangerous: false }),
+  });
+  const invalidResult = await invalidResultResponse.json();
+  assert.equal(invalidResult.stdout, '');
+  assert.equal(invalidResult.dropped_out, true);
+  assert.equal(invalidResult.failureClass, 'provider_error');
+  assert.match(invalidResult.stderr, /document type is not result/);
+
+  const retriesResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ kind: 'usage_json_retries', prompt: 'count every provider retry', dangerous: false }),
+  });
+  assert.equal(retriesResponse.status, 200);
+  const retriesResult = await retriesResponse.json();
+  assert.equal(retriesResult.stdout, 'RETRY_OK');
+  assert.equal(retriesResult.dropped_out, false);
+  assert.equal(retriesResult.provider_retries.count, 2);
+  assert.equal(retriesResult.provider_retries.total_delay_ms, 300);
+  assert.equal(retriesResult.provider_retries.observed_events, 5);
+  assert.equal(retriesResult.provider_retries.invalid_events, 2);
+  assert.equal(retriesResult.provider_retries.duplicate_events, 1);
+  assert.deepEqual(retriesResult.provider_retries.by_error, { overloaded: 1, rate_limit: 1 });
+  assert.deepEqual(retriesResult.provider_retries.by_status, { 429: 1, 529: 1 });
+  assert.equal(retriesResult.provider_retries.events.length, 2);
+  assert.match(retriesResult.provider_retries.events[0].event_id_hash, /^[0-9a-f]{64}$/);
+  assert.equal(retriesResult.provider_stop_reason, 'end_turn');
+  assert.equal(retriesResult.provider_num_turns, 3);
+  assert.equal(retriesResult.provider_duration_ms, 987);
+  assert.equal(retriesResult.provider_api_duration_ms, 654);
+  assert.equal(retriesResult.provider_terminal_reason, 'completed');
+  assert.equal(retriesResult.provider_api_error_status, null);
+  assert.equal(retriesResult.provider_permission_denials.count, 1);
+  assert.equal(retriesResult.provider_permission_denials.observed, 1);
+  assert.deepEqual(retriesResult.provider_permission_denials.byTool, { WebFetch: 1 });
+  assert.equal(Object.prototype.hasOwnProperty.call(retriesResult.provider_permission_denials.retained[0], 'tool_input'), false);
+  const retriesLedger = fs.readFileSync(path.join(tempRoot, 'data', 'receipts', new Date().toISOString().slice(0, 10) + '.jsonl'), 'utf8')
+    .trim().split(/\r?\n/).map((line) => JSON.parse(line));
+  const retriesReceipt = retriesLedger.find((row) => row.receiptId === retriesResult.receiptId);
+  assert.equal(retriesReceipt.providerRetryCount, 2);
+  assert.equal(retriesReceipt.providerRetryDelayMs, 300);
+  assert.deepEqual(retriesReceipt.providerRetryByError, retriesResult.provider_retries.by_error);
+  assert.equal(retriesReceipt.providerRetryInvalidEvents, 2);
+  assert.equal(retriesReceipt.providerRetryDuplicateEvents, 1);
+  assert.equal(retriesReceipt.providerTerminalReason, 'completed');
+  assert.equal(retriesReceipt.providerPermissionDenialCount, 1);
+  assert.deepEqual(retriesReceipt.providerPermissionDenialsByTool, { WebFetch: 1 });
+
+  const budgetErrorResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ kind: 'usage_json_budget_error', prompt: 'classify official budget error arm', dangerous: false }),
+  });
+  const budgetError = await budgetErrorResponse.json();
+  assert.equal(budgetError.exitCode, 0);
+  assert.equal(budgetError.stdout, '');
+  assert.match(budgetError.stderr, /maximum budget exceeded/);
+  assert.equal(budgetError.result_subtype, 'error_max_budget_usd');
+  assert.equal(budgetError.failureClass, 'budget');
+  assert.equal(budgetError.budget_exceeded, true);
+  assert.equal(budgetError.rate_limited, false);
+  assert.equal(budgetError.dropped_out, true);
+  assert.equal(budgetError.usage.total_tokens, 13);
+  assert.equal(budgetError.provider_error_count, 1);
+  assert.equal(budgetError.provider_error_observed, 1);
+  assert.equal(budgetError.provider_error_invalid, 0);
+  assert.equal(budgetError.provider_error_diagnostic_truncated, false);
+  const budgetReceipt = fs.readFileSync(path.join(tempRoot, 'data', 'receipts', new Date().toISOString().slice(0, 10) + '.jsonl'), 'utf8')
+    .trim().split(/\r?\n/).map((line) => JSON.parse(line))
+    .find((row) => row.receiptId === budgetError.receiptId);
+  assert.equal(budgetReceipt.failureClass, 'budget');
+  assert.equal(budgetReceipt.resultSubtype, 'error_max_budget_usd');
+  assert.equal(budgetReceipt.providerErrorCount, 1);
+  assert.match(budgetReceipt.providerErrorHash, /^[0-9a-f]{64}$/);
+
+  const rateErrorResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ kind: 'usage_json_rate_error', prompt: 'rate signal outranks generic execution subtype', dangerous: false }),
+  });
+  const rateError = await rateErrorResponse.json();
+  assert.equal(rateError.failureClass, 'rate_limit');
+  assert.equal(rateError.rate_limited, true);
+  const rateErrorReceipt = fs.readFileSync(path.join(tempRoot, 'data', 'receipts', new Date().toISOString().slice(0, 10) + '.jsonl'), 'utf8')
+    .trim().split(/\r?\n/).map((line) => JSON.parse(line))
+    .find((row) => row.receiptId === rateError.receiptId);
+  assert.equal(rateErrorReceipt.failureClass, 'rate_limit');
+
+  const maxTokensResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ kind: 'usage_json_max_tokens', prompt: 'do not count truncated output as success', dangerous: false }),
+  });
+  const maxTokens = await maxTokensResponse.json();
+  assert.equal(maxTokens.stdout, 'TRUNCATED_ANSWER');
+  assert.equal(maxTokens.provider_stop_reason, 'max_tokens');
+  assert.equal(maxTokens.failureClass, 'max_tokens');
+  assert.equal(maxTokens.dropped_out, true);
+
+  const authErrorResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ kind: 'usage_json_auth_error', prompt: 'classify official login failure', dangerous: false }),
+  });
+  const authError = await authErrorResponse.json();
+  assert.equal(authError.auth_failed, true);
+  assert.equal(authError.failureClass, 'auth');
+  assert.equal(authError.dropped_out, true);
+  assert.match(authError.stderr, /Please run \/login/);
+
+  const apiTimeoutResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ kind: 'usage_json_api_timeout', prompt: 'classify API 504 without prose guessing', dangerous: false }),
+  });
+  const apiTimeout = await apiTimeoutResponse.json();
+  assert.equal(apiTimeout.timed_out, true);
+  assert.equal(apiTimeout.failureClass, 'timeout');
+  assert.equal(apiTimeout.provider_api_error_status, 504);
+  assert.equal(apiTimeout.dropped_out, true);
+
+  const deferredResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ kind: 'usage_json_tool_deferred', prompt: 'do not count deferred work as complete', dangerous: false }),
+  });
+  const deferred = await deferredResponse.json();
+  assert.equal(deferred.stdout, 'TOOL_DEFERRED');
+  assert.equal(deferred.provider_stop_reason, 'tool_deferred');
+  assert.equal(deferred.provider_terminal_reason, 'tool_deferred');
+  assert.equal(deferred.failureClass, 'tool_deferred');
+  assert.equal(deferred.dropped_out, true);
+
+  const expandedTerminalReasons = new Map([
+    ['malformed_tool_use_exhausted', 'malformed_tool_use_exhausted'],
+    ['budget_exhausted', 'budget'],
+    ['structured_output_retry_exhausted', 'structured_output_retry_exhausted'],
+    ['api_error', 'rate_limit'],
+    ['background_requested', 'background_requested'],
+    ['turn_setup_failed', 'turn_setup_failed'],
+    ['tool_deferred_unavailable', 'tool_deferred_unavailable'],
+  ]);
+  for (const [terminalReason, failureClass] of expandedTerminalReasons) {
+    const response = await fetch(baseUrl + '/api/oneshot', {
+      method: 'POST', headers: jsonAuth,
+      body: JSON.stringify({
+        kind: 'usage_json_terminal_from_prompt', prompt: terminalReason, dangerous: false,
+      }),
+    });
+    assert.equal(response.status, 200);
+    const result = await response.json();
+    assert.doesNotMatch(result.stderr, /terminal_reason is unsupported/);
+    assert.equal(result.provider_terminal_reason, terminalReason);
+    assert.equal(result.failureClass, failureClass);
+    assert.equal(result.dropped_out, true);
+    assert.equal(result.usage.total_tokens, 4);
+  }
 
   const cappedTimeoutResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST',
@@ -555,6 +1019,66 @@ test('prompt-file transport preserves long special-character prompts and cleans 
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   assert.equal(activeOneShotCount, 0);
+  const cancellationLedger = fs.readFileSync(path.join(tempRoot, 'data', 'receipts', new Date().toISOString().slice(0, 10) + '.jsonl'), 'utf8')
+    .trim().split(/\r?\n/).map((line) => JSON.parse(line));
+  const cancelledReceipts = cancellationLedger.filter((row) => row.provider === 'slow' && row.status === 'cancelled');
+  assert.equal(cancelledReceipts.length, 1, 'client disconnect writes exactly one terminal receipt');
+  const cancelledReceipt = cancelledReceipts[0];
+  assert.ok(cancelledReceipt, 'client disconnect must persist a terminal provider receipt');
+  assert.equal(cancelledReceipt.failureClass, 'cancelled');
+  assert.equal(cancelledReceipt.modelInvocation, true);
+  assert.equal(cancelledReceipt.tokenUsageSource, 'chars_div_4');
+
+  const retryHangController = new AbortController();
+  const retryHang = fetch(baseUrl + '/api/oneshot', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ kind: 'retry_hang', prompt: 'preserve retry metrics on cancellation', dangerous: false }),
+    signal: retryHangController.signal,
+  });
+  // Windows process startup can exceed 250 ms after the expanded structured
+  // result fixture census. Give the helper enough time to emit the retry event
+  // before cancelling; the assertion below still proves cancellation preserves
+  // that already-observed event rather than manufacturing one.
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+  retryHangController.abort();
+  await retryHang.catch(() => {});
+  const retryHangDeadline = Date.now() + 5000;
+  let retryHangReceipt = null;
+  while (Date.now() < retryHangDeadline) {
+    const rows = fs.readFileSync(path.join(tempRoot, 'data', 'receipts', new Date().toISOString().slice(0, 10) + '.jsonl'), 'utf8')
+      .trim().split(/\r?\n/).map((line) => JSON.parse(line));
+    retryHangReceipt = rows.find((row) => row.provider === 'retry_hang' && row.status === 'cancelled') || null;
+    if (retryHangReceipt) break;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.ok(retryHangReceipt, 'structured cancellation receipt must be durable');
+  assert.equal(retryHangReceipt.providerRetryCount, 1);
+  assert.equal(retryHangReceipt.providerRetryDelayMs, 250);
+  assert.equal(retryHangReceipt.estimatedOutputTokens, 0, 'wire JSON is not model response text');
+  assert.equal(retryHangReceipt.tokenEstimateScope, 'request_chars_only');
+  assert.ok(retryHangReceipt.transportOutputChars > 0);
+  assert.match(retryHangReceipt.transportOutputHash, /^[0-9a-f]{64}$/);
+
+  const retryTimeoutResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({
+      kind: 'retry_timeout', prompt: 'preserve retry metrics on timeout',
+      timeoutMs: 1000, dangerous: false,
+    }),
+  });
+  const retryTimeout = await retryTimeoutResponse.json();
+  assert.equal(retryTimeout.timed_out, true);
+  assert.equal(retryTimeout.failureClass, 'timeout');
+  assert.equal(retryTimeout.provider_retries.count, 1);
+  assert.equal(retryTimeout.provider_retries.total_delay_ms, 250);
+  assert.equal(retryTimeout.stdout, '');
+  const retryTimeoutReceipt = fs.readFileSync(path.join(tempRoot, 'data', 'receipts', new Date().toISOString().slice(0, 10) + '.jsonl'), 'utf8')
+    .trim().split(/\r?\n/).map((line) => JSON.parse(line))
+    .find((row) => row.receiptId === retryTimeout.receiptId);
+  assert.equal(retryTimeoutReceipt.status, 'timed_out');
+  assert.equal(retryTimeoutReceipt.failureClass, 'timeout');
+  assert.equal(retryTimeoutReceipt.providerRetryCount, 1);
+  assert.equal(retryTimeoutReceipt.estimatedOutputTokens, 0);
 
   const diag = await (await fetch(baseUrl + '/api/diag', { headers: auth })).json();
   assert.equal(diag.results.echo.found, true);
@@ -575,9 +1099,19 @@ test('local Ollama adapter uses loopback HTTP, returns final-only text, and reco
     let body = '';
     for await (const chunk of req) body += chunk;
     requestPayload = JSON.parse(body);
+    if (requestPayload.prompt === 'upstream-500') {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'upstream internal failure' }));
+      return;
+    }
+    if (requestPayload.prompt === 'upstream-504') {
+      res.writeHead(504, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'upstream timed out' }));
+      return;
+    }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
-      model: 'fake-local:1b',
+      model: { malformed: true },
       response: '<think>private trace</think>\nFINAL_ONLY',
       done: true,
       done_reason: 'stop',
@@ -644,10 +1178,35 @@ test('local Ollama adapter uses loopback HTTP, returns final-only text, and reco
   assert.equal(result.route.resolved_model, 'fake-local:1b');
   assert.equal(result.usage.input_tokens, 12);
   assert.equal(result.usage.output_tokens, 3);
+  assert.equal(result.usage.total_tokens, 15);
   assert.equal(result.dropped_out, false);
   assert.equal(requestPayload.stream, false);
   assert.equal(requestPayload.think, false);
   assert.equal(requestPayload.options.num_predict, 64);
+
+  const ambiguousFailureResponse = await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ kind: 'local', prompt: 'upstream-500', dangerous: false }),
+  });
+  const ambiguousFailure = await ambiguousFailureResponse.json();
+  assert.equal(ambiguousFailure.exitCode, 500);
+  assert.equal(ambiguousFailure.model_invocation, null);
+  const timeoutFailureResponse = await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ kind: 'local', prompt: 'upstream-504', dangerous: false }),
+  });
+  const timeoutFailure = await timeoutFailureResponse.json();
+  assert.equal(timeoutFailure.timed_out, true);
+  assert.equal(timeoutFailure.model_invocation, null);
+  const receiptRows = fs.readFileSync(path.join(tempRoot, 'data', 'receipts', `${new Date().toISOString().slice(0, 10)}.jsonl`), 'utf8')
+    .trim().split(/\r?\n/).map((line) => JSON.parse(line));
+  const ambiguousReceipt = receiptRows.find((row) => row.receiptId === ambiguousFailure.receiptId);
+  const timeoutReceipt = receiptRows.find((row) => row.receiptId === timeoutFailure.receiptId);
+  assert.equal(ambiguousReceipt.tokenUsageSource, 'unknown');
+  assert.equal(timeoutReceipt.status, 'timed_out');
+  assert.equal(timeoutReceipt.failureClass, 'timeout');
 });
 
 test('hosted OpenAI-compatible adapter blocks China-hosted endpoints before network access', async (t) => {
@@ -701,7 +1260,14 @@ test('hosted OpenAI-compatible adapter blocks China-hosted endpoints before netw
   const result = await response.json();
   assert.equal(result.exitCode, -1);
   assert.equal(result.dropped_out, true);
+  assert.equal(result.model_invocation, false);
   assert.match(result.stderr, /blocked by geo\/supply-chain policy/);
+  const receiptFile = path.join(tempRoot, 'data', 'receipts', `${new Date().toISOString().slice(0, 10)}.jsonl`);
+  const receipt = fs.readFileSync(receiptFile, 'utf8').trim().split(/\r?\n/)
+    .map((line) => JSON.parse(line)).find((row) => row.receiptId === result.receiptId);
+  assert.equal(receipt.modelInvocation, false);
+  assert.equal(receipt.tokenUsageSource, 'not_invoked');
+  assert.equal(receipt.actualTotalTokens, null);
 });
 
 test('agents listing, tag updates, and broadcast fan-out respect auth, autoRoute, and the global cap', { timeout: 60000 }, async (t) => {

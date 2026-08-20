@@ -81,6 +81,8 @@ For a staged bridge:
 
 The installer registers a user-scoped MCP server named `relaybridge` with Codex and Claude when those CLIs are available. It stores the loopback URL and the path to the local token file, not the token value itself. After the canonical registration succeeds, recognized legacy names (`ps_bridge` and `ps-bridge`) are removed only when their command is confirmed to target a RelayBridge `mcp/server.mjs`; unrelated lookalikes are retained. A partial registration restores both client configuration files to their original bytes. Restart Codex or Claude after registration so they reload MCP configuration.
 
+MCP actions that cross into REST or provider admission fail closed unless the MCP process and REST listener report the same exact build and receipt store. The store identity is a SHA-256 value bound to a persisted random seed and the canonical store location; health, errors, and receipts never expose the raw data path. Read-only status tools and local cache replays remain available during a mismatch so an operator can inspect the listener and use the lifecycle tools to replace a stale build. A rejected provider action records `modelInvocation:false`, `tokenUsageSource:not_invoked`, zero retries, and no transport receipt.
+
 Useful checks:
 
 ```powershell

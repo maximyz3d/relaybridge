@@ -400,6 +400,10 @@ function Start-StagedBridge([string]$BridgeRoot, [int]$BridgePort, [string]$Expe
         if (-not $health.capabilityAuth -or $actualBuildId -ne $ExpectedBuildId) {
           throw "Port $BridgePort reported build '$actualBuildId' instead of candidate '$ExpectedBuildId'."
         }
+        if (-not $AllowLegacyVersion -and
+            (-not $health.receiptStoreIdentityReady -or [string]$health.receiptStoreId -notmatch '^[0-9a-f]{64}$')) {
+          throw "RelayBridge candidate $ExpectedBuildId did not initialize a valid receipt-store identity."
+        }
         return [pscustomobject]@{ Process = $proc; Health = $health }
       }
       Start-Sleep -Milliseconds 100

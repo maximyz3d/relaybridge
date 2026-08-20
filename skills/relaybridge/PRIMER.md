@@ -69,6 +69,9 @@ endpoint, provider table, supervision settings) in this same directory. Read
 them before doing anything non-obvious with the bridge — they exist so this
 block can stay short.
 
+**GitHub tracking.** Runs in an enrolled repo auto-commit, devlog, and label
+PRs. Tag prompts `#<issue>` and `bump:patch|minor|major`; merge creates the tag.
+
 **MCP tools.** If the RelayBridge MCP server is registered, prefer its tools
 over raw HTTP: `plan_task` (start here), `bridge_status`, `list_providers`,
 `route_preview`, `list_models`, `list_active_runs`, `bridge_activity`,

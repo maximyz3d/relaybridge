@@ -1,0 +1,6 @@
+[
+  { "name": "bump:patch", "color": "c2e0c6", "description": "Merge = patch version bump (0.0.X)" },
+  { "name": "bump:minor", "color": "bfdadc", "description": "Merge = minor version bump (0.X.0)" },
+  { "name": "bump:major", "color": "f9d0c4", "description": "Merge = major version bump (X.0.0)" },
+  { "name": "relaybridge", "color": "ededed", "description": "Opened or tracked by RelayBridge" }
+]

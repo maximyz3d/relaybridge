@@ -3,11 +3,16 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import TIMEOUT_POLICY from '../timeout-policy.cjs';
+import receiptStoreIdentityModule from '../lib/receipt-store-identity.cjs';
+
+const { receiptStoreIdentity } = receiptStoreIdentityModule;
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const BRIDGE_ROOT = path.resolve(HERE, '..');
 const PACKAGE = JSON.parse(fs.readFileSync(path.join(BRIDGE_ROOT, 'package.json'), 'utf8'));
 function loadExpectedBuildId() {
+  const testValue = process.env.NODE_ENV === 'test' ? process.env.RELAYBRIDGE_TEST_BUILD_ID : '';
+  if (/^[A-Za-z0-9._+-]{1,128}$/.test(String(testValue || ''))) return String(testValue);
   try {
     const value = JSON.parse(fs.readFileSync(path.join(BRIDGE_ROOT, 'build-info.json'), 'utf8')).buildId;
     if (/^[A-Za-z0-9._+-]{1,128}$/.test(String(value || ''))) return String(value);
@@ -24,6 +29,8 @@ function envFirst(...names) {
 }
 
 const TOKEN_FILE = path.resolve(envFirst('RELAYBRIDGE_TOKEN_FILE', 'PS_BRIDGE_TOKEN_FILE') || path.join(BRIDGE_ROOT, '.bridge-token'));
+const DATA_DIR = path.resolve(envFirst('RELAYBRIDGE_DATA_DIR', 'PS_BRIDGE_DATA_DIR') || path.join(BRIDGE_ROOT, 'data'));
+const EXPECTED_RECEIPT_STORE_IDENTITY = receiptStoreIdentity(DATA_DIR);
 const START_LOCK = path.join(BRIDGE_ROOT, '.mcp-start.lock');
 const OUT_LOG = path.join(BRIDGE_ROOT, 'bridge.mcp.out.log');
 const ERR_LOG = path.join(BRIDGE_ROOT, 'bridge.mcp.err.log');
@@ -98,6 +105,7 @@ export async function bridgeRequest(route, {
   timeoutMs = 30000,
   signal,
   tokenRequired = route !== '/api/health' && route !== '/api/capability',
+  actionIdentity = false,
 } = {}) {
   if (typeof route !== 'string' || !route.startsWith('/api/')) throw new Error('bridge route must start with /api/');
   const token = await getCapabilityToken();
@@ -105,11 +113,18 @@ export async function bridgeRequest(route, {
     throw new BridgeError('RelayBridge capability token is unavailable; restart the hardened bridge', { route });
   }
 
+  let actionPreflight = null;
+  if (actionIdentity) actionPreflight = await requireExpectedActionIdentity({ signal });
+
   // Tags every MCP-originated call so bridge telemetry can attribute it; the
   // dashboard shows these alongside its own calls.
   const headers = { Accept: 'application/json', 'X-RelayBridge-Client': 'mcp' };
   if (body !== undefined) headers['Content-Type'] = 'application/json';
   if (token) headers['X-RelayBridge-Token'] = token;
+  if (actionPreflight) {
+    headers['X-RelayBridge-Expected-Build-Id'] = EXPECTED_BUILD_ID;
+    headers['X-RelayBridge-Expected-Receipt-Store-Id'] = EXPECTED_RECEIPT_STORE_IDENTITY.id;
+  }
   let response;
   try {
     response = await fetch(new URL(route, BASE_URL), {
@@ -135,11 +150,57 @@ export async function bridgeRequest(route, {
       detail: payload,
     });
   }
+  if (actionPreflight && payload && typeof payload === 'object' && !Array.isArray(payload)) {
+    return { ...payload, actionPreflight };
+  }
   return payload;
 }
 
-export async function health() {
-  return bridgeRequest('/api/health', { timeoutMs: 3000, tokenRequired: false });
+export async function health({ signal } = {}) {
+  return bridgeRequest('/api/health', { timeoutMs: 3000, tokenRequired: false, signal });
+}
+
+function actionIdentityDetail(live) {
+  const currentBuildId = String(live?.buildId || '');
+  const currentReceiptStoreId = typeof live?.receiptStoreId === 'string' ? live.receiptStoreId : null;
+  const buildMatches = !!currentBuildId && currentBuildId === EXPECTED_BUILD_ID;
+  const receiptStoreMatches = EXPECTED_RECEIPT_STORE_IDENTITY.ready
+    && currentReceiptStoreId !== null
+    && currentReceiptStoreId === EXPECTED_RECEIPT_STORE_IDENTITY.id;
+  return {
+    ok: buildMatches && receiptStoreMatches,
+    expectedBuildId: EXPECTED_BUILD_ID,
+    currentBuildId: currentBuildId || null,
+    expectedReceiptStoreId: EXPECTED_RECEIPT_STORE_IDENTITY.id,
+    currentReceiptStoreId,
+    buildMatches,
+    receiptStoreMatches,
+  };
+}
+
+export async function requireExpectedActionIdentity({ signal } = {}) {
+  const live = await health({ signal });
+  const actionPreflight = actionIdentityDetail(live);
+  if (live?.capabilityAuth && actionPreflight.ok) return actionPreflight;
+  throw new BridgeError(
+    'RelayBridge action identity mismatch; restart/reinstall so MCP and REST use the same build and receipt store',
+    {
+      route: '/api/health',
+      status: 409,
+      detail: {
+        failureClass: 'bridge_identity_mismatch',
+        model_invocation: false,
+        token_usage_source: 'not_invoked',
+        transport_retry_count: 0,
+        provider_retries: {
+          count: 0, total_delay_ms: 0, max_attempt: 0, declared_max_retries: 0,
+          by_error: {}, by_status: {}, events: [], truncated: false,
+          observed_events: 0, invalid_events: 0, duplicate_events: 0,
+        },
+        actionPreflight,
+      },
+    },
+  );
 }
 
 export async function waitForHealth({ timeoutMs = 15000, expectDown = false } = {}) {
@@ -160,8 +221,12 @@ export async function waitForHealth({ timeoutMs = 15000, expectDown = false } = 
 }
 
 function requireExpectedBuild(result) {
-  if (result?.capabilityAuth && String(result.buildId || '') === EXPECTED_BUILD_ID) return result;
-  throw new BridgeError(`RelayBridge build ${result?.buildId || result?.version || 'unknown'} is using this port, but MCP expects ${EXPECTED_BUILD_ID}; perform a one-time restart before MCP can manage it`);
+  const identity = actionIdentityDetail(result);
+  if (result?.capabilityAuth && identity.ok) return result;
+  throw new BridgeError(
+    `RelayBridge build ${result?.buildId || result?.version || 'unknown'} is using this port, but MCP expects ${EXPECTED_BUILD_ID} with receipt store ${EXPECTED_RECEIPT_STORE_IDENTITY.id || 'unavailable'}; perform a one-time restart before MCP can manage it`,
+    { status: 409, detail: { failureClass: 'bridge_identity_mismatch', actionPreflight: identity } },
+  );
 }
 
 function acquireStartLock() {
