@@ -384,6 +384,17 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   assert.equal(identitySuccess.structuredContent.actionPreflight.currentReceiptStoreId, healthPayload.receiptStoreId);
   assert.equal(fs.readFileSync(invocationMarker, 'utf8').trim(), 'SAME_STORE_IDENTITY_OK');
 
+  const planned = await client.callTool({
+    name: 'plan_task',
+    arguments: { task: 'rename a CSS class in one stylesheet' },
+  });
+  assert.equal(planned.isError, undefined, JSON.stringify(planned.structuredContent));
+  assert.equal(planned.structuredContent.ok, true);
+  assert.ok(planned.structuredContent.primary, 'a fresh MCP read-only POST must reach the live planner');
+  assert.equal(planned.structuredContent.actionPreflight.ok, true);
+  assert.equal(planned.structuredContent.actionPreflight.expectedBuildId, 'integration-current');
+  assert.equal(planned.structuredContent.actionPreflight.expectedReceiptStoreId, healthPayload.receiptStoreId);
+
   staleTransport = new StdioClientTransport({
     command: process.execPath,
     args: [path.join(ROOT, 'mcp', 'server.mjs')],
