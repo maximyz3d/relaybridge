@@ -39,7 +39,9 @@ test('the secret skip-list blocks credentials even when not gitignored', () => {
   for (const bad of ['.env', '.env.production', 'server.pem', 'deploy.key',
     'id_rsa', 'credentials.json', '.bridge-token', 'aws-secrets.yaml', 'api_token.txt',
     '.npmrc', '.netrc', 'accesstoken.json', 'refreshcredential.toml', '.pgpass',
-    '.pypirc', '.envrc', 'deploy_key', 'nested/deploy_key', 'prod.env', 'staging.env']) {
+    '.pypirc', '.envrc', 'deploy_key', 'nested/deploy_key', 'prod.env', 'staging.env',
+    '.docker/config.json', 'nested/.docker/config.json', 'service-account.json',
+    'service-account-key.json', 'gcp-key.json', 'my-app-sa-key.json']) {
     assert.ok(tracker.isSecretPath(bad), `${bad} must be skipped`);
   }
   for (const ok of ['server.js', 'README.md', 'lib/github-tracker.js', 'docs/DEVLOG.md', 'monkey.ts']) {
