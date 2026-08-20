@@ -9,6 +9,7 @@ const path = require('path');
 const { spawn } = require('child_process');
 
 const ROOT = path.resolve(__dirname, '..');
+const TEST_BUILD_ID = 'relaybridge-windows-path-test';
 
 function reservePort() {
   return new Promise((resolve, reject) => {
@@ -79,6 +80,8 @@ test('Windows child PATH discovers the official Cursor install directory and kee
   const baseUrl = `http://127.0.0.1:${port}`;
   const serverEnv = {
     ...process.env,
+    NODE_ENV: 'test',
+    RELAYBRIDGE_TEST_BUILD_ID: TEST_BUILD_ID,
     PORT: String(port),
     PTY_MODE: 'none',
     LOCALAPPDATA: localAppData,
