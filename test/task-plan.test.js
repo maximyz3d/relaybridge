@@ -6,7 +6,7 @@ const fs = require('fs');
 const path = require('path');
 
 const { buildTaskPlan, resolveEffort, effortForTier, findEffortVariant, costClassFor, EFFORT_ORDER } = require('../lib/task-plan');
-const { resolveModelArgs } = require('../lib/model-tiers');
+const { resolveModelArgs, applyModelArgs, normalizeSuppressArgs } = require('../lib/model-tiers');
 const config = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'cli-config.json'), 'utf8'));
 
 const route = (tier, kinds) => ({ classification: { tier }, selected: kinds.map((kind) => ({ kind })) });
@@ -49,6 +49,46 @@ test('a provider with no effort knob reports that honestly', () => {
   const resolved = resolveEffort({ entry: config.claude, effort: 'high', baseModel: 'opus' });
   assert.equal(resolved.method, 'model_choice');
   assert.deepEqual(resolved.args, [], 'inventing a flag Claude does not accept would fail every call');
+});
+
+test('a model tier can suppress a CLI flag that its selected model rejects', () => {
+  const entry = {
+    model_tiers: {
+      heavy: {
+        args: ['--model', 'auto'],
+        model: 'auto',
+        suppress_args: [{ flag: '--effort', value_count: 1 }],
+      },
+    },
+  };
+  const choice = resolveModelArgs({ entry, taskTier: 'complex' });
+  const args = applyModelArgs(
+    ['agy.exe', '--model', 'concrete', '--effort', 'high', '--print', '{prompt}'],
+    choice.args,
+    entry,
+    choice.suppressArgs,
+  );
+  assert.deepEqual(args, ['agy.exe', '--model', 'auto', '--print', '{prompt}']);
+});
+
+test('suppressed CLI arguments use declared arity and preserve positional arguments', () => {
+  assert.deepEqual(
+    applyModelArgs(['tool', '--quiet', '{prompt}'], [], {}, [{ flag: '--quiet', value_count: 0 }]),
+    ['tool', '{prompt}'],
+  );
+  assert.deepEqual(
+    applyModelArgs(['tool', '--threshold', '-5', 'input.kicad_pcb'], [], {}, [{ flag: '--threshold', value_count: 1 }]),
+    ['tool', 'input.kicad_pcb'],
+  );
+});
+
+test('invalid suppressed argument definitions are ignored fail-safe', () => {
+  assert.deepEqual(normalizeSuppressArgs(null), []);
+  assert.deepEqual(normalizeSuppressArgs(['--effort', {}, { flag: 'effort', value_count: 1 }, { flag: '--x', value_count: -1 }]), []);
+  assert.deepEqual(
+    applyModelArgs(['tool', '--effort', 'high', '{prompt}'], [], {}, ['--effort']),
+    ['tool', '--effort', 'high', '{prompt}'],
+  );
 });
 
 test('cost class distinguishes free, local, subscription and metered', () => {

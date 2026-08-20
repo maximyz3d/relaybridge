@@ -2616,7 +2616,12 @@ async function executeOneShot(body, res) {
     console.warn(`[RelayBridge] ${kind}: pinned model "${modelChoice.model}" is not in this account's model list â€” falling back to the account default`);
     modelChoice = { ...modelChoice, args: [], model: null, source: 'account_default_retired_pin' };
   }
-  const slot = applyModelArgs(resolveSlot(slotRaw), modelChoice.args, entry);
+  const slot = applyModelArgs(
+    resolveSlot(slotRaw),
+    modelChoice.args,
+    entry,
+    modelChoice.suppressArgs,
+  );
   const hasInlinePrompt = slot.some((a) => typeof a === 'string' && a.includes('{prompt}'));
   const hasPromptFile = slot.some((a) => typeof a === 'string' && a.includes('{prompt_file}'));
   if (hasInlinePrompt && hasPromptFile) {
@@ -2689,6 +2694,10 @@ async function executeOneShot(body, res) {
       ? `${entry.model}${ollamaManifestIdentity(entry) ? `@${ollamaManifestIdentity(entry)}` : ''}`
       : null,
     requested_effort: flagValue('--effort') || flagValue('--reasoning-effort'),
+    effort_method: (flagValue('--effort') || flagValue('--reasoning-effort'))
+      ? 'flag'
+      : (modelChoice.model ? 'model_choice' : 'account_default'),
+    suppressed_cli_flags: (modelChoice.suppressArgs || []).map((spec) => spec.flag),
     dangerous: useDanger,
     prompt_transport: promptTransport,
     prompt_truncated: promptTruncated,
