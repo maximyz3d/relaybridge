@@ -466,6 +466,9 @@ function appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt }
     providerErrorDiagnosticTruncated: payload.provider_error_diagnostic_truncated === true,
     providerErrorHash: payload.provider_error_diagnostic
       ? crypto.createHash('sha256').update(String(payload.provider_error_diagnostic)).digest('hex') : null,
+    stopReason: normalizeClaudeResultString(payload.stop_reason),
+    supervisorStopReason: normalizeClaudeResultString(payload.supervisor_stop_reason),
+    providerTimeoutSource: normalizeClaudeResultString(payload.provider_timeout_source),
     providerPermissionDenialCount: nonnegativeUsageNumber(payload.provider_permission_denials?.count),
     providerPermissionDenialObserved: nonnegativeUsageNumber(payload.provider_permission_denials?.observed),
     providerPermissionDenialInvalid: nonnegativeUsageNumber(payload.provider_permission_denials?.invalid),
@@ -956,6 +959,19 @@ function claudeStopReasonFailureClass(stopReason) {
   if (stopReason === 'refusal') return 'refusal';
   if (stopReason === 'tool_deferred') return 'tool_deferred';
   return null;
+}
+
+const PROVIDER_INTERNAL_TIMEOUT_PATTERNS = [
+  /\btimeout waiting for (?:a )?response\b/i,
+  /\btimed out waiting for (?:a )?response\b/i,
+  /\brequest timed out\b/i,
+  /\bdeadline exceeded\b/i,
+  /\betimedout\b/i,
+];
+
+function hasProviderInternalTimeoutDiagnostic(value) {
+  const diagnostic = String(value || '');
+  return PROVIDER_INTERNAL_TIMEOUT_PATTERNS.some((pattern) => pattern.test(diagnostic));
 }
 
 function parseConfiguredOneShotOutput(entry, rawOutput) {
@@ -2940,7 +2956,13 @@ async function executeOneShot(body, res) {
         && (code !== 0 || !cleanedStdout || parsedOutput.isError));
     const permission_signals = ['headless mode cannot prompt', 'auto-denied', 'no output produced'];
     const permission_denied = permission_signals.some((signal) => failureBlob.includes(signal));
-    const providerTimedOut = timedOut || authoritativeApiFailure === 'timeout';
+    // Provider CLIs can enforce their own request deadline before RelayBridge's
+    // progress supervisor fires. Promote only authoritative failed/no-answer
+    // diagnostics; healthy model prose that discusses timeouts must remain a
+    // successful response.
+    const providerInternalTimedOut = (code !== 0 || !cleanedStdout || parsedOutput.isError)
+      && hasProviderInternalTimeoutDiagnostic(failureBlob);
+    const providerTimedOut = timedOut || authoritativeApiFailure === 'timeout' || providerInternalTimedOut;
     const finalFailureClass = parsedOutput.resultSubtype === 'error_max_budget_usd' ? 'budget'
       : authoritativeApiFailure || (rate_limited ? 'rate_limit'
       : budget_exceeded ? 'budget'
@@ -2982,8 +3004,11 @@ async function executeOneShot(body, res) {
       permission_denied,
       model: modelChoice.model,
       model_tier: modelChoice.modelTier,
-      stop_reason: stopReason,
+      stop_reason: stopReason || (providerInternalTimedOut ? 'provider_internal_timeout' : null),
       supervisor_stop_reason: stopReason,
+      provider_timeout_source: timedOut ? 'relay_supervisor'
+        : authoritativeApiFailure === 'timeout' ? 'provider_api_status'
+          : providerInternalTimedOut ? 'provider_cli_diagnostic' : null,
       stop_detail: stopDetail,
       progress: supervisor.snapshot(),
       timed_out: providerTimedOut,
