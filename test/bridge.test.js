@@ -83,7 +83,7 @@ test('provider config uses the installed subscription CLIs and safe headless mod
   assert.equal(config.gemini.oneshot_safe.at(-1), '{prompt}');
   assert.equal(config.gemini.oneshot_safe[config.gemini.oneshot_safe.indexOf('--add-dir') + 1], '{cwd}');
   assert.equal(config.gemini.oneshot_safe[config.gemini.oneshot_safe.indexOf('--effort') + 1], 'high');
-  assert.deepEqual(config.gemini.model_tiers.heavy.suppress_flags, ['--effort']);
+  assert.deepEqual(config.gemini.model_tiers.heavy.suppress_args, [{ flag: '--effort', value_count: 1 }]);
   assert.equal(config.gemini.oneshot_safe[config.gemini.oneshot_safe.indexOf('--mode') + 1], 'plan');
   assert.ok(config.gemini.dangerous.includes('--dangerously-skip-permissions'));
   assert.equal(config.gemini.npm_package, undefined);
@@ -313,7 +313,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
         heavy: {
           args: ['--model', 'auto'],
           model: 'auto',
-          suppress_flags: ['--effort'],
+          suppress_args: [{ flag: '--effort', value_count: 1 }],
         },
       },
     },
@@ -614,6 +614,8 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(geminiAutoResult.stdout, 'AUTO_COMPAT_OK');
   assert.equal(geminiAutoResult.route.requested_model, 'auto');
   assert.equal(geminiAutoResult.route.requested_effort, null);
+  assert.equal(geminiAutoResult.route.effort_method, 'model_choice');
+  assert.deepEqual(geminiAutoResult.route.suppressed_cli_flags, ['--effort']);
 
   const usageResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST',

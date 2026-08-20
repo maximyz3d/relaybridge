@@ -2620,7 +2620,7 @@ async function executeOneShot(body, res) {
     resolveSlot(slotRaw),
     modelChoice.args,
     entry,
-    modelChoice.suppressFlags,
+    modelChoice.suppressArgs,
   );
   const hasInlinePrompt = slot.some((a) => typeof a === 'string' && a.includes('{prompt}'));
   const hasPromptFile = slot.some((a) => typeof a === 'string' && a.includes('{prompt_file}'));
@@ -2694,6 +2694,10 @@ async function executeOneShot(body, res) {
       ? `${entry.model}${ollamaManifestIdentity(entry) ? `@${ollamaManifestIdentity(entry)}` : ''}`
       : null,
     requested_effort: flagValue('--effort') || flagValue('--reasoning-effort'),
+    effort_method: (flagValue('--effort') || flagValue('--reasoning-effort'))
+      ? 'flag'
+      : (modelChoice.model ? 'model_choice' : 'account_default'),
+    suppressed_cli_flags: (modelChoice.suppressArgs || []).map((spec) => spec.flag),
     dangerous: useDanger,
     prompt_transport: promptTransport,
     prompt_truncated: promptTruncated,
