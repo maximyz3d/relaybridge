@@ -24,6 +24,21 @@ test('a cheap lookup and a hard task get different models from the same CLI', ()
   assert.notDeepEqual(cheap.args, hard.args);
 });
 
+test('Gemini tiers pin only ids in the current agy model census and suppress redundant effort', () => {
+  const current = new Set([
+    'gemini-3.5-flash-low',
+    'gemini-3.6-flash-medium',
+    'gemini-3.1-pro-high',
+  ]);
+  for (const [tier, spec] of Object.entries(config.gemini.model_tiers)) {
+    assert.ok(current.has(spec.model), `gemini ${tier} must be in the verified agy model census`);
+    assert.notEqual(spec.model, 'auto', 'Antigravity 1.1.16 no longer accepts auto');
+    assert.deepEqual(spec.suppress_args, [{ flag: '--effort', value_count: 1 }]);
+  }
+  assert.deepEqual(config.gemini.models_probe, ['agy', 'models']);
+  assert.equal(config.gemini.models_parse, '^([a-z0-9][a-z0-9.-]+)\\t');
+});
+
 test('Claude pins use stable aliases rather than versioned identifiers', () => {
   // Versioned ids rot on release; aliases keep working.
   for (const tier of ['light', 'standard', 'heavy']) {
@@ -77,4 +92,5 @@ test('stale model pins are reported rather than trusted silently', () => {
 test('shipped config carries a verification date and per-CLI check commands', () => {
   assert.ok(config._models.modelsCheckedAt, 'model pins need a checked date');
   assert.ok(config._models.verifyCommands.codex, 'codex ids rot fastest and need a check command');
+  assert.equal(config._models.verifyCommands.gemini, 'agy models');
 });
