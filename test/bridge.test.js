@@ -11,6 +11,7 @@ const { spawn, spawnSync } = require('child_process');
 
 const ROOT = path.resolve(__dirname, '..');
 const CONFIG = path.join(ROOT, 'cli-config.json');
+const TEST_BUILD_ID = 'relaybridge-source-test';
 const TIMEOUT_POLICY = require('../timeout-policy.cjs');
 
 function readConfig() {
@@ -535,6 +536,8 @@ test('prompt-file transport preserves long special-character prompts and cleans 
     cwd: ROOT,
     env: {
       ...process.env,
+      NODE_ENV: 'test',
+      RELAYBRIDGE_TEST_BUILD_ID: TEST_BUILD_ID,
       PORT: String(port),
       PTY_MODE: 'none',
       PS_BRIDGE_CONFIG_FILE: configPath,
@@ -573,7 +576,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.doesNotMatch(dashboardHtml, /__ONE_SHOT_DEFAULT_TIMEOUT_MS__/);
   const runningHealth = await (await fetch(baseUrl + '/api/health')).json();
   assert.equal(runningHealth.fullPermissions, false);
-  assert.equal(runningHealth.buildId, '2.0.1');
+  assert.equal(runningHealth.buildId, TEST_BUILD_ID);
   assert.equal(runningHealth.stickyDangerousEnabled, false);
   assert.deepEqual(runningHealth.oneShotTimeoutPolicy, { minimumMs: 1000, defaultMs: 1200000, maxMs: 2700000 });
   assert.ok(Object.prototype.hasOwnProperty.call(runningHealth, 'tokenAcl'));
@@ -1226,6 +1229,8 @@ test('local Ollama adapter uses loopback HTTP, returns final-only text, and reco
     cwd: ROOT,
     env: {
       ...process.env,
+      NODE_ENV: 'test',
+      RELAYBRIDGE_TEST_BUILD_ID: TEST_BUILD_ID,
       PORT: String(bridgePort),
       PTY_MODE: 'none',
       PS_BRIDGE_CONFIG_FILE: configPath,
@@ -1312,6 +1317,8 @@ test('hosted OpenAI-compatible adapter blocks China-hosted endpoints before netw
     cwd: ROOT,
     env: {
       ...process.env,
+      NODE_ENV: 'test',
+      RELAYBRIDGE_TEST_BUILD_ID: TEST_BUILD_ID,
       PORT: String(bridgePort),
       PTY_MODE: 'none',
       PS_BRIDGE_CONFIG_FILE: configPath,
@@ -1383,6 +1390,8 @@ test('agents listing, tag updates, and broadcast fan-out respect auth, autoRoute
     cwd: ROOT,
     env: {
       ...process.env,
+      NODE_ENV: 'test',
+      RELAYBRIDGE_TEST_BUILD_ID: TEST_BUILD_ID,
       PORT: String(port),
       PTY_MODE: 'none',
       RELAYBRIDGE_CONFIG_FILE: configPath,
