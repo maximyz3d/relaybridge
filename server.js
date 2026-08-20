@@ -1748,6 +1748,14 @@ const ALLOWED_ORIGINS = new Set([
   `http://localhost:${PORT}`,
 ]);
 
+function isDirectLoopbackRequest(req) {
+  const remote = String(req.socket?.remoteAddress || '').toLowerCase();
+  const loopback = remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1';
+  const forwarded = ['forwarded', 'x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto']
+    .some((header) => req.headers[header] != null);
+  return loopback && !forwarded;
+}
+
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
@@ -1824,9 +1832,13 @@ app.get('/api/health', (req, res) => {
 });
 
 // Same-origin browser clients use this bootstrap endpoint once, then attach
-// the token as a non-simple request header. Cross-origin pages are rejected by
-// the origin middleware before they can read the token or submit a preflight.
+// the token as a non-simple request header. Never disclose the master token
+// through a reverse proxy: remote MCP exposes only /mcp, and a path-scoped
+// tunnel must not turn the local dashboard bootstrap into a public endpoint.
 app.get('/api/capability', (req, res) => {
+  if (!isDirectLoopbackRequest(req)) {
+    return res.status(403).json({ error: 'capability bootstrap is loopback-only' });
+  }
   res.setHeader('Cache-Control', 'no-store');
   res.json({ token: CAPABILITY_TOKEN, header: 'X-RelayBridge-Token', legacyHeader: 'X-PS-Bridge-Token' });
 });
@@ -2482,6 +2494,9 @@ app.get('/api/sessions/:id/buffer', (req, res) => {
 
 // One-shot exec â€” for Cowork to run a PowerShell command and get output back.
 app.post('/api/exec', (req, res) => {
+  if (!isDirectLoopbackRequest(req)) {
+    return res.status(403).json({ error: 'command execution is loopback-only' });
+  }
   const { command, shell = 'powershell', timeoutMs = 60000, cwd } = req.body || {};
   if (!command || typeof command !== 'string') {
     return res.status(400).json({ error: 'command (string) required' });

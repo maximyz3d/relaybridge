@@ -553,6 +553,16 @@ test('prompt-file transport preserves long special-character prompts and cleans 
     headers: { Origin: 'https://attacker.example' },
   });
   assert.equal(hostileOrigin.status, 403);
+  const proxiedCapability = await fetch(baseUrl + '/api/capability', {
+    headers: { 'X-Forwarded-For': '203.0.113.9' },
+  });
+  assert.equal(proxiedCapability.status, 403);
+  const proxiedExec = await fetch(baseUrl + '/api/exec', {
+    method: 'POST',
+    headers: { ...auth, 'Content-Type': 'application/json', 'X-Forwarded-For': '203.0.113.9' },
+    body: JSON.stringify({ command: 'Write-Output MUST_NOT_RUN' }),
+  });
+  assert.equal(proxiedExec.status, 403);
   const traversal = await fetch(baseUrl + '/api/collabs/..%2F..%2Fpackage', { headers: auth });
   assert.notEqual(traversal.status, 200);
 

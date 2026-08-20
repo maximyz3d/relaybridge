@@ -184,6 +184,32 @@ test('secrets inside a NEW directory are still caught (the -uall guarantee)', ()
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+test('a pre-staged secret is never included in checkpoint or devlog commits', async () => {
+  const { dir, g } = tempRepo();
+  g('checkout', '-qb', 'feature/safe-checkpoint');
+  fs.writeFileSync(path.join(dir, '.env'), 'SECRET=hunter2');
+  fs.writeFileSync(path.join(dir, 'safe.js'), 'module.exports = 1;');
+  g('add', '--', '.env');
+  const registry = { repos: [{
+    ...tracker.defaultRepoEntry({ name: 'o/r', path: dir }),
+    dryRun: false,
+    autoPush: false,
+  }] };
+
+  const result = await tracker.trackRun({
+    runId: 'run_safe', kind: 'claude', prompt: 'checkpoint safe work', cwd: dir,
+  }, registry);
+
+  assert.equal(result.tracked, true);
+  assert.ok(result.secretsSkipped.includes('.env'));
+  const committed = g('log', '--format=', '--name-only', '-2').toString().split(/\r?\n/).filter(Boolean);
+  assert.ok(committed.includes('safe.js'));
+  assert.ok(committed.includes('docs/DEVLOG.md'));
+  assert.ok(!committed.includes('.env'), 'pre-staged secret must not enter either commit');
+  assert.match(g('status', '--porcelain').toString(), /^A  \.env/m, 'the caller\'s staged secret remains staged but uncommitted');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 test('paths with spaces and non-ASCII survive parsing (-z, no octal escapes)', () => {
   const { dir } = tempRepo();
   fs.mkdirSync(path.join(dir, 'dir with space'));

@@ -52,9 +52,14 @@ hostname — Tailscale Funnel is the right tool; a random `trycloudflare.com` UR
 changes on every restart and breaks the connector each time.
 
 ```powershell
-tailscale funnel --bg 8787
+tailscale funnel --bg --set-path=/mcp http://127.0.0.1:8787/mcp
 tailscale funnel status     # note the https://<machine>.<tailnet>.ts.net URL
 ```
+
+The path-scoped target is mandatory. Never funnel port `8787` or `/` directly:
+the dashboard and REST administration APIs are local-only surfaces. RelayBridge
+also rejects capability-token bootstrap and command execution when proxy
+headers are present, as defense in depth.
 
 Cloudflare quick tunnels work for a one-off test but are not durable:
 
@@ -121,7 +126,7 @@ connector and any MCP clients.
 
 ## Recommended posture
 
-Run the connector in `safe` profile with a Tailscale Funnel URL. That gives
+Run the connector in `safe` profile with a path-scoped Tailscale Funnel URL. That gives
 every surface — phone included — the ability to check status, route work, and
 run committees, while the operations that change your machine stay on stdio
 where they require a local, already-trusted client.
