@@ -1,0 +1,228 @@
+'use strict';
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const http = require('node:http');
+const os = require('node:os');
+const path = require('node:path');
+const { pathToFileURL } = require('node:url');
+const { spawn, spawnSync } = require('node:child_process');
+
+const ROOT = path.resolve(__dirname, '..');
+const TEST_BUILD_ID = 'rest-rejection-receipts-test';
+
+function reservePort() {
+  return new Promise((resolve, reject) => {
+    const server = http.createServer();
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const port = server.address().port;
+      server.close((error) => error ? reject(error) : resolve(port));
+    });
+  });
+}
+
+async function waitForHealth(baseUrl, proc) {
+  const deadline = Date.now() + 10000;
+  while (Date.now() < deadline) {
+    if (proc.exitCode !== null) throw new Error(`test bridge exited ${proc.exitCode}`);
+    try {
+      const response = await fetch(`${baseUrl}/api/health`);
+      if (response.ok) return response.json();
+    } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error('test bridge did not become healthy');
+}
+
+function dereferenceReceipt(dataDir, receiptId) {
+  const moduleUrl = pathToFileURL(path.join(ROOT, 'mcp', 'receipts.mjs')).href;
+  const script = [
+    `import { readReceipt } from ${JSON.stringify(moduleUrl)};`,
+    `process.stdout.write(JSON.stringify(readReceipt(${JSON.stringify(receiptId)})));`,
+  ].join('\n');
+  const result = spawnSync(process.execPath, ['--input-type=module', '--eval', script], {
+    cwd: ROOT,
+    env: { ...process.env, RELAYBRIDGE_DATA_DIR: dataDir },
+    encoding: 'utf8',
+    windowsHide: true,
+  });
+  assert.equal(result.status, 0, result.stderr);
+  return JSON.parse(result.stdout);
+}
+
+test('direct REST pre-admission failures persist deduplicated zero-invocation receipts', { timeout: 30000 }, async (t) => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'relaybridge-rest-rejections-'));
+  const dataDir = path.join(tempRoot, 'data');
+  const tokenPath = path.join(tempRoot, 'bridge.token');
+  const configPath = path.join(tempRoot, 'config.json');
+  const invocationMarker = path.join(tempRoot, 'provider-invocations.txt');
+  const helper = path.join(ROOT, 'test', 'prompt-file-cli.js');
+  const baseSlot = [process.execPath, helper, '--prompt-file', '{prompt_file}', '--invocation-marker', invocationMarker];
+  const probe = [process.execPath, helper, '--version'];
+  const provider = (label, slot = baseSlot, extra = {}) => ({
+    label,
+    safe: probe,
+    dangerous: probe,
+    oneshot_safe: slot,
+    oneshot_dangerous: slot,
+    diagnostic_binary: process.execPath,
+    probe,
+    ...extra,
+  });
+
+  fs.writeFileSync(configPath, JSON.stringify({
+    guarded: provider('Guarded', [...baseSlot, '--delay', '10000']),
+    bad_env: provider('Bad environment', baseSlot, { oneshot_env: ['invalid'] }),
+    no_slot: provider('No one-shot slot', null, { oneshot_safe: [], oneshot_dangerous: [] }),
+    mixed_transport: provider('Mixed transport', [process.execPath, helper, '--prompt-file', '{prompt_file}', '--output', '{prompt}']),
+    signed_out: provider('Signed out', baseSlot, {
+      probe: [process.execPath, '-e', 'process.exit(1)'],
+      login_command: [process.execPath, '-e', 'process.exit(0)'],
+    }),
+  }), 'utf8');
+
+  const port = await reservePort();
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const proc = spawn(process.execPath, [path.join(ROOT, 'server.js')], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      NODE_ENV: 'test',
+      RELAYBRIDGE_TEST_BUILD_ID: TEST_BUILD_ID,
+      PORT: String(port),
+      PTY_MODE: 'none',
+      RELAYBRIDGE_CONFIG_FILE: configPath,
+      RELAYBRIDGE_TOKEN_FILE: tokenPath,
+      RELAYBRIDGE_DATA_DIR: dataDir,
+      RELAYBRIDGE_MAX_ACTIVE_ONESHOTS: '4',
+      RELAYBRIDGE_MAX_ACTIVE_PER_PROVIDER: '1',
+    },
+    windowsHide: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let serverOutput = '';
+  proc.stdout.on('data', (chunk) => { serverOutput += chunk; });
+  proc.stderr.on('data', (chunk) => { serverOutput += chunk; });
+  t.after(async () => {
+    if (proc.exitCode === null) proc.kill('SIGTERM');
+    await new Promise((resolve) => proc.exitCode !== null ? resolve() : proc.once('exit', resolve));
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  });
+
+  let health;
+  try { health = await waitForHealth(baseUrl, proc); }
+  catch (error) { throw new Error(`${error.message}\n${serverOutput}`); }
+  const capability = await (await fetch(`${baseUrl}/api/capability`)).json();
+  const headers = {
+    'Content-Type': 'application/json',
+    'X-RelayBridge-Token': capability.token,
+  };
+
+  const assertRejected = async ({ body, status, failureClass }) => {
+    const response = await fetch(`${baseUrl}/api/oneshot`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+    });
+    assert.equal(response.status, status);
+    const payload = await response.json();
+    assert.equal(payload.failureClass, failureClass);
+    assert.equal(payload.model_invocation, false);
+    assert.equal(payload.token_usage_source, 'not_invoked');
+    assert.equal(payload.transportReceiptId, null);
+    assert.equal(payload.transport_retry_count, 0);
+    assert.equal(payload.provider_retries.count, 0);
+    assert.equal(payload.receiptPersisted, true);
+    assert.match(payload.receiptId, /^rcpt_/);
+    assert.equal(payload.requestId, body.requestId);
+    assert.equal(response.headers.get('x-relaybridge-receipt-id'), payload.receiptId);
+    assert.equal(response.headers.get('x-relaybridge-request-id'), body.requestId);
+    assert.equal(response.headers.get('x-relaybridge-build-id'), health.buildId);
+    assert.equal(response.headers.get('x-relaybridge-receipt-store-id'), health.receiptStoreId);
+
+    const receipt = dereferenceReceipt(dataDir, payload.receiptId);
+    assert.equal(receipt.receiptId, payload.receiptId);
+    assert.equal(receipt.event, 'bridge_provider_rejection');
+    assert.equal(receipt.status, 'rejected');
+    assert.equal(receipt.failureClass, failureClass);
+    assert.equal(receipt.modelInvocation, false);
+    assert.equal(receipt.tokenUsageSource, 'not_invoked');
+    assert.equal(receipt.transportReceiptId, null);
+    assert.equal(receipt.physicalAttemptCount, 0);
+    assert.equal(receipt.transportRetryCount, 0);
+    assert.equal(receipt.providerRetryCount, 0);
+    assert.equal(receipt.requestId, body.requestId);
+    assert.equal(receipt.invocationId, body.requestId);
+    assert.equal(receipt.attemptId, body.requestId);
+    assert.equal(receipt.bridgeBuildId, health.buildId);
+    assert.equal(receipt.receiptStoreId, health.receiptStoreId);
+    assert.ok(Number.isInteger(receipt.durationMs) && receipt.durationMs >= 0);
+    assert.match(receipt._cursor, /^[A-Za-z0-9_-]+$/);
+    return { response, payload, receipt };
+  };
+
+  await assertRejected({
+    body: { kind: 'unknown', prompt: 'must not start', requestId: 'request:validation:unknown' },
+    status: 400,
+    failureClass: 'validation',
+  });
+  await assertRejected({
+    body: { kind: 'bad_env', prompt: 'must not start', requestId: 'request:configuration:env' },
+    status: 500,
+    failureClass: 'configuration',
+  });
+  await assertRejected({
+    body: { kind: 'no_slot', prompt: 'must not start', requestId: 'request:configuration:slot' },
+    status: 400,
+    failureClass: 'configuration',
+  });
+  await assertRejected({
+    body: { kind: 'mixed_transport', prompt: 'must not start', requestId: 'request:configuration:mixed' },
+    status: 400,
+    failureClass: 'configuration',
+  });
+  assert.equal(fs.existsSync(invocationMarker), false, 'validation/config rejections must not start a provider process');
+
+  const diag = await fetch(`${baseUrl}/api/diag`, { headers });
+  assert.equal(diag.status, 200);
+  await assertRejected({
+    body: { kind: 'signed_out', prompt: 'must not start', requestId: 'request:auth:signed-out' },
+    status: 409,
+    failureClass: 'auth',
+  });
+  assert.equal(fs.existsSync(invocationMarker), false, 'signed-out auth rejection must not start a provider process');
+
+  const firstController = new AbortController();
+  const first = fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ kind: 'guarded', prompt: 'first admitted provider', requestId: 'request:admitted:first' }),
+    signal: firstController.signal,
+  });
+  const markerDeadline = Date.now() + 5000;
+  while (Date.now() < markerDeadline && !fs.existsSync(invocationMarker)) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.equal(fs.readFileSync(invocationMarker, 'utf8').trim(), 'first admitted provider');
+
+  const admissionBody = {
+    kind: 'guarded',
+    prompt: 'rejected provider must never start',
+    requestId: 'request:admission:duplicate',
+  };
+  const firstRejection = await assertRejected({ body: admissionBody, status: 429, failureClass: 'admission_limit' });
+  assert.equal(firstRejection.payload.receiptDeduplicated, false);
+  const duplicateRejection = await assertRejected({ body: admissionBody, status: 429, failureClass: 'admission_limit' });
+  assert.equal(duplicateRejection.payload.receiptDeduplicated, true);
+  assert.equal(duplicateRejection.payload.receiptId, firstRejection.payload.receiptId);
+  assert.equal(fs.readFileSync(invocationMarker, 'utf8').trim(), 'first admitted provider', 'admission rejection must not spawn a second provider');
+
+  const receiptFile = path.join(dataDir, 'receipts', `${new Date().toISOString().slice(0, 10)}.jsonl`);
+  const rows = fs.readFileSync(receiptFile, 'utf8').trim().split(/\r?\n/).map((line) => JSON.parse(line));
+  assert.equal(rows.filter((row) => row.requestId === admissionBody.requestId).length, 1, 'one requestId persists exactly one rejection receipt');
+
+  firstController.abort();
+  await first.catch(() => {});
+});
