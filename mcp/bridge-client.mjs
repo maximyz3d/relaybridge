@@ -113,8 +113,14 @@ export async function bridgeRequest(route, {
     throw new BridgeError('RelayBridge capability token is unavailable; restart the hardened bridge', { route });
   }
 
+  // The REST bridge requires build/store identity on every MCP mutation. Make
+  // that invariant automatic for non-read HTTP methods so a newly added MCP
+  // POST cannot accidentally omit the preflight and fail with a 409 (or, on an
+  // older bridge, bypass the intended split-brain guard).
+  const normalizedMethod = String(method || 'GET').toUpperCase();
+  const identityRequired = actionIdentity || !['GET', 'HEAD', 'OPTIONS'].includes(normalizedMethod);
   let actionPreflight = null;
-  if (actionIdentity) actionPreflight = await requireExpectedActionIdentity({ signal });
+  if (identityRequired) actionPreflight = await requireExpectedActionIdentity({ signal });
 
   // Tags every MCP-originated call so bridge telemetry can attribute it; the
   // dashboard shows these alongside its own calls.
