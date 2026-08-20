@@ -51,6 +51,15 @@ Response:
 | `model_tier` | The weight class used. |
 | `receiptId` | Points at the persisted receipt. |
 
+Direct REST rejections that occur before a provider starts (request validation,
+provider configuration/auth gates, and admission backpressure) also return a
+canonical `receiptId`. The receipt has `modelInvocation=false`,
+`tokenUsageSource=not_invoked`, null `transportReceiptId`, and zero provider and
+transport retries. The error response exposes the same identity through
+`X-RelayBridge-Receipt-Id`, `X-RelayBridge-Request-Id`,
+`X-RelayBridge-Build-Id`, and `X-RelayBridge-Receipt-Store-Id`. Reusing one
+`requestId` reuses the original receipt; it does not imply an automatic retry.
+
 ### `GET /api/runs/active`
 Live supervision state for in-flight calls: `phase`, `assessment`, `idleMs`,
 `bytes`, `lines`, `repeatPeak`, `cpuMs`, `idleBudgetMs`, `hardCapRemainingMs`.
@@ -127,11 +136,14 @@ ceiling.
 
 ## Receipts
 
-Every provider call appends to `data/receipts/YYYY-MM-DD.jsonl`: `receiptId`,
+Every provider call or pre-provider rejection appends to
+`data/receipts/YYYY-MM-DD.jsonl`: `receiptId`,
 timestamp, provider, input/output hashes and character counts, `durationMs`,
 `failureClass`, and the route. Hashes rather than content, so receipts are safe
 to read and share. Use them to audit what a session cost and which providers
-actually delivered.
+actually delivered. A `bridge_provider_rejection` receipt proves that
+RelayBridge rejected the request without starting a provider; it is not
+evidence of model work, token spend, or a transport attempt.
 
 ## Constraints
 

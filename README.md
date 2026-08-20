@@ -274,7 +274,11 @@ Use `route_preview` before spending a hosted provider call. Use `route_and_ask` 
 
 Agent management tools: `list_agents` lists AI providers with tags, autoRoute, and cached readiness without spawning probes; `set_agent_tags` replaces one provider's routing tags; `broadcast` fans one prompt out to many providers at once and can therefore spend multiple providers' quota in a single call — prefer a narrow tag or explicit provider list.
 
-Every provider call writes receipts where possible. Use `list_runs`, `get_run`, `list_receipts`, and `get_receipt` to recover provenance instead of relying on a chat transcript alone.
+Every provider call writes receipts where possible. Direct REST validation,
+configuration/auth, and admission-limit rejections also write a privacy-safe
+zero-invocation receipt and return its identity in the response headers. Use
+`list_runs`, `get_run`, `list_receipts`, and `get_receipt` to recover provenance
+instead of relying on a chat transcript alone.
 
 Timeout receipts distinguish the causal layer. A Relay liveness stop reports
 `providerTimeoutSource: relay_supervisor`; an upstream HTTP timeout reports

@@ -488,13 +488,194 @@ function appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt }
                 : payload.exitCode === 0 && !payload.dropped_out ? null : 'provider_error'),
     route,
   };
+  appendBridgeReceiptRecord(receipt);
+  return receipt;
+}
+
+function appendBridgeReceiptRecord(receipt) {
   const filePath = path.join(RECEIPTS_DIR, `${receipt.timestamp.slice(0, 10)}.jsonl`);
   const handle = fs.openSync(filePath, 'a');
   try {
     fs.writeFileSync(handle, `${JSON.stringify(receipt)}\n`, 'utf8');
     fs.fsyncSync(handle);
   } finally { fs.closeSync(handle); }
-  return receipt;
+}
+
+// Direct REST callers need the same durable zero-invocation accounting that an
+// MCP outer receipt provides. Keep a small in-process index and fall back to the
+// append-only store so a caller retrying the same requestId after a bridge
+// restart dereferences the original rejection instead of appending a duplicate.
+const preAdmissionReceiptByRequestId = new Map();
+const MAX_PRE_ADMISSION_RECEIPT_SCAN_LINES = 500000;
+
+function findPreAdmissionReceiptByRequestId(requestId) {
+  if (preAdmissionReceiptByRequestId.has(requestId)) {
+    return preAdmissionReceiptByRequestId.get(requestId);
+  }
+  const requestToken = `\"requestId\":${JSON.stringify(requestId)}`;
+  let scanned = 0;
+  const files = fs.readdirSync(RECEIPTS_DIR)
+    .filter((name) => /^\d{4}-\d{2}-\d{2}\.jsonl$/.test(name))
+    .sort()
+    .reverse();
+  for (const file of files) {
+    const lines = fs.readFileSync(path.join(RECEIPTS_DIR, file), 'utf8').split(/\r?\n/);
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+      if ((scanned += 1) > MAX_PRE_ADMISSION_RECEIPT_SCAN_LINES) return null;
+      if (!lines[index] || !lines[index].includes(requestToken)) continue;
+      try {
+        const receipt = JSON.parse(lines[index]);
+        if (receipt.event === 'bridge_provider_rejection' && receipt.requestId === requestId) {
+          preAdmissionReceiptByRequestId.set(requestId, receipt);
+          return receipt;
+        }
+      } catch {}
+    }
+  }
+  return null;
+}
+
+function normalizeOneShotRequestId(body) {
+  const supplied = String(body?.requestId || '');
+  return /^[A-Za-z0-9._:-]{8,160}$/.test(supplied)
+    ? supplied : `oneshot:${crypto.randomUUID()}`;
+}
+
+function appendBridgePreAdmissionReceipt({
+  kind,
+  prompt,
+  requestId,
+  failureClass,
+  httpStatus,
+  startedAt,
+  route = null,
+  error,
+}) {
+  const existing = findPreAdmissionReceiptByRequestId(requestId);
+  if (existing) return { receipt: existing, deduplicated: true };
+  const promptText = typeof prompt === 'string' ? prompt : '';
+  const inputHash = crypto.createHash('sha256').update(promptText).digest('hex');
+  const receipt = {
+    receiptId: `rcpt_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 8)}`,
+    timestamp: new Date().toISOString(),
+    event: 'bridge_provider_rejection',
+    bridgeBuildId: BRIDGE_BUILD_ID,
+    bridgeInstanceId: INSTANCE_ID,
+    receiptStoreId: RECEIPT_STORE_IDENTITY.id,
+    status: 'rejected',
+    httpStatus,
+    provider: typeof kind === 'string' && kind ? kind : null,
+    inputHash,
+    inputChars: promptText.length,
+    estimatedInputTokens: estimateTokenCount(promptText),
+    outputHash: crypto.createHash('sha256').update('').digest('hex'),
+    outputChars: 0,
+    estimatedOutputTokens: 0,
+    estimatedTotalTokens: estimateTokenCount(promptText),
+    actualInputTokens: null,
+    actualOutputTokens: null,
+    actualCacheReadInputTokens: null,
+    actualCacheCreationInputTokens: null,
+    actualTotalTokens: null,
+    actualThinkingTokens: null,
+    provider_reported_cost_usd: null,
+    tokenUsageSource: 'not_invoked',
+    tokenEstimateScope: null,
+    modelInvocation: false,
+    requestId,
+    invocationId: requestId,
+    attemptId: requestId,
+    physicalAttemptCount: 0,
+    transportRetryCount: 0,
+    providerRetryCount: 0,
+    providerRetryDelayMs: 0,
+    providerRetryMaxAttempt: 0,
+    providerDeclaredMaxRetries: 0,
+    providerRetryByError: {},
+    providerRetryByStatus: {},
+    providerRetryEvents: [],
+    providerRetryEventsTruncated: false,
+    providerRetryObservedEvents: 0,
+    providerRetryInvalidEvents: 0,
+    providerRetryDuplicateEvents: 0,
+    transportReceiptId: null,
+    durationMs: Math.max(0, Date.now() - startedAt),
+    failureClass,
+    errorHash: error
+      ? crypto.createHash('sha256').update(String(error)).digest('hex') : null,
+    route: route || {
+      provider: typeof kind === 'string' && kind ? kind : null,
+      request_id: requestId,
+    },
+  };
+  appendBridgeReceiptRecord(receipt);
+  preAdmissionReceiptByRequestId.set(requestId, receipt);
+  return { receipt, deduplicated: false };
+}
+
+function setRejectionIdentityHeaders(res, receipt) {
+  if (typeof res.setHeader !== 'function') return;
+  res.setHeader('X-RelayBridge-Receipt-Id', receipt.receiptId);
+  res.setHeader('X-RelayBridge-Request-Id', receipt.requestId);
+  res.setHeader('X-RelayBridge-Build-Id', BRIDGE_BUILD_ID);
+  res.setHeader('X-RelayBridge-Receipt-Store-Id', RECEIPT_STORE_IDENTITY.id);
+}
+
+function sendOneShotPreAdmissionRejection(res, {
+  statusCode,
+  payload,
+  kind,
+  prompt,
+  requestId,
+  failureClass,
+  startedAt,
+  route,
+}) {
+  const accounting = {
+    model_invocation: false,
+    token_usage_source: 'not_invoked',
+    transportReceiptId: null,
+    transport_retry_count: 0,
+    provider_retries: ZERO_PROVIDER_RETRIES,
+    requestId,
+    invocationId: requestId,
+    attemptId: requestId,
+    bridgeBuildId: BRIDGE_BUILD_ID,
+    receiptStoreId: RECEIPT_STORE_IDENTITY.id,
+  };
+  try {
+    const { receipt, deduplicated } = appendBridgePreAdmissionReceipt({
+      kind,
+      prompt,
+      requestId,
+      failureClass,
+      httpStatus: statusCode,
+      startedAt,
+      route,
+      error: payload?.error,
+    });
+    setRejectionIdentityHeaders(res, receipt);
+    return res.status(statusCode).json({
+      ...payload,
+      ...accounting,
+      failureClass,
+      receiptId: receipt.receiptId,
+      receiptPersisted: true,
+      receiptDeduplicated: deduplicated,
+    });
+  } catch (error) {
+    const receiptId = `rcpt_unpersisted_${Date.now().toString(36)}`;
+    setRejectionIdentityHeaders(res, { receiptId, requestId });
+    return res.status(statusCode).json({
+      ...payload,
+      ...accounting,
+      failureClass,
+      receiptId,
+      receiptPersisted: false,
+      receiptDeduplicated: false,
+      receiptPersistenceError: error.message,
+    });
+  }
 }
 
 function sendOneShotResult(res, payload, meta) {
@@ -1786,6 +1967,7 @@ app.use((req, res, next) => {
     res.setHeader('Vary', 'Origin');
   }
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-RelayBridge-Token, X-PS-Bridge-Token, X-RelayBridge-Expected-Build-Id, X-RelayBridge-Expected-Receipt-Store-Id');
+  res.setHeader('Access-Control-Expose-Headers', 'X-RelayBridge-Receipt-Id, X-RelayBridge-Request-Id, X-RelayBridge-Build-Id, X-RelayBridge-Receipt-Store-Id');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
   if (origin) res.setHeader('Access-Control-Allow-Private-Network', 'true');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
@@ -2570,9 +2752,18 @@ async function executeOneShot(body, res) {
   const runIntent = typeof body?.intent === 'string'
     ? body.intent.replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 2000)
     : null;
-  const suppliedRequestId = String(body?.requestId || '');
-  const requestId = /^[A-Za-z0-9._:-]{8,160}$/.test(suppliedRequestId)
-    ? suppliedRequestId : `oneshot:${crypto.randomUUID()}`;
+  const requestId = normalizeOneShotRequestId(body);
+  const rejectBeforeAdmission = (statusCode, failureClass, payload, route = null) =>
+    sendOneShotPreAdmissionRejection(res, {
+      statusCode,
+      payload,
+      kind,
+      prompt,
+      requestId,
+      failureClass,
+      startedAt,
+      route,
+    });
   // Two timeout regimes compose here. The timeout policy bounds any EXPLICIT
   // caller timeout, so a caller can neither starve a run nor exceed the
   // transport ceiling the MCP client allows. When the caller sends nothing, no
@@ -2585,11 +2776,16 @@ async function executeOneShot(body, res) {
     : null;
   const adapterTimeoutMs = explicitTimeout ?? TIMEOUT_POLICY.oneShotDefaultMs;
   if (!kind || typeof prompt !== 'string' || !prompt.trim()) {
-    return res.status(400).json({ error: 'kind + non-empty prompt required' });
+    return rejectBeforeAdmission(400, 'validation', { error: 'kind + non-empty prompt required' });
   }
-  const cfg = loadConfig();
+  let cfg;
+  try {
+    cfg = loadConfig();
+  } catch (err) {
+    return rejectBeforeAdmission(500, 'configuration', { error: `could not load provider configuration: ${err.message}` });
+  }
   const entry = cfg[kind];
-  if (!entry) return res.status(400).json({ error: 'unknown kind: ' + kind });
+  if (!entry) return rejectBeforeAdmission(400, 'validation', { error: 'unknown kind: ' + kind });
   // Pre-flight auth gate. If the last readiness sweep saw this CLI installed but
   // signed out, the call would fail with an opaque provider error and the prompt
   // would be wasted. Report it as an actionable auth_required instead, so the
@@ -2597,7 +2793,7 @@ async function executeOneShot(body, res) {
   // observation blocks: an unprobed provider is attempted as before.
   const readiness = lastDiagnostics?.results?.[kind];
   if (readiness && readiness.found && readiness.ready === false && Array.isArray(entry.login_command)) {
-    return res.status(409).json({
+    return rejectBeforeAdmission(409, 'auth', {
       ok: false,
       auth_required: true,
       kind,
@@ -2612,14 +2808,16 @@ async function executeOneShot(body, res) {
   try {
     oneShotEnv = normalizeEnvOverrides(entry.oneshot_env);
   } catch (err) {
-    return res.status(500).json({ error: `invalid oneshot environment for ${kind}: ${err.message}` });
+    return rejectBeforeAdmission(500, 'configuration', { error: `invalid oneshot environment for ${kind}: ${err.message}` });
   }
   // Collab Mode is a discussion, not an agentic task â€” it passes dangerous:false
   // so CLIs run non-agentically (no auto tool/command execution). When the
   // caller doesn't specify, fall back to the global Full Permissions toggle.
   const useDanger = (typeof dangerous === 'boolean') ? dangerous : state.fullPermissions;
   const slotRaw = useDanger ? entry.oneshot_dangerous : entry.oneshot_safe;
-  if (!slotRaw || !slotRaw.length) return res.status(400).json({ error: 'no oneshot config for ' + kind });
+  if (!slotRaw || !slotRaw.length) {
+    return rejectBeforeAdmission(400, 'configuration', { error: 'no oneshot config for ' + kind });
+  }
   // Model selection inside the provider: taskTier/modelTier picks the weight
   // class. A pin discovery proved is retired is dropped rather than sent â€” a
   // missing flag runs on the account default, a dead id fails every call.
@@ -2641,16 +2839,16 @@ async function executeOneShot(body, res) {
   const hasInlinePrompt = slot.some((a) => typeof a === 'string' && a.includes('{prompt}'));
   const hasPromptFile = slot.some((a) => typeof a === 'string' && a.includes('{prompt_file}'));
   if (hasInlinePrompt && hasPromptFile) {
-    return res.status(400).json({ error: 'oneshot config cannot mix {prompt} and {prompt_file}' });
+    return rejectBeforeAdmission(400, 'configuration', { error: 'oneshot config cannot mix {prompt} and {prompt_file}' });
   }
   let resolvedCwd;
   try {
     resolvedCwd = resolveAllowedCwd(cwd);
   } catch (err) {
-    return res.status(400).json({ error: err.message });
+    return rejectBeforeAdmission(400, 'validation', { error: err.message });
   }
   if (!acquireOneShot(kind, res)) {
-    return res.status(429).json({
+    return rejectBeforeAdmission(429, 'admission_limit', {
       error: 'provider concurrency limit reached; retry with backoff',
       kind,
       retryable: true,
@@ -2674,7 +2872,7 @@ async function executeOneShot(body, res) {
       promptFile = path.join(promptFileDir, 'prompt.txt');
       fs.writeFileSync(promptFile, prompt, 'utf8');
     } catch (err) {
-      return res.status(500).json({ error: 'could not create temporary prompt file: ' + err.message });
+      return rejectBeforeAdmission(500, 'configuration', { error: 'could not create temporary prompt file: ' + err.message });
     }
   }
   const slotResolved = slot.map((arg) => {
