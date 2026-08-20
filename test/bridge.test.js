@@ -81,9 +81,21 @@ test('provider config uses the installed subscription CLIs and safe headless mod
   assert.ok(config.gemini.safe.includes('--sandbox'));
   assert.equal(config.gemini.oneshot_safe.at(-2), '--print');
   assert.equal(config.gemini.oneshot_safe.at(-1), '{prompt}');
+  assert.deepEqual(config.gemini.login_command, ['agy'], 'Antigravity signs in through its own interactive TUI');
   assert.equal(config.gemini.oneshot_safe[config.gemini.oneshot_safe.indexOf('--add-dir') + 1], '{cwd}');
   assert.equal(config.gemini.oneshot_safe[config.gemini.oneshot_safe.indexOf('--effort') + 1], 'high');
-  assert.deepEqual(config.gemini.model_tiers.heavy.suppress_args, [{ flag: '--effort', value_count: 1 }]);
+  assert.deepEqual(config.gemini.model_tiers.light, {
+    args: ['--model', 'gemini-3.5-flash-low'], model: 'gemini-3.5-flash-low',
+    suppress_args: [{ flag: '--effort', value_count: 1 }], note: 'current low-effort Flash id reported by agy models',
+  });
+  assert.deepEqual(config.gemini.model_tiers.standard, {
+    args: ['--model', 'gemini-3.6-flash-medium'], model: 'gemini-3.6-flash-medium',
+    suppress_args: [{ flag: '--effort', value_count: 1 }], note: 'current medium-effort Flash id reported by agy models',
+  });
+  assert.deepEqual(config.gemini.model_tiers.heavy, {
+    args: ['--model', 'gemini-3.1-pro-high'], model: 'gemini-3.1-pro-high',
+    suppress_args: [{ flag: '--effort', value_count: 1 }], note: 'current high-effort Pro id reported by agy models',
+  });
   assert.equal(config.gemini.oneshot_safe[config.gemini.oneshot_safe.indexOf('--mode') + 1], 'plan');
   assert.ok(config.gemini.dangerous.includes('--dangerously-skip-permissions'));
   assert.equal(config.gemini.npm_package, undefined);

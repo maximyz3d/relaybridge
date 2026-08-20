@@ -100,9 +100,9 @@ run Luna or Sol. The routing tier selects the weight class automatically:
 
 | Task tier | Model tier | Claude | Codex | Gemini |
 |---|---|---|---|---|
-| utility | light | `haiku` | `gpt-5.6-luna` | `gemini-3.5-flash-lite` |
-| standard | standard | `sonnet` | `gpt-5.6-terra` | `gemini-3.6-flash` |
-| complex / critical | heavy | `opus` | `gpt-5.6-sol` | `auto` |
+| utility | light | `haiku` | `gpt-5.6-luna` | `gemini-3.5-flash-low` |
+| standard | standard | `sonnet` | `gpt-5.6-terra` | `gemini-3.6-flash-medium` |
+| complex / critical | heavy | `opus` | `gpt-5.6-sol` | `gemini-3.1-pro-high` |
 
 `POST /api/route` returns `modelTier` and per-provider `model` + `modelArgs`.
 `POST /api/oneshot` accepts `taskTier` or `modelTier` and applies the flag

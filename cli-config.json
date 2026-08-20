@@ -12,7 +12,7 @@
   },
   "_models": {
     "_note": "Model selection inside a provider. Routing tiers map to weight classes: utility->light, standard->standard, complex/critical->heavy. Provider lineups change on weeks-long cycles, so prefer stable aliases (claude opus/sonnet/haiku) over versioned ids, and leave model_tiers unset where the account decides which models exist (cursor, copilot, grok) â€” a missing flag runs, a retired one fails every call. Discovery at boot reconciles these pins against each CLI's own model list.",
-    "modelsCheckedAt": "2026-08-14",
+    "modelsCheckedAt": "2026-08-20",
     "staleAfterDays": 45,
     "discoverOnBoot": true,
     "discoveryTimeoutMs": 20000,
@@ -21,7 +21,7 @@
       "claude": "claude --help (aliases: opus, sonnet, haiku)",
       "codex": "codex --help; see developers.openai.com/codex/models",
       "cursor": "agent models",
-      "gemini": "gemini /model or --list-models",
+      "gemini": "agy models",
       "copilot": "copilot --help (org model policy applies)",
       "grok": "grok --help"
     }
@@ -384,12 +384,14 @@
   },
   "gemini": {
     "label": "Gemini (Antigravity)",
-    "login_command": ["gemini", "/auth"],
+    "login_command": ["agy"],
     "model_tiers": {
-      "light": { "args": ["--model", "gemini-3.5-flash-lite"], "model": "gemini-3.5-flash-lite", "note": "high-volume, low latency" },
-      "standard": { "args": ["--model", "gemini-3.6-flash"], "model": "gemini-3.6-flash", "note": "GA flash tier" },
-      "heavy": { "args": ["--model", "auto"], "model": "auto", "suppress_args": [{ "flag": "--effort", "value_count": 1 }], "note": "let the CLI pick; auto rejects the explicit effort flag" }
+      "light": { "args": ["--model", "gemini-3.5-flash-low"], "model": "gemini-3.5-flash-low", "suppress_args": [{ "flag": "--effort", "value_count": 1 }], "note": "current low-effort Flash id reported by agy models" },
+      "standard": { "args": ["--model", "gemini-3.6-flash-medium"], "model": "gemini-3.6-flash-medium", "suppress_args": [{ "flag": "--effort", "value_count": 1 }], "note": "current medium-effort Flash id reported by agy models" },
+      "heavy": { "args": ["--model", "gemini-3.1-pro-high"], "model": "gemini-3.1-pro-high", "suppress_args": [{ "flag": "--effort", "value_count": 1 }], "note": "current high-effort Pro id reported by agy models" }
     },
+    "models_probe": ["agy", "models"],
+    "models_parse": "^([a-z0-9][a-z0-9.-]+)\\t",
     "tags": ["coding", "search", "general"],
     "company": "Google",
     "transport": "subscription:antigravity",
