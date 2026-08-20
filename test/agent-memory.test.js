@@ -2,7 +2,9 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const childProcess = require('node:child_process');
 const fs = require('fs');
+const os = require('node:os');
 const path = require('path');
 
 const ROOT = path.resolve(__dirname, '..');
@@ -57,6 +59,37 @@ test('the installer is idempotent and preserves user-authored instructions', () 
     'empty existing memory files must read as an empty string, not PowerShell null');
   assert.ok(!/Set-Content .* -Value \$block\b(?![\s\S]*existing)/.test(installer),
     'the installer must not clobber a file that already has user content');
+});
+
+test('the skill installer resolves its bundled source independently of caller cwd', {
+  skip: process.platform !== 'win32',
+}, () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'relaybridge-skill-cwd-'));
+  try {
+    const callerCwd = path.join(tempRoot, 'unrelated-cwd');
+    const profile = path.join(tempRoot, 'profile');
+    fs.mkdirSync(callerCwd, { recursive: true });
+    fs.mkdirSync(profile, { recursive: true });
+    const result = childProcess.spawnSync('powershell.exe', [
+      '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass',
+      '-File', path.join(ROOT, 'install-skill.ps1'),
+    ], {
+      cwd: callerCwd,
+      encoding: 'utf8',
+      env: { ...process.env, USERPROFILE: profile },
+      timeout: 30_000,
+    });
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    for (const installed of [
+      path.join(profile, '.claude', 'skills', 'relaybridge', 'SKILL.md'),
+      path.join(profile, '.codex', 'relaybridge', 'SKILL.md'),
+      path.join(profile, '.codex', 'AGENTS.md'),
+    ]) {
+      assert.ok(fs.existsSync(installed), `expected installed RelayBridge file ${installed}`);
+    }
+  } finally {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
 });
 
 test('the client restart script force-stops survivors rather than trusting a window close', () => {

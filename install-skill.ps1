@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
   # Where this repo lives; defaults to the folder containing this script.
-  [string]$SourceDir = $(if ($PSScriptRoot) { Join-Path $PSScriptRoot 'skills\relaybridge' } else { Join-Path (Get-Location) 'skills\relaybridge' }),
+  [string]$SourceDir = '',
   [switch]$ClaudeOnly,
   [switch]$CodexOnly,
   # Skip writing the always-loaded primer into agent memory files.
@@ -11,6 +11,15 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Windows PowerShell 5.1 can evaluate parameter-default expressions before
+# $PSScriptRoot is populated. Resolve the bundled skill only after entering the
+# script body so invoking this file from an unrelated cwd remains reliable.
+if (-not $SourceDir) {
+  $scriptRoot = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+  if (-not $scriptRoot) { throw 'Could not resolve the RelayBridge skill installer directory.' }
+  $SourceDir = Join-Path $scriptRoot 'skills\relaybridge'
+}
 
 if (-not (Test-Path -LiteralPath $SourceDir)) {
   throw "Skill source not found at $SourceDir"
