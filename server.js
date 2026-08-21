@@ -186,7 +186,7 @@ function pathIdentity(value) {
 function statDirectoryIdentity(value) {
   const stat = fs.statSync(value, { bigint: true });
   if (!stat.isDirectory()) throw new Error('not a directory');
-  return `${stat.dev}:${stat.ino}`;
+  return `${stat.dev}:${stat.ino}:${stat.birthtimeNs}`;
 }
 
 function snapshotAllowedRoot(value) {
