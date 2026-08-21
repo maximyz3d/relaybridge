@@ -176,6 +176,8 @@ const ALLOWED_ROOTS = (ALLOWED_ROOTS_SETTING.defined
 
 const CWD_OUTSIDE_ALLOWED_ROOTS = 'cwd_outside_allowed_roots';
 const CWD_OUTSIDE_REASON = 'The requested working directory resolves outside RelayBridge allowed roots.';
+const CWD_IDENTITY_CHANGED = 'cwd_identity_changed';
+const CWD_IDENTITY_CHANGED_REASON = 'The working directory identity changed after admission and before provider execution.';
 const CWD_ENROLLMENT_GUIDANCE = 'Use an existing allowed working directory, or explicitly add the intended root to RELAYBRIDGE_ALLOWED_ROOTS and restart RelayBridge. RelayBridge did not change the allowlist.';
 
 function pathIdentity(value) {
@@ -189,6 +191,11 @@ function statDirectoryIdentity(value) {
   return `${stat.dev}:${stat.ino}:${stat.birthtimeNs}`;
 }
 
+function lexicalObjectIdentity(value) {
+  const stat = fs.lstatSync(value, { bigint: true });
+  return `${stat.dev}:${stat.ino}:${stat.birthtimeNs}`;
+}
+
 function snapshotAllowedRoot(value) {
   const lexical = pathIdentity(value);
   try {
@@ -197,13 +204,17 @@ function snapshotAllowedRoot(value) {
     return {
       lexical,
       canonical,
+      lexicalObjectIdentity: lexicalObjectIdentity(value),
       directoryIdentity: statDirectoryIdentity(realpath),
       available: true,
     };
   } catch {
     // A configured root that does not exist at startup is not silently enrolled
     // if it appears later.  Enrollment is a startup-time trust decision.
-    return { lexical, canonical: null, directoryIdentity: null, available: false };
+    return {
+      lexical, canonical: null, lexicalObjectIdentity: null,
+      directoryIdentity: null, available: false,
+    };
   }
 }
 
@@ -215,8 +226,10 @@ function currentAllowedRootSnapshot(snapshot) {
     const realpath = fs.realpathSync.native
       ? fs.realpathSync.native(snapshot.lexical) : fs.realpathSync(snapshot.lexical);
     const canonical = pathIdentity(realpath);
+    const currentLexicalObjectIdentity = lexicalObjectIdentity(snapshot.lexical);
     const directoryIdentity = statDirectoryIdentity(realpath);
     if (canonical !== snapshot.canonical
+      || currentLexicalObjectIdentity !== snapshot.lexicalObjectIdentity
       || directoryIdentity !== snapshot.directoryIdentity) return null;
     return snapshot;
   } catch {
@@ -232,6 +245,19 @@ function pathIdentityHash(value, { raw = false } = {}) {
   // receipt consumer.
   return crypto.createHmac('sha256', CAPABILITY_TOKEN).update(identity).digest('hex');
 }
+
+function opaqueIdentity(value) {
+  return crypto.createHmac('sha256', CAPABILITY_TOKEN)
+    .update(JSON.stringify(value)).digest('hex');
+}
+
+const CWD_POLICY_IDENTITY = opaqueIdentity(ALLOWED_ROOT_SNAPSHOTS.map((root) => ({
+  lexical: root.lexical,
+  canonical: root.canonical,
+  lexicalObjectIdentity: root.lexicalObjectIdentity,
+  directoryIdentity: root.directoryIdentity,
+  available: root.available,
+})));
 
 function isInsideRoots(candidate, roots) {
   const normalized = pathIdentity(candidate);
@@ -262,6 +288,23 @@ function cwdOutsideAllowedRootsError(requested, normalized, canonical = null) {
   };
   const error = new Error(CWD_OUTSIDE_REASON);
   error.code = CWD_OUTSIDE_ALLOWED_ROOTS;
+  error.validation = validation;
+  return error;
+}
+
+function cwdIdentityChangedError(expectedCwdIdentityHash, observedCwdIdentityHash) {
+  const validation = {
+    code: CWD_IDENTITY_CHANGED,
+    field: 'cwd',
+    reason: CWD_IDENTITY_CHANGED_REASON,
+    retryable: false,
+    expectedCwdIdentityHash,
+    observedCwdIdentityHash,
+    cwdPolicyId: CWD_POLICY_IDENTITY,
+    guidance: 'Repeat admission with the intended working directory. RelayBridge did not execute a provider.',
+  };
+  const error = new Error(CWD_IDENTITY_CHANGED_REASON);
+  error.code = CWD_IDENTITY_CHANGED;
   error.validation = validation;
   return error;
 }
@@ -322,10 +365,13 @@ function captureAllowedCwdIdentity(value, fallback) {
   const resolved = resolveAllowedCwd(value, fallback);
   const realpath = fs.realpathSync.native
     ? fs.realpathSync.native(resolved) : fs.realpathSync(resolved);
+  const canonical = pathIdentity(realpath);
+  const directoryIdentity = statDirectoryIdentity(realpath);
   return {
     resolved,
-    canonical: pathIdentity(realpath),
-    directoryIdentity: statDirectoryIdentity(realpath),
+    canonical,
+    directoryIdentity,
+    cwdIdentityHash: opaqueIdentity({ canonical, directoryIdentity }),
   };
 }
 
@@ -333,11 +379,9 @@ function revalidateAllowedCwdIdentity(snapshot) {
   const current = captureAllowedCwdIdentity(snapshot.resolved);
   if (current.canonical !== snapshot.canonical
     || current.directoryIdentity !== snapshot.directoryIdentity) {
-    throw cwdOutsideAllowedRootsError(
-      snapshot.resolved, snapshot.resolved, current.canonical,
-    );
+    throw cwdIdentityChangedError(snapshot.cwdIdentityHash, current.cwdIdentityHash);
   }
-  return current.resolved;
+  return current;
 }
 
 function workspacePolicy() {
@@ -2327,12 +2371,12 @@ app.post('/api/workspace/validate', (req, res) => {
   const body = req.body || {};
   const requestId = normalizeOneShotRequestId(body);
   try {
-    const resolved = resolveAllowedCwd(body.cwd);
-    const canonical = fs.realpathSync.native
-      ? fs.realpathSync.native(resolved) : fs.realpathSync(resolved);
+    const snapshot = captureAllowedCwdIdentity(body.cwd);
+    revalidateAllowedCwdIdentity(snapshot);
     return res.json({
       ok: true,
-      cwdIdentityHash: pathIdentityHash(canonical),
+      cwdIdentityHash: snapshot.cwdIdentityHash,
+      cwdPolicyId: CWD_POLICY_IDENTITY,
       model_invocation: false,
       token_usage_source: 'not_invoked',
       transport_retry_count: 0,
@@ -3053,9 +3097,27 @@ async function executeOneShot(body, res) {
   }
   let resolvedCwd;
   let resolvedCwdIdentity;
+  const expectedCwdIdentityHash = body?.expectedCwdIdentityHash;
+  const expectedCwdPolicyId = body?.expectedCwdPolicyId;
+  if ((expectedCwdIdentityHash !== undefined
+      && !/^[0-9a-f]{64}$/.test(String(expectedCwdIdentityHash)))
+    || (expectedCwdPolicyId !== undefined
+      && !/^[0-9a-f]{64}$/.test(String(expectedCwdPolicyId)))) {
+    return rejectBeforeAdmission(400, 'validation', {
+      error: 'Expected cwd identity fields must be lowercase SHA-256 identifiers.',
+    });
+  }
   try {
     resolvedCwdIdentity = captureAllowedCwdIdentity(cwd);
     resolvedCwd = resolvedCwdIdentity.resolved;
+    if ((expectedCwdPolicyId && expectedCwdPolicyId !== CWD_POLICY_IDENTITY)
+      || (expectedCwdIdentityHash
+        && expectedCwdIdentityHash !== resolvedCwdIdentity.cwdIdentityHash)) {
+      throw cwdIdentityChangedError(
+        expectedCwdIdentityHash || resolvedCwdIdentity.cwdIdentityHash,
+        resolvedCwdIdentity.cwdIdentityHash,
+      );
+    }
   } catch (err) {
     return rejectBeforeAdmission(400, 'validation', {
       error: err.validation?.reason || err.message,
@@ -3181,7 +3243,14 @@ async function executeOneShot(body, res) {
     // directory immediately before child creation. Node's spawn API has no
     // portable cwd-by-handle primitive, so this is the narrowest available
     // TOCTOU boundary without changing provider execution semantics.
-    resolvedCwd = revalidateAllowedCwdIdentity(resolvedCwdIdentity);
+    const spawnCwdIdentity = revalidateAllowedCwdIdentity(resolvedCwdIdentity);
+    if (expectedCwdIdentityHash
+      && expectedCwdIdentityHash !== spawnCwdIdentity.cwdIdentityHash) {
+      throw cwdIdentityChangedError(
+        expectedCwdIdentityHash, spawnCwdIdentity.cwdIdentityHash,
+      );
+    }
+    resolvedCwd = spawnCwdIdentity.resolved;
     // Build the actual spawn target. On Windows, wrap non-.exe (npm shims like
     // claude.cmd) with cmd.exe /c so the shim resolves. Use single-string form
     // for cmd.exe so arg quoting is preserved (shell:true would split prompts

@@ -113,10 +113,16 @@ test('live cwd admission invalidates stale route and committee cache across rest
   const allowedB = path.join(tempRoot, 'allowed-b');
   const outside = path.join(tempRoot, 'outside');
   const link = path.join(allowedA, 'linked-cwd');
+  const targetA = path.join(allowedA, 'target-a');
+  const targetB = path.join(allowedA, 'target-b');
+  const inRootLink = path.join(allowedA, 'in-root-link');
   for (const dir of [allowedA, allowedB, outside]) fs.mkdirSync(dir, { recursive: true });
+  fs.mkdirSync(targetA, { recursive: true });
+  fs.mkdirSync(targetB, { recursive: true });
   fs.mkdirSync(path.join(allowedB, 'nested'), { recursive: true });
   const lexicalB = `${allowedB}${path.sep}nested${path.sep}..`;
   fs.symlinkSync(allowedB, link, process.platform === 'win32' ? 'junction' : 'dir');
+  fs.symlinkSync(targetA, inRootLink, process.platform === 'win32' ? 'junction' : 'dir');
   const dataDir = path.join(tempRoot, 'data');
   const tokenPath = path.join(tempRoot, 'token');
   const configPath = path.join(tempRoot, 'config.json');
@@ -153,24 +159,61 @@ test('live cwd admission invalidates stale route and committee cache across rest
   const routeTaskA = 'Explain a robust software cache invalidation design for a bounded coding task A.';
   const routeTaskLink = 'Explain a robust software cache invalidation design for a linked working directory.';
   const routeTaskLexical = 'Explain a robust software cache invalidation design for a noncanonical working directory.';
+  const routeTaskRetarget = 'Explain a robust software cache invalidation design for an allowed retargeted directory.';
   const committeeTaskB = 'Review a software cache invalidation design and list deterministic tests for B.';
   const committeeTaskA = 'Review a software cache invalidation design and list deterministic tests for A.';
+  const committeeTaskRetarget = 'Review a software cache invalidation design after an allowed directory retarget.';
   for (const args of [
     routeArgs(routeTaskB, allowedB), routeArgs(routeTaskA, allowedA),
     routeArgs(routeTaskLink, link), routeArgs(routeTaskLexical, lexicalB),
+    routeArgs(routeTaskRetarget, inRootLink),
   ]) {
     const seeded = await first.client.callTool({ name: 'route_and_ask', arguments: args });
     assert.ok(seeded.structuredContent.winner, JSON.stringify(seeded.structuredContent));
     assert.equal(seeded.structuredContent.winner.modelInvocation, true);
     assert.equal(seeded.structuredContent.winner.cacheHit, false);
   }
-  for (const args of [committeeArgs(committeeTaskB, allowedB), committeeArgs(committeeTaskA, allowedA)]) {
+  for (const args of [
+    committeeArgs(committeeTaskB, allowedB), committeeArgs(committeeTaskA, allowedA),
+    committeeArgs(committeeTaskRetarget, inRootLink),
+  ]) {
     const seeded = await first.client.callTool({ name: 'run_committee', arguments: args });
     assert.equal(seeded.structuredContent.members[0].modelInvocation, true);
     assert.equal(seeded.structuredContent.members[0].cacheHit, false);
   }
   const seededInvocationCount = fs.readFileSync(marker, 'utf8').length;
-  assert.equal(seededInvocationCount, 6);
+  assert.equal(seededInvocationCount, 8);
+
+  fs.rmSync(inRootLink, { recursive: true, force: true });
+  fs.symlinkSync(targetB, inRootLink, process.platform === 'win32' ? 'junction' : 'dir');
+  const retargetedRoute = await first.client.callTool({
+    name: 'route_and_ask', arguments: routeArgs(routeTaskRetarget, inRootLink),
+  });
+  assert.equal(retargetedRoute.structuredContent.winner.cacheHit, false);
+  assert.equal(retargetedRoute.structuredContent.winner.modelInvocation, true);
+  const retargetedRouteReceipt = retargetedRoute.structuredContent.winner.receiptId;
+  const retargetedRouteHit = await first.client.callTool({
+    name: 'route_and_ask', arguments: routeArgs(routeTaskRetarget, inRootLink),
+  });
+  assert.equal(retargetedRouteHit.structuredContent.winner.cacheHit, true);
+  assert.equal(retargetedRouteHit.structuredContent.winner.sourceReceiptId, retargetedRouteReceipt);
+
+  const retargetedCommittee = await first.client.callTool({
+    name: 'run_committee', arguments: committeeArgs(committeeTaskRetarget, inRootLink),
+  });
+  assert.equal(retargetedCommittee.structuredContent.members[0].cacheHit, false);
+  assert.equal(retargetedCommittee.structuredContent.members[0].modelInvocation, true);
+  const retargetedCommitteeReceipt = retargetedCommittee.structuredContent.members[0].receiptId;
+  const retargetedCommitteeHit = await first.client.callTool({
+    name: 'run_committee', arguments: committeeArgs(committeeTaskRetarget, inRootLink),
+  });
+  assert.equal(retargetedCommitteeHit.structuredContent.members[0].cacheHit, true);
+  assert.equal(
+    retargetedCommitteeHit.structuredContent.members[0].sourceReceiptId,
+    retargetedCommitteeReceipt,
+  );
+  const postRetargetInvocationCount = fs.readFileSync(marker, 'utf8').length;
+  assert.equal(postRetargetInvocationCount, seededInvocationCount + 2);
   await first.close();
   current = null;
 
@@ -207,17 +250,34 @@ test('live cwd admission invalidates stale route and committee cache across rest
   const allowedRoute = await second.client.callTool({
     name: 'route_and_ask', arguments: routeArgs(routeTaskA, allowedA),
   });
-  assert.equal(allowedRoute.structuredContent.winner.cacheHit, true);
-  assert.equal(allowedRoute.structuredContent.winner.modelInvocation, false);
+  assert.equal(allowedRoute.structuredContent.winner.cacheHit, false);
+  assert.equal(allowedRoute.structuredContent.winner.modelInvocation, true);
+  const allowedRouteReceipt = allowedRoute.structuredContent.winner.receiptId;
+  const allowedRouteHit = await second.client.callTool({
+    name: 'route_and_ask', arguments: routeArgs(routeTaskA, allowedA),
+  });
+  assert.equal(allowedRouteHit.structuredContent.winner.cacheHit, true);
+  assert.equal(allowedRouteHit.structuredContent.winner.modelInvocation, false);
+  assert.equal(allowedRouteHit.structuredContent.winner.sourceReceiptId, allowedRouteReceipt);
 
   const allowedCommittee = await second.client.callTool({
     name: 'run_committee', arguments: committeeArgs(committeeTaskA, allowedA),
   });
-  assert.equal(allowedCommittee.structuredContent.members[0].cacheHit, true);
-  assert.equal(allowedCommittee.structuredContent.members[0].modelInvocation, false);
+  assert.equal(allowedCommittee.structuredContent.members[0].cacheHit, false);
+  assert.equal(allowedCommittee.structuredContent.members[0].modelInvocation, true);
+  const allowedCommitteeReceipt = allowedCommittee.structuredContent.members[0].receiptId;
+  const allowedCommitteeHit = await second.client.callTool({
+    name: 'run_committee', arguments: committeeArgs(committeeTaskA, allowedA),
+  });
+  assert.equal(allowedCommitteeHit.structuredContent.members[0].cacheHit, true);
+  assert.equal(allowedCommitteeHit.structuredContent.members[0].modelInvocation, false);
+  assert.equal(
+    allowedCommitteeHit.structuredContent.members[0].sourceReceiptId,
+    allowedCommitteeReceipt,
+  );
   assert.equal(
     fs.readFileSync(marker, 'utf8').length,
-    seededInvocationCount,
-    'stale cwd rejections and unchanged cache hits must not invoke providers',
+    postRetargetInvocationCount + 2,
+    'policy identity changes re-invoke allowed work once while stale cwd rejections never invoke',
   );
 });
