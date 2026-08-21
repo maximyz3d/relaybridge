@@ -161,17 +161,69 @@ const ALLOWED_ROOTS = (ALLOWED_ROOTS_VALUE
   .filter(Boolean)
   .map((value) => path.resolve(value));
 
+const CWD_OUTSIDE_ALLOWED_ROOTS = 'cwd_outside_allowed_roots';
+const CWD_OUTSIDE_REASON = 'The requested working directory resolves outside RelayBridge allowed roots.';
+const CWD_ENROLLMENT_GUIDANCE = 'Use an existing allowed working directory, or explicitly add the intended root to RELAYBRIDGE_ALLOWED_ROOTS and restart RelayBridge. RelayBridge did not change the allowlist.';
+
+function pathIdentity(value) {
+  const normalized = path.resolve(String(value));
+  return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+}
+
+function existingPathIdentity(value) {
+  try {
+    const canonical = fs.realpathSync.native ? fs.realpathSync.native(value) : fs.realpathSync(value);
+    return pathIdentity(canonical);
+  } catch {
+    return pathIdentity(value);
+  }
+}
+
+function pathIdentityHash(value, { raw = false } = {}) {
+  const identity = raw ? String(value) : pathIdentity(value);
+  return crypto.createHash('sha256').update(identity).digest('hex');
+}
+
+function isInsideRoots(candidate, roots) {
+  const normalized = pathIdentity(candidate);
+  return roots.some((root) => {
+    const normalizedRoot = pathIdentity(root);
+    return normalized === normalizedRoot || normalized.startsWith(normalizedRoot + path.sep);
+  });
+}
+
+function cwdOutsideAllowedRootsError(requested, normalized, canonical = null) {
+  const allAllowedRootHashes = [...new Set(
+    ALLOWED_ROOTS.map((root) => pathIdentityHash(existingPathIdentity(root))),
+  )];
+  const validation = {
+    code: CWD_OUTSIDE_ALLOWED_ROOTS,
+    field: 'cwd',
+    reason: CWD_OUTSIDE_REASON,
+    retryable: false,
+    requestedRootHash: pathIdentityHash(requested, { raw: true }),
+    normalizedRootHash: pathIdentityHash(normalized),
+    canonicalRootHash: canonical ? pathIdentityHash(canonical) : null,
+    allowedRootHashes: allAllowedRootHashes.slice(0, 32),
+    allowedRootHashCount: allAllowedRootHashes.length,
+    allowedRootHashesTruncated: allAllowedRootHashes.length > 32,
+    guidance: CWD_ENROLLMENT_GUIDANCE,
+    allowlistChanged: false,
+    restartRequiredForEnrollment: true,
+  };
+  const error = new Error(CWD_OUTSIDE_REASON);
+  error.code = CWD_OUTSIDE_ALLOWED_ROOTS;
+  error.validation = validation;
+  return error;
+}
+
 function isDirectory(value) {
   try { return fs.statSync(value).isDirectory(); }
   catch { return false; }
 }
 
 function isInsideAllowedRoot(candidate) {
-  const normalized = process.platform === 'win32' ? candidate.toLowerCase() : candidate;
-  return ALLOWED_ROOTS.some((root) => {
-    const normalizedRoot = process.platform === 'win32' ? root.toLowerCase() : root;
-    return normalized === normalizedRoot || normalized.startsWith(normalizedRoot + path.sep);
-  });
+  return isInsideRoots(candidate, ALLOWED_ROOTS);
 }
 
 function defaultAllowedCwd() {
@@ -188,11 +240,23 @@ function defaultAllowedCwd() {
 }
 
 function resolveAllowedCwd(value, fallback) {
-  const resolved = path.resolve(value || fallback || defaultAllowedCwd());
+  const requested = value || fallback || defaultAllowedCwd();
+  const resolved = path.resolve(requested);
   if (!isInsideAllowedRoot(resolved)) {
-    throw new Error(`cwd is outside RELAYBRIDGE_ALLOWED_ROOTS: ${resolved}; allowed roots: ${ALLOWED_ROOTS.join('; ')}`);
+    throw cwdOutsideAllowedRootsError(requested, resolved);
   }
-  if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) throw new Error(`cwd is not a directory: ${resolved}`);
+  if (!isDirectory(resolved)) throw new Error('The requested working directory is not an existing directory.');
+  let canonical;
+  try {
+    const realpath = fs.realpathSync.native ? fs.realpathSync.native(resolved) : fs.realpathSync(resolved);
+    canonical = pathIdentity(realpath);
+  } catch {
+    throw new Error('The requested working directory could not be canonicalized.');
+  }
+  const canonicalAllowedRoots = ALLOWED_ROOTS.map(existingPathIdentity);
+  if (!isInsideRoots(canonical, canonicalAllowedRoots)) {
+    throw cwdOutsideAllowedRootsError(requested, resolved, canonical);
+  }
   return resolved;
 }
 
@@ -550,6 +614,8 @@ function appendBridgePreAdmissionReceipt({
   startedAt,
   route = null,
   error,
+  errorCode = null,
+  validation = null,
 }) {
   const existing = findPreAdmissionReceiptByRequestId(requestId);
   if (existing) return { receipt: existing, deduplicated: true };
@@ -601,6 +667,8 @@ function appendBridgePreAdmissionReceipt({
     transportReceiptId: null,
     durationMs: Math.max(0, Date.now() - startedAt),
     failureClass,
+    errorCode,
+    validation,
     errorHash: error
       ? crypto.createHash('sha256').update(String(error)).digest('hex') : null,
     route: route || {
@@ -653,6 +721,8 @@ function sendOneShotPreAdmissionRejection(res, {
       startedAt,
       route,
       error: payload?.error,
+      errorCode: payload?.errorCode || null,
+      validation: payload?.validation || null,
     });
     setRejectionIdentityHeaders(res, receipt);
     return res.status(statusCode).json({
@@ -2845,7 +2915,11 @@ async function executeOneShot(body, res) {
   try {
     resolvedCwd = resolveAllowedCwd(cwd);
   } catch (err) {
-    return rejectBeforeAdmission(400, 'validation', { error: err.message });
+    return rejectBeforeAdmission(400, 'validation', {
+      error: err.validation?.reason || err.message,
+      errorCode: err.code || null,
+      validation: err.validation || null,
+    });
   }
   if (!acquireOneShot(kind, res)) {
     return rejectBeforeAdmission(429, 'admission_limit', {

@@ -659,6 +659,50 @@ function strictBoundedString(value, maxChars = 128) {
   return normalized ? normalized.slice(0, maxChars) : null;
 }
 
+const CWD_OUTSIDE_ALLOWED_ROOTS = 'cwd_outside_allowed_roots';
+const CWD_OUTSIDE_REASON = 'The requested working directory resolves outside RelayBridge allowed roots.';
+const CWD_ENROLLMENT_GUIDANCE = 'Use an existing allowed working directory, or explicitly add the intended root to RELAYBRIDGE_ALLOWED_ROOTS and restart RelayBridge. RelayBridge did not change the allowlist.';
+
+function strictSha256(value) {
+  return typeof value === 'string' && /^[0-9a-f]{64}$/.test(value) ? value : null;
+}
+
+function normalizeValidationDiagnostic(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  if (value.code !== CWD_OUTSIDE_ALLOWED_ROOTS || value.field !== 'cwd') return null;
+  const requestedRootHash = strictSha256(value.requestedRootHash);
+  const normalizedRootHash = strictSha256(value.normalizedRootHash);
+  const canonicalRootHash = value.canonicalRootHash === null
+    ? null : strictSha256(value.canonicalRootHash);
+  if (!requestedRootHash || !normalizedRootHash
+    || (value.canonicalRootHash !== null && !canonicalRootHash)
+    || !Array.isArray(value.allowedRootHashes)
+    || value.allowedRootHashes.length < 1 || value.allowedRootHashes.length > 32
+    || value.retryable !== false || value.allowlistChanged !== false
+    || value.restartRequiredForEnrollment !== true) return null;
+  const allowedRootHashes = value.allowedRootHashes.map(strictSha256);
+  const allowedRootHashCount = strictTokenCount(value.allowedRootHashCount);
+  if (allowedRootHashes.some((item) => !item)
+    || new Set(allowedRootHashes).size !== allowedRootHashes.length
+    || allowedRootHashCount === null || allowedRootHashCount < allowedRootHashes.length
+    || value.allowedRootHashesTruncated !== (allowedRootHashCount > allowedRootHashes.length)) return null;
+  return {
+    code: CWD_OUTSIDE_ALLOWED_ROOTS,
+    field: 'cwd',
+    reason: CWD_OUTSIDE_REASON,
+    retryable: false,
+    requestedRootHash,
+    normalizedRootHash,
+    canonicalRootHash,
+    allowedRootHashes,
+    allowedRootHashCount,
+    allowedRootHashesTruncated: value.allowedRootHashesTruncated,
+    guidance: CWD_ENROLLMENT_GUIDANCE,
+    allowlistChanged: false,
+    restartRequiredForEnrollment: true,
+  };
+}
+
 function strictCountMap(value, allowedKey) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
   const rows = [];
@@ -994,12 +1038,17 @@ async function callProvider({
     const authRequired = error instanceof BridgeError && error.detail?.auth_required === true;
     const transportTimedOut = !signal?.aborted && error instanceof BridgeError
       && (error.cause?.name === 'TimeoutError' || error.cause?.cause?.name === 'TimeoutError');
+    const validation = error instanceof BridgeError
+      ? normalizeValidationDiagnostic(error.detail?.validation) : null;
+    const transportReceiptId = error instanceof BridgeError
+      && /^rcpt_[A-Za-z0-9._:-]{1,180}$/.test(String(error.detail?.receiptId || ''))
+      ? String(error.detail.receiptId) : null;
     sanitized = {
       kind,
       exitCode: -1,
       droppedOut: true,
       stdout: '',
-      stderr: error.message,
+      stderr: validation?.reason || error.message,
       route: {},
       cancelled: !!signal?.aborted,
       timedOut: transportTimedOut,
@@ -1009,12 +1058,15 @@ async function callProvider({
       tokenUsageSource: deterministicPreflightRejection ? 'not_invoked' : 'unknown',
       transportRetryCount: 0,
       providerRetries: deterministicPreflightRejection ? zeroProviderRetries() : null,
-      transportReceiptId: null,
-      transportReceiptPersisted: null,
-      transportReceiptPersistenceError: null,
+      transportReceiptId,
+      transportReceiptPersisted: transportReceiptId ? error.detail?.receiptPersisted ?? null : null,
+      transportReceiptPersistenceError: transportReceiptId
+        ? strictBoundedString(error.detail?.receiptPersistenceError, 500) : null,
       failureClass: deterministicPreflightRejection
         ? (error.detail?.failureClass || 'policy') : null,
       actionPreflight: error.detail?.actionPreflight || null,
+      errorCode: validation?.code || null,
+      validation,
     };
     status = signal?.aborted ? 'cancelled' : transportTimedOut ? 'timed_out' : 'failed';
   }
@@ -1086,6 +1138,8 @@ async function callProvider({
     status,
     route: sanitized.route,
     actionPreflight: sanitized.actionPreflight || null,
+    errorCode: sanitized.errorCode || null,
+    validation: sanitized.validation || null,
     exitCode: sanitized.exitCode,
     failureClass: sanitized.cancelled ? 'cancelled'
       : sanitized.failureClass || (sanitized.rateLimited ? 'rate_limit'
@@ -1663,6 +1717,12 @@ export function buildServer() {
       attempts.push(response);
       run = writeRun({ ...run, status: 'running', members: attempts });
       if (providerSucceeded(response)) break;
+      // A cwd policy rejection is deterministic and provider-independent.
+      // Escalating the unchanged request would only create more zero-invocation
+      // receipts; the operator must correct or explicitly enroll the cwd first.
+      if (response.modelInvocation === false
+        && response.failureClass === 'validation'
+        && response.errorCode === CWD_OUTSIDE_ALLOWED_ROOTS) break;
       if (signal?.aborted) break;
     }
     const winner = attempts.find(providerSucceeded) || null;

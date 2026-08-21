@@ -21,6 +21,17 @@ function reservePort() {
   });
 }
 
+function containsPath(value, candidate) {
+  const needle = process.platform === 'win32' ? candidate.toLowerCase() : candidate;
+  if (typeof value === 'string') {
+    const text = process.platform === 'win32' ? value.toLowerCase() : value;
+    return text.includes(needle);
+  }
+  if (Array.isArray(value)) return value.some((item) => containsPath(item, candidate));
+  if (value && typeof value === 'object') return Object.values(value).some((item) => containsPath(item, candidate));
+  return false;
+}
+
 test('MCP provider accounting rejects malformed usage and contradictory retry aggregates', async () => {
   const { normalizeProviderUsage, normalizeProviderRetries } = await import('../mcp/server.mjs');
   assert.equal(normalizeProviderUsage({
@@ -78,6 +89,12 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   const staleDataDir = path.join(tempRoot, 'stale-mcp-data');
   const configPath = path.join(tempRoot, 'config.json');
   const invocationMarker = path.join(tempRoot, 'identity-provider-invocations.txt');
+  const allowedRootA = path.join(tempRoot, 'allowed-a');
+  const allowedRootB = path.join(tempRoot, 'allowed-b');
+  const outsideRoot = path.join(tempRoot, 'outside');
+  fs.mkdirSync(allowedRootA, { recursive: true });
+  fs.mkdirSync(allowedRootB, { recursive: true });
+  fs.mkdirSync(outsideRoot, { recursive: true });
   const helper = path.join(ROOT, 'test', 'prompt-file-cli.js');
   const echoProvider = {
       label: 'Echo',
@@ -149,6 +166,7 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
       PS_BRIDGE_DATA_DIR: dataDir,
       NODE_ENV: 'test',
       RELAYBRIDGE_TEST_BUILD_ID: 'integration-current',
+      RELAYBRIDGE_ALLOWED_ROOTS: `${allowedRootA};${allowedRootB}`,
     },
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -557,6 +575,107 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   });
   assert.equal(preflightRejected.structuredContent.modelInvocation, false);
   assert.equal(preflightRejected.structuredContent.admissionLimited, false);
+
+  const expectedCwdDiagnostic = {
+    code: 'cwd_outside_allowed_roots',
+    field: 'cwd',
+    reason: 'The requested working directory resolves outside RelayBridge allowed roots.',
+    retryable: false,
+    requestedRootHash: /^[0-9a-f]{64}$/,
+    normalizedRootHash: /^[0-9a-f]{64}$/,
+    canonicalRootHash: null,
+    allowedRootHashes: [/^[0-9a-f]{64}$/, /^[0-9a-f]{64}$/],
+    allowedRootHashCount: 2,
+    allowedRootHashesTruncated: false,
+    guidance: 'Use an existing allowed working directory, or explicitly add the intended root to RELAYBRIDGE_ALLOWED_ROOTS and restart RelayBridge. RelayBridge did not change the allowlist.',
+    allowlistChanged: false,
+    restartRequiredForEnrollment: true,
+  };
+  const assertCwdDiagnostic = (value) => {
+    assert.equal(value.errorCode, expectedCwdDiagnostic.code);
+    assert.equal(value.validation.code, expectedCwdDiagnostic.code);
+    assert.equal(value.validation.field, expectedCwdDiagnostic.field);
+    assert.equal(value.validation.reason, expectedCwdDiagnostic.reason);
+    assert.equal(value.validation.retryable, false);
+    assert.match(value.validation.requestedRootHash, expectedCwdDiagnostic.requestedRootHash);
+    assert.match(value.validation.normalizedRootHash, expectedCwdDiagnostic.normalizedRootHash);
+    assert.equal(value.validation.canonicalRootHash, null);
+    assert.equal(value.validation.allowedRootHashes.length, 2);
+    value.validation.allowedRootHashes.forEach((hash) => assert.match(hash, /^[0-9a-f]{64}$/));
+    assert.equal(value.validation.allowedRootHashCount, 2);
+    assert.equal(value.validation.allowedRootHashesTruncated, false);
+    assert.equal(value.validation.guidance, expectedCwdDiagnostic.guidance);
+    assert.equal(value.validation.allowlistChanged, false);
+    assert.equal(value.validation.restartRequiredForEnrollment, true);
+    assert.equal(value.failureClass, 'validation');
+    assert.equal(value.modelInvocation, false);
+    assert.equal(value.tokenUsageSource, 'not_invoked');
+    assert.equal(value.transportRetryCount, 0);
+    assert.equal(value.providerRetries.count, 0);
+    assert.equal(value.usage, undefined);
+    assert.equal(value.stderr, expectedCwdDiagnostic.reason);
+    assert.equal(containsPath(value, outsideRoot), false);
+  };
+
+  const cwdRoute = await client.callTool({
+    name: 'route_and_ask',
+    arguments: {
+      task: 'Review this JavaScript function for a simple bug.',
+      cwd: outsideRoot,
+      preferredProviders: ['codex'],
+      maxEscalations: 2,
+      useCache: false,
+    },
+  });
+  assert.equal(cwdRoute.structuredContent.status, 'failed');
+  assert.ok(cwdRoute.structuredContent.route.candidates.length > 1, 'the route had alternatives but must not replay a deterministic cwd rejection');
+  assert.equal(cwdRoute.structuredContent.attempts.length, 1);
+  assertCwdDiagnostic(cwdRoute.structuredContent.attempts[0]);
+
+  const cwdCommittee = await client.callTool({
+    name: 'run_committee',
+    arguments: {
+      task: 'Review this JavaScript function for a simple bug.',
+      cwd: outsideRoot,
+      providers: ['codex', 'claude'],
+      maxProviders: 2,
+      mode: 'advisory',
+      useCache: false,
+    },
+  });
+  assert.equal(cwdCommittee.structuredContent.status, 'failed');
+  assert.equal(cwdCommittee.structuredContent.members.length, 2);
+  cwdCommittee.structuredContent.members.forEach(assertCwdDiagnostic);
+
+  for (const rejectedMember of [cwdRoute.structuredContent.attempts[0], ...cwdCommittee.structuredContent.members]) {
+    assert.match(rejectedMember.transportReceiptId, /^rcpt_/);
+    assert.equal(rejectedMember.transportReceiptPersisted, true);
+    const outer = await client.callTool({
+      name: 'get_receipt', arguments: { receiptId: rejectedMember.receiptId },
+    });
+    assert.equal(outer.structuredContent.receipt.errorCode, expectedCwdDiagnostic.code);
+    assert.deepEqual(outer.structuredContent.receipt.validation, rejectedMember.validation);
+    assert.equal(outer.structuredContent.receipt.transportReceiptId, rejectedMember.transportReceiptId);
+    assert.equal(outer.structuredContent.receipt.modelInvocation, false);
+    assert.equal(outer.structuredContent.receipt.tokenUsageSource, 'not_invoked');
+    assert.equal(outer.structuredContent.receipt.providerRetryCount, 0);
+    assert.equal(outer.structuredContent.receipt.transportRetryCount, 0);
+    const transportReceipt = await client.callTool({
+      name: 'get_receipt', arguments: { receiptId: rejectedMember.transportReceiptId },
+    });
+    assert.equal(transportReceipt.structuredContent.receipt.errorCode, expectedCwdDiagnostic.code);
+    assert.deepEqual(transportReceipt.structuredContent.receipt.validation, rejectedMember.validation);
+    assert.equal(transportReceipt.structuredContent.receipt.modelInvocation, false);
+    assert.equal(transportReceipt.structuredContent.receipt.physicalAttemptCount, 0);
+    assert.equal(transportReceipt.structuredContent.receipt.providerRetryCount, 0);
+    assert.equal(containsPath(transportReceipt.structuredContent.receipt, outsideRoot), false);
+  }
+
+  const cwdCommitteeRun = await client.callTool({
+    name: 'get_run', arguments: { runId: cwdCommittee.structuredContent.runId },
+  });
+  assert.equal(cwdCommitteeRun.structuredContent.members.length, 2);
+  cwdCommitteeRun.structuredContent.members.forEach(assertCwdDiagnostic);
 
   const routedProvider = await client.callTool({
     name: 'route_and_ask',
