@@ -58,8 +58,11 @@ function pathIdentity(value) {
   return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
 }
 
+let pathHashKey = null;
 function pathHash(value, { raw = false } = {}) {
-  return crypto.createHash('sha256').update(raw ? String(value) : pathIdentity(value)).digest('hex');
+  assert.ok(pathHashKey, 'test capability must be loaded before path identities are checked');
+  return crypto.createHmac('sha256', pathHashKey)
+    .update(raw ? String(value) : pathIdentity(value)).digest('hex');
 }
 
 function existingPathIdentity(value) {
@@ -155,6 +158,7 @@ test('direct REST pre-admission failures persist deduplicated zero-invocation re
   try { health = await waitForHealth(baseUrl, proc); }
   catch (error) { throw new Error(`${error.message}\n${serverOutput}`); }
   const capability = await (await fetch(`${baseUrl}/api/capability`)).json();
+  pathHashKey = capability.token;
   const headers = {
     'Content-Type': 'application/json',
     'X-RelayBridge-Token': capability.token,
@@ -239,10 +243,24 @@ test('direct REST pre-admission failures persist deduplicated zero-invocation re
       assert.equal(containsPath(rejected.receipt, secretPath), false);
     }
     assert.equal(fs.existsSync(cwdInvocationMarker), false, 'cwd rejection must not start a provider process');
+    assert.notEqual(
+      rejected.payload.validation.requestedRootHash,
+      crypto.createHash('sha256').update(String(cwd)).digest('hex'),
+      'path identities must not be predictable unsalted path digests',
+    );
     return rejected;
   };
 
-  await assertCwdRejected(outsideRoot, 'request:validation:cwd-outside');
+  const firstOutside = await assertCwdRejected(outsideRoot, 'request:validation:cwd-outside');
+  const secondOutside = path.join(tempRoot, 'outside-second');
+  fs.mkdirSync(secondOutside, { recursive: true });
+  const reusedRequest = await assertCwdRejected(secondOutside, 'request:validation:cwd-outside');
+  assert.notEqual(reusedRequest.payload.receiptId, firstOutside.payload.receiptId);
+  assert.notEqual(
+    reusedRequest.receipt.rejectionFingerprint,
+    firstOutside.receipt.rejectionFingerprint,
+    'requestId reuse across distinct cwd policy decisions must not alias receipts',
+  );
   await assertCwdRejected(
     `${allowedRootA}${path.sep}child${path.sep}..${path.sep}..${path.sep}outside`,
     'request:validation:cwd-traversal',
@@ -334,4 +352,41 @@ test('direct REST pre-admission failures persist deduplicated zero-invocation re
 
   firstController.abort();
   await first.catch(() => {});
+
+  const pinnedRoot = allowedRoots.at(-1);
+  const cwdCountBeforeRetarget = fs.readFileSync(cwdInvocationMarker, 'utf8').trim().split(/\r?\n/).length;
+  fs.rmSync(pinnedRoot, { recursive: true, force: true });
+  fs.symlinkSync(outsideRoot, pinnedRoot, process.platform === 'win32' ? 'junction' : 'dir');
+  const retargeted = await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST', headers,
+    body: JSON.stringify({
+      kind: 'cwd_guarded', prompt: 'retargeted root must not start', cwd: pinnedRoot,
+      requestId: 'request:validation:root-retargeted',
+    }),
+  });
+  assert.equal(retargeted.status, 400);
+  const retargetedPayload = await retargeted.json();
+  assert.equal(retargetedPayload.errorCode, 'cwd_outside_allowed_roots');
+  assert.equal(retargetedPayload.model_invocation, false);
+  assert.equal(containsPath(retargetedPayload, pinnedRoot), false);
+  assert.equal(containsPath(retargetedPayload, outsideRoot), false);
+
+  fs.rmSync(pinnedRoot, { recursive: true, force: true });
+  fs.mkdirSync(pinnedRoot, { recursive: true });
+  const recreated = await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST', headers,
+    body: JSON.stringify({
+      kind: 'cwd_guarded', prompt: 'recreated root must await restart', cwd: pinnedRoot,
+      requestId: 'request:validation:root-recreated',
+    }),
+  });
+  assert.equal(recreated.status, 400);
+  const recreatedPayload = await recreated.json();
+  assert.equal(recreatedPayload.errorCode, 'cwd_outside_allowed_roots');
+  assert.equal(recreatedPayload.model_invocation, false);
+  assert.equal(
+    fs.readFileSync(cwdInvocationMarker, 'utf8').trim().split(/\r?\n/).length,
+    cwdCountBeforeRetarget,
+    'retargeted and recreated startup trust roots must never spawn a child',
+  );
 });

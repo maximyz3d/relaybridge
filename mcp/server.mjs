@@ -914,6 +914,49 @@ function providerSucceeded(response) {
     !!String(response.stdout || '').trim();
 }
 
+function bridgeFailureResult(error, { kind, signal }) {
+  const bridgeStatus = error instanceof BridgeError && Number.isInteger(error.status)
+    ? error.status : null;
+  const deterministicPreflightRejection = bridgeStatus !== null
+    && bridgeStatus >= 400 && bridgeStatus < 500;
+  const authRequired = error instanceof BridgeError && error.detail?.auth_required === true;
+  const transportTimedOut = !signal?.aborted && error instanceof BridgeError
+    && (error.cause?.name === 'TimeoutError' || error.cause?.cause?.name === 'TimeoutError');
+  const validation = error instanceof BridgeError
+    ? normalizeValidationDiagnostic(error.detail?.validation) : null;
+  const transportReceiptId = error instanceof BridgeError
+    && /^rcpt_[A-Za-z0-9._:-]{1,180}$/.test(String(error.detail?.receiptId || ''))
+    ? String(error.detail.receiptId) : null;
+  return {
+    status: signal?.aborted ? 'cancelled' : transportTimedOut ? 'timed_out' : 'failed',
+    sanitized: {
+      kind,
+      exitCode: -1,
+      droppedOut: true,
+      stdout: '',
+      stderr: validation?.reason || error.message,
+      route: {},
+      cancelled: !!signal?.aborted,
+      timedOut: transportTimedOut,
+      authFailed: authRequired,
+      admissionLimited: bridgeStatus === 429,
+      modelInvocation: deterministicPreflightRejection ? false : null,
+      tokenUsageSource: deterministicPreflightRejection ? 'not_invoked' : 'unknown',
+      transportRetryCount: 0,
+      providerRetries: deterministicPreflightRejection ? zeroProviderRetries() : null,
+      transportReceiptId,
+      transportReceiptPersisted: transportReceiptId ? error.detail?.receiptPersisted ?? null : null,
+      transportReceiptPersistenceError: transportReceiptId
+        ? strictBoundedString(error.detail?.receiptPersistenceError, 500) : null,
+      failureClass: deterministicPreflightRejection
+        ? (error.detail?.failureClass || 'policy') : null,
+      actionPreflight: error.detail?.actionPreflight || null,
+      errorCode: validation?.code || null,
+      validation,
+    },
+  };
+}
+
 async function callProvider({
   kind,
   prompt,
@@ -935,8 +978,21 @@ async function callProvider({
   const cacheKey = { kind, prompt, cwd: cwd || '', configFingerprint, purpose };
   const cacheKeyHash = stableHash(cacheKey);
   const startedAt = Date.now();
+  let sanitized;
+  let status = 'failed';
   if (signal?.aborted) throw signal.reason || new Error('provider call cancelled before admission');
-  if (useCache && ttl > 0) {
+  try {
+    await bridgeRequest('/api/workspace/validate', {
+      method: 'POST',
+      body: { kind, prompt, cwd, requestId },
+      timeoutMs: TIMEOUT_POLICY.transportTimeoutMs(timeoutMs),
+      signal,
+      actionIdentity: true,
+    });
+  } catch (error) {
+    ({ sanitized, status } = bridgeFailureResult(error, { kind, signal }));
+  }
+  if (!sanitized && useCache && ttl > 0) {
     const cached = readCache(cacheKey, ttl);
     if (cached) {
       const receipt = appendReceipt({
@@ -1009,9 +1065,7 @@ async function callProvider({
     }
   }
 
-  let sanitized;
-  let status = 'failed';
-  try {
+  if (!sanitized) try {
     const response = await bridgeRequest('/api/oneshot', {
       method: 'POST',
       body: {
@@ -1031,44 +1085,7 @@ async function callProvider({
       : sanitized.cancelled ? 'cancelled'
         : sanitized.timedOut ? 'timed_out' : 'dropped';
   } catch (error) {
-    const bridgeStatus = error instanceof BridgeError && Number.isInteger(error.status)
-      ? error.status : null;
-    const deterministicPreflightRejection = bridgeStatus !== null
-      && bridgeStatus >= 400 && bridgeStatus < 500;
-    const authRequired = error instanceof BridgeError && error.detail?.auth_required === true;
-    const transportTimedOut = !signal?.aborted && error instanceof BridgeError
-      && (error.cause?.name === 'TimeoutError' || error.cause?.cause?.name === 'TimeoutError');
-    const validation = error instanceof BridgeError
-      ? normalizeValidationDiagnostic(error.detail?.validation) : null;
-    const transportReceiptId = error instanceof BridgeError
-      && /^rcpt_[A-Za-z0-9._:-]{1,180}$/.test(String(error.detail?.receiptId || ''))
-      ? String(error.detail.receiptId) : null;
-    sanitized = {
-      kind,
-      exitCode: -1,
-      droppedOut: true,
-      stdout: '',
-      stderr: validation?.reason || error.message,
-      route: {},
-      cancelled: !!signal?.aborted,
-      timedOut: transportTimedOut,
-      authFailed: authRequired,
-      admissionLimited: bridgeStatus === 429,
-      modelInvocation: deterministicPreflightRejection ? false : null,
-      tokenUsageSource: deterministicPreflightRejection ? 'not_invoked' : 'unknown',
-      transportRetryCount: 0,
-      providerRetries: deterministicPreflightRejection ? zeroProviderRetries() : null,
-      transportReceiptId,
-      transportReceiptPersisted: transportReceiptId ? error.detail?.receiptPersisted ?? null : null,
-      transportReceiptPersistenceError: transportReceiptId
-        ? strictBoundedString(error.detail?.receiptPersistenceError, 500) : null,
-      failureClass: deterministicPreflightRejection
-        ? (error.detail?.failureClass || 'policy') : null,
-      actionPreflight: error.detail?.actionPreflight || null,
-      errorCode: validation?.code || null,
-      validation,
-    };
-    status = signal?.aborted ? 'cancelled' : transportTimedOut ? 'timed_out' : 'failed';
+    ({ sanitized, status } = bridgeFailureResult(error, { kind, signal }));
   }
 
   const receipt = appendReceipt({
