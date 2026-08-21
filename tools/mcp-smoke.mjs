@@ -64,37 +64,108 @@ export function assessCommittee(result, expectedProviders = DEFAULT_COMMITTEE_PR
   };
 }
 
-function findIdentityEvidence(value, path = [], seen = new Set()) {
-  if (!value || typeof value !== 'object' || seen.has(value)) return null;
-  seen.add(value);
+const CANONICAL_RECEIPT_ID = /^rcpt_[a-z0-9]+_[0-9a-f]{8}$/;
+
+function directIdentityEvidence(value, path) {
+  if (!value || typeof value !== 'object') return null;
   const preflight = value.actionPreflight;
   if (value.failureClass === 'bridge_identity_mismatch'
       && preflight && typeof preflight === 'object'
       && (preflight.buildMatches === false || preflight.receiptStoreMatches === false)) {
-    return { diagnostic: value, preflight, path };
-  }
-  for (const [key, child] of Object.entries(value)) {
-    const found = findIdentityEvidence(child, [...path, key], seen);
-    if (found) return found;
+    return { diagnostic: value, preflight, path, ownedReceiptId: null };
   }
   return null;
 }
 
-function identityFailure(results) {
+function samePreflight(left, right) {
+  const fields = [
+    'expectedBuildId', 'currentBuildId', 'buildMatches',
+    'expectedReceiptStoreId', 'currentReceiptStoreId', 'receiptStoreMatches',
+  ];
+  return fields.every((field) => (left?.[field] ?? null) === (right?.[field] ?? null));
+}
+
+async function verifyOwnedIdentityEvidence({ call, candidate, path, rootReceiptId, expectedKinds }) {
+  const evidence = directIdentityEvidence(candidate, path);
+  const receiptId = candidate?.receiptId;
+  if (!evidence
+      || !CANONICAL_RECEIPT_ID.test(receiptId || '')
+      || !CANONICAL_RECEIPT_ID.test(rootReceiptId || '')
+      || !expectedKinds.has(candidate.kind)) return null;
+  let lookup;
+  try {
+    lookup = await call('get_receipt', { receiptId });
+  } catch {
+    return null;
+  }
+  if (!toolSucceeded(lookup)) return null;
+  const receipt = content(lookup).receipt;
+  if (!receipt || receipt.receiptId !== receiptId
+      || receipt.event !== 'provider_call'
+      || receipt.parentReceiptId !== rootReceiptId
+      || receipt.provider !== candidate.kind
+      || receipt.failureClass !== 'bridge_identity_mismatch'
+      || !samePreflight(receipt.actionPreflight, candidate.actionPreflight)) return null;
+  return { ...evidence, ownedReceiptId: receiptId, verifiedReceipt: receipt };
+}
+
+async function identityFailure(results, call, expectedCommitteeProviders) {
+  // Every top-level structured result belongs to the current smoke request, so
+  // an explicit preflight there is causal. Do not recursively inspect context:
+  // it intentionally contains historical receipts from unrelated requests.
   for (const [phase, result] of Object.entries(results)) {
-    const evidence = findIdentityEvidence(result);
+    const evidence = directIdentityEvidence(content(result), ['structuredContent']);
     if (!evidence) continue;
-    return {
-      phase,
-      kind: 'source_build_identity_mismatch',
-      failureClass: 'bridge_identity_mismatch',
-      diagnosticPath: evidence.path.join('.'),
-      diagnostic: evidence.diagnostic,
-      detail: evidence.preflight,
-      guidance: 'This source checkout does not match the running RelayBridge build or receipt store. Run smoke from the installed root, or regenerate build-info.json and restart that exact build before retrying. The rejected action invoked no provider.',
-    };
+    return identityFailureReport(phase, evidence);
+  }
+
+  // Nested provider diagnostics are causal only in the known outputs of the
+  // current mutating/read-external action and only when they carry their own
+  // canonical receipt. Arbitrary nested history (for example context
+  // recentReceipts) is never considered current failure evidence.
+  const actionOwned = [
+    {
+      phase: 'routed',
+      field: 'attempts',
+      expectedKinds: new Set((content(results.routed).route?.selected || []).map((item) => item?.kind)),
+    },
+    {
+      phase: 'committee',
+      field: 'members',
+      expectedKinds: new Set(expectedCommitteeProviders),
+    },
+  ];
+  for (const { phase, field, expectedKinds } of actionOwned) {
+    const rootReceiptId = content(results[phase]).receiptId;
+    const owned = content(results[phase])?.[field];
+    const candidates = Array.isArray(owned) ? owned : [owned];
+    for (let index = 0; index < candidates.length; index += 1) {
+      const path = ['structuredContent', field, ...(Array.isArray(owned) ? [String(index)] : [])];
+      const evidence = await verifyOwnedIdentityEvidence({
+        call,
+        candidate: candidates[index],
+        path,
+        rootReceiptId,
+        expectedKinds,
+      });
+      if (evidence) return identityFailureReport(phase, evidence);
+    }
   }
   return null;
+}
+
+function identityFailureReport(phase, evidence) {
+  return {
+    phase,
+    kind: 'source_build_identity_mismatch',
+    failureClass: 'bridge_identity_mismatch',
+    diagnosticPath: evidence.path.join('.'),
+    diagnostic: evidence.diagnostic,
+    detail: evidence.preflight,
+    ownedReceiptId: evidence.ownedReceiptId,
+    verifiedReceipt: evidence.verifiedReceipt || null,
+    guidance: 'This source checkout does not match the running RelayBridge build or receipt store. Run smoke from the installed root, or regenerate build-info.json and restart that exact build before retrying. The rejected action invoked no provider.',
+  };
 }
 
 function errorSummary(error) {
@@ -272,7 +343,7 @@ export async function runSmoke({
       results.routed,
       ...(includeAllLocal ? [results.reasoning] : []),
     ];
-    const identity = identityFailure(results);
+    const identity = await identityFailure(results, call, expectedCommitteeProviders);
     const baseSucceeded = requestedResults.every(toolSucceeded);
     const ok = baseSucceeded && !identity && (!includeCommittee || committee.ok);
     payload = {

@@ -62,7 +62,8 @@ function fakeHarness(results, {
     async callTool(request) {
       calls.push(request);
       if (failAt === request.name) throw new Error(`${request.name} failed`);
-      return results[request.name];
+      const fixture = results[request.name];
+      return typeof fixture === 'function' ? fixture(request) : fixture;
     },
     async close() {
       calls.push({ name: 'client.close' });
@@ -183,14 +184,48 @@ test('stale source build identity is nonzero and recommends installed-root recov
   assert.match(emitted[0].failure.guidance, /invoked no provider/i);
 });
 
-test('nested committee member identity mismatch preserves exact diagnostic and preflight', async () => {
+test('historical context identity mismatch cannot fail a healthy current action', async () => {
   const { runSmoke } = await import('../tools/mcp-smoke.mjs');
+  const healthyContext = baseResults().get_context_bundle.structuredContent;
+  const harness = fakeHarness(baseResults({
+    get_context_bundle: result({
+      ...healthyContext,
+      recentReceipts: [{
+        receiptId: 'rcpt-historical-mismatch',
+        failureClass: 'bridge_identity_mismatch',
+        modelInvocation: false,
+        tokenUsageSource: 'not_invoked',
+        actionPreflight: {
+          expectedBuildId: 'historical-source',
+          currentBuildId: 'historical-runtime',
+          buildMatches: false,
+          receiptStoreMatches: true,
+        },
+      }],
+    }),
+  }));
+  const emitted = [];
+  const outcome = await runSmoke({
+    ...harness,
+    cleanupBudgetMs: 20,
+    emit: async (payload) => { emitted.push(payload); },
+  });
+
+  assert.equal(outcome.exitCode, 0);
+  assert.equal(emitted[0].ok, true);
+  assert.equal(emitted[0].failure, null);
+  assert.equal(emitted[0].routed.receiptId, 'rcpt-route');
+});
+
+test('verified current action-owned committee mismatch preserves exact diagnostic and preflight', async () => {
+  const { runSmoke } = await import('../tools/mcp-smoke.mjs');
+  const rootReceiptId = 'rcpt_mt2root_1234abcd';
   const staleMember = {
     kind: 'ollama_coder',
     role: 'critic',
     exitCode: 1,
     droppedOut: true,
-    receiptId: 'rcpt-identity-member',
+    receiptId: 'rcpt_mt2member_5678abcd',
     failureClass: 'bridge_identity_mismatch',
     modelInvocation: false,
     tokenUsageSource: 'not_invoked',
@@ -201,17 +236,30 @@ test('nested committee member identity mismatch preserves exact diagnostic and p
       receiptStoreMatches: true,
     },
   };
+  assert.equal(Object.hasOwn(staleMember, 'invocationId'), false);
   const harness = fakeHarness(baseResults({
     run_committee: result({
       ok: true,
       status: 'failed',
       allSeatsSucceeded: false,
       runId: 'run-stale-committee',
-      receiptId: 'rcpt-stale-committee',
+      receiptId: rootReceiptId,
       members: [
         { kind: 'ollama_fast', role: 'reviewer', exitCode: 0, droppedOut: false },
         staleMember,
       ],
+    }),
+    get_receipt: (request) => result({
+      receipt: {
+        receiptId: request.arguments.receiptId,
+        event: 'provider_call',
+        parentReceiptId: rootReceiptId,
+        provider: staleMember.kind,
+        failureClass: staleMember.failureClass,
+        actionPreflight: staleMember.actionPreflight,
+      },
+      chain: [],
+      chainTruncated: false,
     }),
   }));
   const emitted = [];
@@ -226,11 +274,152 @@ test('nested committee member identity mismatch preserves exact diagnostic and p
   assert.equal(emitted[0].failure.kind, 'source_build_identity_mismatch');
   assert.equal(emitted[0].failure.phase, 'committee');
   assert.equal(emitted[0].failure.diagnosticPath, 'structuredContent.members.1');
+  assert.equal(emitted[0].failure.ownedReceiptId, staleMember.receiptId);
+  assert.equal(emitted[0].failure.verifiedReceipt.parentReceiptId, rootReceiptId);
   assert.deepEqual(emitted[0].failure.diagnostic, staleMember);
   assert.deepEqual(emitted[0].failure.detail, staleMember.actionPreflight);
   assert.match(emitted[0].failure.guidance, /installed root/i);
   assert.match(emitted[0].failure.guidance, /build-info\.json/i);
   assert.match(emitted[0].failure.guidance, /invoked no provider/i);
+});
+
+test('verified current routed attempt mismatch uses the real return shape without invocationId', async () => {
+  const { runSmoke } = await import('../tools/mcp-smoke.mjs');
+  const rootReceiptId = 'rcpt_mt2route_1234abcd';
+  const staleAttempt = {
+    kind: 'ollama_fast',
+    exitCode: -1,
+    droppedOut: true,
+    receiptId: 'rcpt_mt2attempt_5678abcd',
+    failureClass: 'bridge_identity_mismatch',
+    modelInvocation: false,
+    tokenUsageSource: 'not_invoked',
+    actionPreflight: {
+      expectedBuildId: 'source-old',
+      currentBuildId: 'installed-new',
+      buildMatches: false,
+      receiptStoreMatches: true,
+    },
+  };
+  assert.equal(Object.hasOwn(staleAttempt, 'invocationId'), false);
+  const harness = fakeHarness(baseResults({
+    route_and_ask: result({
+      ok: false,
+      status: 'failed',
+      route: { selected: [{ kind: staleAttempt.kind }] },
+      winner: null,
+      attempts: [staleAttempt],
+      runId: 'run-stale-route',
+      receiptId: rootReceiptId,
+    }),
+    get_receipt: (request) => result({
+      receipt: {
+        receiptId: request.arguments.receiptId,
+        event: 'provider_call',
+        parentReceiptId: rootReceiptId,
+        provider: staleAttempt.kind,
+        failureClass: staleAttempt.failureClass,
+        actionPreflight: staleAttempt.actionPreflight,
+      },
+      chain: [],
+      chainTruncated: false,
+    }),
+  }));
+  const emitted = [];
+  const outcome = await runSmoke({
+    ...harness,
+    cleanupBudgetMs: 20,
+    emit: async (payload) => { emitted.push(payload); },
+  });
+
+  assert.equal(outcome.exitCode, 1);
+  assert.equal(emitted[0].failure.kind, 'source_build_identity_mismatch');
+  assert.equal(emitted[0].failure.phase, 'routed');
+  assert.equal(emitted[0].failure.diagnosticPath, 'structuredContent.attempts.0');
+  assert.equal(emitted[0].failure.ownedReceiptId, staleAttempt.receiptId);
+  assert.equal(emitted[0].failure.verifiedReceipt.parentReceiptId, rootReceiptId);
+});
+
+test('unowned nested mismatch diagnostics never masquerade as current identity failure', async (t) => {
+  const { runSmoke } = await import('../tools/mcp-smoke.mjs');
+  const rootReceiptId = 'rcpt_mt2root_1234abcd';
+  const baseMember = {
+    kind: 'ollama_coder',
+    role: 'critic',
+    exitCode: 1,
+    droppedOut: true,
+    receiptId: 'rcpt_mt2member_5678abcd',
+    failureClass: 'bridge_identity_mismatch',
+    modelInvocation: false,
+    tokenUsageSource: 'not_invoked',
+    actionPreflight: {
+      expectedBuildId: 'source-old',
+      currentBuildId: 'installed-new',
+      buildMatches: false,
+      receiptStoreMatches: true,
+    },
+  };
+  const cases = [
+    {
+      name: 'unexpected historical_intruder member',
+      member: { ...baseMember, kind: 'historical_intruder' },
+      receipt: null,
+    },
+    {
+      name: 'fabricated canonical-looking receipt',
+      member: baseMember,
+      receipt: null,
+    },
+    {
+      name: 'noncanonical receipt id',
+      member: { ...baseMember, receiptId: 'fabricated-receipt' },
+      receipt: null,
+    },
+    {
+      name: 'spoofed parent receipt',
+      member: baseMember,
+      receipt: {
+        receiptId: baseMember.receiptId,
+        event: 'provider_call',
+        parentReceiptId: 'rcpt_otherroot_8765dcba',
+        provider: baseMember.kind,
+        failureClass: baseMember.failureClass,
+        actionPreflight: baseMember.actionPreflight,
+      },
+    },
+  ];
+
+  for (const testCase of cases) {
+    await t.test(testCase.name, async () => {
+      const harness = fakeHarness(baseResults({
+        run_committee: result({
+          ok: true,
+          status: 'failed',
+          allSeatsSucceeded: false,
+          runId: 'run-unowned-committee',
+          receiptId: rootReceiptId,
+          members: [
+            { kind: 'ollama_fast', role: 'reviewer', exitCode: 0, droppedOut: false },
+            testCase.member,
+          ],
+        }),
+        get_receipt: testCase.receipt
+          ? result({ receipt: testCase.receipt, chain: [], chainTruncated: false })
+          : result({ ok: false, error: 'receipt not found' }, true),
+      }));
+      const emitted = [];
+      const outcome = await runSmoke({
+        ...harness,
+        includeCommittee: true,
+        cleanupBudgetMs: 20,
+        emit: async (payload) => { emitted.push(payload); },
+      });
+
+      assert.equal(outcome.exitCode, 1);
+      assert.equal(emitted[0].failure.kind, 'requested_committee_failed');
+      assert.notEqual(emitted[0].failure.kind, 'source_build_identity_mismatch');
+    });
+  }
 });
 
 test('partial JSON is emitted on an MCP exception before cleanup', async () => {
