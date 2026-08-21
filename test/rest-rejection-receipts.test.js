@@ -6,6 +6,7 @@ const fs = require('node:fs');
 const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const { pathToFileURL } = require('node:url');
 const { spawn, spawnSync } = require('node:child_process');
 
@@ -52,12 +53,59 @@ function dereferenceReceipt(dataDir, receiptId) {
   return JSON.parse(result.stdout);
 }
 
+function pathIdentity(value) {
+  const normalized = path.resolve(String(value));
+  return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+}
+
+let pathHashKey = null;
+function pathHash(value, { raw = false } = {}) {
+  assert.ok(pathHashKey, 'test capability must be loaded before path identities are checked');
+  return crypto.createHmac('sha256', pathHashKey)
+    .update(raw ? String(value) : pathIdentity(value)).digest('hex');
+}
+
+function existingPathIdentity(value) {
+  const canonical = fs.realpathSync.native ? fs.realpathSync.native(value) : fs.realpathSync(value);
+  return pathIdentity(canonical);
+}
+
+function containsPath(value, candidate) {
+  const needle = process.platform === 'win32' ? candidate.toLowerCase() : candidate;
+  if (typeof value === 'string') {
+    const text = process.platform === 'win32' ? value.toLowerCase() : value;
+    return text.includes(needle);
+  }
+  if (Array.isArray(value)) return value.some((item) => containsPath(item, candidate));
+  if (value && typeof value === 'object') return Object.values(value).some((item) => containsPath(item, candidate));
+  return false;
+}
+
 test('direct REST pre-admission failures persist deduplicated zero-invocation receipts', { timeout: 30000 }, async (t) => {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'relaybridge-rest-rejections-'));
   const dataDir = path.join(tempRoot, 'data');
   const tokenPath = path.join(tempRoot, 'bridge.token');
   const configPath = path.join(tempRoot, 'config.json');
   const invocationMarker = path.join(tempRoot, 'provider-invocations.txt');
+  const cwdInvocationMarker = path.join(tempRoot, 'cwd-provider-invocations.txt');
+  const allowedRoots = Array.from({ length: 34 }, (_, index) => path.join(tempRoot, `allowed-${index}`));
+  const [allowedRootA, allowedRootB] = allowedRoots;
+  const pinnedRoot = allowedRoots.at(-1);
+  const pinnedRootTarget = path.join(tempRoot, 'allowed-root-junction-target');
+  const outsideRoot = path.join(tempRoot, 'outside');
+  const symlinkOutside = path.join(allowedRootA, 'outside-link');
+  const inRootTargetA = path.join(allowedRootB, 'target-a');
+  const inRootTargetB = path.join(allowedRootB, 'target-b');
+  const inRootLink = path.join(allowedRootB, 'target-link');
+  allowedRoots.forEach((root) => fs.mkdirSync(root, { recursive: true }));
+  fs.mkdirSync(pinnedRootTarget, { recursive: true });
+  fs.rmSync(pinnedRoot, { recursive: true, force: true });
+  fs.symlinkSync(pinnedRootTarget, pinnedRoot, process.platform === 'win32' ? 'junction' : 'dir');
+  fs.mkdirSync(outsideRoot, { recursive: true });
+  fs.mkdirSync(inRootTargetA, { recursive: true });
+  fs.mkdirSync(inRootTargetB, { recursive: true });
+  fs.symlinkSync(outsideRoot, symlinkOutside, process.platform === 'win32' ? 'junction' : 'dir');
+  fs.symlinkSync(inRootTargetA, inRootLink, process.platform === 'win32' ? 'junction' : 'dir');
   const helper = path.join(ROOT, 'test', 'prompt-file-cli.js');
   const baseSlot = [process.execPath, helper, '--prompt-file', '{prompt_file}', '--invocation-marker', invocationMarker];
   const probe = [process.execPath, helper, '--version'];
@@ -74,6 +122,11 @@ test('direct REST pre-admission failures persist deduplicated zero-invocation re
 
   fs.writeFileSync(configPath, JSON.stringify({
     guarded: provider('Guarded', [...baseSlot, '--delay', '10000']),
+    cwd_guarded: provider('Cwd guarded', [
+      process.execPath, '-e',
+      "require('node:fs').appendFileSync(process.argv[1], process.cwd() + '\\n'); process.stdout.write(process.cwd())",
+      cwdInvocationMarker,
+    ]),
     bad_env: provider('Bad environment', baseSlot, { oneshot_env: ['invalid'] }),
     no_slot: provider('No one-shot slot', null, { oneshot_safe: [], oneshot_dangerous: [] }),
     mixed_transport: provider('Mixed transport', [process.execPath, helper, '--prompt-file', '{prompt_file}', '--output', '{prompt}']),
@@ -98,6 +151,7 @@ test('direct REST pre-admission failures persist deduplicated zero-invocation re
       RELAYBRIDGE_DATA_DIR: dataDir,
       RELAYBRIDGE_MAX_ACTIVE_ONESHOTS: '4',
       RELAYBRIDGE_MAX_ACTIVE_PER_PROVIDER: '1',
+      RELAYBRIDGE_ALLOWED_ROOTS: allowedRoots.join(';'),
     },
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -115,6 +169,7 @@ test('direct REST pre-admission failures persist deduplicated zero-invocation re
   try { health = await waitForHealth(baseUrl, proc); }
   catch (error) { throw new Error(`${error.message}\n${serverOutput}`); }
   const capability = await (await fetch(`${baseUrl}/api/capability`)).json();
+  pathHashKey = capability.token;
   const headers = {
     'Content-Type': 'application/json',
     'X-RelayBridge-Token': capability.token,
@@ -163,6 +218,96 @@ test('direct REST pre-admission failures persist deduplicated zero-invocation re
     return { response, payload, receipt };
   };
 
+  const admitted = await fetch(`${baseUrl}/api/workspace/validate`, {
+    method: 'POST', headers,
+    body: JSON.stringify({
+      kind: 'cwd_guarded', prompt: 'identity-bound admission', cwd: inRootLink,
+      requestId: 'request:cwd-identity:preflight',
+    }),
+  });
+  assert.equal(admitted.status, 200);
+  const admittedPayload = await admitted.json();
+  assert.match(admittedPayload.cwdIdentityHash, /^[0-9a-f]{64}$/);
+  assert.match(admittedPayload.cwdPolicyId, /^[0-9a-f]{64}$/);
+  fs.rmSync(inRootLink, { recursive: true, force: true });
+  fs.symlinkSync(inRootTargetB, inRootLink, process.platform === 'win32' ? 'junction' : 'dir');
+  const identityChanged = await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST', headers,
+    body: JSON.stringify({
+      kind: 'cwd_guarded', prompt: 'identity-bound admission', cwd: inRootLink,
+      requestId: 'request:cwd-identity:execution',
+      expectedCwdIdentityHash: admittedPayload.cwdIdentityHash,
+      expectedCwdPolicyId: admittedPayload.cwdPolicyId,
+    }),
+  });
+  assert.equal(identityChanged.status, 400);
+  const identityChangedPayload = await identityChanged.json();
+  assert.equal(identityChangedPayload.errorCode, 'cwd_identity_changed');
+  assert.equal(identityChangedPayload.model_invocation, false);
+  assert.equal(identityChangedPayload.token_usage_source, 'not_invoked');
+  assert.match(identityChangedPayload.receiptId, /^rcpt_/);
+  assert.equal(fs.existsSync(cwdInvocationMarker), false);
+
+  const assertCwdRejected = async (cwd, requestId, { canonical = null } = {}) => {
+    const rejected = await assertRejected({
+      body: { kind: 'cwd_guarded', prompt: 'cwd must not start', cwd, requestId },
+      status: 400,
+      failureClass: 'validation',
+    });
+    const expected = {
+      code: 'cwd_outside_allowed_roots',
+      field: 'cwd',
+      reason: 'The requested working directory resolves outside RelayBridge allowed roots.',
+      retryable: false,
+      requestedRootHash: pathHash(cwd, { raw: true }),
+      normalizedRootHash: pathHash(path.resolve(cwd)),
+      canonicalRootHash: canonical ? pathHash(existingPathIdentity(canonical)) : null,
+      allowedRootHashes: allowedRoots.slice(0, 32).map((root) => pathHash(existingPathIdentity(root))),
+      allowedRootHashCount: 34,
+      allowedRootHashesTruncated: true,
+      guidance: 'Use an existing allowed working directory, or explicitly add the intended root to RELAYBRIDGE_ALLOWED_ROOTS and restart RelayBridge. RelayBridge did not change the allowlist.',
+      allowlistChanged: false,
+      restartRequiredForEnrollment: true,
+    };
+    assert.equal(rejected.payload.errorCode, expected.code);
+    assert.deepEqual(rejected.payload.validation, expected);
+    assert.equal(rejected.receipt.errorCode, expected.code);
+    assert.deepEqual(rejected.receipt.validation, expected);
+    if (String(cwd) !== path.resolve(cwd)) {
+      assert.notEqual(expected.requestedRootHash, expected.normalizedRootHash, 'raw traversal identity must remain distinguishable from its normalized identity');
+    }
+    if (canonical) {
+      assert.notEqual(expected.canonicalRootHash, expected.normalizedRootHash, 'symlink target identity must remain distinguishable from its lexical path');
+    }
+    for (const secretPath of [cwd, path.resolve(cwd), ...allowedRoots, outsideRoot]) {
+      assert.equal(containsPath(rejected.payload, secretPath), false);
+      assert.equal(containsPath(rejected.receipt, secretPath), false);
+    }
+    assert.equal(fs.existsSync(cwdInvocationMarker), false, 'cwd rejection must not start a provider process');
+    assert.notEqual(
+      rejected.payload.validation.requestedRootHash,
+      crypto.createHash('sha256').update(String(cwd)).digest('hex'),
+      'path identities must not be predictable unsalted path digests',
+    );
+    return rejected;
+  };
+
+  const firstOutside = await assertCwdRejected(outsideRoot, 'request:validation:cwd-outside');
+  const secondOutside = path.join(tempRoot, 'outside-second');
+  fs.mkdirSync(secondOutside, { recursive: true });
+  const reusedRequest = await assertCwdRejected(secondOutside, 'request:validation:cwd-outside');
+  assert.notEqual(reusedRequest.payload.receiptId, firstOutside.payload.receiptId);
+  assert.notEqual(
+    reusedRequest.receipt.rejectionFingerprint,
+    firstOutside.receipt.rejectionFingerprint,
+    'requestId reuse across distinct cwd policy decisions must not alias receipts',
+  );
+  await assertCwdRejected(
+    `${allowedRootA}${path.sep}child${path.sep}..${path.sep}..${path.sep}outside`,
+    'request:validation:cwd-traversal',
+  );
+  await assertCwdRejected(symlinkOutside, 'request:validation:cwd-symlink', { canonical: outsideRoot });
+
   await assertRejected({
     body: { kind: 'unknown', prompt: 'must not start', requestId: 'request:validation:unknown' },
     status: 400,
@@ -193,6 +338,29 @@ test('direct REST pre-admission failures persist deduplicated zero-invocation re
     failureClass: 'auth',
   });
   assert.equal(fs.existsSync(invocationMarker), false, 'signed-out auth rejection must not start a provider process');
+
+  const allowedSecondRoot = await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST', headers,
+    body: JSON.stringify({
+      kind: 'cwd_guarded', prompt: 'allowed second root', cwd: allowedRootB,
+      requestId: 'request:allowed:second-root',
+    }),
+  });
+  assert.equal(allowedSecondRoot.status, 200);
+  assert.equal(path.resolve((await allowedSecondRoot.json()).stdout), path.resolve(allowedRootB));
+  const allowedNoncanonical = await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST', headers,
+    body: JSON.stringify({
+      kind: 'cwd_guarded', prompt: 'allowed normalized root',
+      cwd: `${allowedRootB}${path.sep}nested${path.sep}..`, requestId: 'request:allowed:normalized-root',
+    }),
+  });
+  assert.equal(allowedNoncanonical.status, 200);
+  assert.equal(path.resolve((await allowedNoncanonical.json()).stdout), path.resolve(allowedRootB));
+  assert.deepEqual(
+    fs.readFileSync(cwdInvocationMarker, 'utf8').trim().split(/\r?\n/).map((value) => path.resolve(value)),
+    [path.resolve(allowedRootB), path.resolve(allowedRootB)],
+  );
 
   const firstController = new AbortController();
   const first = fetch(`${baseUrl}/api/oneshot`, {
@@ -225,4 +393,41 @@ test('direct REST pre-admission failures persist deduplicated zero-invocation re
 
   firstController.abort();
   await first.catch(() => {});
+
+  const cwdCountBeforeRetarget = fs.readFileSync(cwdInvocationMarker, 'utf8').trim().split(/\r?\n/).length;
+  fs.rmSync(pinnedRoot, { recursive: true, force: true });
+  fs.symlinkSync(pinnedRootTarget, pinnedRoot, process.platform === 'win32' ? 'junction' : 'dir');
+  const sameTargetRecreated = await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST', headers,
+    body: JSON.stringify({
+      kind: 'cwd_guarded', prompt: 'recreated root object must await restart', cwd: pinnedRoot,
+      requestId: 'request:validation:root-same-target-recreated',
+    }),
+  });
+  assert.equal(sameTargetRecreated.status, 400);
+  const sameTargetPayload = await sameTargetRecreated.json();
+  assert.equal(sameTargetPayload.errorCode, 'cwd_outside_allowed_roots');
+  assert.equal(sameTargetPayload.model_invocation, false);
+
+  fs.rmSync(pinnedRoot, { recursive: true, force: true });
+  fs.symlinkSync(outsideRoot, pinnedRoot, process.platform === 'win32' ? 'junction' : 'dir');
+  const retargeted = await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST', headers,
+    body: JSON.stringify({
+      kind: 'cwd_guarded', prompt: 'retargeted root must not start', cwd: pinnedRoot,
+      requestId: 'request:validation:root-retargeted',
+    }),
+  });
+  assert.equal(retargeted.status, 400);
+  const retargetedPayload = await retargeted.json();
+  assert.equal(retargetedPayload.errorCode, 'cwd_outside_allowed_roots');
+  assert.equal(retargetedPayload.model_invocation, false);
+  assert.equal(containsPath(retargetedPayload, pinnedRoot), false);
+  assert.equal(containsPath(retargetedPayload, outsideRoot), false);
+
+  assert.equal(
+    fs.readFileSync(cwdInvocationMarker, 'utf8').trim().split(/\r?\n/).length,
+    cwdCountBeforeRetarget,
+    'retargeted and recreated startup trust roots must never spawn a child',
+  );
 });

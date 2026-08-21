@@ -153,6 +153,7 @@ test('Windows child PATH discovers the official Cursor install directory and kee
   });
   assert.equal(rejected.status, 400);
   const rejection = await rejected.json();
-  assert.match(rejection.error, /outside RELAYBRIDGE_ALLOWED_ROOTS/);
-  assert.ok(rejection.error.toLowerCase().includes(allowedRoot.toLowerCase()));
+  assert.equal(rejection.error, 'The requested working directory resolves outside RelayBridge allowed roots.');
+  assert.equal(JSON.stringify(rejection).includes(tempRoot), false);
+  assert.equal(JSON.stringify(rejection).includes(allowedRoot), false);
 });

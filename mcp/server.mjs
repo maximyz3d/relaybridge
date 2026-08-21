@@ -659,6 +659,81 @@ function strictBoundedString(value, maxChars = 128) {
   return normalized ? normalized.slice(0, maxChars) : null;
 }
 
+const CWD_OUTSIDE_ALLOWED_ROOTS = 'cwd_outside_allowed_roots';
+const CWD_OUTSIDE_REASON = 'The requested working directory resolves outside RelayBridge allowed roots.';
+const CWD_IDENTITY_CHANGED = 'cwd_identity_changed';
+const CWD_IDENTITY_CHANGED_REASON = 'The working directory identity changed after admission and before provider execution.';
+const CWD_ENROLLMENT_GUIDANCE = 'Use an existing allowed working directory, or explicitly add the intended root to RELAYBRIDGE_ALLOWED_ROOTS and restart RelayBridge. RelayBridge did not change the allowlist.';
+
+function strictSha256(value) {
+  return typeof value === 'string' && /^[0-9a-f]{64}$/.test(value) ? value : null;
+}
+
+function normalizeValidationDiagnostic(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  if (value.code === CWD_IDENTITY_CHANGED && value.field === 'cwd') {
+    const expectedCwdIdentityHash = strictSha256(value.expectedCwdIdentityHash);
+    const observedCwdIdentityHash = strictSha256(value.observedCwdIdentityHash);
+    const cwdPolicyId = strictSha256(value.cwdPolicyId);
+    if (!expectedCwdIdentityHash || !observedCwdIdentityHash || !cwdPolicyId
+      || value.retryable !== false) return null;
+    return {
+      code: CWD_IDENTITY_CHANGED,
+      field: 'cwd',
+      reason: CWD_IDENTITY_CHANGED_REASON,
+      retryable: false,
+      expectedCwdIdentityHash,
+      observedCwdIdentityHash,
+      cwdPolicyId,
+      guidance: 'Repeat admission with the intended working directory. RelayBridge did not execute a provider.',
+    };
+  }
+  if (value.code !== CWD_OUTSIDE_ALLOWED_ROOTS || value.field !== 'cwd') return null;
+  const requestedRootHash = strictSha256(value.requestedRootHash);
+  const normalizedRootHash = strictSha256(value.normalizedRootHash);
+  const canonicalRootHash = value.canonicalRootHash === null
+    ? null : strictSha256(value.canonicalRootHash);
+  if (!requestedRootHash || !normalizedRootHash
+    || (value.canonicalRootHash !== null && !canonicalRootHash)
+    || !Array.isArray(value.allowedRootHashes)
+    || value.allowedRootHashes.length < 1 || value.allowedRootHashes.length > 32
+    || value.retryable !== false || value.allowlistChanged !== false
+    || value.restartRequiredForEnrollment !== true) return null;
+  const allowedRootHashes = value.allowedRootHashes.map(strictSha256);
+  const allowedRootHashCount = strictTokenCount(value.allowedRootHashCount);
+  if (allowedRootHashes.some((item) => !item)
+    || new Set(allowedRootHashes).size !== allowedRootHashes.length
+    || allowedRootHashCount === null || allowedRootHashCount < allowedRootHashes.length
+    || value.allowedRootHashesTruncated !== (allowedRootHashCount > allowedRootHashes.length)) return null;
+  return {
+    code: CWD_OUTSIDE_ALLOWED_ROOTS,
+    field: 'cwd',
+    reason: CWD_OUTSIDE_REASON,
+    retryable: false,
+    requestedRootHash,
+    normalizedRootHash,
+    canonicalRootHash,
+    allowedRootHashes,
+    allowedRootHashCount,
+    allowedRootHashesTruncated: value.allowedRootHashesTruncated,
+    guidance: CWD_ENROLLMENT_GUIDANCE,
+    allowlistChanged: false,
+    restartRequiredForEnrollment: true,
+  };
+}
+
+function normalizeWorkspaceAdmission(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || value.ok !== true
+    || value.model_invocation !== false || value.token_usage_source !== 'not_invoked'
+    || value.transport_retry_count !== 0) return null;
+  const cwdIdentityHash = strictSha256(value.cwdIdentityHash);
+  const cwdPolicyId = strictSha256(value.cwdPolicyId);
+  const bridgeBuildId = strictBoundedString(value.bridgeBuildId, 180);
+  const receiptStoreId = strictSha256(value.receiptStoreId);
+  if (!cwdIdentityHash || !cwdPolicyId || !bridgeBuildId || !receiptStoreId) return null;
+  return { cwdIdentityHash, cwdPolicyId, bridgeBuildId, receiptStoreId };
+}
+
 function strictCountMap(value, allowedKey) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
   const rows = [];
@@ -870,6 +945,49 @@ function providerSucceeded(response) {
     !!String(response.stdout || '').trim();
 }
 
+function bridgeFailureResult(error, { kind, signal }) {
+  const bridgeStatus = error instanceof BridgeError && Number.isInteger(error.status)
+    ? error.status : null;
+  const deterministicPreflightRejection = bridgeStatus !== null
+    && bridgeStatus >= 400 && bridgeStatus < 500;
+  const authRequired = error instanceof BridgeError && error.detail?.auth_required === true;
+  const transportTimedOut = !signal?.aborted && error instanceof BridgeError
+    && (error.cause?.name === 'TimeoutError' || error.cause?.cause?.name === 'TimeoutError');
+  const validation = error instanceof BridgeError
+    ? normalizeValidationDiagnostic(error.detail?.validation) : null;
+  const transportReceiptId = error instanceof BridgeError
+    && /^rcpt_[A-Za-z0-9._:-]{1,180}$/.test(String(error.detail?.receiptId || ''))
+    ? String(error.detail.receiptId) : null;
+  return {
+    status: signal?.aborted ? 'cancelled' : transportTimedOut ? 'timed_out' : 'failed',
+    sanitized: {
+      kind,
+      exitCode: -1,
+      droppedOut: true,
+      stdout: '',
+      stderr: validation?.reason || error.message,
+      route: {},
+      cancelled: !!signal?.aborted,
+      timedOut: transportTimedOut,
+      authFailed: authRequired,
+      admissionLimited: bridgeStatus === 429,
+      modelInvocation: deterministicPreflightRejection ? false : null,
+      tokenUsageSource: deterministicPreflightRejection ? 'not_invoked' : 'unknown',
+      transportRetryCount: 0,
+      providerRetries: deterministicPreflightRejection ? zeroProviderRetries() : null,
+      transportReceiptId,
+      transportReceiptPersisted: transportReceiptId ? error.detail?.receiptPersisted ?? null : null,
+      transportReceiptPersistenceError: transportReceiptId
+        ? strictBoundedString(error.detail?.receiptPersistenceError, 500) : null,
+      failureClass: deterministicPreflightRejection
+        ? (error.detail?.failureClass || 'policy') : null,
+      actionPreflight: error.detail?.actionPreflight || null,
+      errorCode: validation?.code || null,
+      validation,
+    },
+  };
+}
+
 async function callProvider({
   kind,
   prompt,
@@ -888,11 +1006,39 @@ async function callProvider({
     config: fs.readFileSync(CLI_CONFIG_PATH, 'utf8'),
     providerIdentity: providerIdentityMaterial(kind),
   });
-  const cacheKey = { kind, prompt, cwd: cwd || '', configFingerprint, purpose };
-  const cacheKeyHash = stableHash(cacheKey);
   const startedAt = Date.now();
+  let sanitized;
+  let status = 'failed';
+  let workspaceAdmission = null;
   if (signal?.aborted) throw signal.reason || new Error('provider call cancelled before admission');
-  if (useCache && ttl > 0) {
+  try {
+    const response = await bridgeRequest('/api/workspace/validate', {
+      method: 'POST',
+      body: { kind, prompt, cwd, requestId },
+      timeoutMs: TIMEOUT_POLICY.transportTimeoutMs(timeoutMs),
+      signal,
+      actionIdentity: true,
+    });
+    workspaceAdmission = normalizeWorkspaceAdmission(response);
+    if (!workspaceAdmission) {
+      throw new Error('RelayBridge returned malformed cwd admission identity; provider execution is blocked.');
+    }
+  } catch (error) {
+    ({ sanitized, status } = bridgeFailureResult(error, { kind, signal }));
+  }
+  const cacheKey = {
+    kind,
+    prompt,
+    cwd: cwd || '',
+    configFingerprint,
+    purpose,
+    cwdIdentityHash: workspaceAdmission?.cwdIdentityHash || null,
+    cwdPolicyId: workspaceAdmission?.cwdPolicyId || null,
+    bridgeBuildId: workspaceAdmission?.bridgeBuildId || null,
+    receiptStoreId: workspaceAdmission?.receiptStoreId || null,
+  };
+  const cacheKeyHash = stableHash(cacheKey);
+  if (!sanitized && useCache && ttl > 0) {
     const cached = readCache(cacheKey, ttl);
     if (cached) {
       const receipt = appendReceipt({
@@ -965,9 +1111,7 @@ async function callProvider({
     }
   }
 
-  let sanitized;
-  let status = 'failed';
-  try {
+  if (!sanitized) try {
     const response = await bridgeRequest('/api/oneshot', {
       method: 'POST',
       body: {
@@ -975,6 +1119,8 @@ async function callProvider({
         prompt,
         cwd,
         requestId,
+        expectedCwdIdentityHash: workspaceAdmission.cwdIdentityHash,
+        expectedCwdPolicyId: workspaceAdmission.cwdPolicyId,
         timeoutMs: TIMEOUT_POLICY.normalizeOneShotTimeoutMs(timeoutMs),
         dangerous: false,
       },
@@ -987,36 +1133,7 @@ async function callProvider({
       : sanitized.cancelled ? 'cancelled'
         : sanitized.timedOut ? 'timed_out' : 'dropped';
   } catch (error) {
-    const bridgeStatus = error instanceof BridgeError && Number.isInteger(error.status)
-      ? error.status : null;
-    const deterministicPreflightRejection = bridgeStatus !== null
-      && bridgeStatus >= 400 && bridgeStatus < 500;
-    const authRequired = error instanceof BridgeError && error.detail?.auth_required === true;
-    const transportTimedOut = !signal?.aborted && error instanceof BridgeError
-      && (error.cause?.name === 'TimeoutError' || error.cause?.cause?.name === 'TimeoutError');
-    sanitized = {
-      kind,
-      exitCode: -1,
-      droppedOut: true,
-      stdout: '',
-      stderr: error.message,
-      route: {},
-      cancelled: !!signal?.aborted,
-      timedOut: transportTimedOut,
-      authFailed: authRequired,
-      admissionLimited: bridgeStatus === 429,
-      modelInvocation: deterministicPreflightRejection ? false : null,
-      tokenUsageSource: deterministicPreflightRejection ? 'not_invoked' : 'unknown',
-      transportRetryCount: 0,
-      providerRetries: deterministicPreflightRejection ? zeroProviderRetries() : null,
-      transportReceiptId: null,
-      transportReceiptPersisted: null,
-      transportReceiptPersistenceError: null,
-      failureClass: deterministicPreflightRejection
-        ? (error.detail?.failureClass || 'policy') : null,
-      actionPreflight: error.detail?.actionPreflight || null,
-    };
-    status = signal?.aborted ? 'cancelled' : transportTimedOut ? 'timed_out' : 'failed';
+    ({ sanitized, status } = bridgeFailureResult(error, { kind, signal }));
   }
 
   const receipt = appendReceipt({
@@ -1086,6 +1203,8 @@ async function callProvider({
     status,
     route: sanitized.route,
     actionPreflight: sanitized.actionPreflight || null,
+    errorCode: sanitized.errorCode || null,
+    validation: sanitized.validation || null,
     exitCode: sanitized.exitCode,
     failureClass: sanitized.cancelled ? 'cancelled'
       : sanitized.failureClass || (sanitized.rateLimited ? 'rate_limit'
@@ -1663,6 +1782,13 @@ export function buildServer() {
       attempts.push(response);
       run = writeRun({ ...run, status: 'running', members: attempts });
       if (providerSucceeded(response)) break;
+      // A cwd policy rejection is deterministic and provider-independent.
+      // Escalating the unchanged request would only create more zero-invocation
+      // receipts; the operator must correct or explicitly enroll the cwd first.
+      if (response.modelInvocation === false
+        && response.failureClass === 'validation'
+        && [CWD_OUTSIDE_ALLOWED_ROOTS, CWD_IDENTITY_CHANGED]
+          .includes(response.errorCode)) break;
       if (signal?.aborted) break;
     }
     const winner = attempts.find(providerSucceeded) || null;

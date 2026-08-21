@@ -154,12 +154,160 @@ function loadOrCreateCapabilityToken() {
 }
 
 const CAPABILITY_TOKEN = loadOrCreateCapabilityToken();
-const ALLOWED_ROOTS_VALUE = envFirst('RELAYBRIDGE_ALLOWED_ROOTS', 'PS_BRIDGE_ALLOWED_ROOTS');
-const ALLOWED_ROOTS = (ALLOWED_ROOTS_VALUE
+function firstDefinedEnv(...names) {
+  for (const name of names) {
+    if (Object.prototype.hasOwnProperty.call(process.env, name)) {
+      return { defined: true, name, value: String(process.env[name] || '') };
+    }
+  }
+  return { defined: false, name: null, value: '' };
+}
+
+const ALLOWED_ROOTS_SETTING = firstDefinedEnv(
+  'RELAYBRIDGE_ALLOWED_ROOTS', 'PS_BRIDGE_ALLOWED_ROOTS',
+);
+const ALLOWED_ROOTS_VALUE = ALLOWED_ROOTS_SETTING.value;
+const ALLOWED_ROOTS = (ALLOWED_ROOTS_SETTING.defined
   ? ALLOWED_ROOTS_VALUE.split(';')
   : [process.env.USERPROFILE || ROOT, ROOT])
+  .map((value) => String(value).trim())
   .filter(Boolean)
   .map((value) => path.resolve(value));
+
+const CWD_OUTSIDE_ALLOWED_ROOTS = 'cwd_outside_allowed_roots';
+const CWD_OUTSIDE_REASON = 'The requested working directory resolves outside RelayBridge allowed roots.';
+const CWD_IDENTITY_CHANGED = 'cwd_identity_changed';
+const CWD_IDENTITY_CHANGED_REASON = 'The working directory identity changed after admission and before provider execution.';
+const CWD_ENROLLMENT_GUIDANCE = 'Use an existing allowed working directory, or explicitly add the intended root to RELAYBRIDGE_ALLOWED_ROOTS and restart RelayBridge. RelayBridge did not change the allowlist.';
+
+function pathIdentity(value) {
+  const normalized = path.resolve(String(value));
+  return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+}
+
+function statDirectoryIdentity(value) {
+  const stat = fs.statSync(value, { bigint: true });
+  if (!stat.isDirectory()) throw new Error('not a directory');
+  return `${stat.dev}:${stat.ino}:${stat.birthtimeNs}`;
+}
+
+function lexicalObjectIdentity(value) {
+  const stat = fs.lstatSync(value, { bigint: true });
+  return `${stat.dev}:${stat.ino}:${stat.birthtimeNs}`;
+}
+
+function snapshotAllowedRoot(value) {
+  const lexical = pathIdentity(value);
+  try {
+    const realpath = fs.realpathSync.native ? fs.realpathSync.native(value) : fs.realpathSync(value);
+    const canonical = pathIdentity(realpath);
+    return {
+      lexical,
+      canonical,
+      lexicalObjectIdentity: lexicalObjectIdentity(value),
+      directoryIdentity: statDirectoryIdentity(realpath),
+      available: true,
+    };
+  } catch {
+    // A configured root that does not exist at startup is not silently enrolled
+    // if it appears later.  Enrollment is a startup-time trust decision.
+    return {
+      lexical, canonical: null, lexicalObjectIdentity: null,
+      directoryIdentity: null, available: false,
+    };
+  }
+}
+
+const ALLOWED_ROOT_SNAPSHOTS = ALLOWED_ROOTS.map(snapshotAllowedRoot);
+
+function currentAllowedRootSnapshot(snapshot) {
+  if (!snapshot?.available) return null;
+  try {
+    const realpath = fs.realpathSync.native
+      ? fs.realpathSync.native(snapshot.lexical) : fs.realpathSync(snapshot.lexical);
+    const canonical = pathIdentity(realpath);
+    const currentLexicalObjectIdentity = lexicalObjectIdentity(snapshot.lexical);
+    const directoryIdentity = statDirectoryIdentity(realpath);
+    if (canonical !== snapshot.canonical
+      || currentLexicalObjectIdentity !== snapshot.lexicalObjectIdentity
+      || directoryIdentity !== snapshot.directoryIdentity) return null;
+    return snapshot;
+  } catch {
+    return null;
+  }
+}
+
+function pathIdentityHash(value, { raw = false } = {}) {
+  const identity = raw ? String(value) : pathIdentity(value);
+  // Host paths have low entropy and an unsalted digest is a dictionary oracle.
+  // The installation capability is never returned in receipts, making these
+  // stable identifiers useful to the local operator but non-reversible to a
+  // receipt consumer.
+  return crypto.createHmac('sha256', CAPABILITY_TOKEN).update(identity).digest('hex');
+}
+
+function opaqueIdentity(value) {
+  return crypto.createHmac('sha256', CAPABILITY_TOKEN)
+    .update(JSON.stringify(value)).digest('hex');
+}
+
+const CWD_POLICY_IDENTITY = opaqueIdentity(ALLOWED_ROOT_SNAPSHOTS.map((root) => ({
+  lexical: root.lexical,
+  canonical: root.canonical,
+  lexicalObjectIdentity: root.lexicalObjectIdentity,
+  directoryIdentity: root.directoryIdentity,
+  available: root.available,
+})));
+
+function isInsideRoots(candidate, roots) {
+  const normalized = pathIdentity(candidate);
+  return roots.some((root) => {
+    const normalizedRoot = pathIdentity(root);
+    return normalized === normalizedRoot || normalized.startsWith(normalizedRoot + path.sep);
+  });
+}
+
+function cwdOutsideAllowedRootsError(requested, normalized, canonical = null) {
+  const allAllowedRootHashes = [...new Set(
+    ALLOWED_ROOT_SNAPSHOTS.map((root) => pathIdentityHash(root.canonical || root.lexical)),
+  )];
+  const validation = {
+    code: CWD_OUTSIDE_ALLOWED_ROOTS,
+    field: 'cwd',
+    reason: CWD_OUTSIDE_REASON,
+    retryable: false,
+    requestedRootHash: pathIdentityHash(requested, { raw: true }),
+    normalizedRootHash: pathIdentityHash(normalized),
+    canonicalRootHash: canonical ? pathIdentityHash(canonical) : null,
+    allowedRootHashes: allAllowedRootHashes.slice(0, 32),
+    allowedRootHashCount: allAllowedRootHashes.length,
+    allowedRootHashesTruncated: allAllowedRootHashes.length > 32,
+    guidance: CWD_ENROLLMENT_GUIDANCE,
+    allowlistChanged: false,
+    restartRequiredForEnrollment: true,
+  };
+  const error = new Error(CWD_OUTSIDE_REASON);
+  error.code = CWD_OUTSIDE_ALLOWED_ROOTS;
+  error.validation = validation;
+  return error;
+}
+
+function cwdIdentityChangedError(expectedCwdIdentityHash, observedCwdIdentityHash) {
+  const validation = {
+    code: CWD_IDENTITY_CHANGED,
+    field: 'cwd',
+    reason: CWD_IDENTITY_CHANGED_REASON,
+    retryable: false,
+    expectedCwdIdentityHash,
+    observedCwdIdentityHash,
+    cwdPolicyId: CWD_POLICY_IDENTITY,
+    guidance: 'Repeat admission with the intended working directory. RelayBridge did not execute a provider.',
+  };
+  const error = new Error(CWD_IDENTITY_CHANGED_REASON);
+  error.code = CWD_IDENTITY_CHANGED;
+  error.validation = validation;
+  return error;
+}
 
 function isDirectory(value) {
   try { return fs.statSync(value).isDirectory(); }
@@ -167,11 +315,7 @@ function isDirectory(value) {
 }
 
 function isInsideAllowedRoot(candidate) {
-  const normalized = process.platform === 'win32' ? candidate.toLowerCase() : candidate;
-  return ALLOWED_ROOTS.some((root) => {
-    const normalizedRoot = process.platform === 'win32' ? root.toLowerCase() : root;
-    return normalized === normalizedRoot || normalized.startsWith(normalizedRoot + path.sep);
-  });
+  return isInsideRoots(candidate, ALLOWED_ROOT_SNAPSHOTS.map((root) => root.lexical));
 }
 
 function defaultAllowedCwd() {
@@ -184,16 +328,60 @@ function defaultAllowedCwd() {
     seen.add(normalized);
     if (isInsideAllowedRoot(candidate) && isDirectory(candidate)) return candidate;
   }
-  throw new Error(`no usable default cwd exists inside RELAYBRIDGE_ALLOWED_ROOTS: ${ALLOWED_ROOTS.join('; ')}`);
+  throw new Error('No usable default working directory exists inside the configured RelayBridge allowed roots.');
 }
 
 function resolveAllowedCwd(value, fallback) {
-  const resolved = path.resolve(value || fallback || defaultAllowedCwd());
+  const requested = value || fallback || defaultAllowedCwd();
+  const resolved = path.resolve(requested);
   if (!isInsideAllowedRoot(resolved)) {
-    throw new Error(`cwd is outside RELAYBRIDGE_ALLOWED_ROOTS: ${resolved}; allowed roots: ${ALLOWED_ROOTS.join('; ')}`);
+    throw cwdOutsideAllowedRootsError(requested, resolved);
   }
-  if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) throw new Error(`cwd is not a directory: ${resolved}`);
+  const trustedLexicalRoots = ALLOWED_ROOT_SNAPSHOTS
+    .filter((root) => isInsideRoots(resolved, [root.lexical]))
+    .map(currentAllowedRootSnapshot)
+    .filter(Boolean);
+  if (!trustedLexicalRoots.length) {
+    throw cwdOutsideAllowedRootsError(requested, resolved);
+  }
+  if (!isDirectory(resolved)) throw new Error('The requested working directory is not an existing directory.');
+  let canonical;
+  try {
+    const realpath = fs.realpathSync.native ? fs.realpathSync.native(resolved) : fs.realpathSync(resolved);
+    canonical = pathIdentity(realpath);
+  } catch {
+    throw new Error('The requested working directory could not be canonicalized.');
+  }
+  const trustedCanonicalRoots = ALLOWED_ROOT_SNAPSHOTS
+    .map(currentAllowedRootSnapshot)
+    .filter(Boolean);
+  if (!trustedCanonicalRoots.some((root) => isInsideRoots(canonical, [root.canonical]))) {
+    throw cwdOutsideAllowedRootsError(requested, resolved, canonical);
+  }
   return resolved;
+}
+
+function captureAllowedCwdIdentity(value, fallback) {
+  const resolved = resolveAllowedCwd(value, fallback);
+  const realpath = fs.realpathSync.native
+    ? fs.realpathSync.native(resolved) : fs.realpathSync(resolved);
+  const canonical = pathIdentity(realpath);
+  const directoryIdentity = statDirectoryIdentity(realpath);
+  return {
+    resolved,
+    canonical,
+    directoryIdentity,
+    cwdIdentityHash: opaqueIdentity({ canonical, directoryIdentity }),
+  };
+}
+
+function revalidateAllowedCwdIdentity(snapshot) {
+  const current = captureAllowedCwdIdentity(snapshot.resolved);
+  if (current.canonical !== snapshot.canonical
+    || current.directoryIdentity !== snapshot.directoryIdentity) {
+    throw cwdIdentityChangedError(snapshot.cwdIdentityHash, current.cwdIdentityHash);
+  }
+  return current;
 }
 
 function workspacePolicy() {
@@ -203,7 +391,7 @@ function workspacePolicy() {
   catch (err) { error = err.message; }
   const userProfile = path.resolve(process.env.USERPROFILE || ROOT);
   return {
-    explicit: !!ALLOWED_ROOTS_VALUE,
+    explicit: ALLOWED_ROOTS_SETTING.defined,
     allowedRoots: [...ALLOWED_ROOTS],
     defaultCwd,
     defaultSource: defaultCwd === userProfile ? 'user-profile' : (defaultCwd ? 'allowed-root' : null),
@@ -508,9 +696,14 @@ function appendBridgeReceiptRecord(receipt) {
 const preAdmissionReceiptByRequestId = new Map();
 const MAX_PRE_ADMISSION_RECEIPT_SCAN_LINES = 500000;
 
-function findPreAdmissionReceiptByRequestId(requestId) {
-  if (preAdmissionReceiptByRequestId.has(requestId)) {
-    return preAdmissionReceiptByRequestId.get(requestId);
+function preAdmissionReceiptKey(requestId, rejectionFingerprint) {
+  return `${requestId}:${rejectionFingerprint}`;
+}
+
+function findPreAdmissionReceiptByRequestId(requestId, rejectionFingerprint) {
+  const cacheKey = preAdmissionReceiptKey(requestId, rejectionFingerprint);
+  if (preAdmissionReceiptByRequestId.has(cacheKey)) {
+    return preAdmissionReceiptByRequestId.get(cacheKey);
   }
   const requestToken = `\"requestId\":${JSON.stringify(requestId)}`;
   let scanned = 0;
@@ -525,8 +718,10 @@ function findPreAdmissionReceiptByRequestId(requestId) {
       if (!lines[index] || !lines[index].includes(requestToken)) continue;
       try {
         const receipt = JSON.parse(lines[index]);
-        if (receipt.event === 'bridge_provider_rejection' && receipt.requestId === requestId) {
-          preAdmissionReceiptByRequestId.set(requestId, receipt);
+        if (receipt.event === 'bridge_provider_rejection'
+          && receipt.requestId === requestId
+          && receipt.rejectionFingerprint === rejectionFingerprint) {
+          preAdmissionReceiptByRequestId.set(cacheKey, receipt);
           return receipt;
         }
       } catch {}
@@ -550,11 +745,22 @@ function appendBridgePreAdmissionReceipt({
   startedAt,
   route = null,
   error,
+  errorCode = null,
+  validation = null,
 }) {
-  const existing = findPreAdmissionReceiptByRequestId(requestId);
-  if (existing) return { receipt: existing, deduplicated: true };
   const promptText = typeof prompt === 'string' ? prompt : '';
   const inputHash = crypto.createHash('sha256').update(promptText).digest('hex');
+  const rejectionFingerprint = crypto.createHash('sha256').update(JSON.stringify({
+    kind: typeof kind === 'string' ? kind : null,
+    inputHash,
+    failureClass,
+    httpStatus,
+    errorCode,
+    validation,
+    route: route || null,
+  })).digest('hex');
+  const existing = findPreAdmissionReceiptByRequestId(requestId, rejectionFingerprint);
+  if (existing) return { receipt: existing, deduplicated: true };
   const receipt = {
     receiptId: `rcpt_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 8)}`,
     timestamp: new Date().toISOString(),
@@ -601,6 +807,9 @@ function appendBridgePreAdmissionReceipt({
     transportReceiptId: null,
     durationMs: Math.max(0, Date.now() - startedAt),
     failureClass,
+    errorCode,
+    validation,
+    rejectionFingerprint,
     errorHash: error
       ? crypto.createHash('sha256').update(String(error)).digest('hex') : null,
     route: route || {
@@ -609,7 +818,9 @@ function appendBridgePreAdmissionReceipt({
     },
   };
   appendBridgeReceiptRecord(receipt);
-  preAdmissionReceiptByRequestId.set(requestId, receipt);
+  preAdmissionReceiptByRequestId.set(
+    preAdmissionReceiptKey(requestId, rejectionFingerprint), receipt,
+  );
   return { receipt, deduplicated: false };
 }
 
@@ -653,6 +864,8 @@ function sendOneShotPreAdmissionRejection(res, {
       startedAt,
       route,
       error: payload?.error,
+      errorCode: payload?.errorCode || null,
+      validation: payload?.validation || null,
     });
     setRejectionIdentityHeaders(res, receipt);
     return res.status(statusCode).json({
@@ -2149,6 +2362,47 @@ app.get('/api/workspace', (req, res) => {
   res.json(workspacePolicy());
 });
 
+// MCP cache admission must consult the live REST process before trusting a
+// cached provider result.  This endpoint performs the same startup-pinned cwd
+// validation as /api/oneshot without invoking a provider or exposing a host
+// path.  Rejections receive the normal durable zero-invocation receipt.
+app.post('/api/workspace/validate', (req, res) => {
+  const startedAt = Date.now();
+  const body = req.body || {};
+  const requestId = normalizeOneShotRequestId(body);
+  try {
+    const snapshot = captureAllowedCwdIdentity(body.cwd);
+    revalidateAllowedCwdIdentity(snapshot);
+    return res.json({
+      ok: true,
+      cwdIdentityHash: snapshot.cwdIdentityHash,
+      cwdPolicyId: CWD_POLICY_IDENTITY,
+      model_invocation: false,
+      token_usage_source: 'not_invoked',
+      transport_retry_count: 0,
+      provider_retries: ZERO_PROVIDER_RETRIES,
+      requestId,
+      bridgeBuildId: BRIDGE_BUILD_ID,
+      receiptStoreId: RECEIPT_STORE_IDENTITY.id,
+    });
+  } catch (err) {
+    return sendOneShotPreAdmissionRejection(res, {
+      statusCode: 400,
+      payload: {
+        error: err.validation?.reason || err.message,
+        errorCode: err.code || null,
+        validation: err.validation || null,
+      },
+      kind: typeof body.kind === 'string' ? body.kind : null,
+      prompt: typeof body.prompt === 'string' ? body.prompt : '',
+      requestId,
+      failureClass: 'validation',
+      startedAt,
+      route: { provider: typeof body.kind === 'string' ? body.kind : null, request_id: requestId },
+    });
+  }
+});
+
 function runProbe(slotRaw, timeoutMs = 15000, stripEnv = [], signal) {
   return new Promise((resolve) => {
     if (signal?.aborted) return resolve({ exitCode: -1, stdout: '', stderr: 'diagnostic cancelled', timedOut: false, aborted: true });
@@ -2842,10 +3096,34 @@ async function executeOneShot(body, res) {
     return rejectBeforeAdmission(400, 'configuration', { error: 'oneshot config cannot mix {prompt} and {prompt_file}' });
   }
   let resolvedCwd;
+  let resolvedCwdIdentity;
+  const expectedCwdIdentityHash = body?.expectedCwdIdentityHash;
+  const expectedCwdPolicyId = body?.expectedCwdPolicyId;
+  if ((expectedCwdIdentityHash !== undefined
+      && !/^[0-9a-f]{64}$/.test(String(expectedCwdIdentityHash)))
+    || (expectedCwdPolicyId !== undefined
+      && !/^[0-9a-f]{64}$/.test(String(expectedCwdPolicyId)))) {
+    return rejectBeforeAdmission(400, 'validation', {
+      error: 'Expected cwd identity fields must be lowercase SHA-256 identifiers.',
+    });
+  }
   try {
-    resolvedCwd = resolveAllowedCwd(cwd);
+    resolvedCwdIdentity = captureAllowedCwdIdentity(cwd);
+    resolvedCwd = resolvedCwdIdentity.resolved;
+    if ((expectedCwdPolicyId && expectedCwdPolicyId !== CWD_POLICY_IDENTITY)
+      || (expectedCwdIdentityHash
+        && expectedCwdIdentityHash !== resolvedCwdIdentity.cwdIdentityHash)) {
+      throw cwdIdentityChangedError(
+        expectedCwdIdentityHash || resolvedCwdIdentity.cwdIdentityHash,
+        resolvedCwdIdentity.cwdIdentityHash,
+      );
+    }
   } catch (err) {
-    return rejectBeforeAdmission(400, 'validation', { error: err.message });
+    return rejectBeforeAdmission(400, 'validation', {
+      error: err.validation?.reason || err.message,
+      errorCode: err.code || null,
+      validation: err.validation || null,
+    });
   }
   if (!acquireOneShot(kind, res)) {
     return rejectBeforeAdmission(429, 'admission_limit', {
@@ -2961,6 +3239,18 @@ async function executeOneShot(body, res) {
   const isWindows = process.platform === 'win32';
   let proc;
   try {
+    // Re-check both the startup-pinned allowed-root identity and the selected
+    // directory immediately before child creation. Node's spawn API has no
+    // portable cwd-by-handle primitive, so this is the narrowest available
+    // TOCTOU boundary without changing provider execution semantics.
+    const spawnCwdIdentity = revalidateAllowedCwdIdentity(resolvedCwdIdentity);
+    if (expectedCwdIdentityHash
+      && expectedCwdIdentityHash !== spawnCwdIdentity.cwdIdentityHash) {
+      throw cwdIdentityChangedError(
+        expectedCwdIdentityHash, spawnCwdIdentity.cwdIdentityHash,
+      );
+    }
+    resolvedCwd = spawnCwdIdentity.resolved;
     // Build the actual spawn target. On Windows, wrap non-.exe (npm shims like
     // claude.cmd) with cmd.exe /c so the shim resolves. Use single-string form
     // for cmd.exe so arg quoting is preserved (shell:true would split prompts
@@ -2980,6 +3270,13 @@ async function executeOneShot(body, res) {
     proc = trackChild(spawn(spawnBin, spawnArgs, spawnOpts));
   } catch (err) {
     cleanupPromptFile();
+    if (err.validation) {
+      return rejectBeforeAdmission(400, 'validation', {
+        error: err.validation.reason,
+        errorCode: err.code || null,
+        validation: err.validation,
+      });
+    }
     return sendOneShotResult(res, { kind, route, exitCode: -1, stdout: '', stderr: err.message, error: 'spawn failed', dropped_out: true, model_invocation: false }, { kind, prompt, route, startedAt });
   }
   let stdout = '';
