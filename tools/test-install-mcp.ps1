@@ -57,8 +57,8 @@ try {
     Reset-Configs
 
     & (Join-Path $bridgeRoot 'install-mcp.ps1')
-    $codexAfter = Get-Content -LiteralPath $codexConfig -Raw
-    $claudeAfter = Get-Content -LiteralPath $claudeConfig -Raw | ConvertFrom-Json
+    $codexAfter = [IO.File]::ReadAllText($codexConfig, [Text.UTF8Encoding]::new($false))
+    $claudeAfter = [IO.File]::ReadAllText($claudeConfig, [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
     Assert-True ($codexAfter -match '\[mcp_servers\.relaybridge\]') 'Codex canonical registration must be created'
     Assert-True ($codexAfter -match 'tool_timeout_sec = 2745') 'Codex MCP timeout must cover the 45-minute provider cap plus transport and host grace'
     Assert-True ($codexAfter -notmatch '\[mcp_servers\.ps_bridge\]') 'recognized Codex ps_bridge registration must be removed after promotion'

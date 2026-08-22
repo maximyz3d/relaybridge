@@ -49,7 +49,7 @@ function Get-ProviderGroups {
   param([string]$ConfigPath)
   # Groups provider seats that share one installer (e.g. Claude Code + Fable are
   # one npm package; the four local Ollama seats are one winget install).
-  $config = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
+  $config = [IO.File]::ReadAllText($ConfigPath, [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
   $groups = @()
   foreach ($prop in $config.PSObject.Properties) {
     $kind = $prop.Name
@@ -270,8 +270,8 @@ function Merge-JsonFile([string]$DefaultPath, [string]$ExistingPath) {
     return
   }
   try {
-    $defaults = Get-Content -LiteralPath $DefaultPath -Raw | ConvertFrom-Json
-    $existing = Get-Content -LiteralPath $ExistingPath -Raw | ConvertFrom-Json
+    $defaults = [IO.File]::ReadAllText($DefaultPath, [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
+    $existing = [IO.File]::ReadAllText($ExistingPath, [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
   } catch {
     throw "Cannot safely preserve operator JSON '$ExistingPath': $($_.Exception.Message)"
   }
@@ -311,7 +311,7 @@ function Copy-ReleaseSource([string]$SourceRoot, [string]$StageRoot) {
 }
 
 function Get-ReleaseBuildInfo([string]$StageRoot, [string]$SourceLabel) {
-  $package = Get-Content -LiteralPath (Join-Path $StageRoot 'package.json') -Raw | ConvertFrom-Json
+  $package = [IO.File]::ReadAllText((Join-Path $StageRoot 'package.json'), [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
   $excludedTopLevel = @('node_modules', 'data', 'migration-backups')
   $parts = @()
   $files = @(Get-ChildItem -LiteralPath $StageRoot -File -Recurse -Force | Where-Object {
@@ -534,6 +534,10 @@ try {
     # Capture any operator edits made while staging, after the old process has
     # drained and immediately before the atomic promotion.
     Merge-OperatorConfiguration $stageRoot $runtimeSource
+    # From this point until the transaction commits, stageRoot can contain the
+    # only copy of the capability token and receipt store. Preserve recovery
+    # roots if PowerShell is interrupted in a way that bypasses catch.
+    $preserveRecoveryArtifacts = $true
     $movedRuntime = @(Move-PreservedRuntime $runtimeSource $stageRoot)
   } elseif (Test-LocalPortInUse $Port) {
     throw "Port $Port is already occupied. A fresh RelayBridge install will not replace an unknown listener."
@@ -575,6 +579,7 @@ try {
   if ($MigrateFrom -and -not (Test-SamePath $MigrateFrom $InstallDir)) {
     Write-Host "[RelayBridge] Runtime token/data migrated from $MigrateFrom; its old code tree was left in place without the moved runtime files." -ForegroundColor Yellow
   }
+  $preserveRecoveryArtifacts = $false
   Write-Host "[RelayBridge] Installed build $($buildInfo.buildId) at $InstallDir" -ForegroundColor Green
   if (-not $NoStart -and -not $NoBrowser) {
     try { Start-Process "http://127.0.0.1:$Port" }
@@ -613,11 +618,17 @@ try {
   if ($rollbackErrors.Count) {
     $preserveRecoveryArtifacts = $true
     Write-Warning ("Automatic rollback was incomplete; recovery directories were preserved beside the install root: " + ($rollbackErrors -join '; '))
+  } else {
+    $preserveRecoveryArtifacts = $false
   }
   throw $installError
 } finally {
   $cleanupTargets = @($tempRoot)
-  if (-not $preserveRecoveryArtifacts) { $cleanupTargets += @($stageRoot, $backupRoot, $failedRoot) }
+  if (-not $preserveRecoveryArtifacts) {
+    $cleanupTargets += @($stageRoot, $backupRoot, $failedRoot)
+  } else {
+    Write-Warning "RelayBridge recovery directories were preserved beside the install root. Do not delete stage/rollback/failed roots until token and data ownership are reconciled."
+  }
   foreach ($cleanup in $cleanupTargets) {
     if ($cleanup -and (Test-Path -LiteralPath $cleanup)) { Remove-Item -LiteralPath $cleanup -Recurse -Force -ErrorAction SilentlyContinue }
   }

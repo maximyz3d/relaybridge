@@ -162,7 +162,16 @@ test('direct REST pre-admission failures persist deduplicated zero-invocation re
   t.after(async () => {
     if (proc.exitCode === null) proc.kill('SIGTERM');
     await new Promise((resolve) => proc.exitCode !== null ? resolve() : proc.once('exit', resolve));
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    // Remove the deliberately retargeted reparse points before recursively
+    // deleting their parent. Windows can otherwise keep the parent undeletable
+    // while it tears down a recently used junction.
+    for (const link of [inRootLink, symlinkOutside, pinnedRoot]) {
+      fs.rmSync(link, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+    // Windows can retain a directory handle for a few milliseconds after the
+    // child exits. Bound retries keep teardown from turning a passing security
+    // test into a spurious EPERM failure notification.
+    fs.rmSync(tempRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   let health;

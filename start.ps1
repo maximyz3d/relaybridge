@@ -17,11 +17,11 @@ if (-not (Test-Path -LiteralPath $dependencyPath -PathType Leaf)) {
 }
 if (-not (Test-Path -LiteralPath $serverPath -PathType Leaf)) { throw "RelayBridge server not found: $serverPath" }
 
-$package = Get-Content -LiteralPath $packagePath -Raw | ConvertFrom-Json
+$package = [IO.File]::ReadAllText($packagePath, [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
 $expectedBuildId = [string]$package.version
 $buildInfoPath = Join-Path $bridgeRoot 'build-info.json'
 if (Test-Path -LiteralPath $buildInfoPath -PathType Leaf) {
-  $buildInfo = Get-Content -LiteralPath $buildInfoPath -Raw | ConvertFrom-Json
+  $buildInfo = [IO.File]::ReadAllText($buildInfoPath, [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
   if ($buildInfo.buildId) { $expectedBuildId = [string]$buildInfo.buildId }
 }
 $port = if ($env:PORT) { [int]$env:PORT } else { 8787 }

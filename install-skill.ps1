@@ -40,27 +40,27 @@ function Write-MemoryBlock {
   if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
 
   if (Test-Path -LiteralPath $File) {
-    $existing = [IO.File]::ReadAllText($File)
+    $existing = [IO.File]::ReadAllText($File, [Text.UTF8Encoding]::new($false))
     if ($existing -match [regex]::Escape($begin)) {
       # Refresh in place: re-running must never duplicate the block, and must
       # never disturb instructions the user wrote themselves.
       $pattern = [regex]::Escape($begin) + '[\s\S]*?' + [regex]::Escape($end)
       $updated = [regex]::Replace($existing, $pattern, { param($m) $block })
-      [IO.File]::WriteAllText($File, $updated)
+      [IO.File]::WriteAllText($File, $updated, [Text.UTF8Encoding]::new($false))
       Write-Host "[RelayBridge] refreshed primer in $Label ($File)" -ForegroundColor Green
     } else {
-      [IO.File]::WriteAllText($File, ($existing.TrimEnd() + "`r`n`r`n" + $block + "`r`n"))
+      [IO.File]::WriteAllText($File, ($existing.TrimEnd() + "`r`n`r`n" + $block + "`r`n"), [Text.UTF8Encoding]::new($false))
       Write-Host "[RelayBridge] appended primer to $Label ($File)" -ForegroundColor Green
     }
   } else {
-    [IO.File]::WriteAllText($File, $block + "`r`n")
+    [IO.File]::WriteAllText($File, $block + "`r`n", [Text.UTF8Encoding]::new($false))
     Write-Host "[RelayBridge] created $Label ($File)" -ForegroundColor Green
   }
 }
 
 $primerPath = Join-Path $SourceDir 'PRIMER.md'
 if (-not (Test-Path -LiteralPath $primerPath)) { throw "PRIMER.md not found in $SourceDir" }
-$primer = Get-Content -Raw -LiteralPath $primerPath
+$primer = [IO.File]::ReadAllText($primerPath, [Text.UTF8Encoding]::new($false))
 
 # --- Claude Code: skill folder (on demand) + CLAUDE.md (every session) --------
 if (-not $CodexOnly) {
