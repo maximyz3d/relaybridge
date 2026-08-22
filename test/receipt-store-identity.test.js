@@ -10,7 +10,7 @@ const { ID_FILE_NAME, receiptStoreIdentity } = require('../lib/receipt-store-ide
 
 test('receipt store identity is stable, privacy-safe, and location-bound', (t) => {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'relaybridge-store-id-'));
-  t.after(() => fs.rmSync(tempRoot, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(tempRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   const firstDir = path.join(tempRoot, 'first-store');
   const copiedDir = path.join(tempRoot, 'copied-store');
 
@@ -34,7 +34,7 @@ test('receipt store identity is stable, privacy-safe, and location-bound', (t) =
 
 test('an invalid persisted identity disables actions without exposing the path', (t) => {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'relaybridge-store-id-invalid-'));
-  t.after(() => fs.rmSync(tempRoot, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(tempRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   fs.writeFileSync(path.join(tempRoot, ID_FILE_NAME), 'not-a-hash\n', 'utf8');
 
   const identity = receiptStoreIdentity(tempRoot);
