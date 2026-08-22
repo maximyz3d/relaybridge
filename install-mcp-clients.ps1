@@ -55,7 +55,7 @@ function Merge-McpConfig {
 
     $root = @{}
     if (Test-Path -LiteralPath $File) {
-      $raw = Get-Content -Raw -LiteralPath $File
+      $raw = [IO.File]::ReadAllText($File, [Text.UTF8Encoding]::new($false))
       if ($raw -and $raw.Trim()) {
         try {
           $parsed = $raw | ConvertFrom-Json -ErrorAction Stop
@@ -84,7 +84,7 @@ function Merge-McpConfig {
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     # WriteAllText avoids the UTF-8 BOM that Set-Content adds, which breaks
     # JSON.parse in several clients.
-    [IO.File]::WriteAllText($File, ($root | ConvertTo-Json -Depth 12))
+    [IO.File]::WriteAllText($File, ($root | ConvertTo-Json -Depth 12), [Text.UTF8Encoding]::new($false))
     Write-Host "[RelayBridge] registered with $Label ($File)" -ForegroundColor Green
   } catch {
     Write-Host "[RelayBridge] could not register $Label : $($_.Exception.Message)" -ForegroundColor Yellow
@@ -109,7 +109,7 @@ Merge-McpConfig -File (Join-Path $userHome '.codeium\windsurf\mcp_config.json') 
 # A portable copy any other client can be pointed at by hand.
 $portable = Join-Path $Root 'mcp-config.json'
 if (-not $WhatIfOnly) {
-  [IO.File]::WriteAllText($portable, (@{ mcpServers = @{ relaybridge = (New-ServerEntry) } } | ConvertTo-Json -Depth 12))
+  [IO.File]::WriteAllText($portable, (@{ mcpServers = @{ relaybridge = (New-ServerEntry) } } | ConvertTo-Json -Depth 12), [Text.UTF8Encoding]::new($false))
   Write-Host "[RelayBridge] portable config written to $portable" -ForegroundColor Green
 }
 

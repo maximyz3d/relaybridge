@@ -11,7 +11,7 @@
     "onUnverifiableIdle": "kill"
   },
   "_models": {
-    "_note": "Model selection inside a provider. Routing tiers map to weight classes: utility->light, standard->standard, complex/critical->heavy. Provider lineups change on weeks-long cycles, so prefer stable aliases (claude opus/sonnet/haiku) over versioned ids, and leave model_tiers unset where the account decides which models exist (cursor, copilot, grok) â€” a missing flag runs, a retired one fails every call. Discovery at boot reconciles these pins against each CLI's own model list.",
+    "_note": "Model selection inside a provider. Routing tiers map to weight classes: utility->light, standard->standard, complex/critical->heavy. Provider lineups change on weeks-long cycles, so prefer stable aliases (claude opus/sonnet/haiku) over versioned ids, and leave model_tiers unset where the account decides which models exist (cursor, copilot, grok) — a missing flag runs, a retired one fails every call. Discovery at boot reconciles these pins against each CLI's own model list.",
     "modelsCheckedAt": "2026-08-20",
     "staleAfterDays": 45,
     "discoverOnBoot": true,

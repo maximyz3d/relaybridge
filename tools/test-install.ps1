@@ -14,6 +14,7 @@ $installRoot = Join-Path $testRoot 'RelayBridge'
 $startedPort = 0
 $legacyPort = 0
 $legacyProcess = $null
+$emDash = [string][char]0x2014
 
 function Assert-True([bool]$Condition, [string]$Message) {
   if (-not $Condition) { throw "ASSERTION FAILED: $Message" }
@@ -89,7 +90,7 @@ server.listen(port, '127.0.0.1');
   [IO.File]::WriteAllText((Join-Path $installRoot 'data\receipts\preserved.jsonl'), "{`"receiptId`":`"old`"}`n", [Text.UTF8Encoding]::new($false))
 
   $operatorConfig = [ordered]@{
-    _comment = 'operator-owned config'
+    _comment = "operator-owned config $emDash UTF-8 survives every merge"
     cursor = [ordered]@{
       label = 'Cursor Operator Seat'
       tags = @('custom-routing')
@@ -146,17 +147,20 @@ server.listen(port, '127.0.0.1');
   Assert-True ((Get-Content -LiteralPath (Join-Path $installRoot '.bridge-token') -Raw).Trim() -eq ('a' * 64)) 'capability token bytes must be preserved'
   Assert-True (Test-Path -LiteralPath (Join-Path $installRoot 'data\receipts\preserved.jsonl')) 'retained data must be preserved'
 
-  $merged = Get-Content -LiteralPath (Join-Path $installRoot 'cli-config.json') -Raw | ConvertFrom-Json
+  $merged = [IO.File]::ReadAllText((Join-Path $installRoot 'cli-config.json'), [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
+  Assert-True ($merged._comment -eq "operator-owned config $emDash UTF-8 survives every merge") 'operator UTF-8 text must survive config merge byte-exactly'
+  $mergedBytes = [IO.File]::ReadAllBytes((Join-Path $installRoot 'cli-config.json'))
+  Assert-True (([BitConverter]::ToString($mergedBytes)) -match 'E2-80-94') 'merged JSON must contain the exact UTF-8 em-dash byte sequence'
   Assert-True ($merged.cursor.model -eq 'operator-pinned-model') 'operator model pin must win over release defaults'
   Assert-True ($merged.cursor.tags[0] -eq 'custom-routing') 'operator routing tags must be preserved'
   Assert-True ($merged.cursor.probe_expect -eq 'Logged in as') 'missing release fields must be added to existing providers'
   Assert-True ($null -ne $merged.copilot) 'new release providers must be added'
   Assert-True ($merged.custom_provider.label -eq 'Private Operator Provider') 'unknown operator providers must be preserved'
-  $routing = Get-Content -LiteralPath (Join-Path $installRoot 'config\routing-policy.json') -Raw | ConvertFrom-Json
+  $routing = [IO.File]::ReadAllText((Join-Path $installRoot 'config\routing-policy.json'), [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
   Assert-True ($routing.operatorNote -eq 'preserve me') 'operator routing-policy fields must be preserved'
   Assert-True ($routing.taskPriorities.general[0] -eq 'custom_provider') 'operator routing priority must win'
 
-  $build = Get-Content -LiteralPath (Join-Path $installRoot 'build-info.json') -Raw | ConvertFrom-Json
+  $build = [IO.File]::ReadAllText((Join-Path $installRoot 'build-info.json'), [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
   Assert-True ([string]$build.buildId -match '^2\.0\.1\+[a-f0-9]{16}$') 'installed release must have an exact code-hash build identity'
   $health = Invoke-RestMethod -Uri "http://127.0.0.1:$($success.Port)/api/health" -TimeoutSec 3 -UseBasicParsing
   Assert-True ([string]$health.buildId -eq [string]$build.buildId) 'promoted server health must report the exact staged build identity'

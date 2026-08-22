@@ -72,7 +72,7 @@ if (-not (Test-Path -LiteralPath $mcpServer -PathType Leaf)) {
 if (-not (Test-Path -LiteralPath $timeoutPolicyPath -PathType Leaf)) {
   throw "Timeout policy not found: $timeoutPolicyPath"
 }
-$timeoutPolicy = Get-Content -LiteralPath $timeoutPolicyPath -Raw | ConvertFrom-Json
+$timeoutPolicy = [IO.File]::ReadAllText($timeoutPolicyPath, [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
 $mcpToolTimeoutSec = [int][Math]::Ceiling((
   [double]$timeoutPolicy.oneShotMaxMs +
   [double]$timeoutPolicy.transportGraceMs +
@@ -130,7 +130,7 @@ if (-not $SkipCodex) {
   }
 
   $codexConfig = $codexConfigPath
-  $configText = [IO.File]::ReadAllText($codexConfig)
+  $configText = [IO.File]::ReadAllText($codexConfig, [Text.UTF8Encoding]::new($false))
   $header = "[mcp_servers.$Name]"
   $toolNames = @(
     'bridge_status', 'list_providers', 'route_preview', 'list_sessions',
