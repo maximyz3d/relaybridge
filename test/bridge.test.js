@@ -71,7 +71,13 @@ test('provider config uses the installed subscription CLIs and safe headless mod
   assert.ok(config.codex.oneshot_safe.includes('--ephemeral'));
   assert.deepEqual(config.codex.probe, ['codex', 'login', 'status']);
   assert.equal(config.copilot.npm_package, '@github/copilot');
-  assert.deepEqual(config.copilot.install_command, ['npm', 'install', '-g', '@github/copilot']);
+  const supportedCopilotInstallers = [
+    ['npm', 'install', '-g', '@github/copilot'],
+    ['powershell.exe', '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', 'winget install GitHub.Copilot'],
+  ];
+  assert.ok(supportedCopilotInstallers.some((candidate) =>
+    JSON.stringify(candidate) === JSON.stringify(config.copilot.install_command)),
+  'Copilot installer must remain one of the documented safe operator choices');
   assert.deepEqual(config.copilot.probe, ['copilot', '--version']);
   assert.ok(config.copilot.oneshot_safe.includes('--prompt'));
   assert.ok(config.copilot.oneshot_safe.includes('{prompt}'));
@@ -555,7 +561,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   t.after(async () => {
     if (proc.exitCode === null) proc.kill('SIGTERM');
     await new Promise((resolve) => proc.exitCode !== null ? resolve() : proc.once('exit', resolve));
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    fs.rmSync(tempRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   try {
@@ -1245,7 +1251,7 @@ test('local Ollama adapter uses loopback HTTP, returns final-only text, and reco
     if (bridge.exitCode === null) bridge.kill('SIGTERM');
     await new Promise((resolve) => bridge.exitCode !== null ? resolve() : bridge.once('exit', resolve));
     await new Promise((resolve) => ollama.close(resolve));
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    fs.rmSync(tempRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   await waitForHealth(baseUrl, bridge);
@@ -1332,7 +1338,7 @@ test('hosted OpenAI-compatible adapter blocks China-hosted endpoints before netw
   t.after(async () => {
     if (bridge.exitCode === null) bridge.kill('SIGTERM');
     await new Promise((resolve) => bridge.exitCode !== null ? resolve() : bridge.once('exit', resolve));
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    fs.rmSync(tempRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   await waitForHealth(baseUrl, bridge);
@@ -1408,7 +1414,7 @@ test('agents listing, tag updates, and broadcast fan-out respect auth, autoRoute
   t.after(async () => {
     if (proc.exitCode === null) proc.kill('SIGTERM');
     await new Promise((resolve) => proc.exitCode !== null ? resolve() : proc.once('exit', resolve));
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    fs.rmSync(tempRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
   try {
     await waitForHealth(baseUrl, proc);

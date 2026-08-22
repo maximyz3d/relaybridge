@@ -152,7 +152,7 @@ test('live cwd admission invalidates stale route and committee cache across rest
   let current = first;
   t.after(async () => {
     if (current) await current.close();
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    fs.rmSync(tempRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   const routeTaskB = 'Explain a robust software cache invalidation design for a bounded coding task B.';

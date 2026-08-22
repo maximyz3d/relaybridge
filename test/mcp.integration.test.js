@@ -186,7 +186,7 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
     try { await transport?.close(); } catch {}
     if (bridge.exitCode === null) bridge.kill('SIGTERM');
     await new Promise((resolve) => bridge.exitCode !== null ? resolve() : bridge.once('exit', resolve));
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    fs.rmSync(tempRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   try {

@@ -88,7 +88,7 @@ test('the skill installer resolves its bundled source independently of caller cw
       assert.ok(fs.existsSync(installed), `expected installed RelayBridge file ${installed}`);
     }
   } finally {
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    fs.rmSync(tempRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 

@@ -107,7 +107,7 @@ test('Windows child PATH discovers the official Cursor install directory and kee
   t.after(async () => {
     if (proc.exitCode === null) proc.kill('SIGTERM');
     await new Promise((resolve) => proc.exitCode !== null ? resolve() : proc.once('exit', resolve));
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    fs.rmSync(tempRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   try { await waitForHealth(baseUrl, proc); }
