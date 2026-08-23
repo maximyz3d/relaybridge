@@ -91,6 +91,8 @@ test('provider config uses the installed subscription CLIs and safe headless mod
   assert.deepEqual(config.gemini.login_command, ['agy'], 'Antigravity signs in through its own interactive TUI');
   assert.equal(config.gemini.oneshot_safe[config.gemini.oneshot_safe.indexOf('--add-dir') + 1], '{cwd}');
   assert.equal(config.gemini.oneshot_safe[config.gemini.oneshot_safe.indexOf('--effort') + 1], 'high');
+  assert.equal(config.gemini.oneshot_safe[config.gemini.oneshot_safe.indexOf('--print-timeout') + 1], '15m');
+  assert.equal(config.gemini.oneshot_dangerous[config.gemini.oneshot_dangerous.indexOf('--print-timeout') + 1], '15m');
   assert.deepEqual(config.gemini.model_tiers.light, {
     args: ['--model', 'gemini-3.5-flash-low'], model: 'gemini-3.5-flash-low',
     suppress_args: [{ flag: '--effort', value_count: 1 }], note: 'current low-effort Flash id reported by agy models',
