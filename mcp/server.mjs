@@ -2264,6 +2264,13 @@ export function buildServer() {
     return result({ ...response, receiptId: receipt.receiptId });
   }));
 
+  server.registerTool('provider_cooldowns', {
+    title: 'Which seats are rate limited right now',
+    description: 'Seats currently in cooldown after a 429 or overload, with how long is left, why, and whether the window came from the provider\'s Retry-After or our backoff. A readiness probe only proves authentication — this is the quota picture, and it is shared by every client and survives a bridge restart.',
+    inputSchema: z.object({}),
+    annotations: READ_ONLY,
+  }, safeHandler(async () => result(await bridgeRequest('/api/cooldowns'))));
+
   // ---- Fuel gauge / usage ------------------------------------------------
 
   server.registerTool('usage_gauges', {

@@ -80,3 +80,39 @@ Start from observed usage: run a normal day, open ⛽ Fuel, and set
 `tokensPerDay` to roughly double what a comfortable day consumed. Too low and
 the leveller downgrades work it shouldn't; too high and it won't protect a seat
 before it hits a real wall.
+
+## Provider cooldown (issue #17)
+
+A readiness probe proves **authentication, not usable quota**. Before this, a
+seat that returned a subscription 429 still reported ready, so routing kept
+sending it work that could not succeed — unless every caller remembered an
+out-of-band "don't use that seat right now" rule.
+
+`lib/provider-cooldown.js` makes that state first-class:
+
+- **Durable** — survives a bridge restart; a corrupt file resets loudly rather
+  than blocking startup.
+- **Shared** — Claude Code, Cowork and the dashboard schedule against one picture.
+- **Explained** — `/api/cooldowns` and the `provider_cooldowns` MCP tool report
+  the seat, the reason, time remaining, and whether the window came from the
+  provider's `Retry-After` or our backoff.
+
+Rules:
+
+| | |
+|---|---|
+| What cools a seat | `rate_limited`, `overloaded` — **only** quota classes |
+| What does not | auth failures, missing binaries, bad prompts, internal timeouts |
+| Window | provider `Retry-After` when sent, else backoff 5m → 15m → 1h → 4h |
+| Overload | 60s — transient, not a quota wall |
+| Repeat offences | escalate; reset after 6 quiet hours |
+| Concurrent 429s | never shorten an existing longer window |
+| Success | clears the cooldown, keeps the offence count so a flapping seat still escalates |
+| Explicit request | **never silently withheld** — reported as cooling and left in |
+
+`Retry-After` is read from a header, an HTTP date, or CLI prose
+("try again in 5 minutes"). A value already in the past is ignored.
+
+When every candidate is cooling, the response says `allCooling: true` — so it
+is not mistaken for "no capable provider," which would send someone chasing a
+config problem that does not exist.

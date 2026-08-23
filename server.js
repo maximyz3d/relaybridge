@@ -898,12 +898,29 @@ function sendOneShotResult(res, payload, meta) {
   // accounting must never be able to break a response.
   try {
     if (meta && meta.kind && typeof recordRunUsage === 'function') {
+      const ok = payload.exitCode === 0 && !payload.dropped_out;
+      // Classify once and use it for BOTH accounting and cooldown, so the two
+      // can never disagree about why a run ended.
+      const classified = classifyRunFailure({
+        stdout: payload.stdout, stderr: payload.stderr, exitCode: payload.exitCode,
+        elapsedMs: meta.startedAt ? Date.now() - meta.startedAt : 0,
+        stopReason: payload.stop_reason,
+      });
+      const failureKind = payload.rate_limited ? 'rate_limited'
+        : payload.auth_failed ? 'auth_failed'
+        : (classified.kind !== 'ok' ? classified.kind : null);
       recordRunUsage({
         kind: meta.kind, route: payload.route || meta.route, usage: payload.usage,
-        startedAt: meta.startedAt,
-        ok: payload.exitCode === 0 && !payload.dropped_out,
-        failureKind: payload.auth_failed ? 'auth_failed' : payload.rate_limited ? 'rate_limited' : null,
+        startedAt: meta.startedAt, ok, failureKind,
       });
+      try {
+        if (ok) cooldowns.noteSuccess(meta.kind);
+        else if (failureKind) {
+          cooldowns.noteFailure(meta.kind, failureKind, {
+            retryAfterSec: parseRetryAfter(`${payload.stdout || ''}\n${payload.stderr || ''}`, payload.retry_after),
+          });
+        }
+      } catch { /* cooldown bookkeeping must never break a response */ }
     }
   } catch { /* ignored on purpose */ }
   try {
@@ -3575,6 +3592,16 @@ app.post('/api/tasks/:id/cancel', (req, res) => {
 // Records every run's tokens, duration and shadow cost so the fleet drains
 // evenly and "what would this cost on metered pricing" is answerable while on
 // subscription plans.
+const { createCooldownStore, parseRetryAfter } = require('./lib/provider-cooldown');
+const { classifyRunFailure } = require('./lib/provider-failure');
+// Issue #17: readiness proves auth, not quota. A seat that returned 429 stays
+// "ready" forever unless the 429 is remembered, so remember it durably and
+// share it with every client.
+const cooldowns = createCooldownStore({
+  file: path.join(DATA_DIR, 'cooldowns.json'),
+  log: (m) => console.log(m),
+});
+
 const { createUsageLedger } = require('./lib/usage-ledger');
 const { levelCandidates, suggestTierAdjustment, fleetBalance } = require('./lib/load-leveller');
 
@@ -3624,6 +3651,10 @@ app.get('/api/usage/gauges', (req, res) => {
     res.json({ gauges, balance: fleetBalance(gauges), totals: usageLedger.totals(windowMs) });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
+app.get('/api/cooldowns', (req, res) => {
+  res.json({ cooldowns: cooldowns.all(), cooling: cooldowns.cooling() });
+});
+
 app.get('/api/usage/totals', (req, res) => {
   try { res.json(usageLedger.totals(Number(req.query.windowMs) || 86400000)); }
   catch (err) { res.status(500).json({ error: err.message }); }
@@ -3632,9 +3663,16 @@ app.post('/api/usage/advise', (req, res) => {
   try {
     const { tier = 'standard', candidates = [], highStakes = false, explicitProvider = false } = req.body || {};
     const gauges = usageLedger.gaugeAll(seatCostClasses());
-    const ranked = levelCandidates(candidates, gauges);
+    // Quota state first: a cooling seat cannot do the work at any rank.
+    const { usable, skipped, allCooling } = cooldowns.filterCandidates(
+      candidates, { explicit: explicitProvider ? (req.body?.explicitSeat || null) : null });
+    const ranked = levelCandidates(usable, gauges);
     const top = ranked[0] ? gauges[ranked[0].seat] : null;
-    res.json({ ranked, tierAdjustment: suggestTierAdjustment({ tier, gauge: top, highStakes, explicitProvider }), balance: fleetBalance(gauges) });
+    res.json({
+      ranked, skipped, allCooling,
+      tierAdjustment: suggestTierAdjustment({ tier, gauge: top, highStakes, explicitProvider }),
+      balance: fleetBalance(gauges),
+    });
   } catch (err) { res.status(400).json({ error: err.message }); }
 });
 

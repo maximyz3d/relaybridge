@@ -2619,6 +2619,11 @@ function fuelBar(pct, basis){
 async function refreshFuel(){
   try {
     const { gauges, balance, totals } = await api('/api/usage/gauges?windowMs=' + $('#fuel-window').value);
+    // Quota state is separate from fuel: a seat can read 80% and still be
+    // unusable because the provider 429'd it.
+    let cooling = [];
+    try { cooling = (await api('/api/cooldowns')).cooling || []; } catch {}
+    const coolBySeat = Object.fromEntries(cooling.map(c => [c.seat, c]));
     $('#fuel-balance').innerHTML = balance.advice
       ? `<span style="color:#facc15">⚠ ${esc(balance.advice)}</span>`
       : `<span style="color:#4ade80">✓ fleet balanced${balance.seats?` (${balance.seats} metered, ${balance.spread}pt spread)`:''}</span>`;
@@ -2632,7 +2637,7 @@ async function refreshFuel(){
     $('#fuel-gauges').innerHTML = '<table style="width:100%;font-size:12px;">' +
       '<tr class="muted"><th align="left">seat</th><th align="left">fuel</th><th align="left">burn</th><th align="left">runs</th><th align="left">tokens</th><th align="left">cost</th><th align="left">models</th></tr>' +
       rows.map(g => `<tr>
-        <td><b>${esc(g.seat)}</b><br><span class="muted" style="font-size:10px;">${esc(g.costClass)}${g.basis==='configured'?' · est':''}</span></td>
+        <td><b>${esc(g.seat)}</b>${coolBySeat[g.seat]?` <span style="color:#f87171" title="rate limited — ${esc(coolBySeat[g.seat].reason||'')}, ${coolBySeat[g.seat].remainingSec}s left">🚫 ${Math.ceil(coolBySeat[g.seat].remainingSec/60)}m</span>`:''}<br><span class="muted" style="font-size:10px;">${esc(g.costClass)}${g.basis==='configured'?' · est':''}</span></td>
         <td>${fuelBar(g.percentRemaining, g.basis)}${(g.hoursToEmpty!==null&&g.hoursToEmpty!==undefined)?`<br><span class="muted" style="font-size:10px;">~${g.hoursToEmpty}h to empty</span>`:''}</td>
         <td>${tok(g.burn.tokensPerHour)}/h<br><span class="muted" style="font-size:10px;">${g.burn.runsPerHour}/h runs</span></td>
         <td>${g.used.runs}${g.used.failed?` <span style="color:#f87171">(${g.used.failed}✗)</span>`:''}</td>
