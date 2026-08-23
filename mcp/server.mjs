@@ -1302,6 +1302,47 @@ function remainingTime(deadlineAt, floorMs = 1000) {
   return Math.max(floorMs, deadlineAt - Date.now());
 }
 
+
+// Derive a human-readable range list from a zod object schema, so tool
+// descriptions cannot drift from the constraints actually enforced.
+// Returns e.g. "maxChars 30000-200000, maxSessions 0-20" or null.
+export function describeNumericBounds(schema) {
+  if (!schema || typeof schema !== 'object') return null;
+  const shape = typeof schema.shape === 'object' ? schema.shape
+    : (typeof schema._def?.shape === 'function' ? schema._def.shape() : schema._def?.shape);
+  if (!shape) return null;
+  const parts = [];
+  for (const [key, field] of Object.entries(shape)) {
+    const b = numericBoundsOf(field);
+    if (!b) continue;
+    if (b.min !== null && b.max !== null) parts.push(`${key} ${b.min}-${b.max}`);
+    else if (b.min !== null) parts.push(`${key} >= ${b.min}`);
+    else if (b.max !== null) parts.push(`${key} <= ${b.max}`);
+  }
+  return parts.length ? parts.join(', ') : null;
+}
+
+// Walks .default()/.optional() wrappers to find the underlying number checks.
+function numericBoundsOf(field, depth = 0) {
+  if (!field || depth > 6) return null;
+  const def = field._def || {};
+  const inner = def.innerType || def.schema || def.type;
+  const typeName = def.typeName || def.type;
+  const isNumber = typeName === 'ZodNumber' || typeName === 'number';
+  if (!isNumber) return inner && typeof inner === 'object' ? numericBoundsOf(inner, depth + 1) : null;
+
+  let min = null, max = null;
+  // zod v3 exposes _def.checks; v4 exposes checks with _zod.def
+  for (const check of def.checks || []) {
+    const c = check?._zod?.def || check;
+    const kind = c.kind || c.check;
+    const value = c.value ?? c.minimum ?? c.maximum;
+    if (kind === 'min' || kind === 'greater_than' || c.minimum !== undefined) min = c.minimum ?? value;
+    if (kind === 'max' || kind === 'less_than' || c.maximum !== undefined) max = c.maximum ?? value;
+  }
+  return (min === null && max === null) ? null : { min, max };
+}
+
 export function buildServer() {
   const server = new McpServer({ name: 'relaybridge', version: PACKAGE.version }, {
     instructions: 'Read before acting: call get_context_bundle when taking over existing work, then use bridge_status, list_providers, and route_preview as needed. AI provider one-shots (ask_provider, route_and_ask, run_committee) always force dangerous:false, so they consume subscription quotas or local compute in the provider CLI\'s own safe/headless mode. Terminals are different: start_safe_session only forces the vendor bypass flags off, and start_safe_session(kind="powershell") opens a real host PowerShell shell running with your account\'s full privileges. Anything sent through send_session_input executes on the host with no sandbox and no filesystem confinement, so it needs host approval and human review. The /api/exec route, provider installs, and the global full-permissions toggle are not exposed as tools. Routing scores are operator preferences, not universal model-quality claims; use receipts and preserve the human gate for high-stakes work.',
@@ -1311,6 +1352,28 @@ export function buildServer() {
       'resources/list': { ttlMs: 60000, cacheScope: 'private' },
     },
   });
+
+  // Issue #26: numeric bounds reach the JSON Schema (the SDK emits zod's
+  // .min()/.max() as minimum/maximum), but many clients surface only the
+  // human-readable description to the model. A caller then picks a plausible
+  // value like maxChars=12000, and the request is rejected by validation
+  // before any work is done — a wasted round trip that the description could
+  // have prevented.
+  //
+  // Rather than hand-maintaining ranges in 30 description strings, where they
+  // would immediately drift from the schema, derive them FROM the schema at
+  // registration. The schema stays the single source of truth, and a new
+  // bounded parameter cannot be added without its range being documented.
+  const registerToolRaw = server.registerTool.bind(server);
+  server.registerTool = (name, config, handler) => {
+    try {
+      const ranges = describeNumericBounds(config?.inputSchema);
+      if (ranges && config?.description && !config.description.includes('Accepted ranges:')) {
+        config = { ...config, description: `${config.description} Accepted ranges: ${ranges}.` };
+      }
+    } catch { /* documentation must never block registration */ }
+    return registerToolRaw(name, config, handler);
+  };
 
   server.registerTool('bridge_status', {
     title: 'Bridge status',
