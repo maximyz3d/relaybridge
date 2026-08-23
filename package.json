@@ -11,7 +11,7 @@
     "smoke:mcp": "node tools/mcp-smoke.mjs",
     "test:install": "powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File tools/test-install.ps1",
     "test:install-mcp": "powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File tools/test-install-mcp.ps1",
-    "test": "node --test test/*.test.js"
+    "test": "node --test --test-concurrency=1 test/*.test.js"
   },
   "dependencies": {
     "@modelcontextprotocol/node": "^2.0.0",
