@@ -1,0 +1,14 @@
+{
+  "_comment": "Fuel-gauge budgets. Subscription plans publish no token quota, so these are YOUR estimates of a reasonable daily draw — the gauge reports basis:'configured' so an estimate is never shown as a vendor number. Tune them from observed usage; getting them wrong changes advice, not correctness.",
+  "budgets": {
+    "claude":       { "tokensPerDay": 8000000 },
+    "claude_fable": { "tokensPerDay": 4000000 },
+    "codex":        { "tokensPerDay": 6000000 },
+    "copilot":      { "tokensPerDay": 4000000 },
+    "cursor":       { "tokensPerDay": 4000000 },
+    "gemini":       { "tokensPerDay": 5000000 },
+    "grok":         { "tokensPerDay": 3000000 },
+    "perplexity":   { "tokensPerDay": 2000000 },
+    "groq_llama_fast": { "tokensPerDay": 5000000 }
+  }
+}

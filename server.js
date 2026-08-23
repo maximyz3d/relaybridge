@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const { RunSupervisor, resolveSupervisorOptions } = require('./lib/run-supervisor');
 const { resolveModelArgs, applyModelArgs, modelConfigStaleness, modelTierForTaskTier } = require('./lib/model-tiers');
 const { buildRegistry, parseModelList, pinIsRetired } = require('./lib/model-registry');
-const { buildTaskPlan, EFFORT_ORDER } = require('./lib/task-plan');
+const { buildTaskPlan, EFFORT_ORDER, costClassFor } = require('./lib/task-plan');
 const { receiptStoreIdentity } = require('./lib/receipt-store-identity.cjs');
 const { WebSocketServer } = require('ws');
 const { spawn, spawnSync } = require('child_process');
@@ -893,6 +893,19 @@ function sendOneShotPreAdmissionRejection(res, {
 
 function sendOneShotResult(res, payload, meta) {
   if (res.writableEnded || res.destroyed) return;
+  // Usage ledger: every run — CLI, local Ollama, hosted adapter — exits
+  // through here, so this single hook catches them all. Wrapped because
+  // accounting must never be able to break a response.
+  try {
+    if (meta && meta.kind && typeof recordRunUsage === 'function') {
+      recordRunUsage({
+        kind: meta.kind, route: payload.route || meta.route, usage: payload.usage,
+        startedAt: meta.startedAt,
+        ok: payload.exitCode === 0 && !payload.dropped_out,
+        failureKind: payload.auth_failed ? 'auth_failed' : payload.rate_limited ? 'rate_limited' : null,
+      });
+    }
+  } catch { /* ignored on purpose */ }
   try {
     const receipt = appendBridgeProviderReceipt({ ...meta, payload });
     res._relayReceiptPersisted = receipt.receiptId;
@@ -3526,6 +3539,105 @@ async function executeOneShot(body, res) {
 }
 
 app.post('/api/oneshot', (req, res) => executeOneShot(req.body, res));
+
+// ---- Async task queue (lib/task-queue.js) --------------------------------
+// Submission is decoupled from collection so work outlives the surface that
+// started it: submit from a chat, collect from Cowork or the CLI later.
+const { createTaskQueue } = require('./lib/task-queue');
+const taskQueue = createTaskQueue({
+  dataDir: path.join(DATA_DIR, 'tasks'),
+  executeOneShot, readCollab, writeCollab,
+  maxConcurrent: Number(process.env.RELAYBRIDGE_MAX_TASKS) || 3,
+  log: (m) => console.log(m),
+});
+
+app.post('/api/tasks', (req, res) => {
+  try { res.json(taskQueue.submit(req.body || {})); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+app.get('/api/tasks', (req, res) => {
+  try { res.json({ tasks: taskQueue.list({ collab: req.query.collab, status: req.query.status, limit: req.query.limit }), stats: taskQueue.stats() }); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+app.get('/api/tasks/:id', (req, res) => {
+  try {
+    const task = taskQueue.get(req.params.id);
+    if (!task) return res.status(404).json({ error: 'task not found' });
+    res.json(task);
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+app.post('/api/tasks/:id/cancel', (req, res) => {
+  try { res.json(taskQueue.cancel(req.params.id)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// ---- Usage ledger + fuel gauge (lib/usage-ledger.js) ---------------------
+// Records every run's tokens, duration and shadow cost so the fleet drains
+// evenly and "what would this cost on metered pricing" is answerable while on
+// subscription plans.
+const { createUsageLedger } = require('./lib/usage-ledger');
+const { levelCandidates, suggestTierAdjustment, fleetBalance } = require('./lib/load-leveller');
+
+function loadUsageBudgets() {
+  try {
+    const fp = path.join(ROOT, 'config', 'usage-budgets.json');
+    return fs.existsSync(fp) ? JSON.parse(fs.readFileSync(fp, 'utf8')) : {};
+  } catch { return {}; }
+}
+const usageBudgetsFile = loadUsageBudgets();
+const usageLedger = createUsageLedger({
+  dataDir: path.join(DATA_DIR, 'usage'),
+  budgets: usageBudgetsFile.budgets || {},
+  pricing: usageBudgetsFile.pricing || undefined,
+  log: (m) => console.log(m),
+});
+
+function seatCostClasses() {
+  const cfg = loadConfig();
+  const out = {};
+  for (const [seat, entry] of Object.entries(cfg)) {
+    if (seat.startsWith('_')) continue;
+    out[seat] = { costClass: costClassFor(entry, seat) };
+  }
+  return out;
+}
+
+function recordRunUsage({ kind, route, usage, startedAt, ok, failureKind, taskId }) {
+  try {
+    const classes = seatCostClasses();
+    usageLedger.record({
+      seat: kind,
+      model: route?.resolved_model || route?.model || null,
+      costClass: classes[kind]?.costClass || 'metered',
+      inputTokens: usage?.input_tokens ?? usage?.prompt_tokens ?? 0,
+      outputTokens: usage?.output_tokens ?? usage?.completion_tokens ?? 0,
+      elapsedMs: startedAt ? Date.now() - startedAt : 0,
+      ok, failureKind: failureKind || null, taskId: taskId || null,
+    });
+  } catch (err) { console.log('[RelayBridge] usage record failed: ' + err.message); }
+}
+
+app.get('/api/usage/gauges', (req, res) => {
+  try {
+    const windowMs = Number(req.query.windowMs) || 86400000;
+    const gauges = usageLedger.gaugeAll(seatCostClasses(), windowMs);
+    res.json({ gauges, balance: fleetBalance(gauges), totals: usageLedger.totals(windowMs) });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+app.get('/api/usage/totals', (req, res) => {
+  try { res.json(usageLedger.totals(Number(req.query.windowMs) || 86400000)); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+app.post('/api/usage/advise', (req, res) => {
+  try {
+    const { tier = 'standard', candidates = [], highStakes = false, explicitProvider = false } = req.body || {};
+    const gauges = usageLedger.gaugeAll(seatCostClasses());
+    const ranked = levelCandidates(candidates, gauges);
+    const top = ranked[0] ? gauges[ranked[0].seat] : null;
+    res.json({ ranked, tierAdjustment: suggestTierAdjustment({ tier, gauge: top, highStakes, explicitProvider }), balance: fleetBalance(gauges) });
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
 
 // ---- GitHub integration (lib/github-tracker.js) --------------------------
 // Fire-and-forget middleware on the run-completion path. Activates only for
