@@ -85,6 +85,36 @@ test('account-scoped vendor quota is shared across aliases in one quota seat', (
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+test('one operator observation is shared by every alias while model vendor evidence keeps precedence', () => {
+  const dir = tmp();
+  const now = Date.parse('2026-08-24T12:00:00Z');
+  const ledger = createUsageLedger({
+    dataDir: dir, quotaSeats: mapping, now: () => now,
+    budgets: { [GROUP]: { tokensPerDay: 1000 } },
+  });
+  ledger.observeOperatorQuota({
+    quotaSeat: GROUP, percentRemaining: 4, source: 'operator_reported',
+    provenance: 'human_account_owner', observedAt: new Date(now).toISOString(),
+    expiresAt: new Date(now + 3600000).toISOString(),
+  });
+  ledger.observeVendorQuota({
+    provider: 'claude_fable', model: 'fable', scope: 'model', unit: 'tokens',
+    actual: 90, limit: 100, observedAt: new Date(now).toISOString(),
+    reset: { expiresAt: new Date(now + 3600000).toISOString() },
+  });
+  const claude = ledger.gauge('claude', { costClass: 'subscription', model: 'opus' });
+  const fable = ledger.gauge('claude_fable', { costClass: 'subscription', model: 'fable' });
+  assert.equal(claude.basis, 'operator_observed');
+  assert.equal(claude.percentRemaining, 4);
+  assert.equal(fable.basis, 'vendor_observed');
+  assert.equal(fable.percentRemaining, 10);
+  assert.equal(fable.vendorQuota.scope, 'model');
+  assert.equal(fable.operatorQuota.quotaSeat, GROUP, 'operator evidence remains disclosed even when vendor evidence wins');
+  assert.ok(ledger.clearOperatorQuota(GROUP));
+  assert.equal(ledger.activeOperatorQuota(GROUP), null);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 test('a shared cooldown blocks every alias except the explicitly requested provider', () => {
   const diagnostics = {
     claude: { found: true, ready: true },

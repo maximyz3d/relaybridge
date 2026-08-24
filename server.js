@@ -2850,6 +2850,7 @@ app.post('/api/plan', async (req, res) => {
       cooldownSkipped: fleetInput.skipped,
       balance: fleetBalance(gauges),
       vendorQuota: vendorQuotaFleet(gauges),
+      operatorQuota: operatorQuotaFleet(gauges),
       quotaSeats: quotaSeatRegistry.groups,
     };
     const plan = buildTaskPlan({
@@ -2904,6 +2905,7 @@ app.post('/api/route', async (req, res) => {
       cooldownSkipped: fleetInput.skipped,
       balance: fleetBalance(gauges),
       vendorQuota: vendorQuotaFleet(gauges),
+      operatorQuota: operatorQuotaFleet(gauges),
       quotaSeats: quotaSeatRegistry.groups,
     };
     const taskTier = route.classification?.tier;
@@ -3911,7 +3913,9 @@ const cooldowns = createCooldownStore({
   log: (m) => console.log(m),
 });
 
-const { createUsageLedger } = require('./lib/usage-ledger');
+const {
+  createUsageLedger, OPERATOR_QUOTA_PROVENANCE, MAX_OPERATOR_QUOTA_TTL_MS,
+} = require('./lib/usage-ledger');
 const { parseGrokQuota429 } = require('./lib/vendor-quota');
 const {
   levelCandidates, suggestTierAdjustment, fleetBalance,
@@ -4001,6 +4005,15 @@ function vendorQuotaFleet(gauges) {
   return out;
 }
 
+function operatorQuotaFleet(gauges) {
+  const out = {};
+  for (const gauge of Object.values(gauges)) {
+    if (!gauge?.operatorQuota || out[gauge.quotaSeat]) continue;
+    out[gauge.quotaSeat] = { ...gauge.operatorQuota, aliases: gauge.aliases };
+  }
+  return out;
+}
+
 function recordRunUsage({ kind, route, usage, startedAt, ok, failureKind, taskId }) {
   try {
     const classes = seatCostClasses();
@@ -4026,10 +4039,61 @@ app.get('/api/usage/gauges', (req, res) => {
       gauges,
       balance: fleetBalance(gauges),
       quotaSeats: quotaSeatRegistry.groups,
+      operatorQuota: operatorQuotaFleet(gauges),
       providerUsageCapabilities: providerUsageCapabilities(loadConfig(), runtimeVersions),
       totals: usageLedger.totals(windowMs),
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
+});
+app.get('/api/usage/operator-quota', (req, res) => {
+  res.json({
+    observations: usageLedger.operatorQuotaObservations(),
+    quotaSeats: quotaSeatRegistry.groups,
+    provenanceOptions: OPERATOR_QUOTA_PROVENANCE,
+    maxTtlMs: MAX_OPERATOR_QUOTA_TTL_MS,
+  });
+});
+app.put('/api/usage/operator-quota', (req, res) => {
+  const body = req.body;
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return res.status(400).json({ error: 'JSON object required' });
+  }
+  const allowed = new Set(['quotaSeat', 'percentRemaining', 'provenance', 'observedAt', 'expiresAt']);
+  const unknown = Object.keys(body).filter((key) => !allowed.has(key));
+  if (unknown.length) {
+    return res.status(400).json({ error: `unsupported fields: ${unknown.join(', ')}; credentials and free-form notes are never stored` });
+  }
+  const quotaSeat = typeof body.quotaSeat === 'string' ? body.quotaSeat.trim() : '';
+  if (!quotaSeatRegistry.groups[quotaSeat]) return res.status(400).json({ error: 'quotaSeat must name a configured quota seat' });
+  if (!Number.isInteger(body.percentRemaining) || body.percentRemaining < 0 || body.percentRemaining > 100) {
+    return res.status(400).json({ error: 'percentRemaining must be an integer from 0 to 100' });
+  }
+  if (!OPERATOR_QUOTA_PROVENANCE.includes(body.provenance)) {
+    return res.status(400).json({ error: `provenance must be one of: ${OPERATOR_QUOTA_PROVENANCE.join(', ')}` });
+  }
+  const observation = usageLedger.observeOperatorQuota({
+    quotaSeat,
+    percentRemaining: body.percentRemaining,
+    provenance: body.provenance,
+    observedAt: body.observedAt,
+    expiresAt: body.expiresAt,
+    source: 'operator_reported',
+  });
+  if (!observation) {
+    return res.status(400).json({ error: `observedAt/expiresAt are invalid; expiry must be future, after observation, and within ${MAX_OPERATOR_QUOTA_TTL_MS}ms` });
+  }
+  return res.json({ ok: true, observation });
+});
+app.delete('/api/usage/operator-quota', (req, res) => {
+  const body = req.body;
+  if (!body || typeof body !== 'object' || Array.isArray(body)
+    || Object.keys(body).some((key) => key !== 'quotaSeat')) {
+    return res.status(400).json({ error: 'body must contain only quotaSeat' });
+  }
+  const quotaSeat = typeof body.quotaSeat === 'string' ? body.quotaSeat.trim() : '';
+  if (!quotaSeatRegistry.groups[quotaSeat]) return res.status(400).json({ error: 'quotaSeat must name a configured quota seat' });
+  if (!usageLedger.clearOperatorQuota(quotaSeat)) return res.status(500).json({ error: 'operator quota clear could not be persisted' });
+  return res.json({ ok: true, quotaSeat, cleared: true });
 });
 app.get('/api/cooldowns', (req, res) => {
   res.json({ cooldowns: cooldowns.all(), cooling: coolingQuotaStates(), quotaSeats: quotaSeatRegistry.groups });
@@ -4053,6 +4117,7 @@ app.post('/api/usage/advise', (req, res) => {
       tierAdjustment: suggestTierAdjustment({ tier, gauge: top, highStakes, explicitProvider }),
       balance: fleetBalance(gauges),
       vendorQuota: vendorQuotaFleet(gauges),
+      operatorQuota: operatorQuotaFleet(gauges),
     });
   } catch (err) { res.status(400).json({ error: err.message }); }
 });

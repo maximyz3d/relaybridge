@@ -388,12 +388,22 @@
       <button class="btn" id="fuel-refresh">Refresh</button>
       <span id="fuel-balance" class="muted"></span>
     </div>
+    <div style="display:flex;gap:6px;align-items:end;flex-wrap:wrap;margin-bottom:10px;padding:8px;border:1px solid var(--border);border-radius:6px;">
+      <label style="font-size:11px;">Quota seat<br><select id="operator-quota-seat"></select></label>
+      <label style="font-size:11px;">Remaining %<br><input id="operator-quota-percent" type="number" min="0" max="100" step="1" value="4" style="width:72px;"></label>
+      <label style="font-size:11px;">Expires/reset at<br><input id="operator-quota-expires" type="datetime-local"></label>
+      <label style="font-size:11px;">Provenance<br><select id="operator-quota-provenance"><option value="human_account_owner">account owner report</option><option value="vendor_ui_manual_read">manual vendor UI reading</option><option value="provider_support">provider support</option></select></label>
+      <button class="btn" id="operator-quota-save">Save observation</button>
+      <button class="btn" id="operator-quota-clear">Clear</button>
+      <span id="operator-quota-status" class="muted" style="font-size:11px;"></span>
+      <div class="muted" style="flex-basis:100%;font-size:10px;">Manual, expiring quota-seat observation only. Credentials, dashboard content, and free-form notes are never accepted or stored.</div>
+    </div>
     <div id="fuel-totals" style="margin-bottom:10px;"></div>
     <div id="fuel-gauges">Loading…</div>
     <div class="muted" style="margin-top:10px; font-size:11px;">
       Subscription gauges normally measure against a <b>configured</b> budget in <code>config/usage-budgets.json</code> —
-      an estimate you set, not a vendor number. A recognized vendor quota from a 429 is labelled <b>vendor observed</b>
-      and temporarily takes precedence with its expiry shown. Shadow cost is what the same tokens would have cost at
+      an estimate you set, not a vendor number. Current vendor observations take precedence, followed by explicit
+      expiring <b>operator observed</b> values, then configured estimates. Shadow cost is what the same tokens would have cost at
       list API rates: an order of magnitude, not an invoice.
     </div>
   </div>
@@ -2615,6 +2625,10 @@ const fuelDialog = $('#fuel-dialog');
 let fuelTimer = null;
 const usd = (n) => '$' + Number(n || 0).toFixed(2);
 const tok = (n) => { n = Number(n||0); return n >= 1e6 ? (n/1e6).toFixed(2)+'M' : n >= 1e3 ? (n/1e3).toFixed(1)+'k' : String(n); };
+function quotaDateTimeValue(date){
+  const shifted = new Date(date.getTime() - date.getTimezoneOffset()*60000);
+  return shifted.toISOString().slice(0,16);
+}
 function fuelBar(pct, basis){
   const p = Math.max(0, Math.min(100, Number(pct)||0));
   const c = basis === 'unmetered' ? '#64748b' : p > 50 ? '#4ade80' : p > 20 ? '#facc15' : '#f87171';
@@ -2622,7 +2636,12 @@ function fuelBar(pct, basis){
 }
 async function refreshFuel(){
   try {
-    const { gauges, balance, totals, providerUsageCapabilities = {} } = await api('/api/usage/gauges?windowMs=' + $('#fuel-window').value);
+    const { gauges, balance, totals, quotaSeats = {}, providerUsageCapabilities = {} } = await api('/api/usage/gauges?windowMs=' + $('#fuel-window').value);
+    const quotaSeatSelect = $('#operator-quota-seat');
+    const selectedQuotaSeat = quotaSeatSelect.value;
+    const quotaSeatOptions = Object.keys(quotaSeats).sort().map(seat => `<option value="${esc(seat)}">${esc(seat)} (${(quotaSeats[seat].providers||[]).map(esc).join(', ')})</option>`).join('');
+    if (quotaSeatSelect.innerHTML !== quotaSeatOptions) quotaSeatSelect.innerHTML = quotaSeatOptions;
+    if (selectedQuotaSeat && quotaSeats[selectedQuotaSeat]) quotaSeatSelect.value = selectedQuotaSeat;
     // Quota state is separate from fuel: a seat can read 80% and still be
     // unusable because the provider 429'd it.
     let cooling = [];
@@ -2645,8 +2664,8 @@ async function refreshFuel(){
     $('#fuel-gauges').innerHTML = '<table style="width:100%;font-size:12px;">' +
       '<tr class="muted"><th align="left">seat</th><th align="left">fuel</th><th align="left">burn</th><th align="left">runs</th><th align="left">tokens</th><th align="left">cost</th><th align="left">models</th></tr>' +
       rows.map(g => `<tr>
-        <td><b>${esc(g.seat)}</b>${coolBySeat[g.seat]?` <span style="color:#f87171" title="rate limited — ${esc(coolBySeat[g.seat].reason||'')}, ${coolBySeat[g.seat].remainingSec}s left">🚫 ${Math.ceil(coolBySeat[g.seat].remainingSec/60)}m</span>`:''}<br><span class="muted" style="font-size:10px;">${esc(g.costClass)}${g.basis==='configured'?' · est':g.basis==='vendor_observed'?' · vendor observed':''}</span></td>
-        <td>${fuelBar(g.percentRemaining, g.basis)}${(g.hoursToEmpty!==null&&g.hoursToEmpty!==undefined)?`<br><span class="muted" style="font-size:10px;">~${g.hoursToEmpty}h to empty</span>`:''}${g.vendorQuota?`<br><span style="color:#f87171;font-size:10px;" title="${esc(g.vendorQuota.reset?.note||'')}">${tok(g.vendorQuota.actual)}/${tok(g.vendorQuota.limit)} ${esc(g.vendorQuota.unit)} · ${esc(g.vendorQuota.model)}<br>expires ${esc(new Date(g.vendorQuota.reset.expiresAt).toLocaleString())}</span>`:''}</td>
+        <td><b>${esc(g.seat)}</b>${coolBySeat[g.seat]?` <span style="color:#f87171" title="rate limited — ${esc(coolBySeat[g.seat].reason||'')}, ${coolBySeat[g.seat].remainingSec}s left">🚫 ${Math.ceil(coolBySeat[g.seat].remainingSec/60)}m</span>`:''}<br><span class="muted" style="font-size:10px;">${esc(g.costClass)}${g.basis==='configured'?' · est':g.basis==='vendor_observed'?' · vendor observed':g.basis==='operator_observed'?' · operator observed':''}</span></td>
+        <td>${fuelBar(g.percentRemaining, g.basis)}${(g.hoursToEmpty!==null&&g.hoursToEmpty!==undefined)?`<br><span class="muted" style="font-size:10px;">~${g.hoursToEmpty}h to empty</span>`:''}${g.vendorQuota?`<br><span style="color:#f87171;font-size:10px;" title="${esc(g.vendorQuota.reset?.note||'')}">${tok(g.vendorQuota.actual)}/${tok(g.vendorQuota.limit)} ${esc(g.vendorQuota.unit)} · ${esc(g.vendorQuota.model)}<br>expires ${esc(new Date(g.vendorQuota.reset.expiresAt).toLocaleString())}</span>`:''}${g.operatorQuota?`<br><span style="color:#facc15;font-size:10px;">${esc(g.operatorQuota.provenance)}<br>observed ${esc(new Date(g.operatorQuota.observedAt).toLocaleString())}<br>expires ${esc(new Date(g.operatorQuota.expiresAt).toLocaleString())}</span>`:''}</td>
         <td>${tok(g.burn.tokensPerHour)}/h<br><span class="muted" style="font-size:10px;">${g.burn.runsPerHour}/h runs</span></td>
         <td>${g.used.runs}${g.used.failed?` <span style="color:#f87171">(${g.used.failed}✗)</span>`:''}</td>
         <td>${tok(g.used.totalTokens)}</td><td>${usd(g.used.costUsd)}</td>
@@ -2656,6 +2675,7 @@ async function refreshFuel(){
 }
 function openFuelPanel(){
   if (typeof fuelDialog.showModal === 'function') fuelDialog.showModal(); else fuelDialog.setAttribute('open','true');
+  if (!$('#operator-quota-expires').value) $('#operator-quota-expires').value = quotaDateTimeValue(new Date(Date.now()+5*3600000));
   refreshFuel(); fuelTimer = setInterval(refreshFuel, 10000);
 }
 $('#fuel-btn')?.addEventListener('click', openFuelPanel);
@@ -2663,6 +2683,31 @@ $('#fuel-close-btn')?.addEventListener('click', () => { fuelDialog.close(); if(f
 fuelDialog?.addEventListener('cancel', () => { if(fuelTimer){clearInterval(fuelTimer); fuelTimer=null;} });
 $('#fuel-refresh')?.addEventListener('click', refreshFuel);
 $('#fuel-window')?.addEventListener('change', refreshFuel);
+$('#operator-quota-save')?.addEventListener('click', async () => {
+  const status = $('#operator-quota-status');
+  try {
+    const expires = new Date($('#operator-quota-expires').value);
+    const percentText = $('#operator-quota-percent').value.trim();
+    if (!Number.isFinite(expires.getTime())) throw new Error('Choose a valid expiry/reset time.');
+    if (!percentText) throw new Error('Enter remaining percent from 0 to 100.');
+    await api('/api/usage/operator-quota', { method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify({
+      quotaSeat: $('#operator-quota-seat').value,
+      percentRemaining: Number(percentText),
+      provenance: $('#operator-quota-provenance').value,
+      observedAt: new Date().toISOString(), expiresAt: expires.toISOString(),
+    }) });
+    status.textContent = 'Saved; routing now uses this until expiry.';
+    refreshFuel();
+  } catch (err) { status.textContent = 'Save failed: ' + err.message; }
+});
+$('#operator-quota-clear')?.addEventListener('click', async () => {
+  const status = $('#operator-quota-status');
+  try {
+    await api('/api/usage/operator-quota', { method:'DELETE', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ quotaSeat:$('#operator-quota-seat').value }) });
+    status.textContent = 'Cleared; configured/vendor evidence applies.';
+    refreshFuel();
+  } catch (err) { status.textContent = 'Clear failed: ' + err.message; }
+});
 
 // ---- Tasks panel ----------------------------------------------------------
 const tasksDialog = $('#tasks-dialog');
