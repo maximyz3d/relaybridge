@@ -8,6 +8,7 @@ param(
   [switch]$RegisterMcp,
   [string[]]$Providers = @(),
   [switch]$SkipProviderSetup,
+  [switch]$SkipCliPathRegistration,
   [ValidateRange(1, 65535)]
   [int]$Port = 8787,
   [string]$SourceDir = '',
@@ -664,6 +665,15 @@ try {
   if (-not $SkipProviderSetup) {
     try { Invoke-ProviderSetup -ConfigPath (Join-Path $InstallDir 'cli-config.json') -RequestedProviders $Providers }
     catch { Write-Warning ("Provider CLI setup skipped after core cutover: {0}" -f $_.Exception.Message) }
+  }
+
+  if (-not $SkipCliPathRegistration) {
+    $pathResult = & (Join-Path $InstallDir 'tools\register-cli-path.ps1') -InstallDir $InstallDir
+    if ($pathResult.UserPathChanged) {
+      Write-Host "[RelayBridge] Added $InstallDir to your user PATH. New shells can run 'relaybridge'." -ForegroundColor Green
+    } else {
+      Write-Host "[RelayBridge] CLI path is already registered: $InstallDir" -ForegroundColor DarkGray
+    }
   }
 
   if (Test-Path -LiteralPath $backupRoot) {
