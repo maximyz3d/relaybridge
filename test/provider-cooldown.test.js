@@ -83,6 +83,18 @@ test('a second 429 cannot shorten an existing longer cooldown', () => {
   s.noteFailure('claude', 'rate_limited', { retryAfterSec: 3600 }); // 1h
   s.noteFailure('claude', 'rate_limited', { retryAfterSec: 10 });   // race
   assert.ok(s.status('claude').remainingMs > 3_000_000, 'the longer window must stand');
+  assert.equal(s.status('claude').source, 'retry-after', 'metadata must still describe the active longer window');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('a shorter failure cannot relabel the active longer cooldown', () => {
+  const nowRef = { t: 1_000_000 };
+  const { s, dir } = store(nowRef);
+  s.noteFailure('claude', 'rate_limited', { retryAfterSec: 3600 });
+  s.noteFailure('claude', 'overloaded');
+  const status = s.status('claude');
+  assert.equal(status.reason, 'rate_limited');
+  assert.equal(status.source, 'retry-after');
   fs.rmSync(dir, { recursive: true, force: true });
 });
 

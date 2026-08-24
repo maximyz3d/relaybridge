@@ -2358,6 +2358,7 @@ export function buildServer() {
       candidates: z.array(z.object({ seat: z.string().min(1).max(64), rank: z.number().optional(), costClass: z.string().max(24).optional() })).max(20),
       highStakes: z.boolean().default(false),
       explicitProvider: z.boolean().default(false),
+      explicitSeat: z.string().min(1).max(64).optional(),
     }),
     annotations: READ_ONLY,
   }, safeHandler(async (input) => result(await bridgeRequest('/api/usage/advise', { method: 'POST', body: input }))));

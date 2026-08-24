@@ -59,6 +59,12 @@ metered seats get saved.
 seat — the single number that says whether levelling is working. Over 20
 points, it names which seat to shift away from.
 
+Normal `/api/plan` and `/api/route` calls apply the durable cooldown state
+before candidate selection and then apply fuel levelling to the capable
+providers that remain. An explicitly preferred provider is never filtered.
+The response includes `fleetState` and per-provider `loadLevelling` evidence
+so the changed order is visible rather than implicit.
+
 ## Endpoints
 
 | Method | Path | Purpose |
@@ -66,6 +72,8 @@ points, it names which seat to shift away from.
 | GET | `/api/usage/gauges?windowMs=` | Per-seat gauges + fleet balance + totals |
 | GET | `/api/usage/totals?windowMs=` | Tokens, runs, shadow vs metered cost |
 | POST | `/api/usage/advise` | Re-rank candidates + tier-downgrade advice |
+| POST | `/api/plan` | Fleet-aware primary provider and model plan |
+| POST | `/api/route` | Fleet-aware ranked provider candidates |
 
 MCP: `usage_gauges`, `usage_totals`, `usage_advise` — all reads, so they stay
 available through the connector's safe profile. Knowing how much fuel is left

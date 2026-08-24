@@ -2705,7 +2705,12 @@ app.post('/api/plan', async (req, res) => {
         diagnostics[k] = { found, ready: found, detail: 'path-only check' };
       }
     }
-    const route = router.routeTask({ task, diagnostics });
+    const fleetInput = applyCooldownsToDiagnostics(diagnostics, cooldowns.cooling(), kind ? [kind] : []);
+    diagnostics = fleetInput.diagnostics;
+    let route = router.routeTask({ task, diagnostics });
+    const gauges = usageLedger.gaugeAll(seatCostClasses());
+    route = levelRouteSelection(route, gauges, seatCostClassMap());
+    route.fleetState = { cooldownSkipped: fleetInput.skipped, balance: fleetBalance(gauges) };
     const plan = buildTaskPlan({
       route,
       config: cfg,
@@ -2714,7 +2719,7 @@ app.post('/api/plan', async (req, res) => {
       requestedEffort: effort || null,
       requestedKind: kind || null,
     });
-    res.json({ ok: true, task: task.slice(0, 400), ...plan });
+    res.json({ ok: true, task: task.slice(0, 400), ...plan, fleetState: route.fleetState });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -2744,11 +2749,17 @@ app.post('/api/route', async (req, res) => {
         diagnostics[kind] = { found, ready: found, detail: 'path-only check; run /api/diag for auth status' };
       }
     }
-    const route = router.routeTask({
+    const explicitKinds = Array.isArray(preferKinds) ? preferKinds : [];
+    const fleetInput = applyCooldownsToDiagnostics(diagnostics, cooldowns.cooling(), explicitKinds);
+    diagnostics = fleetInput.diagnostics;
+    let route = router.routeTask({
       task, diagnostics,
-      preferKinds: Array.isArray(preferKinds) ? preferKinds : undefined,
-      excludeKinds: Array.isArray(excludeKinds) ? excludeKinds : undefined,
+      preferredProviders: explicitKinds.length ? explicitKinds : undefined,
+      excludedProviders: Array.isArray(excludeKinds) ? excludeKinds : undefined,
     });
+    const gauges = usageLedger.gaugeAll(seatCostClasses());
+    route = levelRouteSelection(route, gauges, seatCostClassMap());
+    route.fleetState = { cooldownSkipped: fleetInput.skipped, balance: fleetBalance(gauges) };
     const taskTier = route.classification?.tier;
     const selected = (route.selected || []).map((pick) => {
       const resolved = resolveModelArgs({ entry: cfg[pick.kind] || {}, taskTier });
@@ -3059,8 +3070,12 @@ async function executeOneShot(body, res) {
         usage: { input_tokens: 0, output_tokens: 0 },
       }, { kind, prompt, startedAt });
     }
-    if (grounding.overridden) body = { ...body, _groundingOverridden: true };
-  } catch { /* grounding must never block a run it cannot evaluate */ }
+    if (grounding.overridden) body = { ...body, _groundingOverridden: true, _groundingOverrideReason: grounding.reason };
+  } catch (err) {
+    // The gate is advisory when it cannot evaluate, but losing it must be
+    // visible rather than silently disabling a safety layer.
+    console.warn(`[RelayBridge] workspace grounding check unavailable: ${err.message}`);
+  }
 
   // Run association for the GitHub tracker: who did this, and any
   // explicit intent. Falls back to the OS account so checkpoint commits
@@ -3266,6 +3281,8 @@ async function executeOneShot(body, res) {
     timeout_clamped: explicitTimeout != null && Math.trunc(Number(timeoutMs)) !== explicitTimeout,
     environment_overrides: Object.keys(oneShotEnv).sort(),
     request_id: requestId,
+    grounding_override: body?._groundingOverridden === true || null,
+    grounding_note: body?._groundingOverridden ? body._groundingOverrideReason : null,
   };
   // Persist a terminal cancellation even when the HTTP client is already
   // gone. Previously the provider was killed but its token/time attempt
@@ -3333,6 +3350,10 @@ async function executeOneShot(body, res) {
       spawnOpts.windowsVerbatimArguments = true;
     }
     proc = trackChild(spawn(spawnBin, spawnArgs, spawnOpts));
+    // executeOneShot returns after wiring the child events; the response is
+    // delivered by proc.on('close'). Background-task capture must distinguish
+    // that intentional deferred response from a handler that forgot to reply.
+    res._relayDeferredResponse = true;
   } catch (err) {
     cleanupPromptFile();
     if (err.validation) {
@@ -3639,7 +3660,10 @@ const cooldowns = createCooldownStore({
 });
 
 const { createUsageLedger } = require('./lib/usage-ledger');
-const { levelCandidates, suggestTierAdjustment, fleetBalance } = require('./lib/load-leveller');
+const {
+  levelCandidates, suggestTierAdjustment, fleetBalance,
+  applyCooldownsToDiagnostics, levelRouteSelection,
+} = require('./lib/load-leveller');
 
 function loadUsageBudgets() {
   try {
@@ -3663,6 +3687,11 @@ function seatCostClasses() {
     out[seat] = { costClass: costClassFor(entry, seat) };
   }
   return out;
+}
+
+function seatCostClassMap() {
+  const entries = seatCostClasses();
+  return Object.fromEntries(Object.entries(entries).map(([seat, value]) => [seat, value.costClass]));
 }
 
 function recordRunUsage({ kind, route, usage, startedAt, ok, failureKind, taskId }) {

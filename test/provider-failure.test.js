@@ -44,6 +44,12 @@ test('rate limits and quota fail up but are not retried on the same seat', () =>
   }
 });
 
+test('quota text wins over a generic 403 auth signature', () => {
+  const v = classifyRunFailure({ stderr: 'HTTP 403: quota exceeded for this subscription', exitCode: 1 });
+  assert.equal(v.kind, 'rate_limited');
+  assert.equal(v.failUp, true);
+});
+
 test('overload is the one class worth retrying', () => {
   const v = classifyRunFailure({ stderr: 'Error 529: overloaded', exitCode: 1 });
   assert.equal(v.kind, 'overloaded');

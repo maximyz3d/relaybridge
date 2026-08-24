@@ -180,6 +180,24 @@ test('paths escaping the workspace are not counted as evidence either way', () =
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+test('project wording is recognised as workspace-bound', () => {
+  const r = requiresWorkspace('review this project for security issues', { cwd: '/repo' });
+  assert.equal(r.required, true);
+});
+
+test('a sibling whose name shares the workspace prefix is still outside', () => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'rbws-parent-'));
+  const dir = path.join(parent, 'repo');
+  const sibling = path.join(parent, 'repo-copy');
+  fs.mkdirSync(dir);
+  fs.mkdirSync(sibling);
+  fs.writeFileSync(path.join(sibling, 'outside.js'), '');
+  const v = verifyReferencedPaths('see ../repo-copy/outside.js', dir);
+  assert.deepEqual(v.present, []);
+  assert.deepEqual(v.missing, []);
+  fs.rmSync(parent, { recursive: true, force: true });
+});
+
 test('verification degrades honestly when there is no cwd to check against', () => {
   const v = verifyReferencedPaths('src/a.js changed', null);
   assert.equal(v.checked, false);

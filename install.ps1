@@ -289,15 +289,32 @@ function Restore-ShippedModelPins($Merged, $Defaults, $Existing) {
     if ($name.StartsWith('_')) { continue }
     $shipped = $prop.Value
     if (-not ($shipped -is [pscustomobject])) { continue }
-    $shippedTiers = $shipped.PSObject.Properties['model_tiers']
-    if (-not $shippedTiers) { continue }
 
     $mergedEntry = $Merged.PSObject.Properties[$name]
     if (-not $mergedEntry -or -not ($mergedEntry.Value -is [pscustomobject])) { continue }
 
-    $entryLock = $mergedEntry.Value.PSObject.Properties['model_tiers_locked']
-    if ($entryLock -and $entryLock.Value) {
+    # Only a lock that existed in the operator's installed config is an
+    # operator choice. A shipped lock added by this upgrade (Cursor's Auto-only
+    # plan) must not preserve stale tiers resurrected by Merge-JsonDefaults.
+    $operatorEntryLock = $false
+    $existingEntry = $Existing.PSObject.Properties[$name]
+    if ($existingEntry -and $existingEntry.Value -is [pscustomobject]) {
+      $existingLock = $existingEntry.Value.PSObject.Properties['model_tiers_locked']
+      if ($existingLock -and $existingLock.Value) { $operatorEntryLock = $true }
+    }
+    if ($operatorEntryLock) {
       Write-Host ("[RelayBridge] {0}: model_tiers_locked is set; keeping operator pins." -f $name)
+      continue
+    }
+
+    $shippedTiers = $shipped.PSObject.Properties['model_tiers']
+    if (-not $shippedTiers) {
+      $shippedLock = $shipped.PSObject.Properties['model_tiers_locked']
+      $mergedTiers = $mergedEntry.Value.PSObject.Properties['model_tiers']
+      if ($shippedLock -and $shippedLock.Value -and $mergedTiers) {
+        $mergedEntry.Value.PSObject.Properties.Remove('model_tiers')
+        Write-Host ("[RelayBridge] {0}: removed installed model pins because the shipped seat now requires its account default." -f $name)
+      }
       continue
     }
 

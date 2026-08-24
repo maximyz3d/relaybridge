@@ -304,3 +304,20 @@ test('a handler that returns without responding is failed, not left hanging', as
   assert.equal(released, 1);
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+test('a CLI-style handler may return before its child-process response arrives', async () => {
+  const dir = tmpdir();
+  const q = createTaskQueue({
+    dataDir: dir,
+    executeOneShot: async (body, res) => {
+      res._relayDeferredResponse = true;
+      setTimeout(() => res.json({ stdout: 'late CLI result', exitCode: 0 }), 25);
+      // executeOneShot's CLI branch returns here after registering proc events.
+    },
+  });
+  const { id } = q.submit({ kind: 'claude', prompt: 'x' });
+  const t = await settled(q, id);
+  assert.equal(t.status, 'done');
+  assert.equal(t.result, 'late CLI result');
+  fs.rmSync(dir, { recursive: true, force: true });
+});

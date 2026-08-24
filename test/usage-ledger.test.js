@@ -11,7 +11,10 @@ const os = require('os');
 const path = require('path');
 
 const { createUsageLedger, costOf, priceFor } = require('../lib/usage-ledger');
-const { levelCandidates, suggestTierAdjustment, fleetBalance, stressOf } = require('../lib/load-leveller');
+const {
+  levelCandidates, suggestTierAdjustment, fleetBalance, stressOf,
+  applyCooldownsToDiagnostics, levelRouteSelection,
+} = require('../lib/load-leveller');
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'rbusage-'));
 
@@ -204,4 +207,49 @@ test('stress rises on low fuel OR fast burn, not only on low fuel', () => {
   assert.ok(stressOf({ basis: 'configured', percentRemaining: 95, hoursToEmpty: 0.5 }) >= 0.9,
     'emptying within the hour is stressful even at 95%');
   assert.equal(stressOf({ basis: 'unmetered', percentRemaining: 0 }), 0, 'free seats are never stressed');
+});
+
+test('cooling seats are made unavailable to normal route diagnostics', () => {
+  const result = applyCooldownsToDiagnostics({
+    claude: { found: true, ready: true, detail: 'authenticated' },
+    codex: { found: true, ready: true, detail: 'authenticated' },
+  }, [{ seat: 'claude', cooling: true, reason: 'rate_limited', remainingSec: 120 }]);
+  assert.equal(result.diagnostics.claude.ready, false);
+  assert.equal(result.diagnostics.codex.ready, true);
+  assert.deepEqual(result.skipped, ['claude']);
+});
+
+test('an explicitly requested cooling seat remains available', () => {
+  const result = applyCooldownsToDiagnostics(
+    { claude: { found: true, ready: true } },
+    [{ seat: 'claude', cooling: true, reason: 'rate_limited', remainingSec: 120 }],
+    ['claude'],
+  );
+  assert.equal(result.diagnostics.claude.ready, true);
+  assert.deepEqual(result.skipped, []);
+});
+
+test('normal route selections are reordered by fuel without widening capability', () => {
+  const route = { selected: [{ kind: 'claude', policyScore: 100 }, { kind: 'codex', policyScore: 90 }] };
+  const levelled = levelRouteSelection(route, {
+    claude: { basis: 'configured', percentRemaining: 2, hoursToEmpty: 0.2 },
+    codex: { basis: 'configured', percentRemaining: 95, hoursToEmpty: 30 },
+  }, { claude: 'subscription', codex: 'subscription' });
+  assert.deepEqual(levelled.selected.map((pick) => pick.kind), ['codex', 'claude']);
+  assert.equal(levelled.selected.length, 2, 'levelling must not add providers');
+  assert.equal(levelled.selected[0].loadLevelling.originalRank, 1);
+});
+
+test('a nearly empty capable seat may move several ranks to preserve remaining quota', () => {
+  const candidates = ['a', 'b', 'c', 'd', 'e'].map((seat, rank) => ({ seat, rank, costClass: 'subscription' }));
+  const gauges = {
+    a: { basis: 'configured', percentRemaining: 1, hoursToEmpty: 0.1 },
+    b: { basis: 'configured', percentRemaining: 95, hoursToEmpty: 30 },
+    c: { basis: 'configured', percentRemaining: 95, hoursToEmpty: 30 },
+    d: { basis: 'configured', percentRemaining: 95, hoursToEmpty: 30 },
+    e: { basis: 'configured', percentRemaining: 95, hoursToEmpty: 30 },
+  };
+  const ranked = levelCandidates(candidates, gauges);
+  assert.ok(ranked.find((item) => item.seat === 'a').levelledRank >= 3,
+    'capability was already enforced; severe depletion may justify a multi-rank move');
 });
