@@ -6,7 +6,10 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { classifyRunFailure, isNarrationOnlyResponse, seatToleratesLongRuns } = require('../lib/provider-failure');
+const {
+  classifyRunFailure, detectCopilotMonthlyQuota,
+  isNarrationOnlyResponse, seatToleratesLongRuns,
+} = require('../lib/provider-failure');
 
 test('Grok future-tense process narration is incomplete, preserved, and never retried on the same seat', () => {
   const stdout = 'I will inspect the repository and trace the relevant pipeline.\nNext I will review the tests and report any defects.';
@@ -83,6 +86,46 @@ test('rate limits and quota fail up but are not retried on the same seat', () =>
     assert.equal(v.kind, 'rate_limited', msg);
     assert.equal(v.failUp, true);
     assert.equal(v.retryable, false, 'retrying a rate limit on the same seat just fails again');
+  }
+});
+
+test('the exact failed Copilot monthly-quota diagnostic cools the seat without same-seat retry', () => {
+  const stderr = 'You have exceeded your monthly quota (Request ID: 393F:279076:21CF7B:277870:6A7E5965)\n\nChanges    +0 -0\nAI Credits 0 (3s)\nResume     copilot --resume=fixture';
+  const run = {
+    provider: 'copilot', stdout: '', stderr, exitCode: 1,
+    observedAt: '2026-08-24T05:05:27.679Z',
+  };
+  const evidence = detectCopilotMonthlyQuota(run);
+  assert.deepEqual({
+    provider: evidence.provider, scope: evidence.scope, kind: evidence.kind,
+    source: evidence.source, diagnostic: evidence.diagnostic,
+    observedAt: evidence.observedAt, stderrChars: evidence.stderrChars,
+  }, {
+    provider: 'copilot', scope: 'seat', kind: 'monthly_quota_exhausted',
+    source: 'copilot_cli_stderr', diagnostic: 'You have exceeded your monthly quota',
+    observedAt: '2026-08-24T05:05:27.679Z', stderrChars: stderr.length,
+  });
+  assert.match(evidence.stderrHash, /^[0-9a-f]{64}$/);
+  assert.doesNotMatch(JSON.stringify(evidence), /393F|resume=fixture/i, 'bounded evidence excludes request and resume ids');
+
+  const classified = classifyRunFailure(run);
+  assert.equal(classified.kind, 'rate_limited');
+  assert.equal(classified.failUp, true);
+  assert.equal(classified.retryable, false);
+});
+
+test('Copilot quota lookalikes and quoted success prose fail closed', () => {
+  const cases = [
+    { provider: 'claude', stderr: 'You have exceeded your monthly quota', exitCode: 1 },
+    { provider: 'copilot', stderr: 'The docs say: You have exceeded your monthly quota', exitCode: 1 },
+    { provider: 'copilot', stderr: 'You may have exceeded your monthly quota', exitCode: 1 },
+    { provider: 'copilot', stderr: 'You have exceeded your monthly token quota', exitCode: 1 },
+    { provider: 'copilot', stderr: 'You have exceeded your monthly quota (Request ID: ../../secret)', exitCode: 1 },
+    { provider: 'copilot', stdout: 'You have exceeded your monthly quota is the error to handle.', stderr: '', exitCode: 0 },
+  ];
+  for (const fixture of cases) {
+    assert.equal(detectCopilotMonthlyQuota(fixture), null, JSON.stringify(fixture));
+    assert.notEqual(classifyRunFailure(fixture).kind, 'rate_limited', JSON.stringify(fixture));
   }
 });
 

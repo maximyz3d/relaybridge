@@ -33,7 +33,10 @@ function containsPath(value, candidate) {
 }
 
 test('MCP provider accounting rejects malformed usage and contradictory retry aggregates', async () => {
-  const { normalizeProviderUsage, normalizeProviderRetries, normalizeVendorQuota } = await import('../mcp/server.mjs');
+  const {
+    normalizeProviderUsage, normalizeProviderRetries,
+    normalizeVendorQuota, normalizeQuotaEvidence,
+  } = await import('../mcp/server.mjs');
   assert.equal(normalizeProviderUsage({
     input_tokens: 10, output_tokens: 5, cache_read_input_tokens: '999',
     cache_creation_input_tokens: 0, total_tokens: 15,
@@ -82,6 +85,15 @@ test('MCP provider accounting rejects malformed usage and contradictory retry ag
   assert.equal(normalizeVendorQuota(vendorQuota).actual, 552305);
   assert.equal(normalizeVendorQuota({ ...vendorQuota, remaining: 99 }), null);
   assert.equal(normalizeVendorQuota({ ...vendorQuota, evidenceHash: 'not-a-hash' }), null);
+  const quotaEvidence = {
+    provider: 'copilot', scope: 'seat', kind: 'monthly_quota_exhausted',
+    source: 'copilot_cli_stderr', diagnostic: 'You have exceeded your monthly quota',
+    observedAt: '2026-08-24T05:05:27.679Z', stderrChars: 160, stderrHash: 'b'.repeat(64),
+  };
+  assert.equal(normalizeQuotaEvidence(quotaEvidence).kind, 'monthly_quota_exhausted');
+  assert.equal(normalizeQuotaEvidence({ ...quotaEvidence, provider: 'claude' }), null);
+  assert.equal(normalizeQuotaEvidence({ ...quotaEvidence, diagnostic: 'monthly quota maybe exceeded' }), null);
+  assert.equal(normalizeQuotaEvidence({ ...quotaEvidence, stderrChars: '160' }), null);
 });
 
 async function waitForHealth(baseUrl, proc) {
@@ -166,6 +178,15 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
         '--stderr', "API error (status 429 Too Many Requests): subscription:free-usage-exhausted: You've used all the included free usage for model grok-4.6 for now. Usage resets over a rolling 24-hour window — tokens (actual/limit): 552,305/500,000. Upgrade to a Grok subscription. model_id=grok-4.6", '--exit', '1',
       ],
       model: 'grok-4.6',
+      costClass: 'subscription',
+    },
+    copilot: {
+      ...echoProvider,
+      label: 'Copilot monthly quota fixture',
+      oneshot_safe: [
+        process.execPath, helper, '--prompt-file', '{prompt_file}',
+        '--stderr', "You have exceeded your monthly quota (Request ID: 393F:279076:21CF7B:277870:6A7E5965)\n\nChanges    +0 -0\nAI Credits 0 (3s)\nResume     copilot --resume=fixture", '--exit', '1',
+      ],
       costClass: 'subscription',
     },
     retry_json: {
@@ -573,6 +594,19 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   assert.equal(grokQuota.structuredContent.vendorQuota.limit, 500000);
   assert.equal(grokQuota.structuredContent.vendorQuota.model, 'grok-4.6');
 
+  const copilotQuota = await client.callTool({
+    name: 'ask_provider',
+    arguments: { kind: 'copilot', prompt: 'MCP_COPILOT_QUOTA_MARKER', useCache: false },
+  });
+  assert.equal(copilotQuota.structuredContent.failureClass, 'rate_limit');
+  assert.equal(copilotQuota.structuredContent.rateLimited, true);
+  assert.equal(copilotQuota.structuredContent.droppedOut, true);
+  assert.equal(copilotQuota.structuredContent.providerRetries.count, 0);
+  assert.match(copilotQuota.structuredContent.stderr, /^You have exceeded your monthly quota/);
+  assert.equal(copilotQuota.structuredContent.quotaEvidence.provider, 'copilot');
+  assert.equal(copilotQuota.structuredContent.quotaEvidence.kind, 'monthly_quota_exhausted');
+  assert.doesNotMatch(JSON.stringify(copilotQuota.structuredContent.quotaEvidence), /393F|resume=fixture/i);
+
   const retryPrompt = 'MCP_RETRY_ACCOUNTING_MARKER';
   const retryProvider = await client.callTool({
     name: 'ask_provider',
@@ -907,6 +941,18 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   });
   assert.equal(grokQuotaTransport.structuredContent.receipt.vendorQuota.actual, 552305);
   assert.equal(grokQuotaTransport.structuredContent.receipt.vendorQuota.model, 'grok-4.6');
+  const copilotQuotaOuterReceipt = receipts.structuredContent.receipts.find((receipt) =>
+    receipt.receiptId === copilotQuota.structuredContent.receiptId);
+  assert.equal(copilotQuotaOuterReceipt.failureClass, 'rate_limit');
+  assert.equal(copilotQuotaOuterReceipt.providerRetryCount, 0);
+  assert.equal(copilotQuotaOuterReceipt.quotaEvidence.kind, 'monthly_quota_exhausted');
+  assert.match(copilotQuotaOuterReceipt.transportReceiptId, /^rcpt_/);
+  const copilotQuotaTransport = await client.callTool({
+    name: 'get_receipt', arguments: { receiptId: copilotQuotaOuterReceipt.transportReceiptId },
+  });
+  assert.equal(copilotQuotaTransport.structuredContent.receipt.failureClass, 'rate_limit');
+  assert.equal(copilotQuotaTransport.structuredContent.receipt.quotaEvidence.kind, 'monthly_quota_exhausted');
+  assert.doesNotMatch(JSON.stringify(copilotQuotaTransport.structuredContent.receipt.quotaEvidence), /393F|resume=fixture/i);
   const disagreementOuterReceipt = receipts.structuredContent.receipts.find((receipt) =>
     receipt.receiptId === disagreementProvider.structuredContent.receiptId);
   assert.equal(disagreementOuterReceipt.resultSchemaDisagreement, true);

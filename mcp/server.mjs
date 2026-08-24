@@ -911,6 +911,23 @@ export function normalizeVendorQuota(value) {
   };
 }
 
+export function normalizeQuotaEvidence(value) {
+  if (!value || typeof value !== 'object') return null;
+  const stderrChars = strictTokenCount(value.stderrChars);
+  const observedAt = strictBoundedString(value.observedAt, 40);
+  if (value.provider !== 'copilot' || value.scope !== 'seat'
+    || value.kind !== 'monthly_quota_exhausted'
+    || value.source !== 'copilot_cli_stderr'
+    || value.diagnostic !== 'You have exceeded your monthly quota'
+    || stderrChars === null || !Number.isFinite(Date.parse(observedAt))
+    || new Date(observedAt).toISOString() !== observedAt
+    || !/^[0-9a-f]{64}$/.test(String(value.stderrHash || ''))) return null;
+  return {
+    provider: 'copilot', scope: 'seat', kind: value.kind, source: value.source,
+    diagnostic: value.diagnostic, observedAt, stderrChars, stderrHash: value.stderrHash,
+  };
+}
+
 function sanitizeProviderResponse(response) {
   const stdout = clip(response.stdout || '', 24000);
   const stderr = clip(response.stderr || '', 4000);
@@ -961,6 +978,7 @@ function sanitizeProviderResponse(response) {
       && /^[0-9a-f]{64}$/.test(response.transport_output_hash) ? response.transport_output_hash : null,
     providerRetries: normalizeProviderRetries(response.provider_retries, modelInvocation),
     vendorQuota: normalizeVendorQuota(response.vendor_quota),
+    quotaEvidence: normalizeQuotaEvidence(response.quota_evidence),
     stdout: stdout.text,
     stderr: stderr.text,
     stdoutChars: stdout.originalChars,
@@ -1196,6 +1214,7 @@ async function callProvider({
     provider_reported_cost_usd: sanitized.usage?.cost_usd ?? null,
     modelUsage: sanitized.usage?.model_usage ?? [],
     vendorQuota: sanitized.vendorQuota ?? null,
+    quotaEvidence: sanitized.quotaEvidence ?? null,
     providerRetryCount: sanitized.providerRetries?.count ?? null,
     providerRetryDelayMs: sanitized.providerRetries?.total_delay_ms ?? null,
     providerRetryMaxAttempt: sanitized.providerRetries?.max_attempt ?? null,

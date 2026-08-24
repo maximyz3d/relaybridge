@@ -630,6 +630,7 @@ function appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt }
     requestId: route?.request_id || null,
     modelUsage: Array.isArray(usage?.model_usage) ? usage.model_usage : [],
     vendorQuota: payload.vendor_quota || null,
+    quotaEvidence: payload.quota_evidence || null,
     providerRetryCount: nonnegativeUsageNumber(payload.provider_retries?.count),
     providerRetryDelayMs: nonnegativeUsageNumber(payload.provider_retries?.total_delay_ms),
     providerRetryMaxAttempt: nonnegativeUsageNumber(payload.provider_retries?.max_attempt),
@@ -895,6 +896,7 @@ function sendOneShotPreAdmissionRejection(res, {
 function sendOneShotResult(res, payload, meta) {
   if (res.writableEnded || res.destroyed) return;
   const classified = classifyRunFailure({
+    provider: meta?.kind,
     prompt: meta?.prompt,
     stdout: payload.stdout,
     stderr: payload.stderr,
@@ -3556,8 +3558,15 @@ async function executeOneShot(body, res) {
       /\boauth\b.{0,40}\b(?:revoked|expired)\b/,
     ];
     const authoritativeApiFailure = claudeApiStatusFailureClass(parsedOutput.apiErrorStatus);
+    const copilotQuotaEvidence = detectCopilotMonthlyQuota({
+      provider: kind,
+      stdout: cleanedStdout,
+      stderr,
+      exitCode: code,
+    });
     const rate_limited = parsedOutput.resultSubtype !== 'error_max_budget_usd'
-      && (authoritativeApiFailure === 'rate_limit' || rate_signals.some(s => failureBlob.includes(s)));
+      && (authoritativeApiFailure === 'rate_limit' || !!copilotQuotaEvidence
+        || rate_signals.some(s => failureBlob.includes(s)));
     const budget_exceeded = parsedOutput.resultSubtype === 'error_max_budget_usd'
       || authoritativeApiFailure === 'budget'
       || budget_signals.some(s => failureBlob.includes(s));
@@ -3610,6 +3619,7 @@ async function executeOneShot(body, res) {
       provider_error_invalid: parsedOutput.errorInvalid,
       provider_error_diagnostic_truncated: parsedOutput.errorDiagnosticTruncated,
       provider_error_diagnostic: parsedOutput.diagnostic,
+      quota_evidence: copilotQuotaEvidence,
       transport_output_chars: String(stdout).length,
       transport_output_hash: crypto.createHash('sha256').update(String(stdout)).digest('hex'),
       rate_limited,
@@ -3683,7 +3693,7 @@ app.post('/api/tasks/:id/cancel', (req, res) => {
 // subscription plans.
 const { createCooldownStore, parseRetryAfter } = require('./lib/provider-cooldown');
 const { checkGrounding, verifyReferencedPaths } = require('./lib/workspace-grounding');
-const { classifyRunFailure } = require('./lib/provider-failure');
+const { classifyRunFailure, detectCopilotMonthlyQuota } = require('./lib/provider-failure');
 // Issue #17: readiness proves auth, not quota. A seat that returned 429 stays
 // "ready" forever unless the 429 is remembered, so remember it durably and
 // share it with every client.
