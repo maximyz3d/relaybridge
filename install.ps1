@@ -261,6 +261,57 @@ function Merge-JsonDefaults($Defaults, $Existing) {
   return [pscustomobject]$merged
 }
 
+# Model pins are vendor lineup FACTS, not operator preferences. Preserving the
+# installed copy of `model_tiers` means a pin that shipped, was retired by the
+# vendor, and was corrected in a new release gets overwritten by the stale
+# installed value on every upgrade - so the upgrade cannot fix it and every
+# call to that seat fails with model-not-found.
+#
+# So the shipped pins win by default. An operator who has deliberately chosen
+# their own pins keeps them by setting "model_tiers_locked": true on the entry
+# (or "_models": { "pinsLocked": true } globally). Replacements are always
+# reported - silently overwriting operator config would be its own bug.
+function Restore-ShippedModelPins($Merged, $Defaults, $Existing) {
+  if (-not ($Merged -is [pscustomobject]) -or -not ($Defaults -is [pscustomobject])) { return $Merged }
+  $globalLock = $false
+  $modelsProp = $Existing.PSObject.Properties['_models']
+  if ($modelsProp -and $modelsProp.Value -is [pscustomobject]) {
+    $lockProp = $modelsProp.Value.PSObject.Properties['pinsLocked']
+    if ($lockProp -and $lockProp.Value) { $globalLock = $true }
+  }
+  if ($globalLock) {
+    Write-Host '[RelayBridge] _models.pinsLocked is set; keeping operator model pins as-is.'
+    return $Merged
+  }
+
+  foreach ($prop in $Defaults.PSObject.Properties) {
+    $name = $prop.Name
+    if ($name.StartsWith('_')) { continue }
+    $shipped = $prop.Value
+    if (-not ($shipped -is [pscustomobject])) { continue }
+    $shippedTiers = $shipped.PSObject.Properties['model_tiers']
+    if (-not $shippedTiers) { continue }
+
+    $mergedEntry = $Merged.PSObject.Properties[$name]
+    if (-not $mergedEntry -or -not ($mergedEntry.Value -is [pscustomobject])) { continue }
+
+    $entryLock = $mergedEntry.Value.PSObject.Properties['model_tiers_locked']
+    if ($entryLock -and $entryLock.Value) {
+      Write-Host ("[RelayBridge] {0}: model_tiers_locked is set; keeping operator pins." -f $name)
+      continue
+    }
+
+    $currentJson = ($mergedEntry.Value.PSObject.Properties['model_tiers'].Value | ConvertTo-Json -Depth 20 -Compress)
+    $shippedJson = ($shippedTiers.Value | ConvertTo-Json -Depth 20 -Compress)
+    if ($currentJson -ne $shippedJson) {
+      $mergedEntry.Value.PSObject.Properties.Remove('model_tiers')
+      $mergedEntry.Value | Add-Member -NotePropertyName 'model_tiers' -NotePropertyValue $shippedTiers.Value -Force
+      Write-Host ("[RelayBridge] {0}: replaced installed model pins with the shipped set (set model_tiers_locked to keep yours)." -f $name)
+    }
+  }
+  return $Merged
+}
+
 function Merge-JsonFile([string]$DefaultPath, [string]$ExistingPath) {
   if (-not (Test-Path -LiteralPath $ExistingPath -PathType Leaf)) { return }
   if (-not (Test-Path -LiteralPath $DefaultPath -PathType Leaf)) {
@@ -276,6 +327,9 @@ function Merge-JsonFile([string]$DefaultPath, [string]$ExistingPath) {
     throw "Cannot safely preserve operator JSON '$ExistingPath': $($_.Exception.Message)"
   }
   $merged = Merge-JsonDefaults $defaults $existing
+  if ([IO.Path]::GetFileName($DefaultPath) -ieq 'cli-config.json') {
+    $merged = Restore-ShippedModelPins $merged $defaults $existing
+  }
   $tempPath = "$DefaultPath.merge.$([Guid]::NewGuid().ToString('N')).tmp"
   try {
     [IO.File]::WriteAllText($tempPath, (($merged | ConvertTo-Json -Depth 100) + "`n"), [Text.UTF8Encoding]::new($false))
