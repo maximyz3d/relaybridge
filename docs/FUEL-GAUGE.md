@@ -116,3 +116,42 @@ Rules:
 When every candidate is cooling, the response says `allCooling: true` — so it
 is not mistaken for "no capable provider," which would send someone chasing a
 config problem that does not exist.
+
+## Workspace grounding (issue #16)
+
+An audit task — "inspect the git diff in this cwd and report findings" — was
+routed to `ollama_coder`, which talks over local HTTP and has **no filesystem
+access**. It could not see the workspace, so it invented one: a confident patch
+for two files that do not exist. Exit 0, no errors, 416 tokens, receipt
+recorded as a **successful call**.
+
+Silent, confident, recorded as success — the worst shape a failure can take. A
+crash would have been better, because a crash gets noticed.
+
+The defect is routing, not the model: asked to read files it cannot see, a
+model can only refuse or guess, and models lean toward being helpful.
+
+**Two layers**, because neither alone suffices:
+
+1. **Pre-dispatch gate.** `checkGrounding()` blocks a workspace task on a
+   non-grounded seat before any tokens are spent, and says what to do instead.
+   Grounding is inferred from the adapter: `local:*`, `hosted:*`, `api:*` reach
+   the model over HTTP and cannot read files; `subscription:*` CLIs run in the
+   working directory. An unknown adapter is assumed grounded — a false "cannot
+   read" would block legitimate work.
+2. **Post-hoc verification.** A grounded seat can still hallucinate.
+   `verifyReferencedPaths()` extracts file citations from the answer and checks
+   them against the workspace, annotating the payload with
+   `grounding_warning` when they are absent.
+
+| confidence | meaning |
+|---|---|
+| `ok` | cited paths exist |
+| `partial` | some new paths — a legitimate proposal is not fabrication |
+| `suspect` | most cited paths are absent |
+| `likely-fabricated` | **every** cited path is absent |
+
+Inline work (`review this code: …`) is never blocked — local seats must stay
+useful for what they are best at. A `cwd` alone does not make a task
+workspace-bound. `groundingOverride: true` allows an ungrounded opinion
+deliberately, and flags the answer as unverified.

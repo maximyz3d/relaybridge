@@ -913,6 +913,17 @@ function sendOneShotResult(res, payload, meta) {
         kind: meta.kind, route: payload.route || meta.route, usage: payload.usage,
         startedAt: meta.startedAt, ok, failureKind,
       });
+      // Post-hoc grounding check: a seat WITH access can still hallucinate, and
+      // an answer citing only nonexistent files is not about this repository.
+      try {
+        if (ok && meta.cwd && payload.stdout) {
+          const v = verifyReferencedPaths(payload.stdout, meta.cwd);
+          if (v.checked && (v.confidence === 'likely-fabricated' || v.confidence === 'suspect')) {
+            payload.grounding_warning = v.note;
+            payload.grounding = { confidence: v.confidence, missing: v.missing.slice(0, 10), present: v.present.slice(0, 10) };
+          }
+        }
+      } catch { /* verification is advisory; never fail a run over it */ }
       try {
         if (ok) cooldowns.noteSuccess(meta.kind);
         else if (failureKind) {
@@ -3027,6 +3038,30 @@ app.post('/api/exec', (req, res) => {
 async function executeOneShot(body, res) {
   const startedAt = Date.now();
   const { kind, prompt, timeoutMs, cwd, dangerous } = body || {};
+
+  // Issue #16: a workspace-inspection task sent to a seat with no filesystem
+  // access produces a confident, fabricated answer that records as a success.
+  // Refuse BEFORE dispatch — the tokens are wasted either way, but a refusal
+  // is visible and a fabricated audit is not. `groundingOverride` exists for
+  // the caller who genuinely wants an ungrounded opinion; it is flagged.
+  try {
+    const cfgAll = loadConfig();
+    const grounding = checkGrounding({
+      prompt, cwd, seat: kind, seatConfig: cfgAll?.[kind] || {},
+      override: body?.groundingOverride === true,
+    });
+    if (!grounding.allowed) {
+      return sendOneShotResult(res, {
+        ok: false, exitCode: null, stdout: '', stderr: grounding.reason,
+        error: grounding.reason, remedy: grounding.remedy,
+        failure_class: 'workspace_grounding',
+        model_invocation: false, dropped_out: true,
+        usage: { input_tokens: 0, output_tokens: 0 },
+      }, { kind, prompt, startedAt });
+    }
+    if (grounding.overridden) body = { ...body, _groundingOverridden: true };
+  } catch { /* grounding must never block a run it cannot evaluate */ }
+
   // Run association for the GitHub tracker: who did this, and any
   // explicit intent. Falls back to the OS account so checkpoint commits
   // are always attributed (maximyz3d / sover / 3DCPAI machines differ).
@@ -3307,7 +3342,7 @@ async function executeOneShot(body, res) {
         validation: err.validation,
       });
     }
-    return sendOneShotResult(res, { kind, route, exitCode: -1, stdout: '', stderr: err.message, error: 'spawn failed', dropped_out: true, model_invocation: false }, { kind, prompt, route, startedAt });
+    return sendOneShotResult(res, { kind, route, exitCode: -1, stdout: '', stderr: err.message, error: 'spawn failed', dropped_out: true, model_invocation: false }, { kind, prompt, route, startedAt, cwd: resolvedCwd });
   }
   let stdout = '';
   let stderr = '';
@@ -3414,7 +3449,7 @@ async function executeOneShot(body, res) {
     finishSupervision();
     cleanupPromptFile();
     if (clientGone || res.writableEnded) return;
-    sendOneShotResult(res, { kind, route, exitCode: -1, stdout, stderr: stderr + '\n' + err.message, error: err.message, dropped_out: true }, { kind, prompt, route, startedAt });
+    sendOneShotResult(res, { kind, route, exitCode: -1, stdout, stderr: stderr + '\n' + err.message, error: err.message, dropped_out: true }, { kind, prompt, route, startedAt, cwd: resolvedCwd });
   });
   proc.on('close', (code) => {
     if (settled) return;
@@ -3539,7 +3574,7 @@ async function executeOneShot(body, res) {
       timed_out: providerTimedOut,
       dropped_out,
       model_invocation: true,
-    }, { kind, prompt, route, startedAt });
+    }, { kind, prompt, route, startedAt, cwd: resolvedCwd });
     // GitHub middleware: only successful runs checkpoint — a dropped-out run
     // may have left half-applied edits, which the human should triage first.
     if (!dropped_out) {
@@ -3593,6 +3628,7 @@ app.post('/api/tasks/:id/cancel', (req, res) => {
 // evenly and "what would this cost on metered pricing" is answerable while on
 // subscription plans.
 const { createCooldownStore, parseRetryAfter } = require('./lib/provider-cooldown');
+const { checkGrounding, verifyReferencedPaths } = require('./lib/workspace-grounding');
 const { classifyRunFailure } = require('./lib/provider-failure');
 // Issue #17: readiness proves auth, not quota. A seat that returned 429 stays
 // "ready" forever unless the 429 is remembered, so remember it durably and
