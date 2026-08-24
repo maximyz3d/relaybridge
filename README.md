@@ -361,6 +361,17 @@ normalized to `timed_out` / `failureClass: timeout`, while `stopReason` and
 `supervisorStopReason` preserve whether Relay itself killed the process. Token
 usage remains unknown when the provider did not report it.
 
+Provider success is based on the normalized terminal result, not only the
+process exit code. In particular, a Perplexity exit-zero response whose exact
+first line is `No answer received` is returned as `dropped_out: true`,
+`failureClass: incomplete_response`, and `partial_result: true`. Its sentinel
+and any trailing URL/text fragments are disclosed as `failure_sentinel` and
+`partial_diagnostic`; ordinary `stdout` is empty so consumers cannot mistake
+those fragments for a completed answer. Receipts retain hashes/counts for the
+raw transport and normalized partial diagnostic. MCP exposes the same fields in
+camelCase, and the CLI labels partial diagnostics on stderr and exits nonzero.
+The bridge never retries this failure automatically on the same seat.
+
 ## License
 
 MIT.

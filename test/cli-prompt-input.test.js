@@ -123,6 +123,27 @@ test('plan reads a long Unicode prompt file without placing its body in argv', a
   assert.ok(!result.spawnArgs.some((arg) => arg.includes('architecture review')));
 });
 
+test('ask CLI exits failed and labels partial diagnostics instead of printing successful stdout', async (t) => {
+  const requests = [];
+  const server = await startBridgeStub(t, requests, {
+    exitCode: 0,
+    dropped_out: true,
+    stdout: '',
+    failureClass: 'incomplete_response',
+    partial_result: true,
+    failure_sentinel: 'No answer received',
+    partial_diagnostic: 'https://docs.example.test/cli\npartial CLI extraction',
+    stop_reason: 'provider_incomplete_response',
+    stop_detail: 'Perplexity reported that no answer was received',
+  });
+  const result = await runCli(['ask', '--kind', 'fake', 'research task'], '', server.port);
+  assert.equal(result.code, 1);
+  assert.equal(result.stdout, '', 'partial content is not ordinary stdout');
+  assert.match(result.stderr, /# partial diagnostic \(No answer received\):/);
+  assert.match(result.stderr, /https:\/\/docs\.example\.test\/cli/);
+  assert.match(result.stderr, /# stopped: provider_incomplete_response/);
+});
+
 test('empty and conflicting CLI input fails before any bridge request', async (t) => {
   const requests = [];
   const server = await startBridgeStub(t, requests);
@@ -139,7 +160,7 @@ test('empty and conflicting CLI input fails before any bridge request', async (t
   assert.equal(requests.length, 0);
 });
 
-async function startBridgeStub(t, requests) {
+async function startBridgeStub(t, requests, oneShotResult = null) {
   const server = http.createServer(async (req, res) => {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
@@ -158,7 +179,7 @@ async function startBridgeStub(t, requests) {
       return;
     }
     if (req.url === '/api/oneshot') {
-      res.end(JSON.stringify({ exitCode: 0, dropped_out: false, stdout: 'ok' }));
+      res.end(JSON.stringify(oneShotResult || { exitCode: 0, dropped_out: false, stdout: 'ok' }));
       return;
     }
     res.statusCode = 404;

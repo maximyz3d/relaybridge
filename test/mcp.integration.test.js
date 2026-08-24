@@ -170,6 +170,14 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
         'I will inspect the repository and trace the pipeline.\nNext I will review the tests and report any defects.',
       ],
     },
+    perplexity: {
+      ...echoProvider,
+      label: 'Perplexity no-answer sentinel fixture',
+      oneshot_safe: [
+        process.execPath, helper, '--prompt-file', '{prompt_file}', '--perplexity-fixture',
+      ],
+      costClass: 'subscription',
+    },
     grok: {
       ...echoProvider,
       label: 'Grok quota fixture',
@@ -594,6 +602,31 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   assert.equal(narrationOnly.structuredContent.failureClass, 'incomplete_response');
   assert.equal(narrationOnly.structuredContent.stopReason, 'provider_incomplete_response');
   assert.match(narrationOnly.structuredContent.stdout, /^I will inspect/);
+
+  const perplexityPartial = await client.callTool({
+    name: 'ask_provider',
+    arguments: { kind: 'perplexity', prompt: 'MCP_PERPLEXITY_SENTINEL_MARKER', useCache: false },
+  });
+  assert.equal(perplexityPartial.structuredContent.exitCode, 0);
+  assert.equal(perplexityPartial.structuredContent.stdout, '');
+  assert.equal(perplexityPartial.structuredContent.droppedOut, true);
+  assert.equal(perplexityPartial.structuredContent.partialResult, true);
+  assert.equal(perplexityPartial.structuredContent.failureClass, 'incomplete_response');
+  assert.equal(perplexityPartial.structuredContent.failureSentinel, 'No answer received');
+  assert.equal(perplexityPartial.structuredContent.failureSentinelSource, 'perplexity_cli_stdout_first_line');
+  assert.equal(perplexityPartial.structuredContent.partialDiagnostic, 'https://docs.example.test/one\npartial extracted text');
+  assert.equal(perplexityPartial.structuredContent.partialDiagnosticTruncated, false);
+  assert.equal(perplexityPartial.structuredContent.stopReason, 'provider_incomplete_response');
+  assert.equal(perplexityPartial.structuredContent.providerRetries.count, 0);
+  const perplexityOuter = await client.callTool({
+    name: 'get_receipt', arguments: { receiptId: perplexityPartial.structuredContent.receiptId },
+  });
+  assert.equal(perplexityOuter.structuredContent.receipt.status, 'dropped');
+  assert.equal(perplexityOuter.structuredContent.receipt.partialResult, true);
+  assert.equal(perplexityOuter.structuredContent.receipt.failureSentinel, 'No answer received');
+  assert.equal(perplexityOuter.structuredContent.receipt.partialDiagnosticChars,
+    perplexityPartial.structuredContent.partialDiagnostic.length);
+  assert.match(perplexityOuter.structuredContent.receipt.partialDiagnosticHash, /^[0-9a-f]{64}$/);
 
   const grokQuota = await client.callTool({
     name: 'ask_provider',

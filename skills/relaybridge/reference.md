@@ -42,11 +42,14 @@ Response:
 |---|---|
 | `stdout` / `stderr` | Cleaned output. |
 | `exitCode` | Process exit code; `-1` on spawn failure. |
-| `stop_reason` | `null` when the run finished normally; supervisor stops include `idle_stall`, `loop_detected`, `output_cap`, and `hard_cap`; `provider_incomplete_response` means only future-work narration was returned. |
+| `stop_reason` | `null` when the run finished normally; supervisor stops include `idle_stall`, `loop_detected`, `output_cap`, and `hard_cap`; `provider_incomplete_response` means the provider did not return a usable result (future-work narration or a recognized failed-answer sentinel). |
 | `stop_detail` | Human-readable explanation of the stop. |
 | `progress` | Snapshot: `bytes`, `lines`, `idleMs`, `repeatPeak`, `cpuMs`, `phase`. |
 | `dropped_out` | True when the call did not produce a usable answer. |
 | `failureClass` | Machine-readable failure class. `incomplete_response` preserves narration-only stdout but prevents it from counting as a result. |
+| `partial_result` | True when a recognized provider sentinel had trailing diagnostic fragments but no usable answer. |
+| `failure_sentinel` / `failure_sentinel_source` | Canonical sentinel and the provider-specific framing rule that detected it. |
+| `partial_diagnostic` | Trailing URL/text fragments retained explicitly as diagnostics; this content is never ordinary successful `stdout`. |
 | `rate_limited` / `budget_exceeded` / `auth_failed` / `permission_denied` | Failure classification. |
 | `policy_reason` | Concrete policy subtype when known; Antigravity command auto-denial is `headless_command_permission_auto_denied`. |
 | `model` | The model actually selected, or `null` when the account default applied. |

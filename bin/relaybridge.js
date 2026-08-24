@@ -251,6 +251,9 @@ async function main() {
         });
         if (json) { console.log(JSON.stringify(result, null, 2)); return result.exitCode === 0 && !result.dropped_out ? 0 : 1; }
         if (result.stdout) console.log(result.stdout.trim());
+        if (result.partial_result && result.partial_diagnostic) {
+          console.error(`# partial diagnostic (${result.failure_sentinel || 'incomplete provider result'}):\n${result.partial_diagnostic.trim()}`);
+        }
         if (result.stop_reason) console.error(`\n# stopped: ${result.stop_reason} — ${result.stop_detail || ''}`);
         return result.exitCode === 0 && !result.dropped_out ? 0 : 1;
       }

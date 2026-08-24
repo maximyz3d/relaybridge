@@ -70,6 +70,14 @@ setTimeout(() => {
     return;
   }
   const outputIndex = process.argv.indexOf('--output');
+  if (process.argv.includes('--perplexity-fixture')) {
+    if (prompt.includes('PERPLEXITY_QUOTED_DOCUMENT')) {
+      process.stdout.write('> No answer received\nThis is a quoted user document inside a normal answer.');
+    } else {
+      process.stdout.write('No answer received\nhttps://docs.example.test/one\npartial extracted text');
+    }
+    return;
+  }
   if (process.argv.includes('--claude-json')) {
     process.stdout.write(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'fixture' }) + '\n');
     process.stdout.write(JSON.stringify({
