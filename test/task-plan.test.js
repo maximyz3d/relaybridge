@@ -169,6 +169,13 @@ test('the CLI exposes plan before ask and documents effort', () => {
   assert.ok(USAGE.indexOf('plan') < USAGE.indexOf('ask'), 'plan should be presented before ask');
 });
 
+test('CLI status retrieves and labels expiring operator quota observations', () => {
+  const cli = fs.readFileSync(path.join(__dirname, '..', 'bin', 'relaybridge.js'), 'utf8');
+  assert.match(cli, /call\('\/api\/usage\/operator-quota'\)/);
+  assert.match(cli, /operator observed/);
+  assert.match(cli, /observation\.expiresAt/);
+});
+
 test('the CLI ask payload preserves the caller working directory', () => {
   const { buildAskBody } = require('../bin/relaybridge.js');
   const body = buildAskBody(

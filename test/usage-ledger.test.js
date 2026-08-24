@@ -177,6 +177,64 @@ test('malformed vendor quota observations fail closed without altering fuel', ()
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+test('an expiring operator observation overrides a configured estimate and persists without free-form data', () => {
+  const dir = tmp();
+  let clock = Date.parse('2026-08-24T12:00:00Z');
+  const options = { dataDir: dir, budgets: { claude: { tokensPerDay: 8000000 } }, now: () => clock };
+  const ledger = createUsageLedger(options);
+  ledger.record({ seat: 'claude', costClass: 'subscription', inputTokens: 160000, outputTokens: 160000 });
+  const row = ledger.observeOperatorQuota({
+    quotaSeat: 'claude', percentRemaining: 4, source: 'operator_reported',
+    provenance: 'human_account_owner', observedAt: new Date(clock).toISOString(),
+    expiresAt: new Date(clock + 5 * 3600000).toISOString(),
+  });
+  assert.equal(row.percentRemaining, 4);
+  assert.deepEqual(Object.keys(row).sort(), [
+    'action', 'expiresAt', 'observedAt', 'percentRemaining', 'provenance', 'quotaSeat', 'recordedAt', 'source',
+  ]);
+  let gauge = ledger.gauge('claude', { costClass: 'subscription' });
+  assert.equal(gauge.basis, 'operator_observed');
+  assert.equal(gauge.percentRemaining, 4);
+  assert.equal(gauge.capacity, null, 'a percentage report must not invent a token capacity');
+  assert.equal(gauge.configuredEstimate.percentRemaining, 96,
+    'the known 4% operator report must outrank the misleading 96% configured estimate');
+  assert.match(gauge.note, /not scraped or vendor-verified/);
+
+  const restarted = createUsageLedger(options);
+  assert.equal(restarted.activeOperatorQuota('claude').provenance, 'human_account_owner');
+  clock += 5 * 3600000 + 1;
+  gauge = restarted.gauge('claude', { costClass: 'subscription' });
+  assert.equal(gauge.basis, 'configured', 'expired human evidence stops affecting routing automatically');
+  assert.equal(gauge.percentRemaining, 96);
+  assert.equal(gauge.operatorQuota, null);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('operator quota validation rejects unsafe scope, percentages, provenance and expiry', () => {
+  const dir = tmp();
+  const clock = Date.parse('2026-08-24T12:00:00Z');
+  const ledger = createUsageLedger({ dataDir: dir, now: () => clock });
+  const base = {
+    quotaSeat: 'subscription:anthropic:default', percentRemaining: 4,
+    source: 'operator_reported', provenance: 'human_account_owner',
+    observedAt: new Date(clock).toISOString(), expiresAt: new Date(clock + 3600000).toISOString(),
+  };
+  assert.equal(ledger.observeOperatorQuota({ ...base, quotaSeat: '../secrets' }), null);
+  assert.equal(ledger.observeOperatorQuota({ ...base, percentRemaining: '4' }), null);
+  assert.equal(ledger.observeOperatorQuota({ ...base, percentRemaining: 4.5 }), null);
+  assert.equal(ledger.observeOperatorQuota({ ...base, provenance: 'copied_dashboard_with_token' }), null);
+  assert.equal(ledger.observeOperatorQuota({ ...base, expiresAt: new Date(clock - 1).toISOString() }), null);
+  assert.equal(ledger.observeOperatorQuota({ ...base, expiresAt: new Date(clock + 32 * 86400000).toISOString() }), null);
+  assert.deepEqual(ledger.operatorQuotaObservations(), {});
+  fs.appendFileSync(path.join(dir, 'operator-quota.jsonl'), JSON.stringify({
+    action: 'set', ...base, credential: 'must not be disclosed', recordedAt: new Date(clock).toISOString(),
+  }) + '\n');
+  const normalized = ledger.operatorQuotaObservations()['subscription:anthropic:default'];
+  assert.equal(normalized.percentRemaining, 4);
+  assert.equal(normalized.credential, undefined, 'persisted rows are projected onto the credential-free schema');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 // ---- levelling -------------------------------------------------------------
 
 test('a drained seat is deprioritised but a capable order is still respected', () => {

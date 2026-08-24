@@ -135,6 +135,16 @@ with different accounts. Status output lists every alias in each quota seat.
 Vendor evidence marked `scope: "model"` remains model/provider scoped; generic
 429 and overload evidence is conservatively shared across the account group.
 
+When the account owner knows a seat is lower than its configured estimate, the
+Fuel panel can record an explicit quota-seat percentage with provenance and an
+expiry/reset time. The bridge stores only those bounded fields in
+`data/usage/operator-quota.jsonl`; it never scrapes a vendor dashboard or
+accepts credentials/free-form dashboard content. A current vendor observation
+has first precedence, then a current operator observation, then the labelled
+configured estimate. Operator observations automatically stop affecting
+routing at expiry and apply to every provider alias in the declared quota seat.
+REST clients may use `GET`, `PUT`, and `DELETE /api/usage/operator-quota`.
+
 Agentic one-shot providers use bounded multi-turn budgets. Grok receives up to
 32 turns so a repository review can inspect evidence and still return a final
 answer; the bridge deadline, process-tree cancellation, read-only sandbox, and

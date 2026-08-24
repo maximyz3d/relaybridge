@@ -246,6 +246,11 @@ test('server, MCP adapter, Perplexity wrapper, and inline browser script parse',
   assert.match(html, /vendor observed/);
   assert.match(html, /g\.vendorQuota\.actual/);
   assert.match(html, /g\.vendorQuota\.reset\.expiresAt/);
+  assert.match(html, /operator-quota-percent/);
+  assert.match(html, /operator_observed/);
+  assert.match(html, /g\.operatorQuota\.provenance/);
+  assert.match(html, /\/api\/usage\/operator-quota/);
+  assert.match(html, /Credentials, dashboard content, and free-form notes are never accepted or stored/);
   const match = html.match(/<script>\s*(const API =[\s\S]*?)<\/script>/);
   assert.ok(match, 'inline application script was not found');
   assert.doesNotThrow(() => new Function(match[1]));
@@ -1004,6 +1009,89 @@ test('prompt-file transport preserves long special-character prompts and cleans 
     [groupedPlan.fleetState.balance.mostDrained, groupedPlan.fleetState.balance.freshest],
     ['usage_json', 'usage_json_multiturn'],
   );
+
+  const rejectedOperatorQuota = await fetch(baseUrl + '/api/usage/operator-quota', {
+    method: 'PUT', headers: jsonAuth,
+    body: JSON.stringify({
+      quotaSeat: 'subscription:anthropic:default', percentRemaining: 4,
+      provenance: 'human_account_owner', expiresAt: new Date(Date.now() + 3600000).toISOString(),
+      credential: 'must never be accepted',
+    }),
+  });
+  assert.equal(rejectedOperatorQuota.status, 400);
+  assert.match((await rejectedOperatorQuota.json()).error, /credentials.*never stored/);
+
+  const expiresAt = new Date(Date.now() + 3600000).toISOString();
+  const operatorQuotaResponse = await fetch(baseUrl + '/api/usage/operator-quota', {
+    method: 'PUT', headers: jsonAuth,
+    body: JSON.stringify({
+      quotaSeat: 'subscription:anthropic:default', percentRemaining: 4,
+      provenance: 'human_account_owner', observedAt: new Date().toISOString(), expiresAt,
+    }),
+  });
+  assert.equal(operatorQuotaResponse.status, 200);
+  const operatorQuotaResult = await operatorQuotaResponse.json();
+  assert.equal(operatorQuotaResult.observation.source, 'operator_reported');
+  assert.equal(operatorQuotaResult.observation.percentRemaining, 4);
+  assert.equal(operatorQuotaResult.observation.expiresAt, expiresAt);
+
+  const operatorQuotaStatus = await (await fetch(baseUrl + '/api/usage/operator-quota', { headers: auth })).json();
+  assert.equal(operatorQuotaStatus.observations['subscription:anthropic:default'].provenance, 'human_account_owner');
+  assert.deepEqual(operatorQuotaStatus.quotaSeats['subscription:anthropic:default'].providers,
+    ['usage_json', 'usage_json_multiturn']);
+  const observedUsage = await (await fetch(baseUrl + '/api/usage/gauges', { headers: auth })).json();
+  for (const provider of ['usage_json', 'usage_json_multiturn']) {
+    assert.equal(observedUsage.gauges[provider].basis, 'operator_observed');
+    assert.equal(observedUsage.gauges[provider].percentRemaining, 4);
+    assert.equal(observedUsage.gauges[provider].configuredEstimate.basis, 'configured');
+  }
+  assert.equal(observedUsage.operatorQuota['subscription:anthropic:default'].percentRemaining, 4);
+
+  const observedPlan = await (await fetch(baseUrl + '/api/plan', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ task: 'review this architecture', kind: 'usage_json' }),
+  })).json();
+  assert.equal(observedPlan.fleetState.operatorQuota['subscription:anthropic:default'].percentRemaining, 4);
+  assert.equal(observedPlan.fleetState.balance.quotaSeats
+    .find((seat) => seat.quotaSeat === 'subscription:anthropic:default').percentRemaining, 4);
+
+  const observedRoute = await (await fetch(baseUrl + '/api/route', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({
+      task: 'review this architecture',
+      diagnostics: {
+        usage_json: { found: true, ready: true },
+        narration_only: { found: true, ready: true },
+      },
+      preferKinds: ['usage_json', 'narration_only'],
+    }),
+  })).json();
+  assert.equal(observedRoute.fleetState.operatorQuota['subscription:anthropic:default'].percentRemaining, 4);
+  assert.equal(observedRoute.fleetState.balance.quotaSeats
+    .find((seat) => seat.quotaSeat === 'subscription:anthropic:default').percentRemaining, 4);
+
+  const operatorAdvise = await (await fetch(baseUrl + '/api/usage/advise', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({
+      tier: 'complex',
+      candidates: [
+        { seat: 'usage_json', rank: 0, costClass: 'subscription' },
+        { seat: 'narration_only', rank: 1, costClass: 'subscription' },
+      ],
+    }),
+  })).json();
+  assert.equal(operatorAdvise.operatorQuota['subscription:anthropic:default'].percentRemaining, 4);
+  assert.ok(operatorAdvise.ranked.find((item) => item.seat === 'usage_json').stress >= 0.9,
+    'routing advice must use the operator observation instead of the 96% configured estimate');
+
+  const clearOperatorQuota = await fetch(baseUrl + '/api/usage/operator-quota', {
+    method: 'DELETE', headers: jsonAuth,
+    body: JSON.stringify({ quotaSeat: 'subscription:anthropic:default' }),
+  });
+  assert.equal(clearOperatorQuota.status, 200);
+  const clearedUsage = await (await fetch(baseUrl + '/api/usage/gauges', { headers: auth })).json();
+  assert.equal(clearedUsage.gauges.usage_json.basis, 'configured');
+  assert.deepEqual(clearedUsage.operatorQuota, {});
 
   const maxEffortRejected = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST', headers: jsonAuth,

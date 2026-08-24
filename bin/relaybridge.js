@@ -256,8 +256,10 @@ async function main() {
       }
 
       case 'status': {
-        const [health, diag] = await Promise.all([call('/api/health'), call('/api/diag')]);
-        if (json) { console.log(JSON.stringify({ health, diag }, null, 2)); return 0; }
+        const [health, diag, operatorQuota] = await Promise.all([
+          call('/api/health'), call('/api/diag'), call('/api/usage/operator-quota'),
+        ]);
+        if (json) { console.log(JSON.stringify({ health, diag, operatorQuota }, null, 2)); return 0; }
         console.log(`bridge    v${health.version}  pid ${health.pid}  ${health.sessionCount} session(s)`);
         const results = diag.results || {};
         const ready = Object.entries(results).filter(([, v]) => v && v.ready).map(([k]) => k);
@@ -266,6 +268,9 @@ async function main() {
         console.log(`ready     ${ready.join(', ') || '(none)'}`);
         if (signedOut.length) console.log(`signedOut ${signedOut.join(', ')}  → relaybridge login <kind>`);
         if (missing.length) console.log(`missing   ${missing.join(', ')}`);
+        for (const observation of Object.values(operatorQuota.observations || {})) {
+          console.log(`quota     ${observation.quotaSeat}  ${observation.percentRemaining}% remaining  operator observed (${observation.provenance})  expires ${observation.expiresAt}`);
+        }
         return 0;
       }
 
