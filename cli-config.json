@@ -44,14 +44,47 @@
   },
   "claude": {
     "label": "Claude Code",
-    "login_command": ["claude", "/login"],
-    "models_static": ["opus", "sonnet", "haiku"],
+    "login_command": [
+      "claude",
+      "/login"
+    ],
+    "models_static": [
+      "opus",
+      "sonnet",
+      "haiku"
+    ],
     "model_tiers": {
-      "light": { "args": ["--model", "haiku"], "model": "haiku", "note": "cheap pass: lookups, short explanations" },
-      "standard": { "args": ["--model", "sonnet"], "model": "sonnet", "note": "everyday coding and review" },
-      "heavy": { "args": ["--model", "opus"], "model": "opus", "note": "architecture, hard debugging, long context" }
+      "light": {
+        "args": [
+          "--model",
+          "haiku"
+        ],
+        "model": "haiku",
+        "note": "cheap pass: lookups, short explanations"
+      },
+      "standard": {
+        "args": [
+          "--model",
+          "sonnet"
+        ],
+        "model": "sonnet",
+        "note": "everyday coding and review"
+      },
+      "heavy": {
+        "args": [
+          "--model",
+          "opus"
+        ],
+        "model": "opus",
+        "note": "architecture, hard debugging, long context"
+      }
     },
-    "tags": ["coding", "audit", "delegation", "general"],
+    "tags": [
+      "coding",
+      "audit",
+      "delegation",
+      "general"
+    ],
     "company": "Anthropic",
     "transport": "subscription:anthropic",
     "color": "#cc785c",
@@ -123,9 +156,19 @@
   },
   "claude_fable": {
     "label": "Claude Fable 5",
-    "login_command": ["claude", "/login"],
-    "models_static": ["fable"],
-    "tags": ["coding", "audit", "reasoning", "general"],
+    "login_command": [
+      "claude",
+      "/login"
+    ],
+    "models_static": [
+      "fable"
+    ],
+    "tags": [
+      "coding",
+      "audit",
+      "reasoning",
+      "general"
+    ],
     "company": "Anthropic",
     "transport": "subscription:anthropic",
     "model": "claude-fable-5",
@@ -200,19 +243,61 @@
   "codex": {
     "label": "Codex",
     "effort_flags": {
-      "minimal": ["--config", "model_reasoning_effort=minimal"],
-      "low": ["--config", "model_reasoning_effort=low"],
-      "medium": ["--config", "model_reasoning_effort=medium"],
-      "high": ["--config", "model_reasoning_effort=high"],
-      "max": ["--config", "model_reasoning_effort=high"]
+      "minimal": [
+        "--config",
+        "model_reasoning_effort=minimal"
+      ],
+      "low": [
+        "--config",
+        "model_reasoning_effort=low"
+      ],
+      "medium": [
+        "--config",
+        "model_reasoning_effort=medium"
+      ],
+      "high": [
+        "--config",
+        "model_reasoning_effort=high"
+      ],
+      "max": [
+        "--config",
+        "model_reasoning_effort=high"
+      ]
     },
-    "login_command": ["codex", "login"],
+    "login_command": [
+      "codex",
+      "login"
+    ],
     "model_tiers": {
-      "light": { "args": ["--model", "gpt-5.6-luna"], "model": "gpt-5.6-luna", "note": "fast subagent tier; replaced gpt-5.4-mini" },
-      "standard": { "args": ["--model", "gpt-5.6-terra"], "model": "gpt-5.6-terra", "note": "everyday coding; replaced gpt-5.4" },
-      "heavy": { "args": ["--model", "gpt-5.6-sol"], "model": "gpt-5.6-sol", "note": "current recommended default for hard work" }
+      "light": {
+        "args": [
+          "--model",
+          "gpt-5.6-luna"
+        ],
+        "model": "gpt-5.6-luna",
+        "note": "fast subagent tier; replaced gpt-5.4-mini"
+      },
+      "standard": {
+        "args": [
+          "--model",
+          "gpt-5.6-terra"
+        ],
+        "model": "gpt-5.6-terra",
+        "note": "everyday coding; replaced gpt-5.4"
+      },
+      "heavy": {
+        "args": [
+          "--model",
+          "gpt-5.6-sol"
+        ],
+        "model": "gpt-5.6-sol",
+        "note": "current recommended default for hard work"
+      }
     },
-    "tags": ["coding", "delegation"],
+    "tags": [
+      "coding",
+      "delegation"
+    ],
     "company": "OpenAI",
     "transport": "subscription:chatgpt",
     "color": "#10a37f",
@@ -260,8 +345,13 @@
   },
   "copilot": {
     "label": "GitHub Copilot CLI",
-    "login_command": ["copilot", "/login"],
-    "tags": ["coding"],
+    "login_command": [
+      "copilot",
+      "/login"
+    ],
+    "tags": [
+      "coding"
+    ],
     "company": "GitHub",
     "transport": "subscription:github-copilot",
     "color": "#6e40c9",
@@ -310,14 +400,18 @@
   },
   "cursor": {
     "label": "Cursor Agent",
-    "login_command": ["agent", "login"],
-    "models_probe": ["agent", "models"],
-    "model_tiers": {
-      "light": { "args": ["--model", "gpt-5.6-luna-low"], "model": "gpt-5.6-luna-low", "note": "fast tier on the Cursor seat; verified present by discovery" },
-      "standard": { "args": ["--model", "gpt-5.6-terra-medium"], "model": "gpt-5.6-terra-medium", "note": "everyday coding on the Cursor seat" },
-      "heavy": { "args": ["--model", "gpt-5.6-sol-high"], "model": "gpt-5.6-sol-high", "note": "hard work on the Cursor seat" }
-    },
-    "tags": ["coding", "delegation"],
+    "login_command": [
+      "agent",
+      "login"
+    ],
+    "models_probe": [
+      "agent",
+      "models"
+    ],
+    "tags": [
+      "coding",
+      "delegation"
+    ],
     "company": "Cursor (Anysphere)",
     "transport": "subscription:cursor",
     "color": "#7d8590",
@@ -380,19 +474,69 @@
     "install_display": "irm 'https://cursor.com/install?win32=true' | iex",
     "post_install": "Open a fresh PowerShell and run agent login once to connect your Cursor subscription.",
     "docs_url": "https://cursor.com/docs/cli/overview",
-    "_note": "Uses your Cursor subscription via the native Windows agent CLI. No model pinned; the account default applies (run agent models to pin one). Print mode has full write access by default, so the safe one-shot seat pins --mode ask; --trust prevents the headless workspace-trust prompt from hanging bounded calls. CURSOR_API_KEY is stripped so calls never silently fall back to metered API billing."
+    "_note": "Uses your Cursor subscription via the native Windows agent CLI. No model pinned; the account default applies (run agent models to pin one). Print mode has full write access by default, so the safe one-shot seat pins --mode ask; --trust prevents the headless workspace-trust prompt from hanging bounded calls. CURSOR_API_KEY is stripped so calls never silently fall back to metered API billing.",
+    "model_tiers_locked": true,
+    "model_note": "This plan only allows Auto: named models return \"Named models unavailable\". No model flag is sent so the Cursor seat picks its own. model_tiers_locked keeps an upgrade from restoring the shipped pins over this."
   },
   "gemini": {
     "label": "Gemini (Antigravity)",
-    "login_command": ["agy"],
+    "login_command": [
+      "agy"
+    ],
     "model_tiers": {
-      "light": { "args": ["--model", "gemini-3.5-flash-low"], "model": "gemini-3.5-flash-low", "suppress_args": [{ "flag": "--effort", "value_count": 1 }], "note": "current low-effort Flash id reported by agy models" },
-      "standard": { "args": ["--model", "gemini-3.6-flash-medium"], "model": "gemini-3.6-flash-medium", "suppress_args": [{ "flag": "--effort", "value_count": 1 }], "note": "current medium-effort Flash id reported by agy models" },
-      "heavy": { "args": ["--model", "gemini-3.1-pro-high"], "model": "gemini-3.1-pro-high", "suppress_args": [{ "flag": "--effort", "value_count": 1 }], "note": "current high-effort Pro id reported by agy models" }
+      "light": {
+        "args": [
+          "--model",
+          "gemini-3.5-flash-low"
+        ],
+        "model": "gemini-3.5-flash-low",
+        "suppress_args": [
+          {
+            "flag": "--effort",
+            "value_count": 1
+          }
+        ],
+        "note": "current low-effort Flash id reported by agy models"
+      },
+      "standard": {
+        "args": [
+          "--model",
+          "gemini-3.6-flash-medium"
+        ],
+        "model": "gemini-3.6-flash-medium",
+        "suppress_args": [
+          {
+            "flag": "--effort",
+            "value_count": 1
+          }
+        ],
+        "note": "current medium-effort Flash id reported by agy models"
+      },
+      "heavy": {
+        "args": [
+          "--model",
+          "gemini-3.1-pro-high"
+        ],
+        "model": "gemini-3.1-pro-high",
+        "suppress_args": [
+          {
+            "flag": "--effort",
+            "value_count": 1
+          }
+        ],
+        "note": "current high-effort Pro id reported by agy models"
+      }
     },
-    "models_probe": ["agy", "models"],
+    "models_probe": [
+      "agy",
+      "models"
+    ],
     "models_parse": "^([a-z0-9][a-z0-9.-]+)\\t",
-    "tags": ["coding", "search", "general"],
+    "tags": [
+      "coding",
+      "search",
+      "general"
+    ],
     "company": "Google",
     "transport": "subscription:antigravity",
     "color": "#4285f4",
@@ -477,8 +621,15 @@
   },
   "grok": {
     "label": "Grok Build",
-    "login_command": ["grok", "/login"],
-    "tags": ["search", "general", "coding"],
+    "login_command": [
+      "grok",
+      "/login"
+    ],
+    "tags": [
+      "search",
+      "general",
+      "coding"
+    ],
     "company": "xAI",
     "transport": "subscription:grok-build",
     "color": "#f4f4f4",
@@ -559,7 +710,10 @@
   },
   "perplexity": {
     "label": "Perplexity",
-    "tags": ["search", "research"],
+    "tags": [
+      "search",
+      "research"
+    ],
     "company": "Perplexity",
     "transport": "subscription:pwm",
     "model": "auto",
@@ -612,9 +766,15 @@
   },
   "ollama_fast": {
     "label": "Local Qwen 2.5 1.5B (Fast)",
-    "models_probe": ["ollama", "list"],
+    "models_probe": [
+      "ollama",
+      "list"
+    ],
     "models_parse": "^([A-Za-z0-9][A-Za-z0-9._-]*(?::[A-Za-z0-9._-]+)?)\\s",
-    "tags": ["local", "utility"],
+    "tags": [
+      "local",
+      "utility"
+    ],
     "company": "Ollama / Qwen",
     "transport": "local:ollama",
     "oneshot_adapter": "ollama_api",
@@ -622,13 +782,36 @@
     "prompt_max_chars": 16000,
     "max_output_tokens": 512,
     "color": "#65c18c",
-    "safe": ["ollama.exe", "run", "qwen2.5:1.5b"],
-    "dangerous": ["ollama.exe", "run", "qwen2.5:1.5b"],
-    "oneshot_safe": ["ollama.exe", "run", "qwen2.5:1.5b"],
-    "oneshot_dangerous": ["ollama.exe", "run", "qwen2.5:1.5b"],
-    "probe": ["ollama.exe", "show", "qwen2.5:1.5b"],
+    "safe": [
+      "ollama.exe",
+      "run",
+      "qwen2.5:1.5b"
+    ],
+    "dangerous": [
+      "ollama.exe",
+      "run",
+      "qwen2.5:1.5b"
+    ],
+    "oneshot_safe": [
+      "ollama.exe",
+      "run",
+      "qwen2.5:1.5b"
+    ],
+    "oneshot_dangerous": [
+      "ollama.exe",
+      "run",
+      "qwen2.5:1.5b"
+    ],
+    "probe": [
+      "ollama.exe",
+      "show",
+      "qwen2.5:1.5b"
+    ],
     "probe_success_detail": "configured fast local Ollama model is installed",
-    "version_probe": ["ollama.exe", "--version"],
+    "version_probe": [
+      "ollama.exe",
+      "--version"
+    ],
     "diagnostic_binary": "ollama.exe",
     "install_display": "winget install --id Ollama.Ollama -e",
     "post_install": "Run ollama pull qwen2.5:1.5b, then restart RelayBridge.",
@@ -637,9 +820,15 @@
   },
   "ollama_llama": {
     "label": "Local Meta Llama 3.2 3B",
-    "models_probe": ["ollama", "list"],
+    "models_probe": [
+      "ollama",
+      "list"
+    ],
     "models_parse": "^([A-Za-z0-9][A-Za-z0-9._-]*(?::[A-Za-z0-9._-]+)?)\\s",
-    "tags": ["local", "general"],
+    "tags": [
+      "local",
+      "general"
+    ],
     "company": "Ollama / Meta",
     "transport": "local:ollama",
     "oneshot_adapter": "ollama_api",
@@ -647,13 +836,36 @@
     "prompt_max_chars": 16000,
     "max_output_tokens": 1024,
     "color": "#4f9cf9",
-    "safe": ["ollama.exe", "run", "llama3.2:3b"],
-    "dangerous": ["ollama.exe", "run", "llama3.2:3b"],
-    "oneshot_safe": ["ollama.exe", "run", "llama3.2:3b"],
-    "oneshot_dangerous": ["ollama.exe", "run", "llama3.2:3b"],
-    "probe": ["ollama.exe", "show", "llama3.2:3b"],
+    "safe": [
+      "ollama.exe",
+      "run",
+      "llama3.2:3b"
+    ],
+    "dangerous": [
+      "ollama.exe",
+      "run",
+      "llama3.2:3b"
+    ],
+    "oneshot_safe": [
+      "ollama.exe",
+      "run",
+      "llama3.2:3b"
+    ],
+    "oneshot_dangerous": [
+      "ollama.exe",
+      "run",
+      "llama3.2:3b"
+    ],
+    "probe": [
+      "ollama.exe",
+      "show",
+      "llama3.2:3b"
+    ],
     "probe_success_detail": "configured local Meta Llama Ollama model is installed",
-    "version_probe": ["ollama.exe", "--version"],
+    "version_probe": [
+      "ollama.exe",
+      "--version"
+    ],
     "diagnostic_binary": "ollama.exe",
     "install_display": "winget install --id Ollama.Ollama -e",
     "post_install": "Run ollama pull llama3.2:3b, then restart RelayBridge.",
@@ -662,9 +874,15 @@
   },
   "ollama": {
     "label": "Local Qwen3 4B",
-    "models_probe": ["ollama", "list"],
+    "models_probe": [
+      "ollama",
+      "list"
+    ],
     "models_parse": "^([A-Za-z0-9][A-Za-z0-9._-]*(?::[A-Za-z0-9._-]+)?)\\s",
-    "tags": ["local", "general"],
+    "tags": [
+      "local",
+      "general"
+    ],
     "company": "Ollama / Qwen",
     "transport": "local:ollama",
     "oneshot_adapter": "ollama_api",
@@ -711,9 +929,15 @@
   },
   "ollama_coder": {
     "label": "Local Qwen Coder 7B",
-    "models_probe": ["ollama", "list"],
+    "models_probe": [
+      "ollama",
+      "list"
+    ],
     "models_parse": "^([A-Za-z0-9][A-Za-z0-9._-]*(?::[A-Za-z0-9._-]+)?)\\s",
-    "tags": ["local", "coding"],
+    "tags": [
+      "local",
+      "coding"
+    ],
     "company": "Ollama / Qwen",
     "transport": "local:ollama",
     "oneshot_adapter": "ollama_api",
@@ -759,7 +983,10 @@
   },
   "groq_llama_fast": {
     "label": "Groq Llama 3.1 8B",
-    "tags": ["hosted", "utility"],
+    "tags": [
+      "hosted",
+      "utility"
+    ],
     "company": "Groq / Meta",
     "transport": "hosted:openai-compatible",
     "oneshot_adapter": "openai_chat_api",
@@ -773,10 +1000,18 @@
     "max_output_tokens": 1024,
     "temperature": 0.2,
     "color": "#f55036",
-    "safe": ["hosted-openai-compatible"],
-    "dangerous": ["hosted-openai-compatible"],
-    "oneshot_safe": ["hosted-openai-compatible"],
-    "oneshot_dangerous": ["hosted-openai-compatible"],
+    "safe": [
+      "hosted-openai-compatible"
+    ],
+    "dangerous": [
+      "hosted-openai-compatible"
+    ],
+    "oneshot_safe": [
+      "hosted-openai-compatible"
+    ],
+    "oneshot_dangerous": [
+      "hosted-openai-compatible"
+    ],
     "docs_url": "https://console.groq.com/docs/models",
     "post_install": "Create a Groq key, set GROQ_API_KEY, and prefer this provider explicitly until quota/cost receipts are collected.",
     "_note": "Opt-in hosted Meta Llama diversity seat. The bridge blocks known China-hosted endpoints and never treats this as paid fallback; account quota/billing still depends on your Groq account."
