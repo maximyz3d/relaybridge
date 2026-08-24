@@ -48,6 +48,7 @@ Response:
 | `dropped_out` | True when the call did not produce a usable answer. |
 | `failureClass` | Machine-readable failure class. `incomplete_response` preserves narration-only stdout but prevents it from counting as a result. |
 | `rate_limited` / `budget_exceeded` / `auth_failed` / `permission_denied` | Failure classification. |
+| `policy_reason` | Concrete policy subtype when known; Antigravity command auto-denial is `headless_command_permission_auto_denied`. |
 | `model` | The model actually selected, or `null` when the account default applied. |
 | `model_tier` | The weight class used. |
 | `receiptId` | Points at the persisted receipt. |
@@ -115,6 +116,18 @@ hand-picking a provider.
 
 Local Ollama routes cost nothing and never touch a subscription. Prefer them for
 anything at utility tier.
+
+### Antigravity safe headless reviews
+
+Antigravity has no per-invocation narrow command allow flag. Its persistent
+`command(prefix)` rules permit trailing arguments, so RelayBridge does not
+install broad command grants or edit the user's Antigravity permission
+settings. Safe Gemini one-shots prepend the configured command-free review
+policy and use built-in workspace file reading/search only. If Antigravity
+still selects a command, RelayBridge reports
+`policy_reason=headless_command_permission_auto_denied`, persists that subtype
+in the receipt, and does not retry the identical request or switch to
+`--dangerously-skip-permissions`.
 
 ## Supervision
 

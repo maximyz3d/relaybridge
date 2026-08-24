@@ -168,6 +168,18 @@ GitHub Copilot CLI can also be installed with `winget install GitHub.Copilot`. I
 
 Cursor Agent uses the native Windows CLI (the official PowerShell installer places the `agent` launcher in `%LOCALAPPDATA%\cursor-agent`). RelayBridge prepends that directory for child processes, so a bridge that started before Cursor was installed can resolve it without inheriting a refreshed shell PATH. The interactive safe seat runs in plan mode and the bounded one-shot safe seat runs as read-only Q&A (`--mode ask` with `--trust`, since headless print mode otherwise has full write access and would prompt for workspace trust). No model is pinned, so your account default applies; run `agent models` to list options and pin one in `cli-config.json` if you want. `CURSOR_API_KEY` is stripped from child processes so calls use your Cursor subscription login rather than silently billing a metered API key.
 
+Antigravity safe one-shots use `--mode plan` and a visible, config-driven
+command-free review prefix. Headless Antigravity cannot display an Ask-mode
+command permission card, and its current CLI has no per-invocation narrow
+command allow flag. Persistent `command(prefix)` grants accept trailing
+arguments, so RelayBridge does not install a broad `git`, PowerShell, or `rg`
+grant and cannot truthfully call one read-only. The safe prompt instead directs
+the model to built-in workspace file reading and code search only. If a command
+is still selected, the response and receipt report
+`headless_command_permission_auto_denied`, mark the run dropped, and prohibit an
+identical retry. RelayBridge never switches that failure to
+`--dangerously-skip-permissions`; the dangerous slot remains explicit user intent.
+
 The default Perplexity route uses the community `pwm` wrapper and strips paid API fallback variables. It depends on the connected Perplexity web account and may change if that upstream wrapper changes.
 
 Hosted free/quota providers are intentionally opt-in. `groq_llama_fast` uses Groq's OpenAI-compatible endpoint with `GROQ_API_KEY`, pins Meta Llama `llama-3.1-8b-instant`, sets `allow_paid_fallback=false`, and is marked `autoRoute=false` so normal routing will not silently spend hosted quota. Direct China-hosted endpoints such as DeepSeek API and Alibaba DashScope are blocked by the hosted adapter. Local Qwen through Ollama remains available because it runs on your machine rather than a China-hosted service.

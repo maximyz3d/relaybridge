@@ -255,6 +255,13 @@ Also check `dropped_out`, plus `rate_limited`, `auth_failed`, and
 `budget_exceeded`. A rate-limited provider should be skipped for the rest of the
 session, not retried in a loop.
 
+For Antigravity, `policy_reason=headless_command_permission_auto_denied` means
+its headless process selected a terminal command whose Ask-mode permission
+could not be displayed. Safe one-shots already carry a command-free built-in
+file-reading policy. Do not retry the identical request, add a broad persistent
+command grant, or switch to `--dangerously-skip-permissions`; narrow the task or
+use another grounded provider.
+
 ## Watching a long run
 
 A quiet run is not necessarily a stuck run — print-mode CLIs buffer everything

@@ -106,6 +106,9 @@ test('provider config uses the installed subscription CLIs and safe headless mod
     suppress_args: [{ flag: '--effort', value_count: 1 }], note: 'current high-effort Pro id reported by agy models',
   });
   assert.equal(config.gemini.oneshot_safe[config.gemini.oneshot_safe.indexOf('--mode') + 1], 'plan');
+  assert.equal(config.gemini.oneshot_safe_prompt_policy, 'antigravity_headless_builtin_read_only_tools');
+  assert.match(config.gemini.oneshot_safe_prompt_prefix, /do not invoke terminal or command tools/i);
+  assert.doesNotMatch(config.gemini.oneshot_safe_prompt_prefix, /dangerously-skip-permissions/i);
   assert.ok(config.gemini.dangerous.includes('--dangerously-skip-permissions'));
   assert.equal(config.gemini.npm_package, undefined);
 
@@ -348,6 +351,25 @@ test('prompt-file transport preserves long special-character prompts and cleans 
       dangerous: [process.execPath, helper, '--version'],
       oneshot_safe: [...baseSlot, '--stderr', 'Error: timeout waiting for response', '--exit', '1'],
       oneshot_dangerous: [...baseSlot, '--stderr', 'Error: timeout waiting for response', '--exit', '1'],
+    },
+    headless_permission_denial: {
+      label: 'Antigravity Headless Permission Fixture',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--stderr', 'jetski: no output produced — a tool required the command permission that headless mode cannot prompt for, so it was auto-denied.', '--empty'],
+      oneshot_dangerous: [...baseSlot, '--stderr', 'MUST_NOT_USE_DANGEROUS_SLOT', '--exit', '9'],
+      oneshot_safe_prompt_policy: 'antigravity_headless_builtin_read_only_tools',
+      oneshot_safe_prompt_prefix: 'Use built-in workspace file-reading tools only. Never run terminal commands.',
+      prompt_max_chars: 80,
+    },
+    headless_readonly_success: {
+      label: 'Antigravity Command-Free Review Fixture',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: baseSlot,
+      oneshot_dangerous: [...baseSlot, '--stderr', 'MUST_NOT_USE_DANGEROUS_SLOT', '--exit', '9'],
+      oneshot_safe_prompt_policy: 'antigravity_headless_builtin_read_only_tools',
+      oneshot_safe_prompt_prefix: 'Use built-in workspace file-reading tools only. Never run terminal commands.',
     },
     narration_only: {
       label: 'Narration-Only Grok Fixture',
@@ -701,6 +723,54 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(narrationReceipt.status, 'dropped');
   assert.equal(narrationReceipt.failureClass, 'incomplete_response');
   assert.equal(narrationReceipt.outputChars, narrationResult.stdout.length, 'receipt retains evidence of the original output');
+
+  const safeReviewPrompt = 'Review the repository without modifying it.';
+  const safeReviewResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ kind: 'headless_readonly_success', prompt: safeReviewPrompt, dangerous: false }),
+  });
+  const safeReview = await safeReviewResponse.json();
+  assert.equal(safeReview.exitCode, 0);
+  assert.equal(safeReview.dropped_out, false);
+  assert.equal(safeReview.route.dangerous, false);
+  assert.equal(safeReview.route.prompt_policy, 'antigravity_headless_builtin_read_only_tools');
+  assert.equal(safeReview.route.prompt_policy_chars, 'Use built-in workspace file-reading tools only. Never run terminal commands.'.length);
+  assert.equal(safeReview.route.transport_prompt_chars, safeReview.stdout.length);
+  assert.match(safeReview.stdout, /^Use built-in workspace file-reading tools only/);
+  assert.match(safeReview.stdout, /User request:\s*Review the repository without modifying it\./);
+  assert.doesNotMatch(safeReview.stdout, /dangerously-skip-permissions/i);
+
+  const boundaryPrompt = 'x'.repeat(79) + 'Z';
+  const boundaryResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ kind: 'headless_readonly_success', prompt: boundaryPrompt, dangerous: false }),
+  });
+  const boundary = await boundaryResponse.json();
+  assert.equal(boundary.route.prompt_truncated, false, 'policy text must not consume the user prompt allowance');
+  assert.ok(boundary.stdout.endsWith(boundaryPrompt), 'the last user character survives at prompt_max_chars');
+  assert.equal(boundary.route.transport_prompt_chars, boundary.stdout.length);
+
+  const denialResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ kind: 'headless_permission_denial', prompt: safeReviewPrompt, dangerous: false }),
+  });
+  const denial = await denialResponse.json();
+  assert.equal(denial.exitCode, 0, 'matches receipt rcpt_mt6ucssr_287ca02b');
+  assert.equal(denial.stdout, '');
+  assert.equal(denial.failureClass, 'policy');
+  assert.equal(denial.permission_denied, true);
+  assert.equal(denial.policy_reason, 'headless_command_permission_auto_denied');
+  assert.equal(denial.dropped_out, true);
+  assert.equal(denial.route.dangerous, false);
+  assert.match(denial.stop_detail, /headless mode cannot prompt/i);
+  assert.doesNotMatch(denial.stderr, /MUST_NOT_USE_DANGEROUS_SLOT/);
+  const denialReceipt = fs.readFileSync(
+    path.join(tempRoot, 'data', 'receipts', new Date().toISOString().slice(0, 10) + '.jsonl'), 'utf8',
+  ).trim().split(/\r?\n/).map(JSON.parse).find((row) => row.receiptId === denial.receiptId);
+  assert.equal(denialReceipt.failureClass, 'policy');
+  assert.equal(denialReceipt.policyReason, 'headless_command_permission_auto_denied');
+  assert.match(denialReceipt.policyDetailHash, /^[0-9a-f]{64}$/);
+  assert.equal(denialReceipt.route.prompt_policy, 'antigravity_headless_builtin_read_only_tools');
 
   const grokQuotaResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST',
