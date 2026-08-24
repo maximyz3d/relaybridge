@@ -217,3 +217,50 @@ test('defaults leave real headroom for long agentic tasks', () => {
   assert.ok(DEFAULTS.hardCapMs >= 1800000, 'ceiling should allow a long task');
   assert.ok(DEFAULTS.idleMs >= 180000, 'buffered print-mode CLIs need a wide idle window');
 });
+
+test('provider-reported multi-turn usage stops at a distinct token budget without estimates', () => {
+  const s = make({ providerBudget: {
+    maxOutputTokens: 1000, maxTotalTokens: 5000, maxCacheReadTokens: null,
+    maxCacheCreationTokens: null, maxTurns: 2,
+  } });
+  s.recordProviderUsage({ output_tokens: 200, total_tokens: 2100, turns: 1 }, { phase: 'incremental' });
+  assert.equal(s.evaluate(T0 + 1000).action, 'continue');
+  s.recordProviderUsage({ output_tokens: 450, total_tokens: 4300, turns: 2 }, { phase: 'incremental' });
+  assert.equal(s.evaluate(T0 + 2000).action, 'continue');
+  s.recordProviderUsage({ output_tokens: 700, total_tokens: 6200, turns: 3 }, { phase: 'incremental' });
+  const verdict = s.evaluate(T0 + 3000);
+  assert.equal(verdict.reason, 'token_budget');
+  assert.match(verdict.detail, /provider-reported/);
+  assert.equal(s.snapshot(T0 + 3000).providerUsagePhase, 'incremental');
+});
+
+test('missing or malformed provider usage never falls back to output-size enforcement', () => {
+  const s = make({ providerBudget: {
+    maxOutputTokens: 1, maxTotalTokens: 1, maxCacheReadTokens: 1,
+    maxCacheCreationTokens: 1, maxTurns: 1,
+  }, maxOutputBytes: 1000000 });
+  s.recordOutput('a long but unique answer is only a transport estimate\n', T0 + 1000);
+  assert.equal(s.recordProviderUsage({ output_tokens: -1 }), false);
+  assert.equal(s.evaluate(T0 + 2000).action, 'continue');
+  assert.equal(s.snapshot(T0 + 2000).providerUsagePhase, 'unavailable');
+});
+
+test('per-run provider budget overrides provider and global defaults', () => {
+  const opts = resolveSupervisorOptions({
+    globals: { providerBudget: { maxTurns: 20 } },
+    entry: { supervisor: { providerBudget: { maxTurns: 10 } } },
+    providerBudget: { maxTurns: 3, maxOutputTokens: null },
+  });
+  assert.equal(opts.providerBudget.maxTurns, 3);
+  assert.equal(opts.providerBudget.maxOutputTokens, null);
+});
+
+test('a sparse per-run override retains provider-specific ceilings', () => {
+  const opts = resolveSupervisorOptions({
+    globals: { providerBudget: { maxOutputTokens: 9000, maxTurns: 20 } },
+    entry: { supervisor: { providerBudget: { maxOutputTokens: 4000, maxTurns: 10 } } },
+    providerBudget: { maxTurns: 3 },
+  });
+  assert.equal(opts.providerBudget.maxTurns, 3);
+  assert.equal(opts.providerBudget.maxOutputTokens, 4000);
+});

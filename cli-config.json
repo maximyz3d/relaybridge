@@ -8,7 +8,14 @@
     "loopRepeatThreshold": 12,
     "noNewContentMs": 240000,
     "maxOutputBytes": 12582912,
-    "onUnverifiableIdle": "kill"
+    "onUnverifiableIdle": "kill",
+    "providerBudget": {
+      "maxOutputTokens": 100000,
+      "maxTotalTokens": 3000000,
+      "maxCacheReadTokens": 2500000,
+      "maxCacheCreationTokens": 500000,
+      "maxTurns": 24
+    }
   },
   "_models": {
     "_note": "Model selection inside a provider. Routing tiers map to weight classes: utility->light, standard->standard, complex/critical->heavy. Provider lineups change on weeks-long cycles, so prefer stable aliases (claude opus/sonnet/haiku) over versioned ids, and leave model_tiers unset where the account decides which models exist (cursor, copilot, grok) — a missing flag runs, a retired one fails every call. Discovery at boot reconciles these pins against each CLI's own model list.",
@@ -95,14 +102,14 @@
       "--model",
       "opus",
       "--effort",
-      "max"
+      "high"
     ],
     "dangerous": [
       "claude",
       "--model",
       "opus",
       "--effort",
-      "max",
+      "high",
       "--dangerously-skip-permissions"
     ],
     "oneshot_safe": [
@@ -117,7 +124,7 @@
       "--model",
       "opus",
       "--effort",
-      "max"
+      "high"
     ],
     "oneshot_dangerous": [
       "claude",
@@ -129,7 +136,7 @@
       "--model",
       "opus",
       "--effort",
-      "max",
+      "high",
       "--dangerously-skip-permissions"
     ],
     "oneshot_output_parser": "claude_json",
@@ -180,14 +187,14 @@
       "--model",
       "fable",
       "--effort",
-      "max"
+      "high"
     ],
     "dangerous": [
       "claude",
       "--model",
       "fable",
       "--effort",
-      "max",
+      "high",
       "--dangerously-skip-permissions"
     ],
     "oneshot_safe": [
@@ -202,7 +209,7 @@
       "--model",
       "fable",
       "--effort",
-      "max"
+      "high"
     ],
     "oneshot_dangerous": [
       "claude",
@@ -214,7 +221,7 @@
       "--model",
       "fable",
       "--effort",
-      "max",
+      "high",
       "--dangerously-skip-permissions"
     ],
     "oneshot_output_parser": "claude_json",
