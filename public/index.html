@@ -307,6 +307,8 @@
   <button class="btn" id="broadcast-btn" title="Send one prompt to several AI providers at once">📡 Broadcast</button>
   <button class="btn" id="agents-btn" title="View AI providers, readiness, and edit routing tags">🧩 Agents</button>
   <button class="btn" id="github-btn" title="Live per-repo development activity and the version archive">🐙 GitHub</button>
+  <button class="btn" id="fuel-btn" title="Fuel gauges, token usage, shadow cost, and fleet balance">⛽ Fuel</button>
+  <button class="btn" id="tasks-btn" title="Background tasks — submit here, collect from any surface">⏳ Tasks</button>
   <button class="btn" id="restart-btn" title="Restart the RelayBridge server; all terminal sessions close">⟳ Restart</button>
   <button class="btn" id="stop-btn" title="Stop the RelayBridge server">⏻ Stop</button>
   <button class="btn" id="install-all-btn" title="npm install -g for every AI CLI configured with an npm_package">📦 Install all</button>
@@ -372,6 +374,44 @@
 <dialog id="agents-dialog" style="min-width:min(780px,92vw);">
   <div class="dlg-head"><strong>🧩 Agents &amp; routing tags</strong><button class="btn" id="agents-close-btn">Close</button></div>
   <div class="dlg-body" id="agents-body" style="max-height:65vh; overflow:auto;">Loading…</div>
+</dialog>
+
+<dialog id="fuel-dialog" style="min-width:min(940px,95vw);">
+  <div class="dlg-head"><strong>⛽ Fuel &amp; usage</strong><button class="btn" id="fuel-close-btn">Close</button></div>
+  <div class="dlg-body" style="max-height:74vh; overflow:auto;">
+    <div style="display:flex; gap:8px; align-items:center; margin-bottom:8px;">
+      <select id="fuel-window">
+        <option value="3600000">last hour</option>
+        <option value="86400000" selected>last 24h</option>
+        <option value="604800000">last 7 days</option>
+      </select>
+      <button class="btn" id="fuel-refresh">Refresh</button>
+      <span id="fuel-balance" class="muted"></span>
+    </div>
+    <div id="fuel-totals" style="margin-bottom:10px;"></div>
+    <div id="fuel-gauges">Loading…</div>
+    <div class="muted" style="margin-top:10px; font-size:11px;">
+      Subscription plans publish no token quota, so those gauges measure against a <b>configured</b> budget in
+      <code>config/usage-budgets.json</code> — an estimate you set, not a vendor number. Shadow cost is what the same
+      tokens would have cost at list API rates: an order of magnitude, not an invoice.
+    </div>
+  </div>
+</dialog>
+
+<dialog id="tasks-dialog" style="min-width:min(880px,94vw);">
+  <div class="dlg-head"><strong>⏳ Background tasks</strong><button class="btn" id="tasks-close-btn">Close</button></div>
+  <div class="dlg-body" style="max-height:70vh; overflow:auto;">
+    <div class="muted" style="margin-bottom:8px;">Submitted work runs in the background and is stored on disk, so it can be collected from any surface long after the tab that started it is gone.</div>
+    <div style="display:flex; gap:6px; margin-bottom:8px; flex-wrap:wrap;">
+      <select id="task-kind" style="min-width:150px;"></select>
+      <input id="task-prompt" placeholder="Prompt to run in the background" style="flex:1; min-width:260px;">
+      <input id="task-collab" placeholder="collab id (optional)" style="width:150px;">
+      <button class="btn" id="task-submit">Submit</button>
+      <button class="btn" id="task-refresh">Refresh</button>
+    </div>
+    <div id="tasks-stats" class="muted" style="margin-bottom:6px;"></div>
+    <div id="tasks-list">Loading…</div>
+  </div>
 </dialog>
 
 <dialog id="github-dialog" style="min-width:min(860px,94vw);">
@@ -819,6 +859,8 @@ function paletteCommands() {
     { title: 'Broadcast Prompt', detail: 'send one prompt to several providers', run: () => $('#broadcast-btn')?.click() },
     { title: 'Agents & Tags', detail: 'view providers and edit routing tags', run: () => $('#agents-btn')?.click() },
     { title: 'GitHub Development & Versions', detail: 'live repo activity, version archive, rollback', run: () => $('#github-btn')?.click() },
+    { title: 'Fuel & Usage', detail: 'per-model fuel gauges, tokens, shadow cost, fleet balance', run: () => $('#fuel-btn')?.click() },
+    { title: 'Background Tasks', detail: 'submit long work, collect it from anywhere', run: () => $('#tasks-btn')?.click() },
     { title: 'Restart Bridge', detail: 'restart the RelayBridge server', run: () => $('#restart-btn')?.click() },
     { title: 'Stop Bridge', detail: 'stop the RelayBridge server', run: () => $('#stop-btn')?.click() },
     { title: 'Install Providers', detail: 'run configured provider installers', run: () => $('#install-all-btn')?.click() },
@@ -2563,6 +2605,105 @@ async function openGithubPanel(){
   githubTimer = setInterval(refreshGithubActivity, 5000);
 }
 $('#github-btn')?.addEventListener('click', openGithubPanel);
+
+// ---- Fuel & usage panel ---------------------------------------------------
+const fuelDialog = $('#fuel-dialog');
+let fuelTimer = null;
+const usd = (n) => '$' + Number(n || 0).toFixed(2);
+const tok = (n) => { n = Number(n||0); return n >= 1e6 ? (n/1e6).toFixed(2)+'M' : n >= 1e3 ? (n/1e3).toFixed(1)+'k' : String(n); };
+function fuelBar(pct, basis){
+  const p = Math.max(0, Math.min(100, Number(pct)||0));
+  const c = basis === 'unmetered' ? '#64748b' : p > 50 ? '#4ade80' : p > 20 ? '#facc15' : '#f87171';
+  return `<div style="background:#1e293b;border-radius:3px;height:14px;width:130px;display:inline-block;vertical-align:middle;overflow:hidden;"><div style="width:${p}%;height:100%;background:${c};"></div></div> <span style="font-size:11px;">${basis==='unmetered'?'∞':p+'%'}</span>`;
+}
+async function refreshFuel(){
+  try {
+    const { gauges, balance, totals } = await api('/api/usage/gauges?windowMs=' + $('#fuel-window').value);
+    // Quota state is separate from fuel: a seat can read 80% and still be
+    // unusable because the provider 429'd it.
+    let cooling = [];
+    try { cooling = (await api('/api/cooldowns')).cooling || []; } catch {}
+    const coolBySeat = Object.fromEntries(cooling.map(c => [c.seat, c]));
+    $('#fuel-balance').innerHTML = balance.advice
+      ? `<span style="color:#facc15">⚠ ${esc(balance.advice)}</span>`
+      : `<span style="color:#4ade80">✓ fleet balanced${balance.seats?` (${balance.seats} metered, ${balance.spread}pt spread)`:''}</span>`;
+    $('#fuel-totals').innerHTML = `<table style="width:100%;font-size:12px;"><tr>
+      <td><b>${totals.runs}</b> runs</td>
+      <td><b>${tok(totals.totalTokens)}</b> tokens (${tok(totals.inputTokens)} in / ${tok(totals.outputTokens)} out)</td>
+      <td title="what these tokens would have cost at list API rates">plan value: <b>${usd(totals.shadowCostUsd)}</b></td>
+      <td title="what actually billed on metered seats">metered spend: <b>${usd(totals.meteredCostUsd)}</b></td>
+      <td>${totals.failed ? `<span style="color:#f87171">${totals.failed} failed</span>` : '<span style="color:#4ade80">no failures</span>'}</td></tr></table>`;
+    const rows = Object.values(gauges).sort((a,b)=>(a.percentRemaining??101)-(b.percentRemaining??101));
+    $('#fuel-gauges').innerHTML = '<table style="width:100%;font-size:12px;">' +
+      '<tr class="muted"><th align="left">seat</th><th align="left">fuel</th><th align="left">burn</th><th align="left">runs</th><th align="left">tokens</th><th align="left">cost</th><th align="left">models</th></tr>' +
+      rows.map(g => `<tr>
+        <td><b>${esc(g.seat)}</b>${coolBySeat[g.seat]?` <span style="color:#f87171" title="rate limited — ${esc(coolBySeat[g.seat].reason||'')}, ${coolBySeat[g.seat].remainingSec}s left">🚫 ${Math.ceil(coolBySeat[g.seat].remainingSec/60)}m</span>`:''}<br><span class="muted" style="font-size:10px;">${esc(g.costClass)}${g.basis==='configured'?' · est':''}</span></td>
+        <td>${fuelBar(g.percentRemaining, g.basis)}${(g.hoursToEmpty!==null&&g.hoursToEmpty!==undefined)?`<br><span class="muted" style="font-size:10px;">~${g.hoursToEmpty}h to empty</span>`:''}</td>
+        <td>${tok(g.burn.tokensPerHour)}/h<br><span class="muted" style="font-size:10px;">${g.burn.runsPerHour}/h runs</span></td>
+        <td>${g.used.runs}${g.used.failed?` <span style="color:#f87171">(${g.used.failed}✗)</span>`:''}</td>
+        <td>${tok(g.used.totalTokens)}</td><td>${usd(g.used.costUsd)}</td>
+        <td style="font-size:10px;">${Object.entries(g.models).map(([m,v])=>`${esc(m)} <span class="muted">${tok(v.tokens)}</span>`).join('<br>') || '<span class="muted">—</span>'}</td>
+      </tr>`).join('') + '</table>';
+  } catch (err) { $('#fuel-gauges').innerHTML = '<div class="muted">'+esc(err.message)+'</div>'; }
+}
+function openFuelPanel(){
+  if (typeof fuelDialog.showModal === 'function') fuelDialog.showModal(); else fuelDialog.setAttribute('open','true');
+  refreshFuel(); fuelTimer = setInterval(refreshFuel, 10000);
+}
+$('#fuel-btn')?.addEventListener('click', openFuelPanel);
+$('#fuel-close-btn')?.addEventListener('click', () => { fuelDialog.close(); if(fuelTimer){clearInterval(fuelTimer); fuelTimer=null;} });
+fuelDialog?.addEventListener('cancel', () => { if(fuelTimer){clearInterval(fuelTimer); fuelTimer=null;} });
+$('#fuel-refresh')?.addEventListener('click', refreshFuel);
+$('#fuel-window')?.addEventListener('change', refreshFuel);
+
+// ---- Tasks panel ----------------------------------------------------------
+const tasksDialog = $('#tasks-dialog');
+let tasksTimer = null;
+function taskBadge(s){
+  const c = {done:'#4ade80', failed:'#f87171', running:'#facc15', queued:'#94a3b8', cancelled:'#94a3b8', interrupted:'#fb923c'}[s] || '#94a3b8';
+  return `<span style="color:${c}">●</span> ${esc(s)}`;
+}
+async function refreshTasks(){
+  try {
+    const { tasks, stats } = await api('/api/tasks?limit=40');
+    $('#tasks-stats').textContent = `${stats.active} running · ${stats.queued} queued · cap ${stats.maxConcurrent}`;
+    $('#tasks-list').innerHTML = tasks.length ? '<table style="width:100%;font-size:12px;">' +
+      '<tr class="muted"><th align="left">status</th><th align="left">seat</th><th align="left">title</th><th align="left">when</th><th></th></tr>' +
+      tasks.map(t => `<tr><td>${taskBadge(t.status)}</td><td>${esc(t.kind)}</td><td title="${esc(t.title)}">${esc((t.title||'').slice(0,60))}</td><td>${esc(new Date(t.createdAt).toLocaleTimeString())}</td>
+        <td><button class="btn" data-task-open="${esc(t.id)}">View</button>${['queued','running'].includes(t.status)?` <button class="btn" data-task-cancel="${esc(t.id)}">Cancel</button>`:''}</td></tr>`).join('') + '</table>'
+      : '<div class="muted">No tasks yet. Submit one above — it keeps running if you close this tab.</div>';
+    $('#tasks-list').querySelectorAll('[data-task-open]').forEach(b => b.addEventListener('click', async () => {
+      try { const t = await api('/api/tasks/' + encodeURIComponent(b.getAttribute('data-task-open')));
+        alert(`${t.id} — ${t.status}\nseat: ${t.kind}${t.collab?'\ncollab: '+t.collab:''}\n\n${(t.result || t.error || '(no output yet)').slice(0,3000)}`);
+      } catch (err) { alert('Could not load task: ' + err.message); }
+    }));
+    $('#tasks-list').querySelectorAll('[data-task-cancel]').forEach(b => b.addEventListener('click', async () => {
+      try { await api('/api/tasks/' + encodeURIComponent(b.getAttribute('data-task-cancel')) + '/cancel', { method:'POST', headers:{'Content-Type':'application/json'}, body:'{}' }); refreshTasks(); }
+      catch (err) { alert('Cancel failed: ' + err.message); }
+    }));
+  } catch (err) { $('#tasks-list').innerHTML = '<div class="muted">'+esc(err.message)+'</div>'; }
+}
+async function openTasksPanel(){
+  if (typeof tasksDialog.showModal === 'function') tasksDialog.showModal(); else tasksDialog.setAttribute('open','true');
+  try { const { agents } = await api('/api/agents');
+    $('#task-kind').innerHTML = (agents||[]).filter(a=>a.id!=='powershell').map(a=>`<option value="${esc(a.id)}">${esc(a.label||a.id)}</option>`).join('');
+  } catch {}
+  refreshTasks(); tasksTimer = setInterval(refreshTasks, 4000);
+}
+$('#tasks-btn')?.addEventListener('click', openTasksPanel);
+$('#tasks-close-btn')?.addEventListener('click', () => { tasksDialog.close(); if(tasksTimer){clearInterval(tasksTimer); tasksTimer=null;} });
+tasksDialog?.addEventListener('cancel', () => { if(tasksTimer){clearInterval(tasksTimer); tasksTimer=null;} });
+$('#task-refresh')?.addEventListener('click', refreshTasks);
+$('#task-submit')?.addEventListener('click', async () => {
+  const prompt = $('#task-prompt').value.trim();
+  if (!prompt) return;
+  const body = { kind: $('#task-kind').value, prompt, source: 'dashboard' };
+  const collab = $('#task-collab').value.trim();
+  if (collab) body.collab = collab;
+  try { await api('/api/tasks', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+    $('#task-prompt').value = ''; refreshTasks();
+  } catch (err) { alert('Submit failed: ' + err.message); }
+});
 $('#github-close-btn')?.addEventListener('click', () => { githubDialog.close(); if (githubTimer){clearInterval(githubTimer); githubTimer=null;} });
 githubDialog?.addEventListener('cancel', () => { if (githubTimer){clearInterval(githubTimer); githubTimer=null;} });
 $('#github-versions-refresh')?.addEventListener('click', refreshGithubVersions);

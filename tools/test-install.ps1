@@ -96,6 +96,10 @@ server.listen(port, '127.0.0.1');
       tags = @('custom-routing')
       autoRoute = $false
       model = 'operator-pinned-model'
+      model_tiers = [ordered]@{
+        light = [ordered]@{ args = @('--model', 'gpt-retired-light'); model = 'gpt-retired-light' }
+        standard = [ordered]@{ args = @('--model', 'gpt-retired-standard'); model = 'gpt-retired-standard' }
+      }
     }
     custom_provider = [ordered]@{
       label = 'Private Operator Provider'
@@ -152,6 +156,8 @@ server.listen(port, '127.0.0.1');
   $mergedBytes = [IO.File]::ReadAllBytes((Join-Path $installRoot 'cli-config.json'))
   Assert-True (([BitConverter]::ToString($mergedBytes)) -match 'E2-80-94') 'merged JSON must contain the exact UTF-8 em-dash byte sequence'
   Assert-True ($merged.cursor.model -eq 'operator-pinned-model') 'operator model pin must win over release defaults'
+  Assert-True ($null -eq $merged.cursor.PSObject.Properties['model_tiers']) 'an upgrade to Cursor Auto-only must remove inherited stale named-model tiers'
+  Assert-True ($merged.cursor.model_tiers_locked -eq $true) 'the shipped Auto-only lock must prevent future pin restoration'
   Assert-True ($merged.cursor.tags[0] -eq 'custom-routing') 'operator routing tags must be preserved'
   Assert-True ($merged.cursor.probe_expect -eq 'Logged in as') 'missing release fields must be added to existing providers'
   Assert-True ($null -ne $merged.copilot) 'new release providers must be added'

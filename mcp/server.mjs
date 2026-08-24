@@ -1302,6 +1302,47 @@ function remainingTime(deadlineAt, floorMs = 1000) {
   return Math.max(floorMs, deadlineAt - Date.now());
 }
 
+
+// Derive a human-readable range list from a zod object schema, so tool
+// descriptions cannot drift from the constraints actually enforced.
+// Returns e.g. "maxChars 30000-200000, maxSessions 0-20" or null.
+export function describeNumericBounds(schema) {
+  if (!schema || typeof schema !== 'object') return null;
+  const shape = typeof schema.shape === 'object' ? schema.shape
+    : (typeof schema._def?.shape === 'function' ? schema._def.shape() : schema._def?.shape);
+  if (!shape) return null;
+  const parts = [];
+  for (const [key, field] of Object.entries(shape)) {
+    const b = numericBoundsOf(field);
+    if (!b) continue;
+    if (b.min !== null && b.max !== null) parts.push(`${key} ${b.min}-${b.max}`);
+    else if (b.min !== null) parts.push(`${key} >= ${b.min}`);
+    else if (b.max !== null) parts.push(`${key} <= ${b.max}`);
+  }
+  return parts.length ? parts.join(', ') : null;
+}
+
+// Walks .default()/.optional() wrappers to find the underlying number checks.
+function numericBoundsOf(field, depth = 0) {
+  if (!field || depth > 6) return null;
+  const def = field._def || {};
+  const inner = def.innerType || def.schema || def.type;
+  const typeName = def.typeName || def.type;
+  const isNumber = typeName === 'ZodNumber' || typeName === 'number';
+  if (!isNumber) return inner && typeof inner === 'object' ? numericBoundsOf(inner, depth + 1) : null;
+
+  let min = null, max = null;
+  // zod v3 exposes _def.checks; v4 exposes checks with _zod.def
+  for (const check of def.checks || []) {
+    const c = check?._zod?.def || check;
+    const kind = c.kind || c.check;
+    const value = c.value ?? c.minimum ?? c.maximum;
+    if (kind === 'min' || kind === 'greater_than' || c.minimum !== undefined) min = c.minimum ?? value;
+    if (kind === 'max' || kind === 'less_than' || c.maximum !== undefined) max = c.maximum ?? value;
+  }
+  return (min === null && max === null) ? null : { min, max };
+}
+
 export function buildServer() {
   const server = new McpServer({ name: 'relaybridge', version: PACKAGE.version }, {
     instructions: 'Read before acting: call get_context_bundle when taking over existing work, then use bridge_status, list_providers, and route_preview as needed. AI provider one-shots (ask_provider, route_and_ask, run_committee) always force dangerous:false, so they consume subscription quotas or local compute in the provider CLI\'s own safe/headless mode. Terminals are different: start_safe_session only forces the vendor bypass flags off, and start_safe_session(kind="powershell") opens a real host PowerShell shell running with your account\'s full privileges. Anything sent through send_session_input executes on the host with no sandbox and no filesystem confinement, so it needs host approval and human review. The /api/exec route, provider installs, and the global full-permissions toggle are not exposed as tools. Routing scores are operator preferences, not universal model-quality claims; use receipts and preserve the human gate for high-stakes work.',
@@ -1311,6 +1352,28 @@ export function buildServer() {
       'resources/list': { ttlMs: 60000, cacheScope: 'private' },
     },
   });
+
+  // Issue #26: numeric bounds reach the JSON Schema (the SDK emits zod's
+  // .min()/.max() as minimum/maximum), but many clients surface only the
+  // human-readable description to the model. A caller then picks a plausible
+  // value like maxChars=12000, and the request is rejected by validation
+  // before any work is done — a wasted round trip that the description could
+  // have prevented.
+  //
+  // Rather than hand-maintaining ranges in 30 description strings, where they
+  // would immediately drift from the schema, derive them FROM the schema at
+  // registration. The schema stays the single source of truth, and a new
+  // bounded parameter cannot be added without its range being documented.
+  const registerToolRaw = server.registerTool.bind(server);
+  server.registerTool = (name, config, handler) => {
+    try {
+      const ranges = describeNumericBounds(config?.inputSchema);
+      if (ranges && config?.description && !config.description.includes('Accepted ranges:')) {
+        config = { ...config, description: `${config.description} Accepted ranges: ${ranges}.` };
+      }
+    } catch { /* documentation must never block registration */ }
+    return registerToolRaw(name, config, handler);
+  };
 
   server.registerTool('bridge_status', {
     title: 'Bridge status',
@@ -2211,6 +2274,94 @@ export function buildServer() {
     const receipt = appendReceipt({ event: 'github_onboard_repo', status: 'draft_pr_opened', repo: name, prNumber: response.prNumber ?? null });
     return result({ ...response, receiptId: receipt.receiptId });
   }));
+
+  // ---- Async tasks --------------------------------------------------------
+
+  server.registerTool('submit_task', {
+    title: 'Submit a background task',
+    description: 'Queue a prompt to a provider and return a task id IMMEDIATELY without waiting for the run. Use for work longer than a chat turn, or when the result should be collectable later from a different surface. Link a collab id to append the result to that shared thread.',
+    inputSchema: z.object({
+      kind: z.string().min(1).max(64), prompt: z.string().min(1).max(100000),
+      collab: z.string().max(64).optional(), title: z.string().max(120).optional(),
+      cwd: z.string().max(1024).optional(), user: z.string().max(64).optional(),
+    }),
+    annotations: ACTION,
+  }, safeHandler(async (input) => {
+    const response = await bridgeRequest('/api/tasks', { method: 'POST', body: { ...input, source: 'mcp' } });
+    const receipt = appendReceipt({ event: 'submit_task', status: 'queued', taskId: response.id, provider: input.kind });
+    return result({ ...response, receiptId: receipt.receiptId });
+  }));
+
+  server.registerTool('get_task', {
+    title: 'Get a task result',
+    description: 'Fetch one task by id: status (queued/running/done/failed/cancelled/interrupted), full result text, exit code, route and usage. Poll this to collect work submitted earlier from any surface.',
+    inputSchema: z.object({ id: z.string().regex(/^t_[A-Za-z0-9_]+$/) }),
+    annotations: READ_ONLY,
+  }, safeHandler(async ({ id }) => result(await bridgeRequest(`/api/tasks/${encodeURIComponent(id)}`))));
+
+  server.registerTool('list_tasks', {
+    title: 'List tasks',
+    description: 'List recent tasks newest-first with status and timing, optionally filtered by collab thread or status.',
+    inputSchema: z.object({
+      collab: z.string().max(64).optional(),
+      status: z.enum(['queued','running','done','failed','cancelled','interrupted']).optional(),
+      limit: z.number().int().min(1).max(200).default(50),
+    }),
+    annotations: READ_ONLY,
+  }, safeHandler(async ({ collab, status, limit }) => {
+    const q = new URLSearchParams();
+    if (collab) q.set('collab', collab);
+    if (status) q.set('status', status);
+    q.set('limit', String(limit));
+    return result(await bridgeRequest(`/api/tasks?${q.toString()}`));
+  }));
+
+  server.registerTool('cancel_task', {
+    title: 'Cancel a task',
+    description: 'Cancel a queued task so it never runs, or mark a running task cancelled so its result is not recorded.',
+    inputSchema: z.object({ id: z.string().regex(/^t_[A-Za-z0-9_]+$/) }),
+    annotations: ACTION,
+  }, safeHandler(async ({ id }) => {
+    const response = await bridgeRequest(`/api/tasks/${encodeURIComponent(id)}/cancel`, { method: 'POST', body: {} });
+    const receipt = appendReceipt({ event: 'cancel_task', status: response.status, taskId: id });
+    return result({ ...response, receiptId: receipt.receiptId });
+  }));
+
+  server.registerTool('provider_cooldowns', {
+    title: 'Which seats are rate limited right now',
+    description: 'Seats currently in cooldown after a 429 or overload, with how long is left, why, and whether the window came from the provider\'s Retry-After or our backoff. A readiness probe only proves authentication — this is the quota picture, and it is shared by every client and survives a bridge restart.',
+    inputSchema: z.object({}),
+    annotations: READ_ONLY,
+  }, safeHandler(async () => result(await bridgeRequest('/api/cooldowns'))));
+
+  // ---- Fuel gauge / usage ------------------------------------------------
+
+  server.registerTool('usage_gauges', {
+    title: 'Fuel gauges for every seat',
+    description: 'Per-seat fuel: percent remaining, burn rate (tokens/hour), projected hours to empty, runs, tokens and shadow cost, plus fleet balance — whether usage is even and which seat to shift work away from. Subscription seats report basis:"configured" because plans publish no quota; those are estimates.',
+    inputSchema: z.object({ windowMs: z.number().int().min(60000).max(2592000000).default(86400000) }),
+    annotations: READ_ONLY,
+  }, safeHandler(async ({ windowMs }) => result(await bridgeRequest(`/api/usage/gauges?windowMs=${windowMs}`))));
+
+  server.registerTool('usage_totals', {
+    title: 'Token and cost totals',
+    description: 'Aggregate tokens and runs, with cost split into shadowCostUsd (what subscription runs WOULD have cost at list API rates — the value the plans return) and meteredCostUsd (what actually billed).',
+    inputSchema: z.object({ windowMs: z.number().int().min(60000).max(2592000000).default(86400000) }),
+    annotations: READ_ONLY,
+  }, safeHandler(async ({ windowMs }) => result(await bridgeRequest(`/api/usage/totals?windowMs=${windowMs}`))));
+
+  server.registerTool('usage_advise', {
+    title: 'Which seat should take this work',
+    description: 'Given a task tier and capable seats, re-ranks them so the fleet drains evenly and says whether the tier can be safely downgraded to save budget. Never downgrades high-stakes or explicitly-requested work, never below utility. Advisory only — capability wins over economy.',
+    inputSchema: z.object({
+      tier: z.enum(['deterministic','utility','standard','complex','critical']).default('standard'),
+      candidates: z.array(z.object({ seat: z.string().min(1).max(64), rank: z.number().optional(), costClass: z.string().max(24).optional() })).max(20),
+      highStakes: z.boolean().default(false),
+      explicitProvider: z.boolean().default(false),
+      explicitSeat: z.string().min(1).max(64).optional(),
+    }),
+    annotations: READ_ONLY,
+  }, safeHandler(async (input) => result(await bridgeRequest('/api/usage/advise', { method: 'POST', body: input }))));
 
   return server;
 }

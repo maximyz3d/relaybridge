@@ -162,6 +162,18 @@ test('the CLI exposes plan before ask and documents effort', () => {
   assert.ok(USAGE.indexOf('plan') < USAGE.indexOf('ask'), 'plan should be presented before ask');
 });
 
+test('the CLI ask payload preserves the caller working directory', () => {
+  const { buildAskBody } = require('../bin/relaybridge.js');
+  const body = buildAskBody(
+    { primary: { kind: 'claude' }, tier: 'standard' },
+    'review the repo',
+    'C:\\review\\repo',
+  );
+  assert.equal(body.cwd, 'C:\\review\\repo');
+  assert.equal(body.kind, 'claude');
+  assert.equal(body.dangerous, false);
+});
+
 test('the CLI never force-exits while sockets are in flight', () => {
   // process.exit() with a closing HTTP handle trips a libuv assertion on
   // Windows and prints a crash after otherwise-correct output.

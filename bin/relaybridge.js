@@ -118,6 +118,16 @@ function printPlan(plan, { json = false } = {}) {
   for (const line of plan.guidance || []) console.log(`note      ${line}`);
 }
 
+function buildAskBody(plan, task, cwd = process.cwd()) {
+  return {
+    kind: plan.primary.kind,
+    prompt: task,
+    taskTier: plan.tier,
+    dangerous: false,
+    cwd,
+  };
+}
+
 const USAGE = `relaybridge — delegate work to AI CLIs on seats you already pay for
 
   relaybridge plan "<task>"            what to run this on: company, model, effort
@@ -172,7 +182,9 @@ async function main() {
         if (!json) console.error(`# ${plan.primary.kind} · ${plan.primary.model || 'default'} · effort ${plan.effort}`);
         const result = await call('/api/oneshot', {
           method: 'POST',
-          body: { kind: plan.primary.kind, prompt: task, taskTier: plan.tier, dangerous: false },
+          // A CLI provider is only workspace-grounded when the bridge spawns
+          // it in the directory from which `relaybridge ask` was invoked.
+          body: buildAskBody(plan, task),
         });
         if (json) { console.log(JSON.stringify(result, null, 2)); return result.exitCode === 0 ? 0 : 1; }
         if (result.stdout) console.log(result.stdout.trim());
@@ -304,4 +316,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { parseFlags, findToken, USAGE };
+module.exports = { parseFlags, findToken, buildAskBody, USAGE };

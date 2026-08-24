@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const { RunSupervisor, resolveSupervisorOptions } = require('./lib/run-supervisor');
 const { resolveModelArgs, applyModelArgs, modelConfigStaleness, modelTierForTaskTier } = require('./lib/model-tiers');
 const { buildRegistry, parseModelList, pinIsRetired } = require('./lib/model-registry');
-const { buildTaskPlan, EFFORT_ORDER } = require('./lib/task-plan');
+const { buildTaskPlan, EFFORT_ORDER, costClassFor } = require('./lib/task-plan');
 const { receiptStoreIdentity } = require('./lib/receipt-store-identity.cjs');
 const { WebSocketServer } = require('ws');
 const { spawn, spawnSync } = require('child_process');
@@ -893,6 +893,47 @@ function sendOneShotPreAdmissionRejection(res, {
 
 function sendOneShotResult(res, payload, meta) {
   if (res.writableEnded || res.destroyed) return;
+  // Usage ledger: every run — CLI, local Ollama, hosted adapter — exits
+  // through here, so this single hook catches them all. Wrapped because
+  // accounting must never be able to break a response.
+  try {
+    if (meta && meta.kind && typeof recordRunUsage === 'function') {
+      const ok = payload.exitCode === 0 && !payload.dropped_out;
+      // Classify once and use it for BOTH accounting and cooldown, so the two
+      // can never disagree about why a run ended.
+      const classified = classifyRunFailure({
+        stdout: payload.stdout, stderr: payload.stderr, exitCode: payload.exitCode,
+        elapsedMs: meta.startedAt ? Date.now() - meta.startedAt : 0,
+        stopReason: payload.stop_reason,
+      });
+      const failureKind = payload.rate_limited ? 'rate_limited'
+        : payload.auth_failed ? 'auth_failed'
+        : (classified.kind !== 'ok' ? classified.kind : null);
+      recordRunUsage({
+        kind: meta.kind, route: payload.route || meta.route, usage: payload.usage,
+        startedAt: meta.startedAt, ok, failureKind,
+      });
+      // Post-hoc grounding check: a seat WITH access can still hallucinate, and
+      // an answer citing only nonexistent files is not about this repository.
+      try {
+        if (ok && meta.cwd && payload.stdout) {
+          const v = verifyReferencedPaths(payload.stdout, meta.cwd);
+          if (v.checked && (v.confidence === 'likely-fabricated' || v.confidence === 'suspect')) {
+            payload.grounding_warning = v.note;
+            payload.grounding = { confidence: v.confidence, missing: v.missing.slice(0, 10), present: v.present.slice(0, 10) };
+          }
+        }
+      } catch { /* verification is advisory; never fail a run over it */ }
+      try {
+        if (ok) cooldowns.noteSuccess(meta.kind);
+        else if (failureKind) {
+          cooldowns.noteFailure(meta.kind, failureKind, {
+            retryAfterSec: parseRetryAfter(`${payload.stdout || ''}\n${payload.stderr || ''}`, payload.retry_after),
+          });
+        }
+      } catch { /* cooldown bookkeeping must never break a response */ }
+    }
+  } catch { /* ignored on purpose */ }
   try {
     const receipt = appendBridgeProviderReceipt({ ...meta, payload });
     res._relayReceiptPersisted = receipt.receiptId;
@@ -2664,7 +2705,12 @@ app.post('/api/plan', async (req, res) => {
         diagnostics[k] = { found, ready: found, detail: 'path-only check' };
       }
     }
-    const route = router.routeTask({ task, diagnostics });
+    const fleetInput = applyCooldownsToDiagnostics(diagnostics, cooldowns.cooling(), kind ? [kind] : []);
+    diagnostics = fleetInput.diagnostics;
+    let route = router.routeTask({ task, diagnostics });
+    const gauges = usageLedger.gaugeAll(seatCostClasses());
+    route = levelRouteSelection(route, gauges, seatCostClassMap());
+    route.fleetState = { cooldownSkipped: fleetInput.skipped, balance: fleetBalance(gauges) };
     const plan = buildTaskPlan({
       route,
       config: cfg,
@@ -2673,7 +2719,7 @@ app.post('/api/plan', async (req, res) => {
       requestedEffort: effort || null,
       requestedKind: kind || null,
     });
-    res.json({ ok: true, task: task.slice(0, 400), ...plan });
+    res.json({ ok: true, task: task.slice(0, 400), ...plan, fleetState: route.fleetState });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -2703,11 +2749,17 @@ app.post('/api/route', async (req, res) => {
         diagnostics[kind] = { found, ready: found, detail: 'path-only check; run /api/diag for auth status' };
       }
     }
-    const route = router.routeTask({
+    const explicitKinds = Array.isArray(preferKinds) ? preferKinds : [];
+    const fleetInput = applyCooldownsToDiagnostics(diagnostics, cooldowns.cooling(), explicitKinds);
+    diagnostics = fleetInput.diagnostics;
+    let route = router.routeTask({
       task, diagnostics,
-      preferKinds: Array.isArray(preferKinds) ? preferKinds : undefined,
-      excludeKinds: Array.isArray(excludeKinds) ? excludeKinds : undefined,
+      preferredProviders: explicitKinds.length ? explicitKinds : undefined,
+      excludedProviders: Array.isArray(excludeKinds) ? excludeKinds : undefined,
     });
+    const gauges = usageLedger.gaugeAll(seatCostClasses());
+    route = levelRouteSelection(route, gauges, seatCostClassMap());
+    route.fleetState = { cooldownSkipped: fleetInput.skipped, balance: fleetBalance(gauges) };
     const taskTier = route.classification?.tier;
     const selected = (route.selected || []).map((pick) => {
       const resolved = resolveModelArgs({ entry: cfg[pick.kind] || {}, taskTier });
@@ -2997,6 +3049,34 @@ app.post('/api/exec', (req, res) => {
 async function executeOneShot(body, res) {
   const startedAt = Date.now();
   const { kind, prompt, timeoutMs, cwd, dangerous } = body || {};
+
+  // Issue #16: a workspace-inspection task sent to a seat with no filesystem
+  // access produces a confident, fabricated answer that records as a success.
+  // Refuse BEFORE dispatch — the tokens are wasted either way, but a refusal
+  // is visible and a fabricated audit is not. `groundingOverride` exists for
+  // the caller who genuinely wants an ungrounded opinion; it is flagged.
+  try {
+    const cfgAll = loadConfig();
+    const grounding = checkGrounding({
+      prompt, cwd, seat: kind, seatConfig: cfgAll?.[kind] || {},
+      override: body?.groundingOverride === true,
+    });
+    if (!grounding.allowed) {
+      return sendOneShotResult(res, {
+        ok: false, exitCode: null, stdout: '', stderr: grounding.reason,
+        error: grounding.reason, remedy: grounding.remedy,
+        failure_class: 'workspace_grounding',
+        model_invocation: false, dropped_out: true,
+        usage: { input_tokens: 0, output_tokens: 0 },
+      }, { kind, prompt, startedAt });
+    }
+    if (grounding.overridden) body = { ...body, _groundingOverridden: true, _groundingOverrideReason: grounding.reason };
+  } catch (err) {
+    // The gate is advisory when it cannot evaluate, but losing it must be
+    // visible rather than silently disabling a safety layer.
+    console.warn(`[RelayBridge] workspace grounding check unavailable: ${err.message}`);
+  }
+
   // Run association for the GitHub tracker: who did this, and any
   // explicit intent. Falls back to the OS account so checkpoint commits
   // are always attributed (maximyz3d / sover / 3DCPAI machines differ).
@@ -3201,6 +3281,8 @@ async function executeOneShot(body, res) {
     timeout_clamped: explicitTimeout != null && Math.trunc(Number(timeoutMs)) !== explicitTimeout,
     environment_overrides: Object.keys(oneShotEnv).sort(),
     request_id: requestId,
+    grounding_override: body?._groundingOverridden === true || null,
+    grounding_note: body?._groundingOverridden ? body._groundingOverrideReason : null,
   };
   // Persist a terminal cancellation even when the HTTP client is already
   // gone. Previously the provider was killed but its token/time attempt
@@ -3268,6 +3350,10 @@ async function executeOneShot(body, res) {
       spawnOpts.windowsVerbatimArguments = true;
     }
     proc = trackChild(spawn(spawnBin, spawnArgs, spawnOpts));
+    // executeOneShot returns after wiring the child events; the response is
+    // delivered by proc.on('close'). Background-task capture must distinguish
+    // that intentional deferred response from a handler that forgot to reply.
+    res._relayDeferredResponse = true;
   } catch (err) {
     cleanupPromptFile();
     if (err.validation) {
@@ -3277,7 +3363,7 @@ async function executeOneShot(body, res) {
         validation: err.validation,
       });
     }
-    return sendOneShotResult(res, { kind, route, exitCode: -1, stdout: '', stderr: err.message, error: 'spawn failed', dropped_out: true, model_invocation: false }, { kind, prompt, route, startedAt });
+    return sendOneShotResult(res, { kind, route, exitCode: -1, stdout: '', stderr: err.message, error: 'spawn failed', dropped_out: true, model_invocation: false }, { kind, prompt, route, startedAt, cwd: resolvedCwd });
   }
   let stdout = '';
   let stderr = '';
@@ -3384,7 +3470,7 @@ async function executeOneShot(body, res) {
     finishSupervision();
     cleanupPromptFile();
     if (clientGone || res.writableEnded) return;
-    sendOneShotResult(res, { kind, route, exitCode: -1, stdout, stderr: stderr + '\n' + err.message, error: err.message, dropped_out: true }, { kind, prompt, route, startedAt });
+    sendOneShotResult(res, { kind, route, exitCode: -1, stdout, stderr: stderr + '\n' + err.message, error: err.message, dropped_out: true }, { kind, prompt, route, startedAt, cwd: resolvedCwd });
   });
   proc.on('close', (code) => {
     if (settled) return;
@@ -3509,7 +3595,7 @@ async function executeOneShot(body, res) {
       timed_out: providerTimedOut,
       dropped_out,
       model_invocation: true,
-    }, { kind, prompt, route, startedAt });
+    }, { kind, prompt, route, startedAt, cwd: resolvedCwd });
     // GitHub middleware: only successful runs checkpoint — a dropped-out run
     // may have left half-applied edits, which the human should triage first.
     if (!dropped_out) {
@@ -3526,6 +3612,135 @@ async function executeOneShot(body, res) {
 }
 
 app.post('/api/oneshot', (req, res) => executeOneShot(req.body, res));
+
+// ---- Async task queue (lib/task-queue.js) --------------------------------
+// Submission is decoupled from collection so work outlives the surface that
+// started it: submit from a chat, collect from Cowork or the CLI later.
+const { createTaskQueue } = require('./lib/task-queue');
+const taskQueue = createTaskQueue({
+  dataDir: path.join(DATA_DIR, 'tasks'),
+  executeOneShot, readCollab, writeCollab,
+  maxConcurrent: Number(process.env.RELAYBRIDGE_MAX_TASKS) || 3,
+  log: (m) => console.log(m),
+});
+
+app.post('/api/tasks', (req, res) => {
+  try { res.json(taskQueue.submit(req.body || {})); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+app.get('/api/tasks', (req, res) => {
+  try { res.json({ tasks: taskQueue.list({ collab: req.query.collab, status: req.query.status, limit: req.query.limit }), stats: taskQueue.stats() }); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+app.get('/api/tasks/:id', (req, res) => {
+  try {
+    const task = taskQueue.get(req.params.id);
+    if (!task) return res.status(404).json({ error: 'task not found' });
+    res.json(task);
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+app.post('/api/tasks/:id/cancel', (req, res) => {
+  try { res.json(taskQueue.cancel(req.params.id)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// ---- Usage ledger + fuel gauge (lib/usage-ledger.js) ---------------------
+// Records every run's tokens, duration and shadow cost so the fleet drains
+// evenly and "what would this cost on metered pricing" is answerable while on
+// subscription plans.
+const { createCooldownStore, parseRetryAfter } = require('./lib/provider-cooldown');
+const { checkGrounding, verifyReferencedPaths } = require('./lib/workspace-grounding');
+const { classifyRunFailure } = require('./lib/provider-failure');
+// Issue #17: readiness proves auth, not quota. A seat that returned 429 stays
+// "ready" forever unless the 429 is remembered, so remember it durably and
+// share it with every client.
+const cooldowns = createCooldownStore({
+  file: path.join(DATA_DIR, 'cooldowns.json'),
+  log: (m) => console.log(m),
+});
+
+const { createUsageLedger } = require('./lib/usage-ledger');
+const {
+  levelCandidates, suggestTierAdjustment, fleetBalance,
+  applyCooldownsToDiagnostics, levelRouteSelection,
+} = require('./lib/load-leveller');
+
+function loadUsageBudgets() {
+  try {
+    const fp = path.join(ROOT, 'config', 'usage-budgets.json');
+    return fs.existsSync(fp) ? JSON.parse(fs.readFileSync(fp, 'utf8')) : {};
+  } catch { return {}; }
+}
+const usageBudgetsFile = loadUsageBudgets();
+const usageLedger = createUsageLedger({
+  dataDir: path.join(DATA_DIR, 'usage'),
+  budgets: usageBudgetsFile.budgets || {},
+  pricing: usageBudgetsFile.pricing || undefined,
+  log: (m) => console.log(m),
+});
+
+function seatCostClasses() {
+  const cfg = loadConfig();
+  const out = {};
+  for (const [seat, entry] of Object.entries(cfg)) {
+    if (seat.startsWith('_')) continue;
+    out[seat] = { costClass: costClassFor(entry, seat) };
+  }
+  return out;
+}
+
+function seatCostClassMap() {
+  const entries = seatCostClasses();
+  return Object.fromEntries(Object.entries(entries).map(([seat, value]) => [seat, value.costClass]));
+}
+
+function recordRunUsage({ kind, route, usage, startedAt, ok, failureKind, taskId }) {
+  try {
+    const classes = seatCostClasses();
+    usageLedger.record({
+      seat: kind,
+      model: route?.resolved_model || route?.model || null,
+      costClass: classes[kind]?.costClass || 'metered',
+      inputTokens: usage?.input_tokens ?? usage?.prompt_tokens ?? 0,
+      outputTokens: usage?.output_tokens ?? usage?.completion_tokens ?? 0,
+      elapsedMs: startedAt ? Date.now() - startedAt : 0,
+      ok, failureKind: failureKind || null, taskId: taskId || null,
+    });
+  } catch (err) { console.log('[RelayBridge] usage record failed: ' + err.message); }
+}
+
+app.get('/api/usage/gauges', (req, res) => {
+  try {
+    const windowMs = Number(req.query.windowMs) || 86400000;
+    const gauges = usageLedger.gaugeAll(seatCostClasses(), windowMs);
+    res.json({ gauges, balance: fleetBalance(gauges), totals: usageLedger.totals(windowMs) });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+app.get('/api/cooldowns', (req, res) => {
+  res.json({ cooldowns: cooldowns.all(), cooling: cooldowns.cooling() });
+});
+
+app.get('/api/usage/totals', (req, res) => {
+  try { res.json(usageLedger.totals(Number(req.query.windowMs) || 86400000)); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+app.post('/api/usage/advise', (req, res) => {
+  try {
+    const { tier = 'standard', candidates = [], highStakes = false, explicitProvider = false } = req.body || {};
+    const gauges = usageLedger.gaugeAll(seatCostClasses());
+    // Quota state first: a cooling seat cannot do the work at any rank.
+    const { usable, skipped, allCooling } = cooldowns.filterCandidates(
+      candidates, { explicit: explicitProvider ? (req.body?.explicitSeat || null) : null });
+    const ranked = levelCandidates(usable, gauges);
+    const top = ranked[0] ? gauges[ranked[0].seat] : null;
+    res.json({
+      ranked, skipped, allCooling,
+      tierAdjustment: suggestTierAdjustment({ tier, gauge: top, highStakes, explicitProvider }),
+      balance: fleetBalance(gauges),
+    });
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
 
 // ---- GitHub integration (lib/github-tracker.js) --------------------------
 // Fire-and-forget middleware on the run-completion path. Activates only for

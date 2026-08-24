@@ -1029,6 +1029,26 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(cwdResponse.status, 200);
   assert.equal((await cwdResponse.json()).stdout, tempRoot);
 
+  // Regression: executeOneShot's CLI path returns after registering child
+  // callbacks, before proc.on('close') sends the response. Background tasks
+  // must wait for that deferred response instead of failing immediately.
+  const taskSubmitResponse = await fetch(baseUrl + '/api/tasks', {
+    method: 'POST',
+    headers: jsonAuth,
+    body: JSON.stringify({ kind: 'cwd_echo', prompt: 'deferred CLI task', cwd: tempRoot }),
+  });
+  assert.equal(taskSubmitResponse.status, 200);
+  const submittedTask = await taskSubmitResponse.json();
+  let completedTask = null;
+  for (let attempt = 0; attempt < 80; attempt++) {
+    const taskResponse = await fetch(`${baseUrl}/api/tasks/${submittedTask.id}`, { headers: auth });
+    completedTask = await taskResponse.json();
+    if (['done', 'failed', 'cancelled', 'interrupted'].includes(completedTask.status)) break;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.equal(completedTask.status, 'done', completedTask.error || 'CLI background task did not complete');
+  assert.equal(completedTask.result, tempRoot);
+
   const healthyRateDiscussion = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST',
     headers: jsonAuth,
