@@ -20,11 +20,18 @@ function Assert-True([bool]$Condition, [string]$Message) {
   if (-not $Condition) { throw "ASSERTION FAILED: $Message" }
 }
 
+function Get-Sha256([string]$Path) {
+  $stream = [IO.File]::OpenRead($Path)
+  $sha = [Security.Cryptography.SHA256]::Create()
+  try { return ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-', '').ToLowerInvariant() }
+  finally { $sha.Dispose(); $stream.Dispose() }
+}
+
 function Get-TreeFingerprint([string]$Root) {
   $lines = @()
   Get-ChildItem -LiteralPath $Root -File -Recurse -Force | Where-Object { $_.Extension -ine '.log' } | Sort-Object FullName | ForEach-Object {
     $relative = $_.FullName.Substring($Root.Length).TrimStart('\', '/')
-    $lines += ($relative + ':' + (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash)
+    $lines += ($relative + ':' + (Get-Sha256 $_.FullName))
   }
   $bytes = [Text.Encoding]::UTF8.GetBytes(($lines -join "`n"))
   $sha = [Security.Cryptography.SHA256]::Create()
@@ -107,10 +114,20 @@ server.listen(port, '127.0.0.1');
       }
     }
     claude = [ordered]@{
+      safe = @('claude', '--permission-mode', 'plan', '--model', 'operator-claude-model', '--effort', 'max', '--operator-flag')
+      dangerous = @('claude', '--model', 'operator-claude-model', '--effort', 'max', '--dangerously-skip-permissions', '--operator-flag')
+      oneshot_safe = @('claude', '-p', '--output-format', 'stream-json', '--verbose', '--include-partial-messages', '--permission-mode', 'plan', '--model', 'operator-claude-model', '--effort', 'max', '--operator-flag')
+      oneshot_dangerous = @('claude', '-p', '--output-format', 'stream-json', '--verbose', '--include-partial-messages', '--model', 'operator-claude-model', '--effort', 'max', '--dangerously-skip-permissions', '--operator-flag')
       model_tiers_locked = $true
       model_tiers = [ordered]@{
         standard = [ordered]@{ args = @('--model', 'operator-custom-model'); model = 'operator-custom-model' }
       }
+    }
+    claude_fable = [ordered]@{
+      safe = @('claude', '--permission-mode', 'plan', '--model', 'operator-fable-model', '--effort', 'max')
+      dangerous = @('claude', '--model', 'operator-fable-model', '--effort', 'max', '--dangerously-skip-permissions')
+      oneshot_safe = @('claude', '-p', '--output-format', 'stream-json', '--verbose', '--include-partial-messages', '--permission-mode', 'plan', '--model', 'operator-fable-model', '--effort', 'max')
+      oneshot_dangerous = @('claude', '-p', '--output-format', 'stream-json', '--verbose', '--include-partial-messages', '--model', 'operator-fable-model', '--effort', 'max', '--dangerously-skip-permissions')
     }
     custom_provider = [ordered]@{
       label = 'Private Operator Provider'
@@ -183,6 +200,16 @@ server.listen(port, '127.0.0.1');
   Assert-True ($null -eq $merged.cursor.PSObject.Properties['model_tiers_locked']) 'the draft-added lock must not survive as a fake operator override'
   Assert-True ($merged.cursor.model_tiers_mode -eq 'account_default') 'the release must record why Cursor has no named-model tiers'
   Assert-True ($merged.claude.model_tiers.standard.model -eq 'operator-custom-model') 'a genuinely custom locked operator tier must still be preserved'
+  foreach ($providerName in @('claude', 'claude_fable')) {
+    foreach ($slotName in @('safe', 'dangerous', 'oneshot_safe', 'oneshot_dangerous')) {
+      $slotArgs = @($merged.$providerName.$slotName)
+      $effortIndex = [Array]::IndexOf($slotArgs, '--effort')
+      Assert-True ($effortIndex -ge 0 -and $slotArgs[$effortIndex + 1] -eq 'high') "$providerName.$slotName must migrate legacy maximum effort to the shipped safe baseline"
+    }
+  }
+  Assert-True ($merged.claude.safe[[Array]::IndexOf(@($merged.claude.safe), '--model') + 1] -eq 'operator-claude-model') 'managed-argument migration must preserve an operator model choice'
+  Assert-True (@($merged.claude.safe) -contains '--operator-flag') 'managed-argument migration must preserve unrelated operator flags'
+  Assert-True ($merged.claude_fable.safe[[Array]::IndexOf(@($merged.claude_fable.safe), '--model') + 1] -eq 'operator-fable-model') 'managed-argument migration must preserve the Fable model choice'
   Assert-True ($merged.cursor.tags[0] -eq 'custom-routing') 'operator routing tags must be preserved'
   Assert-True ($merged.cursor.probe_expect -eq 'Logged in as') 'missing release fields must be added to existing providers'
   Assert-True ($null -ne $merged.copilot) 'new release providers must be added'

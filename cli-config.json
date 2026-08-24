@@ -1,5 +1,38 @@
 {
   "_comment": "Per-CLI config. 'safe'/'dangerous' launch interactive sessions. 'oneshot_safe'/'oneshot_dangerous' power Collab Mode. Use {prompt} for a bounded inline prompt, {prompt_file} when the CLI supports a file, or no placeholder to pipe stdin. 'oneshot_env' applies validated string environment overrides only to one-shot children. 'probe' is a non-mutating readiness check. Edit freely.",
+  "_config_merge": {
+    "_note": "Installer-owned argument values that must follow shipped safety policy across upgrades. Only the named flag/value slices are refreshed; operator models, extra arguments, provider fields, and unknown providers remain preserved.",
+    "managed_provider_args": {
+      "claude": {
+        "slots": [
+          "safe",
+          "dangerous",
+          "oneshot_safe",
+          "oneshot_dangerous"
+        ],
+        "args": [
+          {
+            "flag": "--effort",
+            "value_count": 1
+          }
+        ]
+      },
+      "claude_fable": {
+        "slots": [
+          "safe",
+          "dangerous",
+          "oneshot_safe",
+          "oneshot_dangerous"
+        ],
+        "args": [
+          {
+            "flag": "--effort",
+            "value_count": 1
+          }
+        ]
+      }
+    }
+  },
   "_supervisor": {
     "_note": "Liveness policy for provider runs. Runs are judged by progress, not by the clock: while new content keeps arriving a run is left alone to finish, and it is stopped early with a reason when it goes silent or starts repeating. idleMs is generous because print-mode CLIs buffer their whole answer and emit nothing until the end. Any provider entry may override these with its own \"supervisor\" object.",
     "idleMs": 1200000,

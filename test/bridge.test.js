@@ -49,6 +49,16 @@ test('transactional installer does not mistake a stale native exit code for MCP 
 
 test('provider config uses the installed subscription CLIs and safe headless modes', () => {
   const config = readConfig();
+  assert.deepEqual(config._config_merge.managed_provider_args, {
+    claude: {
+      slots: ['safe', 'dangerous', 'oneshot_safe', 'oneshot_dangerous'],
+      args: [{ flag: '--effort', value_count: 1 }],
+    },
+    claude_fable: {
+      slots: ['safe', 'dangerous', 'oneshot_safe', 'oneshot_dangerous'],
+      args: [{ flag: '--effort', value_count: 1 }],
+    },
+  });
   assert.equal(config.claude.safe[config.claude.safe.indexOf('--permission-mode') + 1], 'plan');
   assert.equal(config.claude.oneshot_safe[config.claude.oneshot_safe.indexOf('--permission-mode') + 1], 'plan');
   assert.equal(config.claude.oneshot_safe[config.claude.oneshot_safe.indexOf('--output-format') + 1], 'stream-json');
