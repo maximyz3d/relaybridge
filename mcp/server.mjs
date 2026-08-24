@@ -2446,7 +2446,7 @@ export function buildServer() {
 
   server.registerTool('usage_gauges', {
     title: 'Fuel gauges for every seat',
-    description: 'Per-seat fuel: percent remaining, burn rate (tokens/hour), projected hours to empty, runs, tokens and shadow cost, plus fleet balance — whether usage is even and which seat to shift work away from. Subscription seats report basis:"configured" because plans publish no quota; those are estimates.',
+    description: 'Per quota-seat fuel with provider aliases: percent remaining, burn rate (tokens/hour), projected hours to empty, runs, tokens and shadow cost, plus fleet balance. Provider/model receipts remain separate. Subscription seats report basis:"configured" because plans publish no quota; those are estimates.',
     inputSchema: z.object({ windowMs: z.number().int().min(60000).max(2592000000).default(86400000) }),
     annotations: READ_ONLY,
   }, safeHandler(async ({ windowMs }) => result(await bridgeRequest(`/api/usage/gauges?windowMs=${windowMs}`))));

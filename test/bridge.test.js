@@ -57,6 +57,7 @@ test('provider config uses the installed subscription CLIs and safe headless mod
   assert.deepEqual(config.claude.probe, ['claude', 'auth', 'status']);
   assert.ok(config.claude.strip_env.includes('ANTHROPIC_API_KEY'));
   assert.equal(config.claude.safe[config.claude.safe.indexOf('--model') + 1], 'opus');
+  assert.equal(config.claude.quota_seat, 'subscription:anthropic:default');
   assert.equal(config.claude_fable.safe[config.claude_fable.safe.indexOf('--model') + 1], 'fable');
   assert.equal(config.claude_fable.safe[config.claude_fable.safe.indexOf('--effort') + 1], 'high');
   assert.equal(config.claude_fable.oneshot_safe[config.claude_fable.oneshot_safe.indexOf('--effort') + 1], 'high');
@@ -70,6 +71,7 @@ test('provider config uses the installed subscription CLIs and safe headless mod
   assert.ok(config.claude_fable.oneshot_safe.includes('--include-partial-messages'));
   assert.equal(config.claude_fable.oneshot_output_parser, 'claude_json');
   assert.equal(config.claude_fable.model, 'claude-fable-5');
+  assert.equal(config.claude_fable.quota_seat, config.claude.quota_seat);
   assert.deepEqual(config.claude_fable.probe, ['claude', 'auth', 'status']);
   assert.ok(config.claude_fable.strip_env.includes('ANTHROPIC_API_KEY'));
   assert.equal(config.codex.safe[config.codex.safe.indexOf('--sandbox') + 1], 'read-only');
@@ -403,6 +405,8 @@ test('prompt-file transport preserves long special-character prompts and cleans 
     },
     usage_json: {
       label: 'Structured Claude Usage',
+      transport: 'subscription:anthropic',
+      quota_seat: 'subscription:anthropic:default',
       safe: [process.execPath, helper, '--version'],
       dangerous: [process.execPath, helper, '--version'],
       oneshot_safe: [...baseSlot, '--claude-json', '--effort', 'high'],
@@ -411,6 +415,8 @@ test('prompt-file transport preserves long special-character prompts and cleans 
     },
     usage_json_multiturn: {
       label: 'Incremental Multi-Turn Claude Usage',
+      transport: 'subscription:anthropic',
+      quota_seat: 'subscription:anthropic:default',
       safe: [process.execPath, helper, '--version'],
       dangerous: [process.execPath, helper, '--version'],
       oneshot_safe: [...baseSlot, '--claude-json-multiturn'],
@@ -947,6 +953,30 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(multiTurnBudgetResult.provider_num_turns, 3);
   assert.equal(multiTurnBudgetResult.usage.total_tokens, 1995);
   assert.equal(multiTurnBudgetResult.provider_budget_enforcement, 'incremental');
+
+  const groupedUsage = await (await fetch(baseUrl + '/api/usage/gauges', { headers: auth })).json();
+  const usageGauge = groupedUsage.gauges.usage_json;
+  const multiTurnGauge = groupedUsage.gauges.usage_json_multiturn;
+  assert.equal(usageGauge.quotaSeat, 'subscription:anthropic:default');
+  assert.equal(multiTurnGauge.quotaSeat, usageGauge.quotaSeat);
+  assert.equal(multiTurnGauge.used.totalTokens, usageGauge.used.totalTokens);
+  assert.equal(multiTurnGauge.percentRemaining, usageGauge.percentRemaining);
+  assert.deepEqual(usageGauge.aliases, ['usage_json', 'usage_json_multiturn']);
+  assert.deepEqual(groupedUsage.quotaSeats['subscription:anthropic:default'].providers,
+    ['usage_json', 'usage_json_multiturn']);
+  assert.ok(![groupedUsage.balance.mostDrained, groupedUsage.balance.freshest]
+    .includes('usage_json_multiturn'), 'an alias must not be advertised as a separate quota tank');
+
+  const groupedPlan = await (await fetch(baseUrl + '/api/plan', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ task: 'review this architecture', kind: 'usage_json' }),
+  })).json();
+  assert.deepEqual(groupedPlan.fleetState.quotaSeats['subscription:anthropic:default'].providers,
+    ['usage_json', 'usage_json_multiturn']);
+  assert.notDeepEqual(
+    [groupedPlan.fleetState.balance.mostDrained, groupedPlan.fleetState.balance.freshest],
+    ['usage_json', 'usage_json_multiturn'],
+  );
 
   const maxEffortRejected = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST', headers: jsonAuth,
