@@ -94,6 +94,7 @@
     ],
     "company": "Anthropic",
     "transport": "subscription:anthropic",
+    "quota_seat": "subscription:anthropic:default",
     "color": "#cc785c",
     "safe": [
       "claude",
@@ -178,6 +179,7 @@
     ],
     "company": "Anthropic",
     "transport": "subscription:anthropic",
+    "quota_seat": "subscription:anthropic:default",
     "model": "claude-fable-5",
     "color": "#d99574",
     "safe": [

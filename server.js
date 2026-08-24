@@ -12,6 +12,7 @@ const { RunSupervisor, resolveSupervisorOptions, normalizeProviderBudget } = req
 const { resolveModelArgs, applyModelArgs, modelConfigStaleness, modelTierForTaskTier } = require('./lib/model-tiers');
 const { buildRegistry, parseModelList, pinIsRetired } = require('./lib/model-registry');
 const { buildTaskPlan, EFFORT_ORDER, costClassFor } = require('./lib/task-plan');
+const { buildQuotaSeatGroups } = require('./lib/quota-seat');
 const { receiptStoreIdentity } = require('./lib/receipt-store-identity.cjs');
 const { WebSocketServer } = require('ws');
 const { spawn, spawnSync } = require('child_process');
@@ -955,10 +956,19 @@ function sendOneShotResult(res, payload, meta) {
         }
       } catch { /* verification is advisory; never fail a run over it */ }
       try {
-        if (ok) cooldowns.noteSuccess(meta.kind);
+        const quotaSeat = quotaSeatForProvider(meta.kind);
+        if (ok) {
+          cooldowns.noteSuccess(quotaSeat);
+          if (quotaSeat !== meta.kind) cooldowns.noteSuccess(meta.kind);
+        }
         else if (failureKind) {
-          cooldowns.noteFailure(meta.kind, failureKind, {
+          // An explicitly model-scoped vendor observation must not cool every
+          // model on the account. Generic 429/overload evidence has no narrower
+          // scope, so it conservatively applies to the shared quota seat.
+          const cooldownSeat = payload.vendor_quota?.scope === 'model' ? meta.kind : quotaSeat;
+          cooldowns.noteFailure(cooldownSeat, failureKind, {
             retryAfterSec: parseRetryAfter(`${payload.stdout || ''}\n${payload.stderr || ''}`, payload.retry_after),
+            scope: payload.vendor_quota?.scope === 'model' ? 'model' : 'account',
           });
         }
       } catch { /* cooldown bookkeeping must never break a response */ }
@@ -2829,7 +2839,7 @@ app.post('/api/plan', async (req, res) => {
         diagnostics[k] = { found, ready: found, detail: 'path-only check' };
       }
     }
-    const fleetInput = applyCooldownsToDiagnostics(diagnostics, cooldowns.cooling(), kind ? [kind] : []);
+    const fleetInput = applyCooldownsToDiagnostics(diagnostics, coolingQuotaStates(), kind ? [kind] : []);
     diagnostics = fleetInput.diagnostics;
     let route = router.routeTask({ task, diagnostics });
     const gauges = usageLedger.gaugeAll(seatCostClasses());
@@ -2838,6 +2848,7 @@ app.post('/api/plan', async (req, res) => {
       cooldownSkipped: fleetInput.skipped,
       balance: fleetBalance(gauges),
       vendorQuota: vendorQuotaFleet(gauges),
+      quotaSeats: quotaSeatRegistry.groups,
     };
     const plan = buildTaskPlan({
       route,
@@ -2878,7 +2889,7 @@ app.post('/api/route', async (req, res) => {
       }
     }
     const explicitKinds = Array.isArray(preferKinds) ? preferKinds : [];
-    const fleetInput = applyCooldownsToDiagnostics(diagnostics, cooldowns.cooling(), explicitKinds);
+    const fleetInput = applyCooldownsToDiagnostics(diagnostics, coolingQuotaStates(), explicitKinds);
     diagnostics = fleetInput.diagnostics;
     let route = router.routeTask({
       task, diagnostics,
@@ -2891,6 +2902,7 @@ app.post('/api/route', async (req, res) => {
       cooldownSkipped: fleetInput.skipped,
       balance: fleetBalance(gauges),
       vendorQuota: vendorQuotaFleet(gauges),
+      quotaSeats: quotaSeatRegistry.groups,
     };
     const taskTier = route.classification?.tier;
     const selected = (route.selected || []).map((pick) => {
@@ -3909,10 +3921,44 @@ function loadUsageBudgets() {
   } catch { return {}; }
 }
 const usageBudgetsFile = loadUsageBudgets();
+const quotaSeatRegistry = buildQuotaSeatGroups(loadConfig());
+function quotaSeatForProvider(provider) {
+  return quotaSeatRegistry.providerToQuotaSeat[provider] || provider;
+}
+function coolingQuotaStates() {
+  return cooldowns.cooling().map((state) => {
+    const quotaSeat = quotaSeatForProvider(state.seat);
+    const accountScoped = state.scope !== 'model';
+    return {
+      ...state,
+      quotaSeat,
+      aliases: accountScoped
+        ? (quotaSeatRegistry.groups[quotaSeat]?.providers || [state.seat])
+        : [state.seat],
+    };
+  });
+}
+function filterCandidatesByQuotaCooldown(candidates = [], explicit = null) {
+  const byAlias = new Map();
+  for (const state of coolingQuotaStates()) {
+    for (const alias of state.aliases || []) byAlias.set(alias, state);
+  }
+  const usable = [];
+  const skipped = [];
+  for (const candidate of candidates) {
+    const seat = typeof candidate === 'string' ? candidate : candidate.seat;
+    const state = byAlias.get(seat);
+    const item = typeof candidate === 'string' ? { seat } : { ...candidate };
+    if (state && seat !== explicit) skipped.push({ ...item, cooldown: state });
+    else usable.push({ ...item, cooldown: state || null });
+  }
+  return { usable, skipped, allCooling: usable.length === 0 && skipped.length > 0 };
+}
 const usageLedger = createUsageLedger({
   dataDir: path.join(DATA_DIR, 'usage'),
   budgets: usageBudgetsFile.budgets || {},
   pricing: usageBudgetsFile.pricing || undefined,
+  quotaSeats: quotaSeatRegistry.providerToQuotaSeat,
   log: (m) => console.log(m),
 });
 
@@ -3924,6 +3970,8 @@ function seatCostClasses() {
     out[seat] = {
       costClass: costClassFor(entry, seat),
       model: entry.model || null,
+      quotaSeat: quotaSeatForProvider(seat),
+      aliases: quotaSeatRegistry.groups[quotaSeatForProvider(seat)]?.providers || [seat],
     };
   }
   return out;
@@ -3935,9 +3983,18 @@ function seatCostClassMap() {
 }
 
 function vendorQuotaFleet(gauges) {
-  return Object.fromEntries(Object.entries(gauges)
-    .filter(([, gauge]) => gauge?.vendorQuota)
-    .map(([seat, gauge]) => [seat, gauge.vendorQuota]));
+  const out = {};
+  for (const [seat, gauge] of Object.entries(gauges)) {
+    if (!gauge?.vendorQuota) continue;
+    const accountScoped = gauge.vendorQuota.scope === 'account';
+    const key = accountScoped ? (gauge.quotaSeat || seat) : seat;
+    if (!out[key]) out[key] = {
+      ...gauge.vendorQuota,
+      quotaSeat: gauge.quotaSeat || seat,
+      aliases: accountScoped ? gauge.aliases : [seat],
+    };
+  }
+  return out;
 }
 
 function recordRunUsage({ kind, route, usage, startedAt, ok, failureKind, taskId }) {
@@ -3959,11 +4016,11 @@ app.get('/api/usage/gauges', (req, res) => {
   try {
     const windowMs = Number(req.query.windowMs) || 86400000;
     const gauges = usageLedger.gaugeAll(seatCostClasses(), windowMs);
-    res.json({ gauges, balance: fleetBalance(gauges), totals: usageLedger.totals(windowMs) });
+    res.json({ gauges, balance: fleetBalance(gauges), quotaSeats: quotaSeatRegistry.groups, totals: usageLedger.totals(windowMs) });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 app.get('/api/cooldowns', (req, res) => {
-  res.json({ cooldowns: cooldowns.all(), cooling: cooldowns.cooling() });
+  res.json({ cooldowns: cooldowns.all(), cooling: coolingQuotaStates(), quotaSeats: quotaSeatRegistry.groups });
 });
 
 app.get('/api/usage/totals', (req, res) => {
@@ -3975,8 +4032,8 @@ app.post('/api/usage/advise', (req, res) => {
     const { tier = 'standard', candidates = [], highStakes = false, explicitProvider = false } = req.body || {};
     const gauges = usageLedger.gaugeAll(seatCostClasses());
     // Quota state first: a cooling seat cannot do the work at any rank.
-    const { usable, skipped, allCooling } = cooldowns.filterCandidates(
-      candidates, { explicit: explicitProvider ? (req.body?.explicitSeat || null) : null });
+    const { usable, skipped, allCooling } = filterCandidatesByQuotaCooldown(
+      candidates, explicitProvider ? (req.body?.explicitSeat || null) : null);
     const ranked = levelCandidates(usable, gauges);
     const top = ranked[0] ? gauges[ranked[0].seat] : null;
     res.json({

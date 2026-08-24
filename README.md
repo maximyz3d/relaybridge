@@ -125,6 +125,16 @@ Action tools include starting/restarting/stopping the local bridge, opening safe
 
 Provider definitions live in `cli-config.json`. Each provider can define interactive safe/dangerous commands, one-shot safe/dangerous commands, readiness probes, install text, prompt caps, models, and environment variables to strip before execution. A probe may combine `probe_expect` with a `probe_reject` string array; rejected output always wins, even when the CLI exits zero or the positive phrase is also present as part of a negative status.
 
+Provider keys identify routes and models; `quota_seat` identifies the signed-in
+account whose allowance they share. Claude and Claude Fable therefore retain
+separate receipts/model identities but aggregate fuel, burn rate, generic
+quota cooldowns, and fleet balancing under
+`subscription:anthropic:default`. Grouping is explicit rather than inferred
+from `transport`, because two installations may use the same vendor transport
+with different accounts. Status output lists every alias in each quota seat.
+Vendor evidence marked `scope: "model"` remains model/provider scoped; generic
+429 and overload evidence is conservatively shared across the account group.
+
 Agentic one-shot providers use bounded multi-turn budgets. Grok receives up to
 32 turns so a repository review can inspect evidence and still return a final
 answer; the bridge deadline, process-tree cancellation, read-only sandbox, and
