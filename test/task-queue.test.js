@@ -244,3 +244,63 @@ test('a handler that writes twice settles the task once', async () => {
   assert.equal(t.status, 'done');
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+// Regression: the bridge releases a one-shot admission slot on res 'finish' /
+// 'close'. A real Express response emits those; the shim did not, so every
+// background task leaked a slot. Four tasks wedged the bridge at "provider
+// concurrency limit reached" with zero runs active, and restarting did not
+// help because the same leak rebuilt the count.
+test('the capture response emits finish/close so the concurrency slot is released', async () => {
+  const dir = tmpdir();
+  let released = 0;
+  const q = createTaskQueue({
+    dataDir: dir,
+    executeOneShot: async (body, res) => {
+      // Exactly what acquireOneShot() does.
+      let done = false;
+      const release = () => { if (!done) { done = true; released += 1; } };
+      res.once('finish', release);
+      res.once('close', release);
+      res.json({ stdout: 'ok', exitCode: 0 });
+    },
+  });
+  const { id } = q.submit({ kind: 'claude', prompt: 'x' });
+  await settled(q, id);
+  await new Promise((r) => setTimeout(r, 30)); // finish is emitted on the next tick
+  assert.equal(released, 1, 'the admission slot must be released exactly once');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('a handler that throws still releases its slot', async () => {
+  const dir = tmpdir();
+  let released = 0;
+  const q = createTaskQueue({
+    dataDir: dir,
+    executeOneShot: async (body, res) => {
+      res.once('finish', () => { released += 1; });
+      throw new Error('provider blew up');
+    },
+  });
+  const { id } = q.submit({ kind: 'claude', prompt: 'x' });
+  const t = await settled(q, id);
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(t.status, 'failed');
+  assert.equal(released, 1, 'a crash must not leak the slot');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('a handler that returns without responding is failed, not left hanging', async () => {
+  const dir = tmpdir();
+  let released = 0;
+  const q = createTaskQueue({
+    dataDir: dir,
+    executeOneShot: async (body, res) => { res.once('close', () => { released += 1; }); /* no response */ },
+  });
+  const { id } = q.submit({ kind: 'claude', prompt: 'x' });
+  const t = await settled(q, id);
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(t.status, 'failed');
+  assert.match(t.error, /without a response/);
+  assert.equal(released, 1);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
