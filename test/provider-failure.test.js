@@ -8,9 +8,56 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
   classifyRunFailure, detectCopilotMonthlyQuota,
-  detectPerplexityNoAnswerSentinel,
+  detectCursorActionRequired, detectPerplexityNoAnswerSentinel,
   isHeadlessCommandPermissionDenial, isNarrationOnlyResponse, seatToleratesLongRuns,
 } = require('../lib/provider-failure');
+
+const CURSOR_NAMED_MODELS = 'ActionRequiredError: Named models unavailable Free plans can only use Auto. Switch to Auto or upgrade plans to continue.';
+const CURSOR_USAGE_LIMIT = "ActionRequiredError: You've hit your usage limit Get Cursor Pro for more Agent usage, unlimited Tab, and more.";
+
+test('Cursor exact named-model rejection is a plan restriction only when a model flag was sent', () => {
+  const attributed = classifyRunFailure({
+    provider: 'cursor', exitCode: 1, stderr: CURSOR_NAMED_MODELS, modelFlagSent: true,
+  });
+  assert.equal(attributed.kind, 'plan_restriction');
+  assert.equal(attributed.retryable, false);
+  assert.equal(attributed.actionRequired.kind, 'named_models_unavailable');
+  assert.equal(attributed.actionRequired.modelFlagSent, true);
+  assert.match(attributed.detail, /remove the model flag/i);
+
+  const unattributed = classifyRunFailure({
+    provider: 'cursor', exitCode: 1, stderr: CURSOR_NAMED_MODELS, modelFlagSent: false,
+  });
+  assert.equal(unattributed.kind, 'provider_error');
+  assert.equal(unattributed.actionRequired.modelFlagSent, false);
+  assert.doesNotMatch(unattributed.detail, /remove the model flag/i);
+  assert.match(unattributed.detail, /sent no model flag/i);
+});
+
+test('Cursor exact usage-limit ActionRequiredError is exhausted budget evidence', () => {
+  const run = { provider: 'cursor', exitCode: 1, stdout: '', stderr: CURSOR_USAGE_LIMIT };
+  assert.deepEqual(detectCursorActionRequired(run), {
+    provider: 'cursor', kind: 'usage_quota_exhausted', scope: 'seat',
+    source: 'cursor_cli_stderr', diagnostic: "You've hit your usage limit", modelFlagSent: false,
+  });
+  const classified = classifyRunFailure(run);
+  assert.equal(classified.kind, 'budget');
+  assert.equal(classified.retryable, false);
+  assert.equal(classified.failUp, true);
+});
+
+test('Cursor ActionRequired detection rejects other providers, successful quotes, and prose lookalikes', () => {
+  const fixtures = [
+    { provider: 'claude', exitCode: 1, stderr: CURSOR_USAGE_LIMIT },
+    { provider: 'cursor', exitCode: 0, stdout: CURSOR_USAGE_LIMIT },
+    { provider: 'cursor', exitCode: 1, stderr: `The docs say: ${CURSOR_USAGE_LIMIT}` },
+    { provider: 'cursor', exitCode: 1, stderr: CURSOR_USAGE_LIMIT.replace('Get Cursor Pro', 'Try Cursor Pro') },
+    { provider: 'cursor', exitCode: 1, stderr: `Quoted diagnostic: ${CURSOR_NAMED_MODELS}` },
+  ];
+  for (const fixture of fixtures) {
+    assert.equal(detectCursorActionRequired(fixture), null, JSON.stringify(fixture));
+  }
+});
 
 test('Perplexity exact first-line no-answer sentinel is a non-retryable partial drop', () => {
   const partialDiagnostic = 'https://example.com/one\nSupporting fragment without a complete answer.';

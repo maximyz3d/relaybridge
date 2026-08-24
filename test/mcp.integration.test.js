@@ -35,7 +35,7 @@ function containsPath(value, candidate) {
 test('MCP provider accounting rejects malformed usage and contradictory retry aggregates', async () => {
   const {
     normalizeProviderUsage, normalizeProviderRetries,
-    normalizeVendorQuota, normalizeQuotaEvidence,
+    normalizeVendorQuota, normalizeQuotaEvidence, normalizeProviderActionRequired,
   } = await import('../mcp/server.mjs');
   assert.equal(normalizeProviderUsage({
     input_tokens: 10, output_tokens: 5, cache_read_input_tokens: '999',
@@ -94,6 +94,14 @@ test('MCP provider accounting rejects malformed usage and contradictory retry ag
   assert.equal(normalizeQuotaEvidence({ ...quotaEvidence, provider: 'claude' }), null);
   assert.equal(normalizeQuotaEvidence({ ...quotaEvidence, diagnostic: 'monthly quota maybe exceeded' }), null);
   assert.equal(normalizeQuotaEvidence({ ...quotaEvidence, stderrChars: '160' }), null);
+  const cursorUsage = {
+    provider: 'cursor', kind: 'usage_quota_exhausted', scope: 'seat',
+    source: 'cursor_cli_stderr', diagnostic: "You've hit your usage limit", modelFlagSent: false,
+  };
+  assert.deepEqual(normalizeProviderActionRequired(cursorUsage), cursorUsage);
+  assert.equal(normalizeProviderActionRequired({ ...cursorUsage, provider: 'claude' }), null);
+  assert.equal(normalizeProviderActionRequired({ ...cursorUsage, diagnostic: 'usage limit maybe reached' }), null);
+  assert.equal(normalizeProviderActionRequired({ ...cursorUsage, modelFlagSent: 'false' }), null);
 });
 
 async function waitForHealth(baseUrl, proc) {
