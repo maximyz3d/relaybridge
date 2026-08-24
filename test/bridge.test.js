@@ -365,6 +365,14 @@ test('prompt-file transport preserves long special-character prompts and cleans 
       model: 'grok-4.6',
       costClass: 'subscription',
     },
+    copilot: {
+      label: 'Copilot Monthly Quota Fixture',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--stderr', "You have exceeded your monthly quota (Request ID: 393F:279076:21CF7B:277870:6A7E5965)\n\nChanges    +0 -0\nAI Credits 0 (3s)\nResume     copilot --resume=fixture", '--exit', '1'],
+      oneshot_dangerous: [...baseSlot, '--stderr', "You have exceeded your monthly quota (Request ID: 393F:279076:21CF7B:277870:6A7E5965)\n\nChanges    +0 -0\nAI Credits 0 (3s)\nResume     copilot --resume=fixture", '--exit', '1'],
+      costClass: 'subscription',
+    },
     usage_json: {
       label: 'Structured Claude Usage',
       safe: [process.execPath, helper, '--version'],
@@ -718,6 +726,54 @@ test('prompt-file transport preserves long special-character prompts and cleans 
     .trim().split(/\r?\n/).map(JSON.parse);
   assert.equal(quotaRows.length, 1);
   assert.equal(quotaRows[0].model, 'grok-4.6');
+
+  const copilotQuotaResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ kind: 'copilot', prompt: 'Return a bounded review.', dangerous: false }),
+  });
+  assert.equal(copilotQuotaResponse.status, 200);
+  const copilotQuotaResult = await copilotQuotaResponse.json();
+  assert.equal(copilotQuotaResult.failureClass, 'rate_limit');
+  assert.equal(copilotQuotaResult.rate_limited, true);
+  assert.equal(copilotQuotaResult.budget_exceeded, false);
+  assert.equal(copilotQuotaResult.dropped_out, true);
+  assert.equal(copilotQuotaResult.provider_retries.count, 0, 'monthly exhaustion is never retried on the same seat');
+  assert.match(copilotQuotaResult.stderr, /^You have exceeded your monthly quota/);
+  assert.equal(copilotQuotaResult.quota_evidence.provider, 'copilot');
+  assert.equal(copilotQuotaResult.quota_evidence.kind, 'monthly_quota_exhausted');
+  assert.equal(copilotQuotaResult.quota_evidence.diagnostic, 'You have exceeded your monthly quota');
+  assert.match(copilotQuotaResult.quota_evidence.stderrHash, /^[0-9a-f]{64}$/);
+  assert.doesNotMatch(JSON.stringify(copilotQuotaResult.quota_evidence), /393F|resume=fixture/i);
+
+  const cooldownResponse = await fetch(baseUrl + '/api/cooldowns', { headers: auth });
+  assert.equal(cooldownResponse.status, 200);
+  const cooldownResult = await cooldownResponse.json();
+  const copilotCooldown = cooldownResult.cooling.find((item) => item.seat === 'copilot');
+  assert.ok(copilotCooldown);
+  assert.equal(copilotCooldown.reason, 'rate_limited');
+
+  const copilotRouteResponse = await fetch(baseUrl + '/api/route', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({
+      task: 'Review a complex architecture',
+      diagnostics: {
+        copilot: { found: true, ready: true },
+        echo: { found: true, ready: true },
+      },
+    }),
+  });
+  assert.equal(copilotRouteResponse.status, 200);
+  const copilotRouteResult = await copilotRouteResponse.json();
+  assert.ok(copilotRouteResult.fleetState.cooldownSkipped.includes('copilot'));
+
+  const copilotQuotaReceipt = fs.readFileSync(
+    path.join(tempRoot, 'data', 'receipts', new Date().toISOString().slice(0, 10) + '.jsonl'), 'utf8',
+  ).trim().split(/\r?\n/).map(JSON.parse).find((row) => row.receiptId === copilotQuotaResult.receiptId);
+  assert.equal(copilotQuotaReceipt.failureClass, 'rate_limit');
+  assert.equal(copilotQuotaReceipt.providerRetryCount, 0);
+  assert.equal(copilotQuotaReceipt.quotaEvidence.kind, 'monthly_quota_exhausted');
+  assert.equal(copilotQuotaReceipt.quotaEvidence.diagnostic, 'You have exceeded your monthly quota');
+  assert.doesNotMatch(JSON.stringify(copilotQuotaReceipt.quotaEvidence), /393F|resume=fixture/i);
 
   const geminiAutoResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST',
