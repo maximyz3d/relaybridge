@@ -1,5 +1,5 @@
 {
-  "_comment": "Per-CLI config. 'safe'/'dangerous' launch interactive sessions. 'oneshot_safe'/'oneshot_dangerous' power Collab Mode. Use {prompt} for a bounded inline prompt, {prompt_file} when the CLI supports a file, or no placeholder to pipe stdin. 'oneshot_env' applies validated string environment overrides only to one-shot children. 'probe' is a non-mutating readiness check. Edit freely.",
+  "_comment": "Per-CLI config. 'safe'/'dangerous' launch interactive sessions. 'oneshot_safe'/'oneshot_dangerous' power Collab Mode. Every safe one-shot requires oneshot_safe_filesystem_policy: read_only_enforced, isolated_home, or unverified_provider_policy (fail closed). Use {prompt} for a bounded inline prompt, {prompt_file} when the CLI supports a file, or no placeholder to pipe stdin. 'oneshot_env' applies validated string environment overrides only to one-shot children. 'probe' is a non-mutating readiness check. Edit freely.",
   "_config_merge": {
     "_note": "Installer-owned argument values that must follow shipped safety policy across upgrades. Only the named flag/value slices are refreshed; operator models, extra arguments, provider fields, and unknown providers remain preserved.",
     "managed_provider_args": {
@@ -84,6 +84,7 @@
   },
   "claude": {
     "label": "Claude Code",
+    "oneshot_safe_filesystem_policy": "unverified_provider_policy",
     "login_command": [
       "claude",
       "/login"
@@ -197,6 +198,7 @@
   },
   "claude_fable": {
     "label": "Claude Fable 5",
+    "oneshot_safe_filesystem_policy": "unverified_provider_policy",
     "login_command": [
       "claude",
       "/login"
@@ -284,6 +286,7 @@
   },
   "codex": {
     "label": "Codex",
+    "oneshot_safe_filesystem_policy": "unverified_provider_policy",
     "effort_flags": {
       "minimal": [
         "--config",
@@ -387,6 +390,7 @@
   },
   "copilot": {
     "label": "GitHub Copilot CLI",
+    "oneshot_safe_filesystem_policy": "unverified_provider_policy",
     "login_command": [
       "copilot",
       "/login"
@@ -442,6 +446,7 @@
   },
   "cursor": {
     "label": "Cursor Agent",
+    "oneshot_safe_filesystem_policy": "unverified_provider_policy",
     "login_command": [
       "agent",
       "login"
@@ -527,6 +532,7 @@
   },
   "gemini": {
     "label": "Gemini (Antigravity)",
+    "oneshot_safe_filesystem_policy": "unverified_provider_policy",
     "oneshot_safe_prompt_policy": "antigravity_headless_builtin_read_only_tools",
     "oneshot_safe_prompt_prefix": "RelayBridge headless read-only review policy: do not invoke terminal or command tools. Use only Antigravity's built-in workspace file-reading and code-search tools. Do not write or edit files, run commands, access URLs, or request permissions. If the required evidence cannot be obtained without a command, stop and report the exact missing evidence and command that a human could run; do not attempt it.",
     "login_command": [
@@ -677,6 +683,7 @@
   },
   "grok": {
     "label": "Grok Build",
+    "oneshot_safe_filesystem_policy": "unverified_provider_policy",
     "login_command": [
       "grok",
       "/login"
@@ -766,6 +773,7 @@
   },
   "perplexity": {
     "label": "Perplexity",
+    "oneshot_safe_filesystem_policy": "unverified_provider_policy",
     "tags": [
       "search",
       "research"
@@ -822,6 +830,7 @@
   },
   "ollama_fast": {
     "label": "Local Qwen 2.5 1.5B (Fast)",
+    "oneshot_safe_filesystem_policy": "read_only_enforced",
     "models_probe": [
       "ollama",
       "list"
@@ -876,6 +885,7 @@
   },
   "ollama_llama": {
     "label": "Local Meta Llama 3.2 3B",
+    "oneshot_safe_filesystem_policy": "read_only_enforced",
     "models_probe": [
       "ollama",
       "list"
@@ -930,6 +940,7 @@
   },
   "ollama": {
     "label": "Local Qwen3 4B",
+    "oneshot_safe_filesystem_policy": "read_only_enforced",
     "models_probe": [
       "ollama",
       "list"
@@ -985,6 +996,7 @@
   },
   "ollama_coder": {
     "label": "Local Qwen Coder 7B",
+    "oneshot_safe_filesystem_policy": "read_only_enforced",
     "models_probe": [
       "ollama",
       "list"
@@ -1039,6 +1051,7 @@
   },
   "groq_llama_fast": {
     "label": "Groq Llama 3.1 8B",
+    "oneshot_safe_filesystem_policy": "read_only_enforced",
     "tags": [
       "hosted",
       "utility"

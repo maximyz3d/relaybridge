@@ -147,8 +147,43 @@ REST clients may use `GET`, `PUT`, and `DELETE /api/usage/operator-quota`.
 
 Agentic one-shot providers use bounded multi-turn budgets. Grok receives up to
 32 turns so a repository review can inspect evidence and still return a final
-answer; the bridge deadline, process-tree cancellation, read-only sandbox, and
-no-subagent rules remain the hard safety limits.
+answer; the bridge deadline, process-tree cancellation, and no-subagent rules
+remain safety limits. A provider CLI's nominal plan/read-only flag is not by
+itself proof that the CLI cannot persist state outside the workspace.
+
+Safe one-shots now fail closed on an explicit filesystem-effects contract. Each provider declares
+`oneshot_safe_filesystem_policy` as exactly one of:
+
+- `read_only_enforced`: the transport has a proven no-write boundary;
+- `isolated_home`: RelayBridge starts the CLI with a fresh disposable HOME,
+  USERPROFILE, AppData, and XDG tree, then deletes only that marker-owned temp
+  child after exit; no credentials or settings are copied into it. This
+  contains conventional provider-state paths but is not reported as an OS-wide
+  read-only sandbox;
+- `unverified_provider_policy`: the safe request is rejected before admission
+  with `safe_filesystem_unverified`, zero provider tokens, and migration
+  guidance.
+
+Responses and receipts report `filesystem_policy`, `read_only_enforced`, and
+the terminal isolated-home cleanup state. If ownership validation or deletion
+fails, RelayBridge preserves that exact temp directory for inspection and marks
+the run dropped as `isolation_cleanup`; it never broadens deletion to the real
+provider home. `dangerous:true` remains the only explicit human-authorized
+writer path, and no safe rejection is automatically retried as dangerous.
+Claude plan mode is currently `unverified_provider_policy`: it is known to
+create plan artifacts in its provider home, while authentication from an empty
+isolated home has not been proven without copying credentials. Other unproven
+subscription CLIs are likewise temporarily unavailable for safe one-shots.
+
+Filesystem eligibility is applied before routing, not only at execution.
+`/api/diag`, `/api/agents`, MCP provider summaries, route candidates, plans,
+and usage advice distinguish provider login readiness from safe-one-shot
+readiness. Normal safe routing excludes `unverified_provider_policy` seats and
+reports them in `filesystemSkipped`; explicitly requesting one keeps it visible
+as a blocked, pre-invocation plan instead of silently choosing it.
+Writer-capable route/plan previews require both `dangerous:true` and
+`acknowledgeFilesystemWrites:true`; neither field changes execution authority
+by itself.
 
 The global `_supervisor.providerBudget` sets provider-reported ceilings for
 output tokens, total tokens (including cache traffic), cache reads, cache
@@ -206,9 +241,9 @@ Provider buttons and terminal tabs describe configured launch seats; they are no
 
 GitHub Copilot CLI can also be installed with `winget install GitHub.Copilot`. It requires an active Copilot plan and may ask you to trust the current workspace before it reads or changes files. RelayBridge configures Copilot as a bounded one-shot provider using `copilot --prompt`, and it strips GitHub token environment variables from child processes.
 
-Cursor Agent uses the native Windows CLI (the official PowerShell installer places the `agent` launcher in `%LOCALAPPDATA%\cursor-agent`). RelayBridge prepends that directory for child processes, so a bridge that started before Cursor was installed can resolve it without inheriting a refreshed shell PATH. The interactive safe seat runs in plan mode and the bounded one-shot safe seat runs as read-only Q&A (`--mode ask` with `--trust`, since headless print mode otherwise has full write access and would prompt for workspace trust). No model is pinned, so your account default applies; run `agent models` to list options and pin one in `cli-config.json` if you want. `CURSOR_API_KEY` is stripped from child processes so calls use your Cursor subscription login rather than silently billing a metered API key.
+Cursor Agent uses the native Windows CLI (the official PowerShell installer places the `agent` launcher in `%LOCALAPPDATA%\cursor-agent`). RelayBridge prepends that directory for child processes, so a bridge that started before Cursor was installed can resolve it without inheriting a refreshed shell PATH. The configured bounded safe slot uses Q&A (`--mode ask` with `--trust`), but the provider's cross-filesystem no-write behavior is not verified, so it fails closed until that boundary or credential-free isolated-home authentication is proven. No model is pinned, so your account default applies; run `agent models` to list options and pin one in `cli-config.json` if you want. `CURSOR_API_KEY` is stripped from child processes so calls use your Cursor subscription login rather than silently billing a metered API key.
 
-Antigravity safe one-shots use `--mode plan` and a visible, config-driven
+The configured Antigravity safe slot uses `--mode plan` and a visible, config-driven
 command-free review prefix. Headless Antigravity cannot display an Ask-mode
 command permission card, and its current CLI has no per-invocation narrow
 command allow flag. Persistent `command(prefix)` grants accept trailing
@@ -219,6 +254,8 @@ is still selected, the response and receipt report
 `headless_command_permission_auto_denied`, mark the run dropped, and prohibit an
 identical retry. RelayBridge never switches that failure to
 `--dangerously-skip-permissions`; the dangerous slot remains explicit user intent.
+Because provider-home writes are also unverified, admission now fails before
+invocation unless a stronger filesystem policy is proven and configured.
 
 The default Perplexity route uses the community `pwm` wrapper and strips paid API fallback variables. It depends on the connected Perplexity web account and may change if that upstream wrapper changes.
 
@@ -253,7 +290,7 @@ The dashboard includes:
 
 New collaboration rooms preselect local seats when available. Hosted seats are opt-in so a fresh room does not accidentally spend subscription quota.
 
-Provider entries may declare a string-only `oneshot_env` map for child-process isolation and use a validated `{cwd}` placeholder to bind tools to the requested workspace. RelayBridge applies overrides only to that provider's one-shot process and reports only the overridden variable names in route metadata. Grok one-shots disable automatic Claude/Cursor MCP discovery and bypass inherited leader processes, preventing a repository review from recursively reconnecting to RelayBridge; interactive Grok sessions retain their normal MCP configuration. Gemini one-shots receive the validated workspace explicitly so safe headless reads do not depend on launch-directory inference.
+Provider entries may declare a string-only `oneshot_env` map for child-process environment overrides and use a validated `{cwd}` placeholder to bind tools to the requested workspace. This field alone is not filesystem isolation. RelayBridge applies overrides only to that provider's one-shot process and reports only the overridden variable names in route metadata. `isolated_home` adds the complete disposable provider-state tree described above. Grok one-shots disable automatic Claude/Cursor MCP discovery and bypass inherited leader processes, preventing a repository review from recursively reconnecting to RelayBridge; interactive Grok sessions retain their normal MCP configuration. Gemini one-shots receive the validated workspace explicitly so safe headless reads do not depend on launch-directory inference.
 
 ## REST API
 

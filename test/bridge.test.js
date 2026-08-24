@@ -61,6 +61,7 @@ test('provider config uses the installed subscription CLIs and safe headless mod
   });
   assert.equal(config.claude.safe[config.claude.safe.indexOf('--permission-mode') + 1], 'plan');
   assert.equal(config.claude.oneshot_safe[config.claude.oneshot_safe.indexOf('--permission-mode') + 1], 'plan');
+  assert.equal(config.claude.oneshot_safe_filesystem_policy, 'unverified_provider_policy');
   assert.equal(config.claude.oneshot_safe[config.claude.oneshot_safe.indexOf('--output-format') + 1], 'stream-json');
   assert.ok(config.claude.oneshot_safe.includes('--include-partial-messages'));
   assert.equal(config.claude.oneshot_output_parser, 'claude_json');
@@ -86,6 +87,7 @@ test('provider config uses the installed subscription CLIs and safe headless mod
   assert.ok(config.claude_fable.strip_env.includes('ANTHROPIC_API_KEY'));
   assert.equal(config.codex.safe[config.codex.safe.indexOf('--sandbox') + 1], 'read-only');
   assert.equal(config.codex.oneshot_safe[config.codex.oneshot_safe.indexOf('--sandbox') + 1], 'read-only');
+  assert.equal(config.codex.oneshot_safe_filesystem_policy, 'unverified_provider_policy');
   assert.ok(config.codex.oneshot_safe.includes('--ephemeral'));
   assert.deepEqual(config.codex.probe, ['codex', 'login', 'status']);
   assert.equal(config.copilot.npm_package, '@github/copilot');
@@ -158,6 +160,7 @@ test('provider config uses the installed subscription CLIs and safe headless mod
   assert.ok(config.perplexity.strip_env.includes('PPLX_API_KEY'));
   assert.ok(config.perplexity.strip_env.includes('PPLX_ALLOW_PAID_API_FALLBACK'));
   assert.deepEqual(config.ollama.oneshot_safe.slice(0, 2), ['ollama.exe', 'run']);
+  assert.equal(config.ollama.oneshot_safe_filesystem_policy, 'read_only_enforced');
   assert.deepEqual(config.ollama_coder.oneshot_safe.slice(0, 2), ['ollama.exe', 'run']);
   assert.equal(config.ollama.oneshot_adapter, 'ollama_api');
   assert.equal(config.ollama_coder.oneshot_adapter, 'ollama_api');
@@ -343,7 +346,9 @@ async function capabilityHeaders(baseUrl, contentType = false) {
 test('prompt-file transport preserves long special-character prompts and cleans up', async (t) => {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ps-bridge-test-'));
   const promptTemp = path.join(tempRoot, 'prompt-temp');
+  const realProviderHome = path.join(tempRoot, 'real-provider-home');
   fs.mkdirSync(promptTemp);
+  fs.mkdirSync(realProviderHome);
   const helper = path.join(ROOT, 'test', 'prompt-file-cli.js');
   const configPath = path.join(tempRoot, 'config.json');
   const tokenPath = path.join(tempRoot, 'capability.token');
@@ -351,6 +356,40 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   fs.writeFileSync(configPath, JSON.stringify({
     echo: {
       label: 'Echo',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: baseSlot,
+      oneshot_dangerous: baseSlot,
+      diagnostic_binary: process.execPath,
+      probe: [process.execPath, helper, '--version'],
+    },
+    isolated_echo: {
+      label: 'Isolated Echo',
+      oneshot_safe_filesystem_policy: 'isolated_home',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--write-home-artifact'],
+      oneshot_dangerous: [...baseSlot, '--write-home-artifact'],
+    },
+    isolated_race: {
+      label: 'Isolated Disconnect Race',
+      oneshot_safe_filesystem_policy: 'isolated_home',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--spawn-delayed-home-artifact', '--delay', '10000'],
+      oneshot_dangerous: [...baseSlot, '--spawn-delayed-home-artifact', '--delay', '10000'],
+    },
+    unverified_echo: {
+      label: 'Unverified Echo',
+      oneshot_safe_filesystem_policy: 'unverified_provider_policy',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--write-home-artifact'],
+      oneshot_dangerous: [...baseSlot, '--write-home-artifact'],
+    },
+    claude: {
+      label: 'Unverified Claude Routing Fixture',
+      oneshot_safe_filesystem_policy: 'unverified_provider_policy',
       safe: [process.execPath, helper, '--version'],
       dangerous: [process.execPath, helper, '--version'],
       oneshot_safe: baseSlot,
@@ -654,6 +693,9 @@ test('prompt-file transport preserves long special-character prompts and cleans 
       PS_BRIDGE_DATA_DIR: path.join(tempRoot, 'data'),
       TEMP: promptTemp,
       TMP: promptTemp,
+      HOME: realProviderHome,
+      USERPROFILE: realProviderHome,
+      RELAYBRIDGE_ALLOWED_ROOTS: tempRoot,
     },
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -702,6 +744,59 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   const usageAgents = await (await fetch(baseUrl + '/api/agents', { headers: auth })).json();
   assert.equal(usageAgents.agents.find((agent) => agent.id === 'narration_only')
     .usageCapability.budgetEnforcement, 'unenforceable');
+  assert.equal(usageDiagnostics.results.claude.ready, true, 'provider authentication/readiness remains distinct');
+  assert.equal(usageDiagnostics.results.claude.safeReady, false);
+  assert.equal(usageDiagnostics.results.claude.safeFilesystem.policy, 'unverified_provider_policy');
+  const claudeAgent = usageAgents.agents.find((agent) => agent.id === 'claude');
+  assert.equal(claudeAgent.readiness.ready, true);
+  assert.equal(claudeAgent.safeOneShot.ready, false);
+  assert.match(claudeAgent.safeOneShot.blockedReason, /filesystem policy is unverified/);
+
+  const safeFilesystemRoute = await (await fetch(baseUrl + '/api/route', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ task: 'review this code change', preferKinds: ['claude'] }),
+  })).json();
+  assert.equal(safeFilesystemRoute.selected.some((pick) => pick.kind === 'claude'), false);
+  const blockedClaudeCandidate = safeFilesystemRoute.candidates.find((pick) => pick.kind === 'claude');
+  assert.equal(blockedClaudeCandidate.readiness.ready, false);
+  assert.equal(blockedClaudeCandidate.readiness.safeFilesystem.policy, 'unverified_provider_policy');
+  assert.match(blockedClaudeCandidate.policyReasons.join(' '), /not ready/);
+  assert.ok(safeFilesystemRoute.fleetState.filesystemSkipped.some((item) => item.kind === 'claude'));
+
+  const explicitSafePlan = await (await fetch(baseUrl + '/api/plan', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ task: 'review this code change', kind: 'claude' }),
+  })).json();
+  assert.equal(explicitSafePlan.primary.kind, 'claude');
+  assert.equal(explicitSafePlan.primary.ready, false);
+  assert.equal(explicitSafePlan.primary.blocked, true);
+  assert.equal(explicitSafePlan.primary.filesystem.policy, 'unverified_provider_policy');
+  assert.match(explicitSafePlan.guidance.join(' '), /blocked before invocation/);
+
+  const unauthorizedWriterPlan = await fetch(baseUrl + '/api/plan', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ task: 'review and edit this code', kind: 'claude', dangerous: true }),
+  });
+  assert.equal(unauthorizedWriterPlan.status, 400);
+  assert.match((await unauthorizedWriterPlan.json()).error, /acknowledgeFilesystemWrites=true/);
+  const authorizedWriterPlan = await (await fetch(baseUrl + '/api/plan', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({
+      task: 'review and edit this code', kind: 'claude', dangerous: true,
+      acknowledgeFilesystemWrites: true,
+    }),
+  })).json();
+  assert.equal(authorizedWriterPlan.primary.ready, true);
+  assert.equal(authorizedWriterPlan.primary.filesystem.policy, 'writer_authorized');
+  assert.equal(authorizedWriterPlan.fleetState.filesystemAuthority.dangerous, true);
+
+  const safeFilesystemAdvise = await (await fetch(baseUrl + '/api/usage/advise', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ candidates: [{ seat: 'claude' }, { seat: 'grok' }] }),
+  })).json();
+  assert.equal(safeFilesystemAdvise.ranked.some((item) => item.seat === 'claude'), false);
+  assert.equal(safeFilesystemAdvise.filesystemSkipped[0].seat, 'claude');
+  assert.equal(safeFilesystemAdvise.filesystemSkipped[0].blocked, true);
 
   const datasheetTask = 'Read-only manufacturer-datasheet audit of BNO085 and KX134 exact pins, packages, required support circuits, interrupt/reset/boot topology, and power-domain isolation requirements; no file edits';
   const datasheetRouteResponse = await fetch(baseUrl + '/api/route', {
@@ -761,6 +856,70 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(result.route.effective_timeout_ms, 600001);
   assert.equal(result.route.timeout_clamped, false);
   assert.deepEqual(fs.readdirSync(promptTemp), []);
+
+  const isolatedResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ kind: 'isolated_echo', prompt: 'safe isolated state', dangerous: false }),
+  });
+  assert.equal(isolatedResponse.status, 200);
+  const isolated = await isolatedResponse.json();
+  assert.equal(isolated.route.filesystem_policy, 'isolated_home');
+  assert.equal(isolated.route.read_only_enforced, false);
+  assert.equal(isolated.route.isolated_home_cleanup, 'complete');
+  assert.equal(fs.existsSync(path.join(realProviderHome, 'provider-artifact.txt')), false);
+  assert.deepEqual(fs.readdirSync(promptTemp), []);
+
+  const abortController = new AbortController();
+  const racedRequest = fetch(baseUrl + '/api/oneshot', {
+    method: 'POST', headers: jsonAuth, signal: abortController.signal,
+    body: JSON.stringify({ kind: 'isolated_race', prompt: 'disconnect cleanup race', dangerous: false }),
+  }).catch(() => null);
+  const raceStartDeadline = Date.now() + 5000;
+  while (Date.now() < raceStartDeadline
+    && !fs.readdirSync(promptTemp).some((name) => name.startsWith('RelayBridge-provider-home-'))) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.ok(fs.readdirSync(promptTemp).some((name) => name.startsWith('RelayBridge-provider-home-')));
+  abortController.abort();
+  await racedRequest;
+  const raceCleanupDeadline = Date.now() + 5000;
+  while (Date.now() < raceCleanupDeadline && fs.readdirSync(promptTemp).length) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.deepEqual(fs.readdirSync(promptTemp), [], 'process tree exits before exact isolated-home cleanup');
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+  assert.deepEqual(fs.readdirSync(promptTemp), [], 'a killed descendant cannot recreate state after cleanup');
+  const raceReceipt = fs.readFileSync(
+    path.join(tempRoot, 'data', 'receipts', new Date().toISOString().slice(0, 10) + '.jsonl'), 'utf8',
+  ).trim().split(/\r?\n/).map(JSON.parse).find((row) => row.provider === 'isolated_race');
+  assert.equal(raceReceipt.route.isolated_home_cleanup, 'complete');
+
+  const unverifiedResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ kind: 'unverified_echo', prompt: 'must not invoke', dangerous: false }),
+  });
+  assert.equal(unverifiedResponse.status, 409);
+  const unverified = await unverifiedResponse.json();
+  assert.equal(unverified.failureClass, 'safe_filesystem_unverified');
+  assert.equal(unverified.model_invocation, false);
+  assert.equal(unverified.token_usage_source, 'not_invoked');
+  assert.equal(unverified.route.filesystem_policy, 'unverified_provider_policy');
+  assert.equal(fs.existsSync(path.join(realProviderHome, 'provider-artifact.txt')), false);
+  const unverifiedReceipt = fs.readFileSync(
+    path.join(tempRoot, 'data', 'receipts', new Date().toISOString().slice(0, 10) + '.jsonl'), 'utf8',
+  ).trim().split(/\r?\n/).map(JSON.parse).find((row) => row.receiptId === unverified.receiptId);
+  assert.equal(unverifiedReceipt.route.filesystem_policy, 'unverified_provider_policy');
+  assert.equal(unverifiedReceipt.modelInvocation, false);
+
+  const writerResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ kind: 'isolated_echo', prompt: 'human authorized writer', dangerous: true }),
+  });
+  assert.equal(writerResponse.status, 200);
+  const writer = await writerResponse.json();
+  assert.equal(writer.route.filesystem_policy, 'writer_authorized');
+  assert.equal(writer.route.isolated_home, false);
+  assert.equal(fs.readFileSync(path.join(realProviderHome, 'provider-artifact.txt'), 'utf8'), 'provider state');
 
   const narrationResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST',

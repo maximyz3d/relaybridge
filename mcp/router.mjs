@@ -179,13 +179,17 @@ function tierRank(tier) {
   return ['utility', 'standard', 'complex', 'critical'].indexOf(tier);
 }
 
-function readinessFor(kind, diagnostics) {
+function readinessFor(kind, diagnostics, dangerous = false) {
   const info = diagnostics && diagnostics[kind];
   if (!info) return { found: null, ready: null, detail: 'not probed in this route preview' };
+  const ready = dangerous
+    ? info.ready
+    : (info.executionReady ?? info.safeReady ?? info.ready);
   return {
     found: !!info.found,
-    ready: !!info.ready,
-    detail: String(info.detail || ''),
+    ready: ready == null ? null : !!ready,
+    detail: String((ready === false ? info.executionDetail : null) || info.detail || ''),
+    safeFilesystem: info.safeFilesystem || null,
   };
 }
 
@@ -207,6 +211,7 @@ export function routeTask({
   localOnly = false,
   maxProviders,
   committeeMode = 'advisory',
+  dangerous = false,
 } = {}) {
   const classification = classifyTask(task);
   const { policy, evidence, fingerprints } = loadRoutingData();
@@ -219,7 +224,7 @@ export function routeTask({
   const priority = policy.taskPriorities[primaryTag] || policy.taskPriorities.general;
 
   const candidates = Object.entries(evidence.providers).map(([kind, provider]) => {
-    const ready = readinessFor(kind, diagnostics);
+    const ready = readinessFor(kind, diagnostics, dangerous);
     const priorityIndex = priority.indexOf(kind);
     let policyScore = priorityIndex >= 0 ? 100 - priorityIndex * 8 : 10;
     const reasons = [];

@@ -185,9 +185,14 @@ function providerSummaries(diagnostics = {}) {
       transport: cli.transport || (kind === 'powershell' ? 'local:process' : 'cli'),
       configuredModel: cli.model || item.modelIdentity,
       usageCapability: diag.usageCapability || null,
+      safeOneShot: diag.safeFilesystem ? {
+        ...diag.safeFilesystem,
+        ready: diag.safeReady ?? null,
+      } : null,
       readiness: {
         found: diag.found ?? null,
         ready: diag.ready ?? null,
+        safeReady: diag.safeReady ?? null,
         detail: diag.detail || '',
         path: Array.isArray(diag.paths) ? diag.paths[0] || null : null,
         runtimeVersion: diag.runtimeVersion || null,
@@ -1511,10 +1516,15 @@ export function buildServer() {
       localOnly: z.boolean().default(false),
       maxProviders: z.number().int().min(1).max(4).optional(),
       committeeMode: z.enum(['advisory', 'consensus']).default('advisory'),
+      dangerous: z.boolean().default(false).describe('preview the explicit writer route instead of normal safe routing'),
+      acknowledgeFilesystemWrites: z.boolean().default(false).describe('required with dangerous=true; confirms persistent writes are authorized'),
     }),
     annotations: AUDITED_READ,
   }, safeHandler(async (args, context) => {
     const diagnostics = await getDiagnostics(context?.mcpReq?.signal);
+    if (args.dangerous !== args.acknowledgeFilesystemWrites) {
+      return result({ ok: false, blocked: true, error: 'dangerous=true requires acknowledgeFilesystemWrites=true, and acknowledgement is invalid for safe planning' }, { isError: true });
+    }
     const route = routeTask({ ...args, diagnostics });
     const receipt = appendReceipt({
       event: 'route_preview',
@@ -1536,12 +1546,14 @@ export function buildServer() {
       task: z.string().min(1).describe('what needs doing, in a sentence or two'),
       effort: z.enum(['minimal', 'low', 'medium', 'high', 'max']).optional().describe('override the effort the tier would pick'),
       kind: z.string().optional().describe('force a specific provider and plan around it'),
+      dangerous: z.boolean().default(false).describe('plan an explicit writer-capable provider invocation'),
+      acknowledgeFilesystemWrites: z.boolean().default(false).describe('required with dangerous=true; confirms persistent writes are authorized'),
     }),
     annotations: READ_ONLY,
-  }, safeHandler(async ({ task, effort, kind }) => {
+  }, safeHandler(async ({ task, effort, kind, dangerous, acknowledgeFilesystemWrites }) => {
     const plan = await bridgeRequest('/api/plan', {
       method: 'POST',
-      body: { task, effort: effort ?? null, kind: kind ?? null },
+      body: { task, effort: effort ?? null, kind: kind ?? null, dangerous, acknowledgeFilesystemWrites },
       timeoutMs: 20000,
     });
     return result(plan);
