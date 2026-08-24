@@ -133,12 +133,15 @@ if (-not $SkipCodex) {
   $configText = [IO.File]::ReadAllText($codexConfig, [Text.UTF8Encoding]::new($false))
   $header = "[mcp_servers.$Name]"
   $toolNames = @(
-    'bridge_status', 'list_providers', 'route_preview', 'list_sessions',
+    'bridge_status', 'list_providers', 'route_preview', 'plan_task',
+    'list_models', 'list_active_runs', 'bridge_activity', 'list_sessions',
     'read_session_output', 'list_collabs', 'read_collab', 'list_projects',
     'list_runs', 'get_run', 'list_receipts', 'get_receipt', 'get_context_bundle', 'start_bridge', 'restart_bridge',
     'stop_bridge', 'start_safe_session', 'send_session_input', 'stop_session',
     'ask_provider', 'route_and_ask', 'run_committee',
-    'list_agents', 'set_agent_tags', 'broadcast'
+    'list_agents', 'set_agent_tags', 'broadcast',
+    'submit_task', 'get_task', 'list_tasks', 'cancel_task',
+    'provider_cooldowns', 'usage_gauges', 'usage_totals', 'usage_advise'
   )
   $toolList = ($toolNames | ForEach-Object { '"' + $_ + '"' }) -join ', '
   $settings = @(
