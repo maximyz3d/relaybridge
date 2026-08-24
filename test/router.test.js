@@ -67,6 +67,47 @@ test('fresh research uses a source-capable route and local-only stays local', ()
   assert.ok(local.selected.every((candidate) => candidate.privacyBoundary.startsWith('local')));
 });
 
+test('manufacturer-datasheet evidence audits require retrieval-capable providers', () => {
+  const task = 'Read-only manufacturer-datasheet audit of BNO085 and KX134 exact pins, packages, required support circuits, interrupt/reset/boot topology, and power-domain isolation requirements for an automotive ESP32-S31 plus RP2350 sensor board; no file edits';
+  const route = router.routeTask({ task, diagnostics: readyDiagnostics() });
+
+  assert.equal(route.classification.tier, 'standard');
+  assert.equal(route.classification.signals.authoritativeDocumentResearch, true);
+  assert.ok(route.classification.tags.includes('research'));
+  assert.equal(route.primaryTag, 'research');
+  assert.equal(route.selected[0].kind, 'perplexity');
+  assert.ok(route.selected.every((candidate) => candidate.capabilities.includes('research')));
+  assert.ok(route.candidates.find((candidate) => candidate.kind === 'ollama').policyReasons.some((reason) => /missing required capability: research/.test(reason)));
+});
+
+test('authoritative document evidence variants route to research without matching bare datasheet mentions', () => {
+  const positives = [
+    'Audit the official datasheet and cite evidence for the exact land pattern.',
+    'Find the manufacturer documentation for this regulator and cite the source-backed electrical limits.',
+    'Verify the exact pinout and package drawing against the vendor datasheet.',
+    'Retrieve the current application note and provide citations for its support circuit.',
+    'Audit the manufacturer\ndatasheet against the exact thermal characteristics.',
+    'Find the vendor errata and cite evidence for the corrected pin behavior.',
+  ];
+  for (const task of positives) {
+    const classification = router.classifyTask(task);
+    assert.ok(classification.tags.includes('research'), task);
+    assert.equal(classification.signals.authoritativeDocumentResearch, true, task);
+  }
+
+  const negatives = [
+    'Summarize this datasheet section in one paragraph.',
+    'The README says to consult the manufacturer datasheet.',
+    'Fix the spelling of datasheet in this comment.',
+    'Verify that the phrase manufacturer datasheet appears in README.md.',
+  ];
+  for (const task of negatives) {
+    const classification = router.classifyTask(task);
+    assert.ok(!classification.tags.includes('research'), task);
+    assert.equal(classification.signals.authoritativeDocumentResearch, false, task);
+  }
+});
+
 test('high-stakes tags are explicit and require the advisory human gate', () => {
   const route = router.routeTask({
     task: 'Read this API key and make an investment decision for a patient prescription.',

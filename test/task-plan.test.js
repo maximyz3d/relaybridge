@@ -11,6 +11,13 @@ const config = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'cli-config
 
 const route = (tier, kinds) => ({ classification: { tier }, selected: kinds.map((kind) => ({ kind })) });
 
+test('plan preserves classifier tags for CLI and MCP consumers', () => {
+  const classifiedRoute = route('standard', ['perplexity']);
+  classifiedRoute.classification.tags = ['research', 'hardware'];
+  const plan = buildTaskPlan({ route: classifiedRoute, config, resolveModelArgs });
+  assert.deepEqual(plan.taskTags, ['research', 'hardware']);
+});
+
 test('effort scales with tier and never exceeds the ladder', () => {
   assert.equal(effortForTier('utility'), 'low');
   assert.equal(effortForTier('standard'), 'medium');

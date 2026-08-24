@@ -49,6 +49,33 @@ export function classifyTask(task) {
   const looksLikeResearch = hasAny(text, [
     /\b(latest|current|research|browse|search the web|sources?|citations?|evidence|compare products?|github projects?)\b/,
   ]);
+  // A bare mention of a datasheet is not a research contract: the caller may
+  // already have the document, or may only be editing prose that names it.
+  // Fail up to retrieval only when an authoritative/current document is paired
+  // with an explicit evidence request, retrieval verb, or exact technical
+  // audit. This catches pin/package/land-pattern work without spending a web
+  // seat on ordinary questions such as "summarize this datasheet section".
+  const authoritativeDocument = hasAny(text, [
+    /\b(?:current|latest|official|manufacturer(?:'s)?|vendor)\b[\s\S]{0,48}\b(?:data[ -]?sheet|documentation|technical (?:reference|manual)|reference manual|application note|reference design|errata|specification)\b/,
+    /\b(?:data[ -]?sheet|documentation|technical (?:reference|manual)|reference manual|application note|reference design|errata|specification)\b[\s\S]{0,48}\b(?:current|latest|official|manufacturer(?:'s)?|vendor)\b/,
+    /\bprimary[- ]source\s+(?:document(?:ation)?|evidence|specification)\b/,
+  ]);
+  const sourceEvidenceContract = hasAny(text, [
+    /\b(?:source[- ]backed|primary[- ]source|citations?|cite|evidence)\b/,
+  ]);
+  const documentRetrievalIntent = hasAny(text, [
+    /\b(?:browse|search|find|locate|retrieve|look up|download)\b[\s\S]{0,64}\b(?:data[ -]?sheet|documentation|manual|application note|reference design|errata|specification)\b/,
+    /\b(?:data[ -]?sheet|documentation|manual|application note|reference design|errata|specification)\b[\s\S]{0,64}\b(?:browse|search|find|locate|retrieve|look up|download)\b/,
+  ]);
+  const exactTechnicalAudit = hasAny(text, [
+    /\b(?:audit|verify|validate|confirm|cross[- ]check)\b/,
+  ]) && hasAny(text, [
+    /\bexact\s+(?:pins?|pinout|packages?|land patterns?|footprints?|support circuits?|electrical characteristics?|ratings?|limits?|topology)\b/,
+    /\b(?:pinout|land pattern|footprint|support circuits?|electrical characteristics?|thermal characteristics?|absolute maximum|package drawing|power[- ]domain isolation)\b/,
+  ]);
+  const looksLikeAuthoritativeDocumentResearch = authoritativeDocument && (
+    sourceEvidenceContract || documentRetrievalIntent || exactTechnicalAudit
+  );
   const looksLikeReasoning = hasAny(text, [
     /\b(prove|proof|theorem|conjecture|formal reasoning|logic puzzle|mathematical reasoning|p\s*(?:=|equals?|vs\.?|versus)\s*np)\b/,
   ]);
@@ -80,7 +107,7 @@ export function classifyTask(task) {
 
   if (looksLikeCode) tags.add('coding');
   if (looksLikeReview) tags.add(looksLikeCode ? 'code_review' : 'reasoning');
-  if (looksLikeResearch) tags.add('research');
+  if (looksLikeResearch || looksLikeAuthoritativeDocumentResearch) tags.add('research');
   if (looksLikeReasoning) tags.add('reasoning');
   if (looksLikeVision) tags.add('vision');
   if (looksLikeHardware) tags.add('hardware');
@@ -109,7 +136,7 @@ export function classifyTask(task) {
   ) {
     tier = 'complex';
     reasons.push('long, multi-part, or architectural task');
-  } else if (looksLikeCode || looksLikeResearch || looksLikeReasoning || looksLikeHardware || raw.length > 1000 || conjunctions >= 2) {
+  } else if (looksLikeCode || looksLikeResearch || looksLikeAuthoritativeDocumentResearch || looksLikeReasoning || looksLikeHardware || raw.length > 1000 || conjunctions >= 2) {
     tier = 'standard';
     reasons.push('specialized or multi-step task');
   } else {
@@ -117,7 +144,7 @@ export function classifyTask(task) {
   }
 
   if (looksLikeQuickLookup || looksLikeDeterministic) reasons.push('eligible for a cheap or deterministic first route');
-  if (looksLikeResearch) reasons.push('requires a source-capable route and freshness controls');
+  if (looksLikeResearch || looksLikeAuthoritativeDocumentResearch) reasons.push('requires a source-capable route and freshness controls');
 
   const domainTags = [...tags].filter((tag) => !['destructive', 'medical', 'legal', 'financial', 'secrets', 'safety_critical'].includes(tag));
   const confidence = domainTags.includes('general') ? 'low'
@@ -136,6 +163,7 @@ export function classifyTask(task) {
       requirements,
       destructive,
       highStakes,
+      authoritativeDocumentResearch: looksLikeAuthoritativeDocumentResearch,
     },
     routingConfidence: {
       level: confidence,
