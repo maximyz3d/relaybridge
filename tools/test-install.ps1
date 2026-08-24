@@ -96,9 +96,20 @@ server.listen(port, '127.0.0.1');
       tags = @('custom-routing')
       autoRoute = $false
       model = 'operator-pinned-model'
+      # Reproduce the briefly-installed PR #40 draft: the old shipped pins and
+      # the release-added lock coexisted, so a later upgrade mistook the lock
+      # for an operator override.
+      model_tiers_locked = $true
       model_tiers = [ordered]@{
-        light = [ordered]@{ args = @('--model', 'gpt-retired-light'); model = 'gpt-retired-light' }
-        standard = [ordered]@{ args = @('--model', 'gpt-retired-standard'); model = 'gpt-retired-standard' }
+        light = [ordered]@{ args = @('--model', 'gpt-5.6-luna-low'); model = 'gpt-5.6-luna-low' }
+        standard = [ordered]@{ args = @('--model', 'gpt-5.6-terra-medium'); model = 'gpt-5.6-terra-medium' }
+        heavy = [ordered]@{ args = @('--model', 'gpt-5.6-sol-high'); model = 'gpt-5.6-sol-high' }
+      }
+    }
+    claude = [ordered]@{
+      model_tiers_locked = $true
+      model_tiers = [ordered]@{
+        standard = [ordered]@{ args = @('--model', 'operator-custom-model'); model = 'operator-custom-model' }
       }
     }
     custom_provider = [ordered]@{
@@ -157,7 +168,9 @@ server.listen(port, '127.0.0.1');
   Assert-True (([BitConverter]::ToString($mergedBytes)) -match 'E2-80-94') 'merged JSON must contain the exact UTF-8 em-dash byte sequence'
   Assert-True ($merged.cursor.model -eq 'operator-pinned-model') 'operator model pin must win over release defaults'
   Assert-True ($null -eq $merged.cursor.PSObject.Properties['model_tiers']) 'an upgrade to Cursor Auto-only must remove inherited stale named-model tiers'
-  Assert-True ($merged.cursor.model_tiers_locked -eq $true) 'the shipped Auto-only lock must prevent future pin restoration'
+  Assert-True ($null -eq $merged.cursor.PSObject.Properties['model_tiers_locked']) 'the draft-added lock must not survive as a fake operator override'
+  Assert-True ($merged.cursor.model_tiers_mode -eq 'account_default') 'the release must record why Cursor has no named-model tiers'
+  Assert-True ($merged.claude.model_tiers.standard.model -eq 'operator-custom-model') 'a genuinely custom locked operator tier must still be preserved'
   Assert-True ($merged.cursor.tags[0] -eq 'custom-routing') 'operator routing tags must be preserved'
   Assert-True ($merged.cursor.probe_expect -eq 'Logged in as') 'missing release fields must be added to existing providers'
   Assert-True ($null -ne $merged.copilot) 'new release providers must be added'

@@ -302,18 +302,41 @@ function Restore-ShippedModelPins($Merged, $Defaults, $Existing) {
       $existingLock = $existingEntry.Value.PSObject.Properties['model_tiers_locked']
       if ($existingLock -and $existingLock.Value) { $operatorEntryLock = $true }
     }
-    if ($operatorEntryLock) {
+
+    $existingTiers = if ($existingEntry -and $existingEntry.Value -is [pscustomobject]) {
+      $existingEntry.Value.PSObject.Properties['model_tiers']
+    } else { $null }
+    $retiredPins = $shipped.PSObject.Properties['retired_model_pins']
+    $onlyKnownRetiredPins = $false
+    if ($existingTiers -and $existingTiers.Value -is [pscustomobject] -and $retiredPins) {
+      $existingModels = @($existingTiers.Value.PSObject.Properties | ForEach-Object {
+        $modelProp = $_.Value.PSObject.Properties['model']
+        if ($modelProp -and $modelProp.Value) { [string]$modelProp.Value }
+      })
+      if ($existingModels.Count -gt 0) {
+        $knownRetired = @($retiredPins.Value | ForEach-Object { ([string]$_).ToLowerInvariant() })
+        $onlyKnownRetiredPins = -not @($existingModels | Where-Object { $knownRetired -notcontains $_.ToLowerInvariant() }).Count
+      }
+    }
+    $mode = $shipped.PSObject.Properties['model_tiers_mode']
+    $requiresAccountDefault = $mode -and ([string]$mode.Value -ieq 'account_default')
+
+    if ($operatorEntryLock -and -not ($requiresAccountDefault -and $onlyKnownRetiredPins)) {
       Write-Host ("[RelayBridge] {0}: model_tiers_locked is set; keeping operator pins." -f $name)
       continue
     }
 
     $shippedTiers = $shipped.PSObject.Properties['model_tiers']
     if (-not $shippedTiers) {
-      $shippedLock = $shipped.PSObject.Properties['model_tiers_locked']
       $mergedTiers = $mergedEntry.Value.PSObject.Properties['model_tiers']
-      if ($shippedLock -and $shippedLock.Value -and $mergedTiers) {
+      if ($requiresAccountDefault -and $mergedTiers) {
         $mergedEntry.Value.PSObject.Properties.Remove('model_tiers')
         Write-Host ("[RelayBridge] {0}: removed installed model pins because the shipped seat now requires its account default." -f $name)
+      }
+      if ($requiresAccountDefault -and $onlyKnownRetiredPins) {
+        # PR #40's draft briefly shipped model_tiers_locked beside the stale
+        # defaults. It was release metadata, not an operator decision.
+        $mergedEntry.Value.PSObject.Properties.Remove('model_tiers_locked')
       }
       continue
     }
