@@ -872,6 +872,45 @@ export function normalizeProviderPermissionDenials(value, modelInvocation) {
   return { retained, count, observed, invalid, truncated: value.truncated, byTool };
 }
 
+export function normalizeVendorQuota(value) {
+  if (!value || typeof value !== 'object') return null;
+  const actual = strictTokenCount(value.actual);
+  const limit = strictTokenCount(value.limit);
+  const remaining = strictTokenCount(value.remaining);
+  const percentRemaining = strictTokenCount(value.percentRemaining);
+  const model = strictBoundedString(value.model, 120);
+  const observedAt = strictBoundedString(value.observedAt, 40);
+  const expiresAt = strictBoundedString(value.reset?.expiresAt, 40);
+  const windowMs = strictTokenCount(value.window?.durationMs);
+  if (value.provider !== 'grok' || value.unit !== 'tokens'
+    || value.source !== 'grok_429_subscription_free_usage_exhausted'
+    || !/^grok-[a-z0-9._-]+$/i.test(model || '')
+    || actual === null || limit === null || limit < 1 || remaining === null
+    || percentRemaining === null || percentRemaining > 100
+    || remaining !== Math.max(0, limit - actual)
+    || value.overLimit !== (actual > limit)
+    || value.window?.kind !== 'rolling' || windowMs === null || windowMs < 3600000 || windowMs > 604800000
+    || value.reset?.kind !== 'conservative_expiry'
+    || !Number.isFinite(Date.parse(observedAt)) || !Number.isFinite(Date.parse(expiresAt))
+    || Date.parse(expiresAt) - Date.parse(observedAt) !== windowMs
+    || !/^[0-9a-f]{64}$/.test(String(value.evidenceHash || ''))) return null;
+  return {
+    provider: 'grok', model, unit: 'tokens', actual, limit, remaining, percentRemaining,
+    overLimit: value.overLimit,
+    source: value.source,
+    observedAt,
+    window: {
+      kind: 'rolling', durationMs: windowMs,
+      label: strictBoundedString(value.window?.label, 120),
+    },
+    reset: {
+      kind: 'conservative_expiry', expiresAt,
+      note: strictBoundedString(value.reset?.note, 240),
+    },
+    evidenceHash: value.evidenceHash,
+  };
+}
+
 function sanitizeProviderResponse(response) {
   const stdout = clip(response.stdout || '', 24000);
   const stderr = clip(response.stderr || '', 4000);
@@ -921,6 +960,7 @@ function sanitizeProviderResponse(response) {
     transportOutputHash: typeof response.transport_output_hash === 'string'
       && /^[0-9a-f]{64}$/.test(response.transport_output_hash) ? response.transport_output_hash : null,
     providerRetries: normalizeProviderRetries(response.provider_retries, modelInvocation),
+    vendorQuota: normalizeVendorQuota(response.vendor_quota),
     stdout: stdout.text,
     stderr: stderr.text,
     stdoutChars: stdout.originalChars,
@@ -1155,6 +1195,7 @@ async function callProvider({
     actualThinkingTokens: sanitized.usage?.thinking_tokens ?? null,
     provider_reported_cost_usd: sanitized.usage?.cost_usd ?? null,
     modelUsage: sanitized.usage?.model_usage ?? [],
+    vendorQuota: sanitized.vendorQuota ?? null,
     providerRetryCount: sanitized.providerRetries?.count ?? null,
     providerRetryDelayMs: sanitized.providerRetries?.total_delay_ms ?? null,
     providerRetryMaxAttempt: sanitized.providerRetries?.max_attempt ?? null,

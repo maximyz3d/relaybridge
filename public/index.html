@@ -391,9 +391,10 @@
     <div id="fuel-totals" style="margin-bottom:10px;"></div>
     <div id="fuel-gauges">Loading…</div>
     <div class="muted" style="margin-top:10px; font-size:11px;">
-      Subscription plans publish no token quota, so those gauges measure against a <b>configured</b> budget in
-      <code>config/usage-budgets.json</code> — an estimate you set, not a vendor number. Shadow cost is what the same
-      tokens would have cost at list API rates: an order of magnitude, not an invoice.
+      Subscription gauges normally measure against a <b>configured</b> budget in <code>config/usage-budgets.json</code> —
+      an estimate you set, not a vendor number. A recognized vendor quota from a 429 is labelled <b>vendor observed</b>
+      and temporarily takes precedence with its expiry shown. Shadow cost is what the same tokens would have cost at
+      list API rates: an order of magnitude, not an invoice.
     </div>
   </div>
 </dialog>
@@ -2638,8 +2639,8 @@ async function refreshFuel(){
     $('#fuel-gauges').innerHTML = '<table style="width:100%;font-size:12px;">' +
       '<tr class="muted"><th align="left">seat</th><th align="left">fuel</th><th align="left">burn</th><th align="left">runs</th><th align="left">tokens</th><th align="left">cost</th><th align="left">models</th></tr>' +
       rows.map(g => `<tr>
-        <td><b>${esc(g.seat)}</b>${coolBySeat[g.seat]?` <span style="color:#f87171" title="rate limited — ${esc(coolBySeat[g.seat].reason||'')}, ${coolBySeat[g.seat].remainingSec}s left">🚫 ${Math.ceil(coolBySeat[g.seat].remainingSec/60)}m</span>`:''}<br><span class="muted" style="font-size:10px;">${esc(g.costClass)}${g.basis==='configured'?' · est':''}</span></td>
-        <td>${fuelBar(g.percentRemaining, g.basis)}${(g.hoursToEmpty!==null&&g.hoursToEmpty!==undefined)?`<br><span class="muted" style="font-size:10px;">~${g.hoursToEmpty}h to empty</span>`:''}</td>
+        <td><b>${esc(g.seat)}</b>${coolBySeat[g.seat]?` <span style="color:#f87171" title="rate limited — ${esc(coolBySeat[g.seat].reason||'')}, ${coolBySeat[g.seat].remainingSec}s left">🚫 ${Math.ceil(coolBySeat[g.seat].remainingSec/60)}m</span>`:''}<br><span class="muted" style="font-size:10px;">${esc(g.costClass)}${g.basis==='configured'?' · est':g.basis==='vendor_observed'?' · vendor observed':''}</span></td>
+        <td>${fuelBar(g.percentRemaining, g.basis)}${(g.hoursToEmpty!==null&&g.hoursToEmpty!==undefined)?`<br><span class="muted" style="font-size:10px;">~${g.hoursToEmpty}h to empty</span>`:''}${g.vendorQuota?`<br><span style="color:#f87171;font-size:10px;" title="${esc(g.vendorQuota.reset?.note||'')}">${tok(g.vendorQuota.actual)}/${tok(g.vendorQuota.limit)} ${esc(g.vendorQuota.unit)} · ${esc(g.vendorQuota.model)}<br>expires ${esc(new Date(g.vendorQuota.reset.expiresAt).toLocaleString())}</span>`:''}</td>
         <td>${tok(g.burn.tokensPerHour)}/h<br><span class="muted" style="font-size:10px;">${g.burn.runsPerHour}/h runs</span></td>
         <td>${g.used.runs}${g.used.failed?` <span style="color:#f87171">(${g.used.failed}✗)</span>`:''}</td>
         <td>${tok(g.used.totalTokens)}</td><td>${usd(g.used.costUsd)}</td>

@@ -218,6 +218,9 @@ test('server, MCP adapter, Perplexity wrapper, and inline browser script parse',
   assert.match(html, /\/vendor\/xterm\/lib\/xterm\.js/);
   assert.match(html, /summary\.textContent/);
   assert.match(html, /failureClass === 'incomplete_response'/);
+  assert.match(html, /vendor observed/);
+  assert.match(html, /g\.vendorQuota\.actual/);
+  assert.match(html, /g\.vendorQuota\.reset\.expiresAt/);
   const match = html.match(/<script>\s*(const API =[\s\S]*?)<\/script>/);
   assert.ok(match, 'inline application script was not found');
   assert.doesNotThrow(() => new Function(match[1]));
@@ -352,6 +355,15 @@ test('prompt-file transport preserves long special-character prompts and cleans 
       dangerous: [process.execPath, helper, '--version'],
       oneshot_safe: [...baseSlot, '--output', 'I will inspect the repository and trace the pipeline.\nNext I will review the tests and report any defects.'],
       oneshot_dangerous: [...baseSlot, '--output', 'I will inspect the repository and trace the pipeline.\nNext I will review the tests and report any defects.'],
+    },
+    grok: {
+      label: 'Grok Quota Fixture',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--stderr', "API error (status 429 Too Many Requests): subscription:free-usage-exhausted: You've used all the included free usage for model grok-4.6 for now. Usage resets over a rolling 24-hour window — tokens (actual/limit): 552,305/500,000. Upgrade to a Grok subscription. model_id=grok-4.6", '--exit', '1'],
+      oneshot_dangerous: [...baseSlot, '--stderr', "API error (status 429 Too Many Requests): subscription:free-usage-exhausted: You've used all the included free usage for model grok-4.6 for now. Usage resets over a rolling 24-hour window — tokens (actual/limit): 552,305/500,000. Upgrade to a Grok subscription. model_id=grok-4.6", '--exit', '1'],
+      model: 'grok-4.6',
+      costClass: 'subscription',
     },
     usage_json: {
       label: 'Structured Claude Usage',
@@ -656,6 +668,56 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(narrationReceipt.status, 'dropped');
   assert.equal(narrationReceipt.failureClass, 'incomplete_response');
   assert.equal(narrationReceipt.outputChars, narrationResult.stdout.length, 'receipt retains evidence of the original output');
+
+  const grokQuotaResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST',
+    headers: jsonAuth,
+    body: JSON.stringify({ kind: 'grok', prompt: 'Return a bounded quota fixture.', dangerous: false }),
+  });
+  assert.equal(grokQuotaResponse.status, 200);
+  const grokQuotaResult = await grokQuotaResponse.json();
+  assert.equal(grokQuotaResult.failureClass, 'rate_limit');
+  assert.equal(grokQuotaResult.rate_limited, true);
+  assert.equal(grokQuotaResult.dropped_out, true);
+  assert.equal(grokQuotaResult.provider_retries.count, 0, 'RelayBridge does not retry the exhausted seat');
+  assert.equal(grokQuotaResult.vendor_quota.provider, 'grok');
+  assert.equal(grokQuotaResult.vendor_quota.model, 'grok-4.6');
+  assert.equal(grokQuotaResult.vendor_quota.actual, 552305);
+  assert.equal(grokQuotaResult.vendor_quota.limit, 500000);
+  assert.equal(grokQuotaResult.vendor_quota.reset.kind, 'conservative_expiry');
+
+  const gaugeResponse = await fetch(baseUrl + '/api/usage/gauges', { headers: auth });
+  assert.equal(gaugeResponse.status, 200);
+  const gaugeResult = await gaugeResponse.json();
+  assert.equal(gaugeResult.gauges.grok.basis, 'vendor_observed');
+  assert.equal(gaugeResult.gauges.grok.percentRemaining, 0);
+  assert.equal(gaugeResult.gauges.grok.vendorQuota.evidenceHash, grokQuotaResult.vendor_quota.evidenceHash);
+
+  const routeResponse = await fetch(baseUrl + '/api/route', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({
+      task: 'Review a complex architecture',
+      diagnostics: {
+        grok: { found: true, ready: true },
+        echo: { found: true, ready: true },
+      },
+    }),
+  });
+  assert.equal(routeResponse.status, 200);
+  const routeResult = await routeResponse.json();
+  assert.ok(routeResult.fleetState.cooldownSkipped.includes('grok'));
+  assert.equal(routeResult.fleetState.vendorQuota.grok.actual, 552305);
+
+  const grokQuotaReceipt = fs.readFileSync(
+    path.join(tempRoot, 'data', 'receipts', new Date().toISOString().slice(0, 10) + '.jsonl'), 'utf8',
+  ).trim().split(/\r?\n/).map(JSON.parse).find((row) => row.receiptId === grokQuotaResult.receiptId);
+  assert.equal(grokQuotaReceipt.vendorQuota.actual, 552305);
+  assert.equal(grokQuotaReceipt.vendorQuota.source, 'grok_429_subscription_free_usage_exhausted');
+  assert.equal(grokQuotaReceipt.providerRetryCount, 0);
+  const quotaRows = fs.readFileSync(path.join(tempRoot, 'data', 'usage', 'vendor-quota.jsonl'), 'utf8')
+    .trim().split(/\r?\n/).map(JSON.parse);
+  assert.equal(quotaRows.length, 1);
+  assert.equal(quotaRows[0].model, 'grok-4.6');
 
   const geminiAutoResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST',

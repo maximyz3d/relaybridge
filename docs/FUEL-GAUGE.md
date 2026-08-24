@@ -9,14 +9,24 @@ Answers four questions the bridge could not previously answer:
 
 ## Honesty about what is known
 
-Subscription plans **do not publish a token quota**. So for those seats the
-gauge measures against a budget *you configure* in
+Subscription plans generally **do not publish a token quota**. So for those seats the
+gauge normally measures against a budget *you configure* in
 `config/usage-budgets.json`, and reports `basis: "configured"` — the UI marks
 those with `· est`. Getting a budget wrong changes advice, not correctness.
+
+When a recognized vendor 429 does disclose bounded quota, RelayBridge records
+that evidence separately and reports `basis: "vendor_observed"` ahead of the
+configured estimate. The current Grok parser requires the xAI
+`subscription:free-usage-exhausted` code, HTTP 429, model, rolling-window reset
+phrase, and labelled token `(actual/limit)` tuple. Arbitrary stderr numbers are
+not trusted. Because a rolling window does not reveal which tokens age out
+when, the observation expires conservatively one full stated window after it
+was seen; the API and UI expose that policy and timestamp explicitly.
 
 | basis | meaning |
 |---|---|
 | `configured` | measured against your estimate, not a vendor number |
+| `vendor_observed` | actual/limit directly observed in a recognized vendor 429; temporarily overrides the configured estimate |
 | `metered` | measured against a real spend cap |
 | `unmetered` | local/free seat — nothing to exhaust, always reads full |
 
@@ -31,6 +41,10 @@ Every run exits through `sendOneShotResult`, so one hook catches CLI, local
 Ollama, and hosted adapters alike. Rows are append-only JSONL in
 `data/usage/usage-YYYY-MM-DD.jsonl` — a crash cannot corrupt history, and a
 malformed line is skipped rather than breaking the gauge.
+
+Vendor observations are append-only in `data/usage/vendor-quota.jsonl`. They
+store provider/model scope, actual and limit, source, observation time, stated
+window, conservative expiry semantics, and an evidence hash — never raw stderr.
 
 Per run: seat, model, cost class, input/output tokens, elapsed ms, ok/failed,
 failure kind, task id, and computed `costUsd`.
@@ -62,7 +76,8 @@ points, it names which seat to shift away from.
 Normal `/api/plan` and `/api/route` calls apply the durable cooldown state
 before candidate selection and then apply fuel levelling to the capable
 providers that remain. An explicitly preferred provider is never filtered.
-The response includes `fleetState` and per-provider `loadLevelling` evidence
+The response includes `fleetState` (including active `vendorQuota` evidence)
+and per-provider `loadLevelling` evidence
 so the changed order is visible rather than implicit.
 
 ## Endpoints
@@ -80,7 +95,8 @@ available through the connector's safe profile. Knowing how much fuel is left
 is exactly what a remote surface needs to decide whether to delegate at all.
 
 Dashboard: **⛽ Fuel** — per-seat bars, burn rate, time-to-empty, per-model
-breakdown, plan value vs metered spend, and a fleet-balance banner.
+breakdown, plan value vs metered spend, and a fleet-balance banner. Active
+vendor observations show actual/limit, model, and conservative expiry.
 
 ## Tuning budgets
 
