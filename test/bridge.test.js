@@ -1080,6 +1080,9 @@ test('prompt-file transport preserves long special-character prompts and cleans 
     method: 'POST', headers: jsonAuth,
     body: JSON.stringify({
       task: 'Review a complex architecture',
+      dangerous: true,
+      acknowledgeFilesystemWrites: true,
+      preferKinds: ['grok'],
       diagnostics: {
         grok: { found: true, ready: true },
         echo: { found: true, ready: true },
@@ -1088,8 +1091,33 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   });
   assert.equal(routeResponse.status, 200);
   const routeResult = await routeResponse.json();
-  assert.ok(routeResult.fleetState.cooldownSkipped.includes('grok'));
+  assert.ok(!routeResult.fleetState.cooldownSkipped.includes('grok'),
+    'explicit preference may bypass the heuristic cooldown');
+  assert.ok(!routeResult.selected.some((item) => item.kind === 'grok'),
+    'authoritative unexpired vendor exhaustion cannot be bypassed by preference');
+  const grokQuotaSkip = routeResult.fleetState.vendorQuotaSkipped.find((item) => item.kind === 'grok');
+  assert.equal(grokQuotaSkip.reason, 'vendor_quota_exhausted');
+  assert.equal(grokQuotaSkip.authoritative, true);
+  assert.equal(grokQuotaSkip.retry.action, 'use_alternate_quota_seat_until_reset');
+  assert.equal(grokQuotaSkip.retry.allowedAfter, grokQuotaResult.vendor_quota.reset.expiresAt);
+  assert.equal(routeResult.candidates.find((item) => item.kind === 'grok').readiness.ready, false);
   assert.equal(routeResult.fleetState.vendorQuota.grok.actual, 552305);
+
+  const grokPlanResponse = await fetch(baseUrl + '/api/plan', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({
+      task: 'Review a complex architecture', kind: 'grok',
+      dangerous: true, acknowledgeFilesystemWrites: true,
+    }),
+  });
+  assert.equal(grokPlanResponse.status, 200);
+  const grokPlan = await grokPlanResponse.json();
+  assert.equal(grokPlan.primary.kind, 'grok');
+  assert.equal(grokPlan.primary.blocked, true);
+  assert.equal(grokPlan.primary.ready, false);
+  assert.equal(grokPlan.primary.reason, 'vendor_quota_exhausted');
+  assert.equal(grokPlan.primary.vendorQuotaBlock.retry.allowedAfter, grokQuotaResult.vendor_quota.reset.expiresAt);
+  assert.ok(grokPlan.guidance.some((line) => /do not retry before/i.test(line)));
 
   const grokQuotaReceipt = fs.readFileSync(
     path.join(tempRoot, 'data', 'receipts', new Date().toISOString().slice(0, 10) + '.jsonl'), 'utf8',

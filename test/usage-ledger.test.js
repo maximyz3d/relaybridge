@@ -13,7 +13,8 @@ const path = require('path');
 const { createUsageLedger, costOf, priceFor } = require('../lib/usage-ledger');
 const {
   levelCandidates, suggestTierAdjustment, fleetBalance, stressOf,
-  applyCooldownsToDiagnostics, levelRouteSelection,
+  applyCooldownsToDiagnostics, applyVendorQuotaExhaustionToDiagnostics,
+  levelRouteSelection,
 } = require('../lib/load-leveller');
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'rbusage-'));
@@ -175,6 +176,17 @@ test('malformed vendor quota observations fail closed without altering fuel', ()
   }), null);
   assert.equal(l.gauge('grok', { costClass: 'subscription' }).basis, 'configured');
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('configured and operator estimates never become authoritative hard route exclusions', () => {
+  const diagnostics = { claude: { found: true, ready: true } };
+  for (const basis of ['configured', 'operator_observed', 'metered']) {
+    const gated = applyVendorQuotaExhaustionToDiagnostics(diagnostics, {
+      claude: { seat: 'claude', basis, remaining: 0, percentRemaining: 0, vendorQuota: null },
+    });
+    assert.deepEqual(gated.skipped, [], basis);
+    assert.equal(gated.diagnostics.claude.ready, true, basis);
+  }
 });
 
 test('an expiring operator observation overrides a configured estimate and persists without free-form data', () => {
