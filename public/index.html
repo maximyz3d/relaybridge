@@ -698,6 +698,8 @@ function safeTeamSnapshot({ live, diagnostics, sessions, collabs, projects, acti
       kind,
       label: info.label || state.config[kind]?.label || kind,
       ready: !!info.ready,
+      safeReady: info.safeReady ?? null,
+      safeFilesystem: info.safeFilesystem || null,
       detail: info.detail || '',
       runtimeVersion: info.runtimeVersion || '',
       usageCapability: info.usageCapability || null,
@@ -726,12 +728,12 @@ function safeTeamSnapshot({ live, diagnostics, sessions, collabs, projects, acti
 }
 
 function renderTeamStatus(snapshot) {
-  const ready = snapshot.providers.filter((provider) => provider.ready).length;
+  const ready = snapshot.providers.filter((provider) => provider.ready && provider.safeReady !== false).length;
   const providerRows = snapshot.providers.map((provider) => `
     <div class="team-provider">
       <div><strong>${escapeHtml(provider.label)}</strong><div style="color:var(--muted);font-size:11px">${escapeHtml(provider.configuredModel || provider.kind)}</div></div>
-      <div class="${provider.ready ? 'ok' : 'warn'}">${provider.ready ? '✓ ready' : '⚠ setup needed'}</div>
-      <div style="color:var(--muted);font-size:11px">${escapeHtml(provider.runtimeVersion || provider.detail || 'not reported')}${provider.usageCapability?.budgetEnforcement==='unenforceable'?'<br><span class="warn">⚠ token/turn budgets unenforceable</span>':''}</div>
+      <div class="${provider.ready && provider.safeReady !== false ? 'ok' : 'warn'}">${provider.ready && provider.safeReady !== false ? '✓ safe ready' : provider.ready ? '⚠ safe blocked' : '⚠ setup needed'}</div>
+      <div style="color:var(--muted);font-size:11px">${escapeHtml(provider.safeReady === false ? (provider.safeFilesystem?.blockedReason || 'safe filesystem policy unverified') : (provider.runtimeVersion || provider.detail || 'not reported'))}${provider.usageCapability?.budgetEnforcement==='unenforceable'?'<br><span class="warn">⚠ token/turn budgets unenforceable</span>':''}</div>
     </div>`).join('');
   const runRows = snapshot.recentRuns.slice(0, 8).map((run) => `
     <div style="display:flex;gap:8px;align-items:center;padding:6px 0;border-bottom:1px solid var(--border)">
@@ -1278,13 +1280,17 @@ async function loadAgents() {
 
 function agentReadinessBadge(agent) {
   const readiness = agent.readiness;
+  const safeOneShot = agent.safeOneShot;
   const badge = document.createElement('span');
   badge.style.fontSize = '11px';
   if (!readiness) { badge.style.color = 'var(--muted)'; badge.textContent = 'not checked'; }
+  else if (readiness.ready && safeOneShot?.ready === false) { badge.style.color = '#ddb000'; badge.textContent = '⚠ safe blocked'; }
   else if (readiness.ready) { badge.style.color = '#2ea043'; badge.textContent = '✓ ready'; }
   else if (readiness.found) { badge.style.color = '#ddb000'; badge.textContent = '⚠ setup'; }
   else { badge.style.color = '#d9534f'; badge.textContent = '✗ missing'; }
-  if (readiness?.detail) badge.title = readiness.detail;
+  badge.title = safeOneShot?.ready === false
+    ? (safeOneShot.blockedReason || 'safe one-shot filesystem policy is unverified')
+    : (readiness?.detail || '');
   return badge;
 }
 
@@ -1300,10 +1306,19 @@ function renderBroadcastProviders() {
     checkbox.type = 'checkbox';
     checkbox.value = agent.id;
     checkbox.checked = agent.autoRoute !== false;
+    checkbox.disabled = agent.safeOneShot?.ready === false;
+    if (checkbox.disabled) checkbox.checked = false;
     const name = document.createElement('span');
     name.textContent = agent.label;
     name.style.cssText = 'overflow:hidden; text-overflow:ellipsis; white-space:nowrap;';
     row.append(checkbox, name);
+    if (agent.safeOneShot?.ready === false) {
+      const blocked = document.createElement('span');
+      blocked.style.cssText = 'margin-left:auto; color:#ddb000; font-size:10px; flex:none;';
+      blocked.title = agent.safeOneShot.blockedReason || 'safe provider filesystem policy is unverified';
+      blocked.textContent = 'safe blocked';
+      row.appendChild(blocked);
+    }
     if (agent.autoRoute === false) {
       const warn = document.createElement('span');
       warn.style.cssText = 'margin-left:auto; color:#ddb000; font-size:10px; flex:none;';
@@ -1401,7 +1416,7 @@ async function openAgents() {
     body.innerHTML = '';
     const note = document.createElement('div');
     note.style.cssText = 'color:var(--muted); font-size:11px; margin-bottom:8px;';
-    note.textContent = 'Tags group providers for 📡 Broadcast and MCP targeting. Comma-separated, lowercase (e.g. coding, audit, search, local). Readiness comes from the last install check.';
+    note.textContent = 'Tags group providers for 📡 Broadcast and MCP targeting. Readiness reports both provider login and safe one-shot filesystem eligibility; "safe blocked" seats are not normally routed.';
     body.appendChild(note);
     for (const agent of agentsCache) {
       const row = document.createElement('div');

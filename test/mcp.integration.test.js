@@ -413,6 +413,9 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   });
   assert.equal(providers.isError, undefined, JSON.stringify(providers.structuredContent));
   assert.ok(providers.structuredContent.providers.some((provider) => provider.kind === 'codex' && provider.readiness.ready));
+  assert.ok(providers.structuredContent.providers.some((provider) => provider.kind === 'codex'
+    && provider.safeOneShot?.ready === true
+    && provider.safeOneShot?.policy === 'read_only_enforced'));
   assert.ok(Array.isArray(providers.structuredContent.candidateIntegrations));
 
   const preview = await client.callTool({
@@ -422,6 +425,8 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   assert.equal(preview.isError, undefined);
   assert.equal(preview.structuredContent.classification.tier, 'utility');
   assert.match(preview.structuredContent.note, /not a universal model-quality score/);
+  assert.ok(preview.structuredContent.candidates.every((candidate) =>
+    candidate.readiness.safeFilesystem == null || typeof candidate.readiness.safeFilesystem.eligible === 'boolean'));
 
   const datasheetPreview = await client.callTool({
     name: 'route_preview',

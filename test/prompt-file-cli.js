@@ -15,6 +15,18 @@ if (fileIndex < 0 || !process.argv[fileIndex + 1]) {
 }
 
 const prompt = fs.readFileSync(process.argv[fileIndex + 1], 'utf8');
+if (process.argv.includes('--write-home-artifact')) {
+  fs.writeFileSync(require('path').join(process.env.HOME || process.env.USERPROFILE, 'provider-artifact.txt'), 'provider state', 'utf8');
+}
+if (process.argv.includes('--spawn-delayed-home-artifact')) {
+  const artifact = require('path').join(process.env.HOME || process.env.USERPROFILE, 'late-provider-artifact.txt');
+  const child = require('child_process').spawn(process.execPath, [
+    '-e',
+    "setTimeout(() => require('fs').writeFileSync(process.argv[1], 'late state'), 750)",
+    artifact,
+  ], { windowsHide: true, stdio: 'ignore' });
+  child.unref();
+}
 const markerIndex = process.argv.indexOf('--invocation-marker');
 if (markerIndex >= 0 && process.argv[markerIndex + 1]) {
   fs.appendFileSync(process.argv[markerIndex + 1], `${prompt}\n`, 'utf8');

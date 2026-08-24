@@ -15,6 +15,10 @@ const { buildTaskPlan, EFFORT_ORDER, costClassFor } = require('./lib/task-plan')
 const { buildQuotaSeatGroups } = require('./lib/quota-seat');
 const { providerUsageCapability, providerUsageCapabilities } = require('./lib/provider-usage-capability');
 const { receiptStoreIdentity } = require('./lib/receipt-store-identity.cjs');
+const {
+  resolveFilesystemPolicy, providerFilesystemEligibility,
+  createIsolatedProviderHome, cleanupIsolatedProviderHome,
+} = require('./lib/provider-filesystem-policy');
 const { WebSocketServer } = require('ws');
 const { spawn, spawnSync } = require('child_process');
 const TIMEOUT_POLICY = require('./timeout-policy.cjs');
@@ -887,6 +891,7 @@ function sendOneShotPreAdmissionRejection(res, {
     return res.status(statusCode).json({
       ...payload,
       ...accounting,
+      route: route || payload?.route || null,
       failureClass,
       receiptId: receipt.receiptId,
       receiptPersisted: true,
@@ -898,6 +903,7 @@ function sendOneShotPreAdmissionRejection(res, {
     return res.status(statusCode).json({
       ...payload,
       ...accounting,
+      route: route || payload?.route || null,
       failureClass,
       receiptId,
       receiptPersisted: false,
@@ -2670,8 +2676,55 @@ function isAiProviderEntry(kind, entry) {
     (Array.isArray(entry.oneshot_dangerous) && entry.oneshot_dangerous.length));
 }
 
+function planningFilesystemAuthority(body = {}) {
+  const dangerous = body?.dangerous === true;
+  const acknowledged = body?.acknowledgeFilesystemWrites === true;
+  if (dangerous && !acknowledged) {
+    throw new Error('dangerous=true planning requires acknowledgeFilesystemWrites=true');
+  }
+  if (!dangerous && acknowledged) {
+    throw new Error('acknowledgeFilesystemWrites is valid only with dangerous=true');
+  }
+  return { dangerous, acknowledged };
+}
+
+function runtimeFilesystemPolicyEntry(entry = {}) {
+  return process.env.NODE_ENV === 'test' && entry.oneshot_safe_filesystem_policy == null
+    ? { ...entry, oneshot_safe_filesystem_policy: 'read_only_enforced' }
+    : entry;
+}
+
+function applyFilesystemEligibilityToDiagnostics(diagnostics = {}, cfg = {}, { dangerous = false } = {}) {
+  const out = {};
+  const skipped = [];
+  const kinds = new Set([...Object.keys(diagnostics || {}), ...Object.keys(cfg || {}).filter((kind) => !kind.startsWith('_'))]);
+  for (const kind of kinds) {
+    const prior = diagnostics?.[kind] && typeof diagnostics[kind] === 'object' ? diagnostics[kind] : {};
+    if (!isAiProviderEntry(kind, cfg[kind])) {
+      out[kind] = { ...prior };
+      continue;
+    }
+    const eligibility = providerFilesystemEligibility(runtimeFilesystemPolicyEntry(cfg[kind] || {}), { dangerous });
+    const transportReady = prior.ready ?? null;
+    const executionReady = transportReady === false ? false : eligibility.eligible;
+    out[kind] = {
+      ...prior,
+      safeFilesystem: eligibility,
+      executionReady,
+      safeReady: dangerous ? null : executionReady,
+      executionDetail: executionReady ? (prior.detail || '')
+        : (eligibility.blockedReason || prior.detail || 'provider is not executable'),
+    };
+    if (!executionReady && eligibility.blockedReason) {
+      skipped.push({ kind, reason: eligibility.blockedReason, policy: eligibility.policy });
+    }
+  }
+  return { diagnostics: out, skipped, dangerous };
+}
+
 function agentSummary(kind, entry) {
   const diag = lastDiagnostics?.results?.[kind] || null;
+  const safeFilesystem = diag?.safeFilesystem || providerFilesystemEligibility(runtimeFilesystemPolicyEntry(entry));
   return {
     id: kind,
     label: entry.label || kind,
@@ -2679,9 +2732,14 @@ function agentSummary(kind, entry) {
     tags: Array.isArray(entry.tags) ? entry.tags.filter((tag) => PROVIDER_TAG_RE.test(String(tag))) : [],
     autoRoute: entry.autoRoute !== false,
     usageCapability: diag?.usageCapability || providerUsageCapability(entry),
+    safeOneShot: {
+      ...safeFilesystem,
+      ready: diag?.safeReady ?? ((diag?.ready ?? null) === false ? false : safeFilesystem.eligible),
+    },
     readiness: diag ? {
       found: diag.found ?? null,
       ready: diag.ready ?? null,
+      safeReady: diag.safeReady ?? null,
       detail: diag.detail || '',
       checkedAt: new Date(lastDiagnostics.at).toISOString(),
     } : null,
@@ -2717,7 +2775,7 @@ function saveConfig(cfg) {
 // Resolve the target providers for one broadcast. Explicitly named providers
 // are honored even when opt-in (autoRoute:false); tag and all selection always
 // skip opt-in hosted quota seats so a broad fan-out cannot silently spend them.
-function resolveBroadcastTargets(cfg, { providers, tag, all } = {}) {
+function resolveBroadcastTargets(cfg, { providers, tag, all, dangerous = false } = {}) {
   const aiKinds = Object.entries(cfg).filter(([kind, entry]) => isAiProviderEntry(kind, entry));
   const explicit = Array.isArray(providers) ? [...new Set(providers.map((value) => String(value)))] : [];
   if (explicit.length) {
@@ -2733,7 +2791,9 @@ function resolveBroadcastTargets(cfg, { providers, tag, all } = {}) {
   } else {
     matched = [];
   }
-  return matched.filter(([, entry]) => entry.autoRoute !== false).map(([kind]) => kind);
+  return matched.filter(([, entry]) => entry.autoRoute !== false
+    && providerFilesystemEligibility(runtimeFilesystemPolicyEntry(entry), { dangerous }).eligible)
+    .map(([kind]) => kind);
 }
 
 // Minimal Express-response stand-in that executeOneShot can drive. It captures
@@ -2846,6 +2906,9 @@ app.post('/api/plan', async (req, res) => {
   if (effort && !EFFORT_ORDER.includes(String(effort).toLowerCase())) {
     return res.status(400).json({ error: `effort must be one of: ${EFFORT_ORDER.join(', ')}` });
   }
+  let filesystemAuthority;
+  try { filesystemAuthority = planningFilesystemAuthority(req.body || {}); }
+  catch (err) { return res.status(400).json({ error: err.message }); }
   try {
     const router = await import('./mcp/router.mjs');
     const cfg = loadConfig();
@@ -2863,8 +2926,9 @@ app.post('/api/plan', async (req, res) => {
       }
     }
     const fleetInput = applyCooldownsToDiagnostics(diagnostics, coolingQuotaStates(), kind ? [kind] : []);
-    diagnostics = fleetInput.diagnostics;
-    let route = router.routeTask({ task, diagnostics });
+    const filesystemInput = applyFilesystemEligibilityToDiagnostics(fleetInput.diagnostics, cfg, filesystemAuthority);
+    diagnostics = filesystemInput.diagnostics;
+    let route = router.routeTask({ task, diagnostics, dangerous: filesystemAuthority.dangerous });
     const gauges = usageLedger.gaugeAll(seatCostClasses());
     route = levelRouteSelection(route, gauges, seatCostClassMap());
     route.fleetState = {
@@ -2873,6 +2937,8 @@ app.post('/api/plan', async (req, res) => {
       vendorQuota: vendorQuotaFleet(gauges),
       operatorQuota: operatorQuotaFleet(gauges),
       quotaSeats: quotaSeatRegistry.groups,
+      filesystemSkipped: filesystemInput.skipped,
+      filesystemAuthority,
     };
     const plan = buildTaskPlan({
       route,
@@ -2895,6 +2961,9 @@ app.post('/api/route', async (req, res) => {
   if (!task || typeof task !== 'string' || !task.trim()) {
     return res.status(400).json({ error: 'task (non-empty string) required' });
   }
+  let filesystemAuthority;
+  try { filesystemAuthority = planningFilesystemAuthority(req.body || {}); }
+  catch (err) { return res.status(400).json({ error: err.message }); }
   try {
     const router = await import('./mcp/router.mjs');
     const cfg = loadConfig();
@@ -2914,9 +2983,11 @@ app.post('/api/route', async (req, res) => {
     }
     const explicitKinds = Array.isArray(preferKinds) ? preferKinds : [];
     const fleetInput = applyCooldownsToDiagnostics(diagnostics, coolingQuotaStates(), explicitKinds);
-    diagnostics = fleetInput.diagnostics;
+    const filesystemInput = applyFilesystemEligibilityToDiagnostics(fleetInput.diagnostics, cfg, filesystemAuthority);
+    diagnostics = filesystemInput.diagnostics;
     let route = router.routeTask({
       task, diagnostics,
+      dangerous: filesystemAuthority.dangerous,
       preferredProviders: explicitKinds.length ? explicitKinds : undefined,
       excludedProviders: Array.isArray(excludeKinds) ? excludeKinds : undefined,
     });
@@ -2928,6 +2999,8 @@ app.post('/api/route', async (req, res) => {
       vendorQuota: vendorQuotaFleet(gauges),
       operatorQuota: operatorQuotaFleet(gauges),
       quotaSeats: quotaSeatRegistry.groups,
+      filesystemSkipped: filesystemInput.skipped,
+      filesystemAuthority,
     };
     const taskTier = route.classification?.tier;
     const selected = (route.selected || []).map((pick) => {
@@ -3111,7 +3184,8 @@ app.get('/api/diag', async (req, res) => {
       usageCapability: providerUsageCapability(entry, { runtimeVersion }),
     }];
   }));
-  const results = Object.fromEntries(pairs);
+  const rawResults = Object.fromEntries(pairs);
+  const results = applyFilesystemEligibilityToDiagnostics(rawResults, cfg).diagnostics;
   if (!controller.signal.aborted) lastDiagnostics = { at: Date.now(), results };
   if (!clientGone && !res.writableEnded) res.json({ results });
 });
@@ -3337,6 +3411,33 @@ async function executeOneShot(body, res) {
   // so CLIs run non-agentically (no auto tool/command execution). When the
   // caller doesn't specify, fall back to the global Full Permissions toggle.
   const useDanger = (typeof dangerous === 'boolean') ? dangerous : state.fullPermissions;
+  let filesystemPolicy;
+  try {
+    // Existing test fixtures predate this mandatory production contract. They
+    // execute a local deterministic helper, so treat only missing test policy
+    // fields as enforced; explicit fixture policies still exercise fail-close.
+    const policyEntry = runtimeFilesystemPolicyEntry(entry);
+    filesystemPolicy = resolveFilesystemPolicy(policyEntry, useDanger);
+  } catch (err) {
+    return rejectBeforeAdmission(500, 'configuration', { error: `invalid safe filesystem policy for ${kind}: ${err.message}` });
+  }
+  if (!useDanger && filesystemPolicy === 'unverified_provider_policy') {
+    return rejectBeforeAdmission(409, 'safe_filesystem_unverified', {
+      ok: false,
+      error: `${entry.label || kind} has no verified no-write boundary for safe one-shots`,
+      remedy: `Configure and test oneshot_safe_filesystem_policy as read_only_enforced or isolated_home. Use dangerous=true only when a human explicitly authorizes persistent writes.`,
+      kind,
+      dropped_out: true,
+      usage: { input_tokens: 0, output_tokens: 0 },
+    }, {
+      provider: kind,
+      dangerous: false,
+      filesystem_policy: filesystemPolicy,
+      read_only_enforced: false,
+      isolated_home: false,
+      request_id: requestId,
+    });
+  }
   const slotRaw = useDanger ? entry.oneshot_dangerous : entry.oneshot_safe;
   if (!slotRaw || !slotRaw.length) {
     return rejectBeforeAdmission(400, 'configuration', { error: 'no oneshot config for ' + kind });
@@ -3420,6 +3521,20 @@ async function executeOneShot(body, res) {
     });
   }
   let promptFileDir = null;
+  let isolatedProviderHome = null;
+  if (!useDanger && filesystemPolicy === 'isolated_home') {
+    try {
+      isolatedProviderHome = createIsolatedProviderHome();
+    } catch (err) {
+      return rejectBeforeAdmission(500, 'safe_isolation_setup', {
+        error: `could not create isolated provider home: ${err.message}`,
+        dropped_out: true,
+      }, {
+        provider: kind, dangerous: false, filesystem_policy: filesystemPolicy,
+        read_only_enforced: false, isolated_home: true, isolated_home_cleanup: 'setup_failed', request_id: requestId,
+      });
+    }
+  }
   let promptFile = '';
   let userPromptForProvider = prompt;
   let promptTruncated = false;
@@ -3440,7 +3555,19 @@ async function executeOneShot(body, res) {
       promptFile = path.join(promptFileDir, 'prompt.txt');
       fs.writeFileSync(promptFile, effectivePrompt, 'utf8');
     } catch (err) {
-      return rejectBeforeAdmission(500, 'configuration', { error: 'could not create temporary prompt file: ' + err.message });
+      const isolationCleanup = isolatedProviderHome
+        ? cleanupIsolatedProviderHome(isolatedProviderHome)
+        : { status: 'not_applicable', detail: '' };
+      isolatedProviderHome = null;
+      return rejectBeforeAdmission(500, isolationCleanup.status === 'failed_preserved' ? 'isolation_cleanup' : 'configuration', {
+        error: 'could not create temporary prompt file: ' + err.message,
+      }, {
+        provider: kind, dangerous: false, filesystem_policy: filesystemPolicy,
+        read_only_enforced: false, isolated_home: true,
+        isolated_home_cleanup: isolationCleanup.status,
+        isolated_home_cleanup_detail: isolationCleanup.detail || null,
+        request_id: requestId,
+      });
     }
   }
   const slotResolved = slot.map((arg) => {
@@ -3457,7 +3584,7 @@ async function executeOneShot(body, res) {
     promptFileDir = null;
   };
   const [bin, ...args] = slotResolved;
-  const childEnv = buildEnv(oneShotEnv, entry.strip_env || []);
+  const childEnv = buildEnv({ ...oneShotEnv, ...(isolatedProviderHome?.env || {}) }, entry.strip_env || []);
   const resolvedBin = resolveExecutable(bin, childEnv);
   const flagValue = (name) => {
     const index = args.indexOf(name);
@@ -3483,6 +3610,11 @@ async function executeOneShot(body, res) {
       : (modelChoice.model ? 'model_choice' : 'account_default'),
     suppressed_cli_flags: (modelChoice.suppressArgs || []).map((spec) => spec.flag),
     dangerous: useDanger,
+    filesystem_policy: filesystemPolicy,
+    read_only_enforced: !useDanger && filesystemPolicy === 'read_only_enforced',
+    isolated_home: filesystemPolicy === 'isolated_home',
+    isolated_home_id: isolatedProviderHome?.id || null,
+    isolated_home_cleanup: isolatedProviderHome ? 'pending' : 'not_applicable',
     prompt_transport: promptTransport,
     prompt_truncated: promptTruncated,
     prompt_policy: safePromptPrefix
@@ -3495,28 +3627,28 @@ async function executeOneShot(body, res) {
     // this records the caller-facing view.
     effective_timeout_ms: explicitTimeout,
     timeout_clamped: explicitTimeout != null && Math.trunc(Number(timeoutMs)) !== explicitTimeout,
-    environment_overrides: Object.keys(oneShotEnv).sort(),
+    environment_overrides: Object.keys({ ...oneShotEnv, ...(isolatedProviderHome?.env || {}) }).sort(),
     request_id: requestId,
     grounding_override: body?._groundingOverridden === true || null,
     grounding_note: body?._groundingOverridden ? body._groundingOverrideReason : null,
   };
-  // Persist a terminal cancellation even when the HTTP client is already
-  // gone. Previously the provider was killed but its token/time attempt
-  // disappeared because sendOneShotResult refuses to write to a dead socket.
-  res.once('close', () => {
-    if (res.writableEnded || res._relayReceiptPersisted) return;
+  const cleanupProviderHome = () => {
+    if (!isolatedProviderHome || route.isolated_home_cleanup !== 'pending') {
+      return { ok: true, status: route.isolated_home_cleanup };
+    }
+    const result = cleanupIsolatedProviderHome(isolatedProviderHome);
+    route.isolated_home_cleanup = result.status;
+    route.isolated_home_cleanup_detail = result.detail || null;
+    isolatedProviderHome = null;
+    return result;
+  };
+  const persistCancellationReceipt = () => {
+    if (res._relayReceiptPersisted) return;
     const payload = typeof res._relayCancellationPayload === 'function'
       ? res._relayCancellationPayload()
       : {
-          kind,
-          route,
-          exitCode: -1,
-          stdout: '',
-          stderr: '',
-          cancelled: true,
-          timed_out: false,
-          dropped_out: true,
-          model_invocation: true,
+          kind, route, exitCode: -1, stdout: '', stderr: '', cancelled: true,
+          timed_out: false, dropped_out: true, model_invocation: true,
         };
     try {
       const receipt = appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt });
@@ -3525,6 +3657,20 @@ async function executeOneShot(body, res) {
       res._relayReceiptPersisted = `rcpt_unpersisted_${Date.now().toString(36)}`;
       console.error(`[RelayBridge] cancellation receipt persistence failed: ${error.message}`);
     }
+  };
+  // Persist a terminal cancellation even when the HTTP client is already
+  // gone. Previously the provider was killed but its token/time attempt
+  // disappeared because sendOneShotResult refuses to write to a dead socket.
+  // An isolated home cannot be cleaned while its provider is still alive: the
+  // process could recreate state after deletion. Defer that receipt until the
+  // child close/error path has confirmed termination and terminal cleanup.
+  res.once('close', () => {
+    if (res.writableEnded || res._relayReceiptPersisted) return;
+    if (route.isolated_home_cleanup === 'pending') {
+      res._relayIsolationReceiptDeferred = true;
+      return;
+    }
+    persistCancellationReceipt();
   });
   const resolvedProviderBudget = resolveSupervisorOptions({
     entry, globals: cfg._supervisor || {}, providerBudget: requestedProviderBudget,
@@ -3575,6 +3721,7 @@ async function executeOneShot(body, res) {
     res._relayDeferredResponse = true;
   } catch (err) {
     cleanupPromptFile();
+    cleanupProviderHome();
     if (err.validation) {
       return rejectBeforeAdmission(400, 'validation', {
         error: err.validation.reason,
@@ -3703,15 +3850,23 @@ async function executeOneShot(body, res) {
     settled = true;
     finishSupervision();
     cleanupPromptFile();
-    if (clientGone || res.writableEnded) return;
-    sendOneShotResult(res, { kind, route, exitCode: -1, stdout, stderr: stderr + '\n' + err.message, error: err.message, dropped_out: true }, { kind, prompt, route, startedAt, cwd: resolvedCwd });
+    const isolationCleanup = cleanupProviderHome();
+    if (clientGone || res.writableEnded) {
+      if (res._relayIsolationReceiptDeferred) persistCancellationReceipt();
+      return;
+    }
+    sendOneShotResult(res, { kind, route, exitCode: -1, stdout, stderr: stderr + '\n' + err.message, error: err.message, failureClass: isolationCleanup.ok ? null : 'isolation_cleanup', dropped_out: true }, { kind, prompt, route, startedAt, cwd: resolvedCwd });
   });
   proc.on('close', (code) => {
     if (settled) return;
     settled = true;
     finishSupervision();
     cleanupPromptFile();
-    if (clientGone || res.writableEnded) return;
+    const isolationCleanup = cleanupProviderHome();
+    if (clientGone || res.writableEnded) {
+      if (res._relayIsolationReceiptDeferred) persistCancellationReceipt();
+      return;
+    }
     usageObserver.flush();
     const parsedOutput = parseConfiguredOneShotOutput(entry, stdout);
     if (parsedOutput.usage || parsedOutput.numTurns !== null) {
@@ -3812,7 +3967,8 @@ async function executeOneShot(body, res) {
       && hasProviderInternalTimeoutDiagnostic(failureBlob);
     const providerTimedOut = timedOut || authoritativeApiFailure === 'timeout' || providerInternalTimedOut;
     const tokenBudgetExceeded = stopReason === 'token_budget';
-    const finalFailureClass = tokenBudgetExceeded ? 'token_budget'
+    const finalFailureClass = !isolationCleanup.ok ? 'isolation_cleanup'
+      : tokenBudgetExceeded ? 'token_budget'
       : parsedOutput.resultSubtype === 'error_max_budget_usd' ? 'budget'
       : authoritativeApiFailure || (rate_limited ? 'rate_limit'
       : budget_exceeded ? 'budget'
@@ -3820,7 +3976,7 @@ async function executeOneShot(body, res) {
           : providerTimedOut ? 'timeout'
             : permission_denied ? 'policy'
               : parsedOutput.failureClass);
-    const dropped_out = tokenBudgetExceeded || providerTimedOut || code !== 0 || permission_denied || rate_limited || budget_exceeded
+    const dropped_out = !isolationCleanup.ok || tokenBudgetExceeded || providerTimedOut || code !== 0 || permission_denied || rate_limited || budget_exceeded
       || auth_failed || parsedOutput.isError || !!parsedOutput.failureClass
       || !!parsedOutput.parseError || !cleanedStdout;
     const sentPayload = sendOneShotResult(res, {
@@ -4126,15 +4282,26 @@ app.get('/api/usage/totals', (req, res) => {
 });
 app.post('/api/usage/advise', (req, res) => {
   try {
+    const filesystemAuthority = planningFilesystemAuthority(req.body || {});
     const { tier = 'standard', candidates = [], highStakes = false, explicitProvider = false } = req.body || {};
     const gauges = usageLedger.gaugeAll(seatCostClasses());
+    const cfg = loadConfig();
+    const filesystemUsable = [];
+    const filesystemSkipped = [];
+    for (const raw of candidates) {
+      const item = typeof raw === 'string' ? { seat: raw } : { ...raw };
+      const eligibility = providerFilesystemEligibility(runtimeFilesystemPolicyEntry(cfg[item.seat] || {}), filesystemAuthority);
+      const annotated = { ...item, safeFilesystem: eligibility };
+      if (eligibility.eligible) filesystemUsable.push(annotated);
+      else filesystemSkipped.push({ ...annotated, blocked: true, reason: eligibility.blockedReason });
+    }
     // Quota state first: a cooling seat cannot do the work at any rank.
     const { usable, skipped, allCooling } = filterCandidatesByQuotaCooldown(
-      candidates, explicitProvider ? (req.body?.explicitSeat || null) : null);
+      filesystemUsable, explicitProvider ? (req.body?.explicitSeat || null) : null);
     const ranked = levelCandidates(usable, gauges);
     const top = ranked[0] ? gauges[ranked[0].seat] : null;
     res.json({
-      ranked, skipped, allCooling,
+      ranked, skipped, allCooling, filesystemSkipped, filesystemAuthority,
       tierAdjustment: suggestTierAdjustment({ tier, gauge: top, highStakes, explicitProvider }),
       balance: fleetBalance(gauges),
       vendorQuota: vendorQuotaFleet(gauges),
@@ -4259,7 +4426,7 @@ app.post('/api/broadcast', async (req, res) => {
   const cfg = loadConfig();
   let targets;
   try {
-    targets = resolveBroadcastTargets(cfg, { providers, tag, all });
+    targets = resolveBroadcastTargets(cfg, { providers, tag, all, dangerous: dangerous === true });
   } catch (err) {
     return res.status(400).json({ error: err.message });
   }
