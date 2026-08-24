@@ -117,6 +117,66 @@ test('burn rate projects time-to-empty from actual usage', () => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+test('active vendor quota overrides configured fuel while preserving the estimate', () => {
+  const dir = tmp();
+  let clock = Date.parse('2026-08-24T04:20:31.357Z');
+  const l = createUsageLedger({
+    dataDir: dir,
+    budgets: { grok: { tokensPerDay: 1000000 } },
+    now: () => clock,
+  });
+  const observation = {
+    provider: 'grok', model: 'grok-4.6', unit: 'tokens',
+    actual: 552305, limit: 500000, remaining: 0, percentRemaining: 0,
+    overLimit: true, source: 'grok_429_subscription_free_usage_exhausted',
+    observedAt: new Date(clock).toISOString(),
+    window: { kind: 'rolling', durationMs: 86400000, label: 'rolling 24-hour window' },
+    reset: {
+      kind: 'conservative_expiry',
+      expiresAt: new Date(clock + 86400000).toISOString(),
+      note: 'rolling-window membership is unknown',
+    },
+    evidenceHash: 'a'.repeat(64),
+  };
+  assert.ok(l.observeVendorQuota(observation));
+
+  const active = l.gauge('grok', { costClass: 'subscription' });
+  assert.equal(active.basis, 'vendor_observed');
+  assert.equal(active.percentRemaining, 0);
+  assert.equal(active.capacity, 500000);
+  assert.equal(active.vendorQuota.model, 'grok-4.6');
+  assert.equal(active.configuredEstimate.basis, 'configured');
+  assert.equal(active.configuredEstimate.percentRemaining, 100);
+  assert.match(active.note, /vendor-observed quota/);
+
+  const restarted = createUsageLedger({
+    dataDir: dir,
+    budgets: { grok: { tokensPerDay: 1000000 } },
+    now: () => clock,
+  });
+  assert.equal(restarted.activeVendorQuota('grok').actual, 552305, 'observation survives process restart');
+
+  clock += 86400001;
+  const expired = restarted.gauge('grok', { costClass: 'subscription' });
+  assert.equal(expired.basis, 'configured');
+  assert.equal(expired.percentRemaining, 100);
+  assert.equal(expired.vendorQuota, null);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('malformed vendor quota observations fail closed without altering fuel', () => {
+  const dir = tmp();
+  const l = createUsageLedger({ dataDir: dir, budgets: { grok: { tokensPerDay: 1000 } } });
+  assert.equal(l.observeVendorQuota({ provider: 'grok', actual: 5, limit: 0 }), null);
+  assert.equal(l.observeVendorQuota({
+    provider: 'grok', model: 'grok-4.6', unit: 'tokens', actual: Number.MAX_SAFE_INTEGER + 1,
+    limit: 500000, observedAt: new Date().toISOString(),
+    reset: { expiresAt: new Date(Date.now() + 1000).toISOString() },
+  }), null);
+  assert.equal(l.gauge('grok', { costClass: 'subscription' }).basis, 'configured');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 // ---- levelling -------------------------------------------------------------
 
 test('a drained seat is deprioritised but a capable order is still respected', () => {

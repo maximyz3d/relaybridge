@@ -629,6 +629,7 @@ function appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt }
     modelInvocation,
     requestId: route?.request_id || null,
     modelUsage: Array.isArray(usage?.model_usage) ? usage.model_usage : [],
+    vendorQuota: payload.vendor_quota || null,
     providerRetryCount: nonnegativeUsageNumber(payload.provider_retries?.count),
     providerRetryDelayMs: nonnegativeUsageNumber(payload.provider_retries?.total_delay_ms),
     providerRetryMaxAttempt: nonnegativeUsageNumber(payload.provider_retries?.max_attempt),
@@ -921,6 +922,16 @@ function sendOneShotResult(res, payload, meta) {
       const failureKind = payload.rate_limited ? 'rate_limited'
         : payload.auth_failed ? 'auth_failed'
         : payload.failureClass || (classified.kind !== 'ok' ? classified.kind : null);
+      if (failureKind === 'rate_limited') {
+        const vendorQuota = parseGrokQuota429({
+          provider: meta.kind,
+          rateLimited: payload.rate_limited,
+          failureClass: payload.failureClass,
+          text: `${payload.stdout || ''}\n${payload.stderr || ''}`,
+          model: payload.route?.resolved_model_identity || payload.model || null,
+        });
+        if (vendorQuota) payload.vendor_quota = usageLedger.observeVendorQuota(vendorQuota);
+      }
       recordRunUsage({
         kind: meta.kind, route: payload.route || meta.route, usage: payload.usage,
         startedAt: meta.startedAt, ok, failureKind,
@@ -2724,7 +2735,11 @@ app.post('/api/plan', async (req, res) => {
     let route = router.routeTask({ task, diagnostics });
     const gauges = usageLedger.gaugeAll(seatCostClasses());
     route = levelRouteSelection(route, gauges, seatCostClassMap());
-    route.fleetState = { cooldownSkipped: fleetInput.skipped, balance: fleetBalance(gauges) };
+    route.fleetState = {
+      cooldownSkipped: fleetInput.skipped,
+      balance: fleetBalance(gauges),
+      vendorQuota: vendorQuotaFleet(gauges),
+    };
     const plan = buildTaskPlan({
       route,
       config: cfg,
@@ -2773,7 +2788,11 @@ app.post('/api/route', async (req, res) => {
     });
     const gauges = usageLedger.gaugeAll(seatCostClasses());
     route = levelRouteSelection(route, gauges, seatCostClassMap());
-    route.fleetState = { cooldownSkipped: fleetInput.skipped, balance: fleetBalance(gauges) };
+    route.fleetState = {
+      cooldownSkipped: fleetInput.skipped,
+      balance: fleetBalance(gauges),
+      vendorQuota: vendorQuotaFleet(gauges),
+    };
     const taskTier = route.classification?.tier;
     const selected = (route.selected || []).map((pick) => {
       const resolved = resolveModelArgs({ entry: cfg[pick.kind] || {}, taskTier });
@@ -3674,6 +3693,7 @@ const cooldowns = createCooldownStore({
 });
 
 const { createUsageLedger } = require('./lib/usage-ledger');
+const { parseGrokQuota429 } = require('./lib/vendor-quota');
 const {
   levelCandidates, suggestTierAdjustment, fleetBalance,
   applyCooldownsToDiagnostics, levelRouteSelection,
@@ -3698,7 +3718,10 @@ function seatCostClasses() {
   const out = {};
   for (const [seat, entry] of Object.entries(cfg)) {
     if (seat.startsWith('_')) continue;
-    out[seat] = { costClass: costClassFor(entry, seat) };
+    out[seat] = {
+      costClass: costClassFor(entry, seat),
+      model: entry.model || null,
+    };
   }
   return out;
 }
@@ -3706,6 +3729,12 @@ function seatCostClasses() {
 function seatCostClassMap() {
   const entries = seatCostClasses();
   return Object.fromEntries(Object.entries(entries).map(([seat, value]) => [seat, value.costClass]));
+}
+
+function vendorQuotaFleet(gauges) {
+  return Object.fromEntries(Object.entries(gauges)
+    .filter(([, gauge]) => gauge?.vendorQuota)
+    .map(([seat, gauge]) => [seat, gauge.vendorQuota]));
 }
 
 function recordRunUsage({ kind, route, usage, startedAt, ok, failureKind, taskId }) {
@@ -3751,6 +3780,7 @@ app.post('/api/usage/advise', (req, res) => {
       ranked, skipped, allCooling,
       tierAdjustment: suggestTierAdjustment({ tier, gauge: top, highStakes, explicitProvider }),
       balance: fleetBalance(gauges),
+      vendorQuota: vendorQuotaFleet(gauges),
     });
   } catch (err) { res.status(400).json({ error: err.message }); }
 });

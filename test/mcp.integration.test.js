@@ -33,7 +33,7 @@ function containsPath(value, candidate) {
 }
 
 test('MCP provider accounting rejects malformed usage and contradictory retry aggregates', async () => {
-  const { normalizeProviderUsage, normalizeProviderRetries } = await import('../mcp/server.mjs');
+  const { normalizeProviderUsage, normalizeProviderRetries, normalizeVendorQuota } = await import('../mcp/server.mjs');
   assert.equal(normalizeProviderUsage({
     input_tokens: 10, output_tokens: 5, cache_read_input_tokens: '999',
     cache_creation_input_tokens: 0, total_tokens: 15,
@@ -67,6 +67,21 @@ test('MCP provider accounting rejects malformed usage and contradictory retry ag
     by_error: {}, by_status: {}, events: [], truncated: false,
     observed_events: 0, invalid_events: 0, duplicate_events: 0,
   });
+  const vendorQuota = {
+    provider: 'grok', model: 'grok-4.6', unit: 'tokens', actual: 552305, limit: 500000,
+    remaining: 0, percentRemaining: 0, overLimit: true,
+    source: 'grok_429_subscription_free_usage_exhausted',
+    observedAt: '2026-08-24T04:20:31.357Z',
+    window: { kind: 'rolling', durationMs: 86400000, label: 'rolling 24-hour window' },
+    reset: {
+      kind: 'conservative_expiry', expiresAt: '2026-08-25T04:20:31.357Z',
+      note: 'rolling-window membership is unknown',
+    },
+    evidenceHash: 'a'.repeat(64),
+  };
+  assert.equal(normalizeVendorQuota(vendorQuota).actual, 552305);
+  assert.equal(normalizeVendorQuota({ ...vendorQuota, remaining: 99 }), null);
+  assert.equal(normalizeVendorQuota({ ...vendorQuota, evidenceHash: 'not-a-hash' }), null);
 });
 
 async function waitForHealth(baseUrl, proc) {
@@ -142,6 +157,16 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
         process.execPath, helper, '--prompt-file', '{prompt_file}', '--output',
         'I will inspect the repository and trace the pipeline.\nNext I will review the tests and report any defects.',
       ],
+    },
+    grok: {
+      ...echoProvider,
+      label: 'Grok quota fixture',
+      oneshot_safe: [
+        process.execPath, helper, '--prompt-file', '{prompt_file}',
+        '--stderr', "API error (status 429 Too Many Requests): subscription:free-usage-exhausted: You've used all the included free usage for model grok-4.6 for now. Usage resets over a rolling 24-hour window — tokens (actual/limit): 552,305/500,000. Upgrade to a Grok subscription. model_id=grok-4.6", '--exit', '1',
+      ],
+      model: 'grok-4.6',
+      costClass: 'subscription',
     },
     retry_json: {
       ...echoProvider,
@@ -537,6 +562,17 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   assert.equal(narrationOnly.structuredContent.stopReason, 'provider_incomplete_response');
   assert.match(narrationOnly.structuredContent.stdout, /^I will inspect/);
 
+  const grokQuota = await client.callTool({
+    name: 'ask_provider',
+    arguments: { kind: 'grok', prompt: 'MCP_GROK_QUOTA_MARKER', useCache: false },
+  });
+  assert.equal(grokQuota.structuredContent.failureClass, 'rate_limit');
+  assert.equal(grokQuota.structuredContent.droppedOut, true);
+  assert.equal(grokQuota.structuredContent.providerRetries.count, 0);
+  assert.equal(grokQuota.structuredContent.vendorQuota.actual, 552305);
+  assert.equal(grokQuota.structuredContent.vendorQuota.limit, 500000);
+  assert.equal(grokQuota.structuredContent.vendorQuota.model, 'grok-4.6');
+
   const retryPrompt = 'MCP_RETRY_ACCOUNTING_MARKER';
   const retryProvider = await client.callTool({
     name: 'ask_provider',
@@ -861,6 +897,16 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   });
   assert.equal(usageTransport.structuredContent.receipt.actualTotalTokens, usageOuterReceipt.actualTotalTokens);
   assert.equal(usageTransport.structuredContent.receipt.requestId, usageOuterReceipt.requestId);
+  const grokQuotaOuterReceipt = receipts.structuredContent.receipts.find((receipt) =>
+    receipt.receiptId === grokQuota.structuredContent.receiptId);
+  assert.equal(grokQuotaOuterReceipt.vendorQuota.actual, 552305);
+  assert.equal(grokQuotaOuterReceipt.providerRetryCount, 0);
+  assert.match(grokQuotaOuterReceipt.transportReceiptId, /^rcpt_/);
+  const grokQuotaTransport = await client.callTool({
+    name: 'get_receipt', arguments: { receiptId: grokQuotaOuterReceipt.transportReceiptId },
+  });
+  assert.equal(grokQuotaTransport.structuredContent.receipt.vendorQuota.actual, 552305);
+  assert.equal(grokQuotaTransport.structuredContent.receipt.vendorQuota.model, 'grok-4.6');
   const disagreementOuterReceipt = receipts.structuredContent.receipts.find((receipt) =>
     receipt.receiptId === disagreementProvider.structuredContent.receiptId);
   assert.equal(disagreementOuterReceipt.resultSchemaDisagreement, true);
