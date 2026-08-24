@@ -217,6 +217,7 @@ test('server, MCP adapter, Perplexity wrapper, and inline browser script parse',
   assert.doesNotMatch(html, /cdn\.jsdelivr\.net/);
   assert.match(html, /\/vendor\/xterm\/lib\/xterm\.js/);
   assert.match(html, /summary\.textContent/);
+  assert.match(html, /failureClass === 'incomplete_response'/);
   const match = html.match(/<script>\s*(const API =[\s\S]*?)<\/script>/);
   assert.ok(match, 'inline application script was not found');
   assert.doesNotThrow(() => new Function(match[1]));
@@ -344,6 +345,13 @@ test('prompt-file transport preserves long special-character prompts and cleans 
       dangerous: [process.execPath, helper, '--version'],
       oneshot_safe: [...baseSlot, '--stderr', 'Error: timeout waiting for response', '--exit', '1'],
       oneshot_dangerous: [...baseSlot, '--stderr', 'Error: timeout waiting for response', '--exit', '1'],
+    },
+    narration_only: {
+      label: 'Narration-Only Grok Fixture',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--output', 'I will inspect the repository and trace the pipeline.\nNext I will review the tests and report any defects.'],
+      oneshot_dangerous: [...baseSlot, '--output', 'I will inspect the repository and trace the pipeline.\nNext I will review the tests and report any defects.'],
     },
     usage_json: {
       label: 'Structured Claude Usage',
@@ -628,6 +636,26 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(result.route.effective_timeout_ms, 600001);
   assert.equal(result.route.timeout_clamped, false);
   assert.deepEqual(fs.readdirSync(promptTemp), []);
+
+  const narrationResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST',
+    headers: jsonAuth,
+    body: JSON.stringify({ kind: 'narration_only', prompt: 'Audit this repository and return concrete findings.', dangerous: false }),
+  });
+  assert.equal(narrationResponse.status, 200);
+  const narrationResult = await narrationResponse.json();
+  assert.equal(narrationResult.exitCode, 0, 'the provider transport itself exited cleanly');
+  assert.equal(narrationResult.dropped_out, true);
+  assert.equal(narrationResult.failureClass, 'incomplete_response');
+  assert.equal(narrationResult.stop_reason, 'provider_incomplete_response');
+  assert.match(narrationResult.stop_detail, /switch providers/);
+  assert.match(narrationResult.stdout, /^I will inspect/);
+  const narrationReceipt = fs.readFileSync(
+    path.join(tempRoot, 'data', 'receipts', new Date().toISOString().slice(0, 10) + '.jsonl'), 'utf8',
+  ).trim().split(/\r?\n/).map(JSON.parse).find((row) => row.receiptId === narrationResult.receiptId);
+  assert.equal(narrationReceipt.status, 'dropped');
+  assert.equal(narrationReceipt.failureClass, 'incomplete_response');
+  assert.equal(narrationReceipt.outputChars, narrationResult.stdout.length, 'receipt retains evidence of the original output');
 
   const geminiAutoResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST',

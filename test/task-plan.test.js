@@ -185,6 +185,11 @@ test('the CLI never force-exits while sockets are in flight', () => {
   assert.match(tail, /unref/, 'the safety timer must not hold the process open by itself');
 });
 
+test('the CLI JSON ask path treats a dropped-out zero exit as failure', () => {
+  const cli = fs.readFileSync(path.join(__dirname, '..', 'bin', 'relaybridge.js'), 'utf8');
+  assert.match(cli, /result\.exitCode === 0 && !result\.dropped_out \? 0 : 1/);
+});
+
 test('a 404 is explained as a stale bridge rather than a CLI fault', () => {
   const cli = fs.readFileSync(path.join(__dirname, '..', 'bin', 'relaybridge.js'), 'utf8');
   assert.match(cli, /not available on the running bridge/);

@@ -645,6 +645,7 @@ const PROVIDER_FAILURE_CLASSES = new Set([
   'tool_deferred', 'aborted_streaming', 'aborted_tools', 'hook_stopped',
   'stop_hook_prevented', 'blocking_limit', 'prompt_too_long',
   'provider_error', 'admission_limit', 'bridge_identity_mismatch',
+  'incomplete_response',
 ]);
 
 const PROVIDER_TERMINAL_REASONS = new Set([

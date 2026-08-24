@@ -6,7 +6,49 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { classifyRunFailure, seatToleratesLongRuns } = require('../lib/provider-failure');
+const { classifyRunFailure, isNarrationOnlyResponse, seatToleratesLongRuns } = require('../lib/provider-failure');
+
+test('Grok future-tense process narration is incomplete, preserved, and never retried on the same seat', () => {
+  const stdout = 'I will inspect the repository and trace the relevant pipeline.\nNext I will review the tests and report any defects.';
+  assert.equal(isNarrationOnlyResponse({ prompt: 'Audit this repository and return concrete findings.', stdout }), true);
+  assert.equal(isNarrationOnlyResponse({
+    prompt: 'Audit this repository and return concrete findings.',
+    stdout: "I’ll inspect the repository first.\nNext I’m going to review the tests.",
+  }), true, 'common straight and curly apostrophe contractions are covered');
+  const v = classifyRunFailure({ prompt: 'Audit this repository and return concrete findings.', stdout, exitCode: 0 });
+  assert.equal(v.kind, 'incomplete_response');
+  assert.equal(v.failUp, true);
+  assert.equal(v.retryable, false);
+});
+
+test('legitimate concise results are not narration-only', () => {
+  for (const stdout of [
+    'Use a 10 kΩ pull-up. It limits current while preserving the required logic threshold.',
+    'I will use a 10 kΩ pull-up.',
+    'I inspected the repository. I found two stale routes and confirmed the focused tests pass.',
+  ]) {
+    assert.equal(isNarrationOnlyResponse({ prompt: 'Return the answer.', stdout }), false, stdout);
+  }
+});
+
+test('a requested plan remains a valid answer even when every line is future-tense', () => {
+  const stdout = 'First I will inspect the existing tests.\nNext I will implement the narrow fix.\nFinally I will run the full suite.';
+  for (const prompt of [
+    'Please provide a detailed implementation plan.',
+    'How would you approach this migration?',
+  ]) assert.equal(isNarrationOnlyResponse({ prompt, stdout }), false, prompt);
+  assert.equal(isNarrationOnlyResponse({ prompt: 'Plan and implement this migration.', stdout }), true,
+    'an execution request must not be exempt merely because it starts with plan');
+});
+
+test('code, tables, and structured data outputs are never narration-only', () => {
+  for (const stdout of [
+    '```js\nconst result = 42;\n```',
+    '{"status":"complete","findings":[]}',
+    '[{"status":"complete"}]',
+    '| check | result |\n| --- | --- |\n| tests | pass |',
+  ]) assert.equal(isNarrationOnlyResponse({ prompt: 'Return results.', stdout }), false, stdout);
+});
 
 test('the real Gemini case: internal timeout is not counted as an answer', () => {
   const v = classifyRunFailure({
