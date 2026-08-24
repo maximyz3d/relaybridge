@@ -666,6 +666,9 @@ function appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt }
     providerPermissionDenialsByTool: payload.provider_permission_denials?.byTool || {},
     providerPermissionDenials: Array.isArray(payload.provider_permission_denials?.retained)
       ? payload.provider_permission_denials.retained : [],
+    policyReason: normalizeClaudeResultString(payload.policy_reason),
+    policyDetailHash: payload.policy_detail
+      ? crypto.createHash('sha256').update(String(payload.policy_detail)).digest('hex') : null,
     transportOutputChars: nonnegativeUsageNumber(payload.transport_output_chars),
     transportOutputHash: normalizeClaudeResultString(payload.transport_output_hash, 64),
     durationMs: Date.now() - startedAt,
@@ -3205,6 +3208,13 @@ async function executeOneShot(body, res) {
     entry,
     modelChoice.suppressArgs,
   );
+  const safePromptPrefix = !useDanger && typeof entry.oneshot_safe_prompt_prefix === 'string'
+    ? entry.oneshot_safe_prompt_prefix.trim() : '';
+  if (safePromptPrefix.length > 4096) {
+    return rejectBeforeAdmission(400, 'configuration', {
+      error: 'oneshot_safe_prompt_prefix exceeds the 4096-character safety limit',
+    });
+  }
   const hasInlinePrompt = slot.some((a) => typeof a === 'string' && a.includes('{prompt}'));
   const hasPromptFile = slot.some((a) => typeof a === 'string' && a.includes('{prompt_file}'));
   if (hasInlinePrompt && hasPromptFile) {
@@ -3252,18 +3262,24 @@ async function executeOneShot(body, res) {
   }
   let promptFileDir = null;
   let promptFile = '';
-  let promptForArgs = prompt;
+  let userPromptForProvider = prompt;
   let promptTruncated = false;
   if (hasInlinePrompt) {
+    // Preserve the established user-prompt allowance. The policy prefix is a
+    // separate bounded transport envelope, not text that silently consumes
+    // the tail of a request which previously fit prompt_max_chars.
     const capped = capPrompt(prompt, Number(entry.prompt_max_chars || 6000));
-    promptForArgs = capped.text;
+    userPromptForProvider = capped.text;
     promptTruncated = capped.truncated;
   }
+  const effectivePrompt = safePromptPrefix
+    ? `${safePromptPrefix}\n\nUser request:\n${userPromptForProvider}` : userPromptForProvider;
+  const promptForArgs = effectivePrompt;
   if (hasPromptFile) {
     try {
       promptFileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'RelayBridge-prompt-'));
       promptFile = path.join(promptFileDir, 'prompt.txt');
-      fs.writeFileSync(promptFile, prompt, 'utf8');
+      fs.writeFileSync(promptFile, effectivePrompt, 'utf8');
     } catch (err) {
       return rejectBeforeAdmission(500, 'configuration', { error: 'could not create temporary prompt file: ' + err.message });
     }
@@ -3308,6 +3324,10 @@ async function executeOneShot(body, res) {
     dangerous: useDanger,
     prompt_transport: promptTransport,
     prompt_truncated: promptTruncated,
+    prompt_policy: safePromptPrefix
+      ? (entry.oneshot_safe_prompt_policy || 'configured_safe_prompt_prefix') : null,
+    prompt_policy_chars: safePromptPrefix.length,
+    transport_prompt_chars: effectivePrompt.length,
     requested_timeout_ms: Number.isFinite(Number(timeoutMs)) ? Math.trunc(Number(timeoutMs)) : null,
     // With no explicit timeout the CLI path is governed by supervision, so the
     // effective ceiling is resolved after the supervisor is constructed below;
@@ -3577,8 +3597,14 @@ async function executeOneShot(body, res) {
     const auth_failed = authoritativeApiFailure === 'auth'
       || (auth_signals.some((pattern) => pattern.test(failureBlob))
         && (code !== 0 || !cleanedStdout || parsedOutput.isError));
-    const permission_signals = ['headless mode cannot prompt', 'auto-denied', 'no output produced'];
-    const permission_denied = permission_signals.some((signal) => failureBlob.includes(signal));
+    const permissionClassification = classifyRunFailure({
+      provider: kind,
+      prompt,
+      stdout: cleanedStdout,
+      stderr: cleanOutput([stderr, parsedOutput.diagnostic].filter(Boolean).join('\n')),
+      exitCode: code,
+    });
+    const permission_denied = permissionClassification.kind === 'headless_command_permission_auto_denied';
     // Provider CLIs can enforce their own request deadline before RelayBridge's
     // progress supervisor fires. Promote only authoritative failed/no-answer
     // diagnostics; healthy model prose that discusses timeouts must remain a
@@ -3626,6 +3652,8 @@ async function executeOneShot(body, res) {
       budget_exceeded,
       auth_failed,
       permission_denied,
+      policy_reason: permission_denied ? permissionClassification.kind : null,
+      policy_detail: permission_denied ? permissionClassification.detail : null,
       model: modelChoice.model,
       model_tier: modelChoice.modelTier,
       stop_reason: stopReason || (providerInternalTimedOut ? 'provider_internal_timeout' : null),
@@ -3633,7 +3661,7 @@ async function executeOneShot(body, res) {
       provider_timeout_source: timedOut ? 'relay_supervisor'
         : authoritativeApiFailure === 'timeout' ? 'provider_api_status'
           : providerInternalTimedOut ? 'provider_cli_diagnostic' : null,
-      stop_detail: stopDetail,
+      stop_detail: stopDetail || (permission_denied ? permissionClassification.detail : ''),
       progress: supervisor.snapshot(),
       timed_out: providerTimedOut,
       dropped_out,
@@ -3648,7 +3676,7 @@ async function executeOneShot(body, res) {
   // Providers without a placeholder (Claude/Codex/Perplexity wrapper) read
   // stdin. Antigravity consumes {prompt}; Grok consumes {prompt_file}.
   if (promptTransport === 'stdin') {
-    try { proc.stdin.write(prompt); proc.stdin.end(); } catch {}
+    try { proc.stdin.write(effectivePrompt); proc.stdin.end(); } catch {}
   } else {
     try { proc.stdin.end(); } catch {}
   }

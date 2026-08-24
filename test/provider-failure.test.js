@@ -8,7 +8,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
   classifyRunFailure, detectCopilotMonthlyQuota,
-  isNarrationOnlyResponse, seatToleratesLongRuns,
+  isHeadlessCommandPermissionDenial, isNarrationOnlyResponse, seatToleratesLongRuns,
 } = require('../lib/provider-failure');
 
 test('Grok future-tense process narration is incomplete, preserved, and never retried on the same seat', () => {
@@ -78,6 +78,31 @@ test('transport-level drops are recognized as internal timeouts', () => {
     const v = classifyRunFailure({ stderr: msg, exitCode: 1 });
     assert.equal(v.kind, 'provider_internal_timeout', `${msg} should classify as internal timeout`);
   }
+});
+
+test('Antigravity headless command auto-denial is concrete policy evidence and is never retried', () => {
+  for (const exitCode of [0, 1]) {
+    const run = {
+      provider: 'gemini', stdout: '', exitCode,
+      stderr: 'jetski: no output produced — a tool required the command permission that headless mode cannot prompt for, so it was auto-denied.',
+    };
+    assert.equal(isHeadlessCommandPermissionDenial(run), true);
+    const classified = classifyRunFailure(run);
+    assert.equal(classified.kind, 'headless_command_permission_auto_denied');
+    assert.equal(classified.retryable, false);
+    assert.equal(classified.failUp, true);
+    assert.match(classified.detail, /command-free read-only review policy/);
+  }
+});
+
+test('quoted permission diagnostics in successful answers are not policy failures', () => {
+  const run = {
+    provider: 'gemini', exitCode: 0,
+    stdout: 'The diagnostic is: jetski: no output produced — a tool required the command permission that headless mode cannot prompt for, so it was auto-denied.',
+    stderr: '',
+  };
+  assert.equal(isHeadlessCommandPermissionDenial(run), false);
+  assert.equal(classifyRunFailure(run).kind, 'ok');
 });
 
 test('rate limits and quota fail up but are not retried on the same seat', () => {

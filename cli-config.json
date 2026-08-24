@@ -485,6 +485,8 @@
   },
   "gemini": {
     "label": "Gemini (Antigravity)",
+    "oneshot_safe_prompt_policy": "antigravity_headless_builtin_read_only_tools",
+    "oneshot_safe_prompt_prefix": "RelayBridge headless read-only review policy: do not invoke terminal or command tools. Use only Antigravity's built-in workspace file-reading and code-search tools. Do not write or edit files, run commands, access URLs, or request permissions. If the required evidence cannot be obtained without a command, stop and report the exact missing evidence and command that a human could run; do not attempt it.",
     "login_command": [
       "agy"
     ],
@@ -622,7 +624,8 @@
     ],
     "install_display": "irm https://antigravity.google/cli/install.ps1 | iex",
     "post_install": "Open a fresh PowerShell and run agy once to sign in.",
-    "docs_url": "https://antigravity.google/docs/cli/gcli-migration"
+    "docs_url": "https://antigravity.google/docs/permissions",
+    "_permission_note": "Antigravity CLI 1.1.19 has no per-invocation command allow-rule flag. Persistent command(prefix) rules permit trailing arguments and RelayBridge cannot prove broad git, PowerShell, or rg rules read-only. Safe headless calls therefore use a visible command-free prompt policy and surface any auto-denial without retrying. The dangerous slot remains explicit and is never selected as fallback."
   },
   "grok": {
     "label": "Grok Build",
