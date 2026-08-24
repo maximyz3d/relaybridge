@@ -604,7 +604,10 @@ function appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt }
   const tokenUsageSource = modelInvocation === false ? 'not_invoked'
     : modelInvocation === null ? 'unknown'
     : actualTotalTokens !== null || actualInputTokens !== null || actualOutputTokens !== null
-      ? 'provider_reported' : 'chars_div_4';
+      ? 'provider_reported' : payload.cancelled ? 'unknown' : 'chars_div_4';
+  const requestId = route?.request_id || null;
+  const invocationId = route?.invocation_id || requestId;
+  const attemptId = route?.attempt_id || (requestId ? `${requestId}:attempt:1` : null);
   const receipt = {
     receiptId: `rcpt_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 8)}`,
     timestamp: new Date().toISOString(),
@@ -633,7 +636,11 @@ function appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt }
     tokenEstimateScope: tokenUsageSource === 'chars_div_4'
       ? (estimatedOutputTokens > 0 ? 'request_and_response_chars_only' : 'request_chars_only') : null,
     modelInvocation,
-    requestId: route?.request_id || null,
+    requestId,
+    invocationId,
+    attemptId,
+    physicalAttemptCount: modelInvocation === false ? 0 : 1,
+    outerReceiptId: route?.outer_receipt_id || null,
     modelUsage: Array.isArray(usage?.model_usage) ? usage.model_usage : [],
     vendorQuota: payload.vendor_quota || null,
     quotaEvidence: payload.quota_evidence || null,
@@ -686,8 +693,12 @@ function appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt }
       ? crypto.createHash('sha256').update(String(payload.policy_detail)).digest('hex') : null,
     transportOutputChars: nonnegativeUsageNumber(payload.transport_output_chars),
     transportOutputHash: normalizeClaudeResultString(payload.transport_output_hash, 64),
+    progressAtCancellation: payload.cancelled && payload.progress
+      ? payload.progress : null,
+    cleanedOutputUnavailable: payload.cancelled
+      ? !String(payload.stdout || '').trim() : null,
     durationMs: Date.now() - startedAt,
-    failureClass: payload.cancelled ? 'cancelled'
+    failureClass: payload.cancelled ? (payload.failureClass || 'cancelled')
       : payload.failureClass || (payload.rate_limited ? 'rate_limit'
         : payload.budget_exceeded ? 'budget'
           : payload.auth_failed ? 'auth'
@@ -754,6 +765,19 @@ function normalizeOneShotRequestId(body) {
   const supplied = String(body?.requestId || '');
   return /^[A-Za-z0-9._:-]{8,160}$/.test(supplied)
     ? supplied : `oneshot:${crypto.randomUUID()}`;
+}
+
+function canonicalAttemptIdentity(requestId) {
+  return {
+    invocationId: requestId,
+    attemptId: `${requestId}:attempt:1`,
+  };
+}
+
+function normalizeOuterReceiptId(body) {
+  if (body?._relayClient !== 'mcp') return null;
+  const value = String(body?.outerReceiptId || '');
+  return /^rcpt_[A-Za-z0-9._:-]{1,180}$/.test(value) ? value : null;
 }
 
 function appendBridgePreAdmissionReceipt({
@@ -915,6 +939,14 @@ function sendOneShotPreAdmissionRejection(res, {
 
 function sendOneShotResult(res, payload, meta) {
   if (res.writableEnded || res.destroyed) return;
+  const requestId = meta?.route?.request_id || null;
+  payload = {
+    ...payload,
+    requestId,
+    invocationId: meta?.route?.invocation_id || requestId,
+    attemptId: meta?.route?.attempt_id || (requestId ? `${requestId}:attempt:1` : null),
+    physical_attempt_count: payload.model_invocation === false ? 0 : 1,
+  };
   const classified = classifyRunFailure({
     provider: meta?.kind,
     prompt: meta?.prompt,
@@ -1757,6 +1789,12 @@ async function runOpenAIChatOneShot({ entry, prompt, timeoutMs, res, route, star
     exitCode: -1,
     stdout: '',
     stderr: '',
+    failureClass: timedOut ? 'timeout' : disconnectFailureClass({
+      client: route.client_surface, deadlineAt: route.client_deadline_at,
+    }),
+    stop_reason: timedOut ? 'hard_cap' : disconnectFailureClass({
+      client: route.client_surface, deadlineAt: route.client_deadline_at,
+    }),
     cancelled: !timedOut,
     timed_out: timedOut,
     dropped_out: true,
@@ -1898,6 +1936,12 @@ async function runOllamaApiOneShot({ entry, prompt, timeoutMs, res, route, start
     exitCode: -1,
     stdout: '',
     stderr: '',
+    failureClass: timedOut ? 'timeout' : disconnectFailureClass({
+      client: route.client_surface, deadlineAt: route.client_deadline_at,
+    }),
+    stop_reason: timedOut ? 'hard_cap' : disconnectFailureClass({
+      client: route.client_surface, deadlineAt: route.client_deadline_at,
+    }),
     cancelled: !timedOut,
     timed_out: timedOut,
     dropped_out: true,
@@ -3332,6 +3376,8 @@ async function executeOneShot(body, res) {
     ? body.intent.replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 2000)
     : null;
   const requestId = normalizeOneShotRequestId(body);
+  const { invocationId, attemptId } = canonicalAttemptIdentity(requestId);
+  const outerReceiptId = normalizeOuterReceiptId(body);
   const rejectBeforeAdmission = (statusCode, failureClass, payload, route = null) =>
     sendOneShotPreAdmissionRejection(res, {
       statusCode,
@@ -3629,6 +3675,14 @@ async function executeOneShot(body, res) {
     timeout_clamped: explicitTimeout != null && Math.trunc(Number(timeoutMs)) !== explicitTimeout,
     environment_overrides: Object.keys({ ...oneShotEnv, ...(isolatedProviderHome?.env || {}) }).sort(),
     request_id: requestId,
+    invocation_id: invocationId,
+    attempt_id: attemptId,
+    outer_receipt_id: outerReceiptId,
+    client_surface: body?._relayClient || null,
+    client_deadline_at: body?._relayClientDeadlineAt !== null
+      && body?._relayClientDeadlineAt !== ''
+      && Number.isFinite(Number(body._relayClientDeadlineAt))
+      ? Number(body._relayClientDeadlineAt) : null,
     grounding_override: body?._groundingOverridden === true || null,
     grounding_note: body?._groundingOverridden ? body._groundingOverrideReason : null,
   };
@@ -3647,8 +3701,21 @@ async function executeOneShot(body, res) {
     const payload = typeof res._relayCancellationPayload === 'function'
       ? res._relayCancellationPayload()
       : {
-          kind, route, exitCode: -1, stdout: '', stderr: '', cancelled: true,
-          timed_out: false, dropped_out: true, model_invocation: true,
+          kind,
+          route,
+          exitCode: -1,
+          stdout: '',
+          stderr: '',
+          failureClass: disconnectFailureClass({
+            client: route.client_surface, deadlineAt: route.client_deadline_at,
+          }),
+          stop_reason: disconnectFailureClass({
+            client: route.client_surface, deadlineAt: route.client_deadline_at,
+          }),
+          cancelled: true,
+          timed_out: false,
+          dropped_out: true,
+          model_invocation: true,
         };
     try {
       const receipt = appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt });
@@ -3738,6 +3805,14 @@ async function executeOneShot(body, res) {
   let settled = false;
   res._relayCancellationPayload = () => {
     const parsedOutput = parseConfiguredOneShotOutput(entry, stdout);
+    const cancellationState = resolveCancellationTerminalState({
+      stopReason,
+      timedOut,
+      disconnectClass: disconnectFailureClass({
+        client: body?._relayClient, deadlineAt: body?._relayClientDeadlineAt,
+      }),
+    });
+    const progress = supervisor.snapshot();
     return {
       kind,
       route,
@@ -3745,7 +3820,7 @@ async function executeOneShot(body, res) {
       stdout: parsedOutput.output,
       stderr: cleanOutput([stderr, parsedOutput.diagnostic, parsedOutput.parseError].filter(Boolean).join('\n')),
       usage: parsedOutput.usage,
-      failureClass: parsedOutput.failureClass,
+      failureClass: cancellationState.failureClass,
       result_subtype: parsedOutput.resultSubtype,
       result_schema_disagreement: parsedOutput.resultSchemaDisagreement,
       provider_retries: parsedOutput.retries,
@@ -3763,8 +3838,12 @@ async function executeOneShot(body, res) {
       provider_error_diagnostic: parsedOutput.diagnostic,
       transport_output_chars: String(stdout).length,
       transport_output_hash: crypto.createHash('sha256').update(String(stdout)).digest('hex'),
-      cancelled: !timedOut,
-      timed_out: timedOut,
+      stop_reason: cancellationState.stopReason,
+      supervisor_stop_reason: cancellationState.supervisorStopReason,
+      stop_detail: stopReason ? stopDetail : 'the caller disconnected before the provider returned a usable result',
+      progress,
+      cancelled: cancellationState.cancelled,
+      timed_out: cancellationState.timedOut,
       dropped_out: true,
       model_invocation: true,
     };
@@ -4042,7 +4121,11 @@ async function executeOneShot(body, res) {
   }
 }
 
-app.post('/api/oneshot', (req, res) => executeOneShot(req.body, res));
+app.post('/api/oneshot', (req, res) => executeOneShot({
+  ...req.body,
+  _relayClient: req.get('X-RelayBridge-Client') || null,
+  _relayClientDeadlineAt: req.get('X-RelayBridge-Client-Deadline-At') || null,
+}, res));
 
 // ---- Async task queue (lib/task-queue.js) --------------------------------
 // Submission is decoupled from collection so work outlives the surface that
@@ -4094,6 +4177,10 @@ const {
   createUsageLedger, OPERATOR_QUOTA_PROVENANCE, MAX_OPERATOR_QUOTA_TTL_MS,
 } = require('./lib/usage-ledger');
 const { parseGrokQuota429 } = require('./lib/vendor-quota');
+const {
+  disconnectFailureClass,
+  resolveCancellationTerminalState,
+} = require('./lib/cancellation-state');
 const {
   levelCandidates, suggestTierAdjustment, fleetBalance,
   applyCooldownsToDiagnostics, levelRouteSelection,
