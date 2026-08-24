@@ -645,8 +645,16 @@ const PROVIDER_FAILURE_CLASSES = new Set([
   'tool_deferred', 'aborted_streaming', 'aborted_tools', 'hook_stopped',
   'stop_hook_prevented', 'blocking_limit', 'prompt_too_long',
   'provider_error', 'admission_limit', 'bridge_identity_mismatch',
-  'incomplete_response',
+  'incomplete_response', 'token_budget',
 ]);
+
+const PROVIDER_BUDGET_SCHEMA = z.object({
+  maxOutputTokens: z.number().int().positive().nullable().optional(),
+  maxTotalTokens: z.number().int().positive().nullable().optional(),
+  maxCacheReadTokens: z.number().int().positive().nullable().optional(),
+  maxCacheCreationTokens: z.number().int().positive().nullable().optional(),
+  maxTurns: z.number().int().positive().nullable().optional(),
+}).strict();
 
 const PROVIDER_TERMINAL_REASONS = new Set([
   'completed', 'max_turns', 'tool_deferred', 'aborted_streaming', 'aborted_tools',
@@ -963,6 +971,9 @@ function sanitizeProviderResponse(response) {
     stopReason: strictBoundedString(response.stop_reason),
     supervisorStopReason: strictBoundedString(response.supervisor_stop_reason),
     providerTimeoutSource: strictBoundedString(response.provider_timeout_source),
+    providerBudget: response.provider_budget && typeof response.provider_budget === 'object'
+      ? response.provider_budget : null,
+    providerBudgetEnforcement: strictBoundedString(response.provider_budget_enforcement),
     providerApiErrorStatus: apiErrorStatusCandidate !== null
       && apiErrorStatusCandidate >= 100 && apiErrorStatusCandidate <= 599 ? apiErrorStatusCandidate : null,
     providerPermissionDenials: normalizeProviderPermissionDenials(response.provider_permission_denials, modelInvocation),
@@ -1057,6 +1068,9 @@ async function callProvider({
   parentReceiptId,
   purpose = 'ask_provider',
   signal,
+  providerBudget,
+  effort,
+  maxEffortOverride = false,
 }) {
   const requestId = `mcp:${crypto.randomUUID()}`;
   const classification = classifyTask(prompt);
@@ -1091,6 +1105,9 @@ async function callProvider({
     cwd: cwd || '',
     configFingerprint,
     purpose,
+    providerBudget: providerBudget || null,
+    effort: effort || null,
+    maxEffortOverride: maxEffortOverride === true,
     cwdIdentityHash: workspaceAdmission?.cwdIdentityHash || null,
     cwdPolicyId: workspaceAdmission?.cwdPolicyId || null,
     bridgeBuildId: workspaceAdmission?.bridgeBuildId || null,
@@ -1181,6 +1198,9 @@ async function callProvider({
         expectedCwdIdentityHash: workspaceAdmission.cwdIdentityHash,
         expectedCwdPolicyId: workspaceAdmission.cwdPolicyId,
         timeoutMs: TIMEOUT_POLICY.normalizeOneShotTimeoutMs(timeoutMs),
+        providerBudget,
+        effort,
+        maxEffortOverride,
         dangerous: false,
       },
       timeoutMs: TIMEOUT_POLICY.transportTimeoutMs(timeoutMs),
@@ -1234,6 +1254,8 @@ async function callProvider({
     stopReason: sanitized.stopReason ?? null,
     supervisorStopReason: sanitized.supervisorStopReason ?? null,
     providerTimeoutSource: sanitized.providerTimeoutSource ?? null,
+    providerBudget: sanitized.providerBudget ?? providerBudget ?? null,
+    providerBudgetEnforcement: sanitized.providerBudgetEnforcement ?? null,
     providerApiErrorStatus: sanitized.providerApiErrorStatus ?? null,
     providerPermissionDenialCount: sanitized.providerPermissionDenials?.count ?? null,
     providerPermissionDenialObserved: sanitized.providerPermissionDenials?.observed ?? null,
@@ -1788,6 +1810,9 @@ export function buildServer() {
       timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).max(TIMEOUT_POLICY.oneShotMaxMs).default(TIMEOUT_POLICY.oneShotDefaultMs),
       useCache: z.boolean().default(true),
       cacheTtlMs: z.number().int().min(0).max(86400000).optional(),
+      providerBudget: PROVIDER_BUDGET_SCHEMA.optional(),
+      effort: z.enum(['low', 'medium', 'high', 'max']).optional(),
+      maxEffortOverride: z.boolean().default(false),
       acknowledgeHumanGate: z.boolean().default(false),
     }),
     annotations: EXTERNAL_READ,
@@ -1822,6 +1847,9 @@ export function buildServer() {
       acknowledgeHumanGate: z.boolean().default(false),
       allowModelForDeterministic: z.boolean().default(false),
       allowInputTruncation: z.boolean().default(false),
+      providerBudget: PROVIDER_BUDGET_SCHEMA.optional(),
+      effort: z.enum(['low', 'medium', 'high', 'max']).optional(),
+      maxEffortOverride: z.boolean().default(false),
     }),
     annotations: EXTERNAL_READ,
   }, safeHandler(async (args, context) => {
@@ -1902,6 +1930,9 @@ export function buildServer() {
         parentReceiptId: rootReceipt.receiptId,
         purpose: 'route_and_ask',
         signal,
+        providerBudget: args.providerBudget,
+        effort: args.effort,
+        maxEffortOverride: args.maxEffortOverride,
       });
       attempts.push(response);
       run = writeRun({ ...run, status: 'running', members: attempts });
@@ -1913,6 +1944,7 @@ export function buildServer() {
         && response.failureClass === 'validation'
         && [CWD_OUTSIDE_ALLOWED_ROOTS, CWD_IDENTITY_CHANGED]
           .includes(response.errorCode)) break;
+      if (response.failureClass === 'token_budget' || response.stopReason === 'token_budget') break;
       if (signal?.aborted) break;
     }
     const winner = attempts.find(providerSucceeded) || null;
@@ -1960,6 +1992,9 @@ export function buildServer() {
       synthesisProvider: z.string().max(64).optional(),
       acknowledgeHumanGate: z.boolean().default(false),
       acknowledgeTruncatedEvidence: z.boolean().default(false),
+      providerBudget: PROVIDER_BUDGET_SCHEMA.optional(),
+      effort: z.enum(['low', 'medium', 'high', 'max']).optional(),
+      maxEffortOverride: z.boolean().default(false),
     }),
     annotations: EXTERNAL_READ,
   }, safeHandler(async (args, context) => {
@@ -2038,6 +2073,9 @@ export function buildServer() {
           parentReceiptId: rootReceipt.receiptId,
           purpose: `committee:${role}`,
           signal,
+          providerBudget: args.providerBudget,
+          effort: args.effort,
+          maxEffortOverride: args.maxEffortOverride,
         });
         member = {
           ...response,
@@ -2090,6 +2128,9 @@ export function buildServer() {
           parentReceiptId: rootReceipt.receiptId,
           purpose: 'committee:chair',
           signal,
+          providerBudget: args.providerBudget,
+          effort: args.effort,
+          maxEffortOverride: args.maxEffortOverride,
         });
         if (providerSucceeded(synthesis)) synthesisAssessment = parseChairAssessment(synthesis.stdout);
       }
@@ -2206,12 +2247,18 @@ export function buildServer() {
       all: z.boolean().default(false),
       cwd: z.string().max(1000).optional(),
       timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).max(TIMEOUT_POLICY.oneShotMaxMs).default(TIMEOUT_POLICY.oneShotDefaultMs),
+      providerBudget: PROVIDER_BUDGET_SCHEMA.optional(),
+      effort: z.enum(['low', 'medium', 'high', 'max']).optional(),
+      maxEffortOverride: z.boolean().default(false),
     }),
     annotations: { ...ACTION, openWorldHint: true },
-  }, safeHandler(async ({ prompt, tag, providers, all, cwd, timeoutMs }, context) => {
+  }, safeHandler(async ({ prompt, tag, providers, all, cwd, timeoutMs, providerBudget, effort, maxEffortOverride }, context) => {
     const response = await bridgeRequest('/api/broadcast', {
       method: 'POST',
-      body: { prompt, tag, providers, all, cwd, timeoutMs, dangerous: false },
+      body: {
+        prompt, tag, providers, all, cwd, timeoutMs, providerBudget, effort,
+        maxEffortOverride, dangerous: false,
+      },
       timeoutMs: TIMEOUT_POLICY.transportTimeoutMs(timeoutMs),
       signal: context?.mcpReq?.signal,
       actionIdentity: true,

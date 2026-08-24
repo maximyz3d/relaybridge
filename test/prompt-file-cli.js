@@ -22,6 +22,39 @@ if (markerIndex >= 0 && process.argv[markerIndex + 1]) {
 const delayIndex = process.argv.indexOf('--delay');
 const delayMs = delayIndex >= 0 ? Math.max(0, Number(process.argv[delayIndex + 1] || 0)) : 0;
 
+if (process.argv.includes('--claude-json-multiturn')) {
+  const events = [1, 2, 3].map((turn) => ({
+    type: 'assistant',
+    message: {
+      id: `fixture-turn-${turn}`,
+      usage: {
+        input_tokens: 100,
+        output_tokens: 40,
+        cache_read_input_tokens: 500,
+        cache_creation_input_tokens: 25,
+      },
+      content: [{ type: 'text', text: `turn ${turn}` }],
+    },
+  }));
+  let index = 0;
+  const interval = setInterval(() => {
+    if (index < events.length) {
+      process.stdout.write(JSON.stringify(events[index++]) + '\n');
+      return;
+    }
+    clearInterval(interval);
+    process.stdout.write(JSON.stringify({
+      type: 'result', is_error: false, subtype: 'success', result: 'MULTITURN_OK',
+      num_turns: 3,
+      usage: {
+        input_tokens: 300, output_tokens: 120,
+        cache_read_input_tokens: 1500, cache_creation_input_tokens: 75,
+      },
+    }));
+  }, 30);
+  return;
+}
+
 setTimeout(() => {
   const stderrIndex = process.argv.indexOf('--stderr');
   if (stderrIndex >= 0) process.stderr.write(String(process.argv[stderrIndex + 1] || '') + '\n');

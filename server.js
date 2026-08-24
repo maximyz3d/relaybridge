@@ -8,7 +8,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
-const { RunSupervisor, resolveSupervisorOptions } = require('./lib/run-supervisor');
+const { RunSupervisor, resolveSupervisorOptions, normalizeProviderBudget } = require('./lib/run-supervisor');
 const { resolveModelArgs, applyModelArgs, modelConfigStaleness, modelTierForTaskTier } = require('./lib/model-tiers');
 const { buildRegistry, parseModelList, pinIsRetired } = require('./lib/model-registry');
 const { buildTaskPlan, EFFORT_ORDER, costClassFor } = require('./lib/task-plan');
@@ -659,6 +659,8 @@ function appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt }
     stopReason: normalizeClaudeResultString(payload.stop_reason),
     supervisorStopReason: normalizeClaudeResultString(payload.supervisor_stop_reason),
     providerTimeoutSource: normalizeClaudeResultString(payload.provider_timeout_source),
+    providerBudget: payload.provider_budget || null,
+    providerBudgetEnforcement: normalizeClaudeResultString(payload.provider_budget_enforcement),
     providerPermissionDenialCount: nonnegativeUsageNumber(payload.provider_permission_denials?.count),
     providerPermissionDenialObserved: nonnegativeUsageNumber(payload.provider_permission_denials?.observed),
     providerPermissionDenialInvalid: nonnegativeUsageNumber(payload.provider_permission_denials?.invalid),
@@ -1215,6 +1217,75 @@ function normalizeClaudeJsonUsage(document) {
   };
 }
 
+// Incremental Claude stream-json usage is authoritative when attached to a
+// uniquely identified assistant message. Aggregate each message exactly once;
+// the terminal result, when present, replaces the aggregate with the CLI's
+// complete model census. Other providers remain explicitly terminal-only or
+// unavailable rather than being policed with character-count guesses.
+function createProviderUsageObserver(parserName, supervisor) {
+  if (parserName !== 'claude_json') return { record() {}, flush() {} };
+  let partial = '';
+  const seen = new Set();
+  const cumulative = {
+    input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0,
+    cache_creation_input_tokens: 0, total_tokens: 0, turns: 0,
+  };
+  const consume = (line) => {
+    let event;
+    try { event = JSON.parse(line); } catch { return; }
+    if (event?.type === 'result') {
+      const usage = normalizeClaudeJsonUsage(event);
+      const turns = nonnegativeUsageNumber(event.num_turns);
+      if (usage) supervisor.recordProviderUsage({ ...usage, turns }, { phase: 'terminal' });
+      else if (turns !== null) supervisor.recordProviderUsage({ turns }, { phase: 'terminal' });
+      return;
+    }
+    if (event?.type !== 'assistant' || !event.message || typeof event.message !== 'object') return;
+    const id = typeof event.message.id === 'string' ? event.message.id.trim() : '';
+    if (!id || seen.has(id)) return;
+    const usage = event.message.usage;
+    if (!usage || typeof usage !== 'object' || Array.isArray(usage)) return;
+    const values = {
+      input_tokens: nonnegativeUsageNumber(usage.input_tokens),
+      output_tokens: nonnegativeUsageNumber(usage.output_tokens),
+      cache_read_input_tokens: nonnegativeUsageNumber(usage.cache_read_input_tokens ?? 0),
+      cache_creation_input_tokens: nonnegativeUsageNumber(usage.cache_creation_input_tokens ?? 0),
+    };
+    if (Object.values(values).some((value) => value === null)) return;
+    const total = safeTokenSum(Object.values(values));
+    if (total === null) return;
+    seen.add(id);
+    for (const [key, value] of Object.entries(values)) cumulative[key] += value;
+    cumulative.total_tokens += total;
+    cumulative.turns += 1;
+    supervisor.recordProviderUsage(cumulative, { phase: 'incremental' });
+  };
+  return {
+    record(chunk) {
+      const lines = (partial + String(chunk || '')).split(/\r?\n/);
+      partial = lines.pop() || '';
+      for (const line of lines) consume(line);
+    },
+    flush() { if (partial.trim()) consume(partial); partial = ''; },
+  };
+}
+
+function validateProviderBudgetRequest(value) {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('providerBudget must be an object');
+  const allowed = new Set(['maxOutputTokens', 'maxTotalTokens', 'maxCacheReadTokens', 'maxCacheCreationTokens', 'maxTurns']);
+  for (const [key, candidate] of Object.entries(value)) {
+    if (!allowed.has(key)) throw new Error(`unknown providerBudget field: ${key}`);
+    if (candidate !== null && (!Number.isSafeInteger(candidate) || candidate <= 0)) {
+      throw new Error(`providerBudget.${key} must be a positive safe integer or null`);
+    }
+  }
+  // Keep the validated request sparse. resolveSupervisorOptions performs the
+  // precedence merge; eagerly filling defaults here would erase provider-
+  // specific limits whenever a caller overrides only one dimension.
+  return { ...value };
+}
+
 const CLAUDE_RETRY_ERROR_CATEGORIES = new Set([
   'authentication_failed',
   'oauth_org_not_allowed',
@@ -1621,7 +1692,16 @@ function isUpstreamTimeoutStatus(status) {
   return Number(status) === 408 || Number(status) === 504;
 }
 
-async function runOpenAIChatOneShot({ entry, prompt, timeoutMs, res, route, startedAt }) {
+function terminalProviderBudgetOutcome(usage, providerBudget, turns = null) {
+  const supervisor = new RunSupervisor({ providerBudget });
+  supervisor.recordProviderUsage({ ...(usage || {}), turns }, { phase: 'terminal' });
+  const verdict = supervisor.evaluate();
+  return verdict.action === 'kill' && verdict.reason === 'token_budget'
+    ? { exceeded: true, detail: verdict.detail, budget: supervisor.snapshot().providerBudget }
+    : { exceeded: false, detail: '', budget: supervisor.snapshot().providerBudget };
+}
+
+async function runOpenAIChatOneShot({ entry, prompt, timeoutMs, res, route, startedAt, providerBudget }) {
   const bounded = capPrompt(prompt, Number(entry.prompt_max_chars || 12000));
   route.prompt_transport = 'hosted_openai_compatible';
   route.prompt_truncated = bounded.truncated;
@@ -1723,6 +1803,7 @@ async function runOpenAIChatOneShot({ entry, prompt, timeoutMs, res, route, star
         total_tokens: computedTotal ?? nonnegativeUsageNumber(payload.usage.total_tokens),
       };
     })() : null;
+    const budgetOutcome = terminalProviderBudgetOutcome(usage, providerBudget);
     if (!clientGone && !res.writableEnded) {
       sendOneShotResult(res, {
         kind: route.provider,
@@ -1731,12 +1812,18 @@ async function runOpenAIChatOneShot({ entry, prompt, timeoutMs, res, route, star
         stdout,
         stderr: '',
         usage,
+        failureClass: budgetOutcome.exceeded ? 'token_budget' : null,
+        stop_reason: budgetOutcome.exceeded ? 'token_budget' : null,
+        supervisor_stop_reason: budgetOutcome.exceeded ? 'token_budget' : null,
+        stop_detail: budgetOutcome.detail,
+        provider_budget: budgetOutcome.budget,
+        provider_budget_enforcement: usage ? 'terminal' : 'unavailable',
         rate_limited: false,
         budget_exceeded: false,
         auth_failed: false,
         permission_denied: false,
         timed_out: false,
-        dropped_out: !stdout,
+        dropped_out: budgetOutcome.exceeded || !stdout,
         model_invocation: true,
       }, { kind: route.provider, prompt, route, startedAt });
     }
@@ -1759,7 +1846,7 @@ async function runOpenAIChatOneShot({ entry, prompt, timeoutMs, res, route, star
   }
 }
 
-async function runOllamaApiOneShot({ entry, prompt, timeoutMs, res, route, startedAt }) {
+async function runOllamaApiOneShot({ entry, prompt, timeoutMs, res, route, startedAt, providerBudget }) {
   const bounded = capPrompt(prompt, Number(entry.prompt_max_chars || 24000));
   route.prompt_transport = 'local_http';
   route.prompt_truncated = bounded.truncated;
@@ -1846,6 +1933,7 @@ async function runOllamaApiOneShot({ entry, prompt, timeoutMs, res, route, start
       load_duration_ns: Number.isFinite(Number(payload.load_duration)) ? Number(payload.load_duration) : null,
       done_reason: payload.done_reason || null,
     };
+    const budgetOutcome = terminalProviderBudgetOutcome(usage, providerBudget);
     if (!clientGone && !res.writableEnded) {
       sendOneShotResult(res, {
         kind: route.provider,
@@ -1854,12 +1942,18 @@ async function runOllamaApiOneShot({ entry, prompt, timeoutMs, res, route, start
         stdout,
         stderr: '',
         usage,
+        failureClass: budgetOutcome.exceeded ? 'token_budget' : null,
+        stop_reason: budgetOutcome.exceeded ? 'token_budget' : null,
+        supervisor_stop_reason: budgetOutcome.exceeded ? 'token_budget' : null,
+        stop_detail: budgetOutcome.detail,
+        provider_budget: budgetOutcome.budget,
+        provider_budget_enforcement: inputTokens !== null || outputTokens !== null ? 'terminal' : 'unavailable',
         rate_limited: false,
         budget_exceeded: false,
         auth_failed: false,
         permission_denied: false,
         timed_out: false,
-        dropped_out: !stdout,
+        dropped_out: budgetOutcome.exceeded || !stdout,
         model_invocation: true,
       }, { kind: route.provider, prompt, route, startedAt });
     }
@@ -3158,6 +3252,24 @@ async function executeOneShot(body, res) {
   }
   const entry = cfg[kind];
   if (!entry) return rejectBeforeAdmission(400, 'validation', { error: 'unknown kind: ' + kind });
+  let requestedProviderBudget;
+  try {
+    requestedProviderBudget = validateProviderBudgetRequest(body?.providerBudget);
+  } catch (err) {
+    return rejectBeforeAdmission(400, 'validation', { error: err.message });
+  }
+  const requestedEffort = typeof body?.effort === 'string' ? body.effort.trim().toLowerCase() : null;
+  if (requestedEffort && !['low', 'medium', 'high', 'max'].includes(requestedEffort)) {
+    return rejectBeforeAdmission(400, 'validation', { error: 'effort must be low, medium, high, or max' });
+  }
+  if (requestedEffort === 'max' && body?.maxEffortOverride !== true) {
+    return rejectBeforeAdmission(400, 'validation', {
+      error: 'effort=max requires maxEffortOverride=true; RelayBridge never infers maximum effort',
+    });
+  }
+  if (body?.maxEffortOverride === true && requestedEffort !== 'max') {
+    return rejectBeforeAdmission(400, 'validation', { error: 'maxEffortOverride is valid only with effort=max' });
+  }
   // Pre-flight auth gate. If the last readiness sweep saw this CLI installed but
   // signed out, the call would fail with an opaque provider error and the prompt
   // would be wasted. Report it as an actionable auth_required instead, so the
@@ -3202,12 +3314,20 @@ async function executeOneShot(body, res) {
     console.warn(`[RelayBridge] ${kind}: pinned model "${modelChoice.model}" is not in this account's model list â€” falling back to the account default`);
     modelChoice = { ...modelChoice, args: [], model: null, source: 'account_default_retired_pin' };
   }
-  const slot = applyModelArgs(
+  let slot = applyModelArgs(
     resolveSlot(slotRaw),
     modelChoice.args,
     entry,
     modelChoice.suppressArgs,
   );
+  if (requestedEffort) {
+    const effortFlagIndex = slot.findIndex((arg) => arg === '--effort' || arg === '--reasoning-effort');
+    if (effortFlagIndex < 0 || effortFlagIndex + 1 >= slot.length) {
+      return rejectBeforeAdmission(400, 'validation', { error: `${kind} does not expose an explicit effort control` });
+    }
+    slot = [...slot];
+    slot[effortFlagIndex + 1] = requestedEffort;
+  }
   const safePromptPrefix = !useDanger && typeof entry.oneshot_safe_prompt_prefix === 'string'
     ? entry.oneshot_safe_prompt_prefix.trim() : '';
   if (safePromptPrefix.length > 4096) {
@@ -3317,6 +3437,8 @@ async function executeOneShot(body, res) {
       ? `${entry.model}${ollamaManifestIdentity(entry) ? `@${ollamaManifestIdentity(entry)}` : ''}`
       : null,
     requested_effort: flagValue('--effort') || flagValue('--reasoning-effort'),
+    effort_explicit: !!requestedEffort,
+    max_effort_override: requestedEffort === 'max' && body?.maxEffortOverride === true,
     effort_method: (flagValue('--effort') || flagValue('--reasoning-effort'))
       ? 'flag'
       : (modelChoice.model ? 'model_choice' : 'account_default'),
@@ -3365,13 +3487,16 @@ async function executeOneShot(body, res) {
       console.error(`[RelayBridge] cancellation receipt persistence failed: ${error.message}`);
     }
   });
+  const resolvedProviderBudget = resolveSupervisorOptions({
+    entry, globals: cfg._supervisor || {}, providerBudget: requestedProviderBudget,
+  }).providerBudget;
   if (entry.oneshot_adapter === 'ollama_api') {
     cleanupPromptFile();
-    return runOllamaApiOneShot({ entry, prompt, timeoutMs: adapterTimeoutMs, res, route, startedAt });
+    return runOllamaApiOneShot({ entry, prompt, timeoutMs: adapterTimeoutMs, res, route, startedAt, providerBudget: resolvedProviderBudget });
   }
   if (entry.oneshot_adapter === 'openai_chat_api') {
     cleanupPromptFile();
-    return runOpenAIChatOneShot({ entry, prompt, timeoutMs: adapterTimeoutMs, res, route, startedAt });
+    return runOpenAIChatOneShot({ entry, prompt, timeoutMs: adapterTimeoutMs, res, route, startedAt, providerBudget: resolvedProviderBudget });
   }
   const isWindows = process.platform === 'win32';
   let proc;
@@ -3466,6 +3591,7 @@ async function executeOneShot(body, res) {
   const supervisor = new RunSupervisor(resolveSupervisorOptions({
     entry,
     globals: cfg._supervisor || {},
+    providerBudget: resolvedProviderBudget,
     hardCapMs: explicitTimeout,
     startedAt,
   }));
@@ -3473,7 +3599,9 @@ async function executeOneShot(body, res) {
   activeRuns.set(runId, { runId, kind, route, startedAt, supervisor, pid: proc.pid });
   let stopReason = null;
   let stopDetail = '';
+  let stopBudgetEnforcement = null;
   let sampling = false;
+  const usageObserver = createProviderUsageObserver(entry.oneshot_output_parser, supervisor);
 
   const finishSupervision = () => {
     clearInterval(tick);
@@ -3486,7 +3614,8 @@ async function executeOneShot(body, res) {
       if (verdict.action !== 'kill') return;
       stopReason = verdict.reason;
       stopDetail = verdict.detail;
-      timedOut = true;
+      if (verdict.reason === 'token_budget') stopBudgetEnforcement = supervisor.snapshot().providerUsagePhase;
+      timedOut = verdict.reason !== 'token_budget';
       killProcessTree(proc);
     };
     // CPU is only sampled once a run has gone quiet, so healthy runs never pay
@@ -3517,7 +3646,18 @@ async function executeOneShot(body, res) {
   proc.stderr.setEncoding('utf8');
   // recordOutput returns false once the output cap is reached, which stops the
   // buffer growing before the kill lands â€” a runaway CLI cannot OOM the bridge.
-  proc.stdout.on('data', (d) => { if (supervisor.recordOutput(d)) stdout += d; });
+  proc.stdout.on('data', (d) => {
+    usageObserver.record(d);
+    if (supervisor.recordOutput(d)) stdout += d;
+    const verdict = supervisor.evaluate();
+    if (verdict.action === 'kill' && !stopReason) {
+      stopReason = verdict.reason;
+      stopDetail = verdict.detail;
+      if (verdict.reason === 'token_budget') stopBudgetEnforcement = supervisor.snapshot().providerUsagePhase;
+      timedOut = verdict.reason !== 'token_budget';
+      killProcessTree(proc);
+    }
+  });
   proc.stderr.on('data', (d) => { if (supervisor.recordOutput(d)) stderr += d; });
   proc.on('error', (err) => {
     if (settled) return;
@@ -3533,7 +3673,27 @@ async function executeOneShot(body, res) {
     finishSupervision();
     cleanupPromptFile();
     if (clientGone || res.writableEnded) return;
+    usageObserver.flush();
     const parsedOutput = parseConfiguredOneShotOutput(entry, stdout);
+    if (parsedOutput.usage || parsedOutput.numTurns !== null) {
+      supervisor.recordProviderUsage({ ...(parsedOutput.usage || {}), turns: parsedOutput.numTurns }, { phase: 'terminal' });
+      const terminalVerdict = supervisor.evaluate();
+      if (terminalVerdict.action === 'kill' && !stopReason) {
+        stopReason = terminalVerdict.reason;
+        stopDetail = terminalVerdict.detail;
+        if (terminalVerdict.reason === 'token_budget') stopBudgetEnforcement = 'terminal';
+      }
+    }
+    const supervisedUsage = supervisor.snapshot().providerUsage;
+    const authoritativeUsage = parsedOutput.usage || (supervisedUsage ? {
+      input_tokens: supervisedUsage.input_tokens ?? 0,
+      output_tokens: supervisedUsage.output_tokens ?? 0,
+      cache_read_input_tokens: supervisedUsage.cache_read_input_tokens ?? 0,
+      cache_creation_input_tokens: supervisedUsage.cache_creation_input_tokens ?? 0,
+      total_tokens: supervisedUsage.total_tokens ?? null,
+      token_source: 'provider_reported',
+      model_usage: [],
+    } : null);
     const cleanedStdout = parsedOutput.output;
     if (Array.isArray(parsedOutput.usage?.model_usage) && parsedOutput.usage.model_usage.length) {
       const dominant = [...parsedOutput.usage.model_usage].sort((left, right) =>
@@ -3612,14 +3772,16 @@ async function executeOneShot(body, res) {
     const providerInternalTimedOut = (code !== 0 || !cleanedStdout || parsedOutput.isError)
       && hasProviderInternalTimeoutDiagnostic(failureBlob);
     const providerTimedOut = timedOut || authoritativeApiFailure === 'timeout' || providerInternalTimedOut;
-    const finalFailureClass = parsedOutput.resultSubtype === 'error_max_budget_usd' ? 'budget'
+    const tokenBudgetExceeded = stopReason === 'token_budget';
+    const finalFailureClass = tokenBudgetExceeded ? 'token_budget'
+      : parsedOutput.resultSubtype === 'error_max_budget_usd' ? 'budget'
       : authoritativeApiFailure || (rate_limited ? 'rate_limit'
       : budget_exceeded ? 'budget'
         : auth_failed ? 'auth'
           : providerTimedOut ? 'timeout'
             : permission_denied ? 'policy'
               : parsedOutput.failureClass);
-    const dropped_out = providerTimedOut || code !== 0 || permission_denied || rate_limited || budget_exceeded
+    const dropped_out = tokenBudgetExceeded || providerTimedOut || code !== 0 || permission_denied || rate_limited || budget_exceeded
       || auth_failed || parsedOutput.isError || !!parsedOutput.failureClass
       || !!parsedOutput.parseError || !cleanedStdout;
     const sentPayload = sendOneShotResult(res, {
@@ -3628,7 +3790,7 @@ async function executeOneShot(body, res) {
       exitCode: code,
       stdout: cleanedStdout,
       stderr: cleanOutput([stderr, parsedOutput.diagnostic, parsedOutput.parseError].filter(Boolean).join('\n')),
-      usage: parsedOutput.usage,
+      usage: authoritativeUsage,
       failureClass: finalFailureClass,
       result_subtype: parsedOutput.resultSubtype,
       result_schema_disagreement: parsedOutput.resultSchemaDisagreement,
@@ -3637,7 +3799,7 @@ async function executeOneShot(body, res) {
       provider_terminal_reason: parsedOutput.terminalReason,
       provider_api_error_status: parsedOutput.apiErrorStatus,
       provider_permission_denials: parsedOutput.permissionDenials,
-      provider_num_turns: parsedOutput.numTurns,
+      provider_num_turns: parsedOutput.numTurns ?? supervisedUsage?.turns ?? null,
       provider_duration_ms: parsedOutput.providerDurationMs,
       provider_api_duration_ms: parsedOutput.providerApiDurationMs,
       provider_error_count: parsedOutput.errorCount,
@@ -3662,6 +3824,9 @@ async function executeOneShot(body, res) {
         : authoritativeApiFailure === 'timeout' ? 'provider_api_status'
           : providerInternalTimedOut ? 'provider_cli_diagnostic' : null,
       stop_detail: stopDetail || (permission_denied ? permissionClassification.detail : ''),
+      provider_budget: supervisor.snapshot().providerBudget,
+      provider_budget_enforcement: tokenBudgetExceeded ? stopBudgetEnforcement
+        : (supervisor.snapshot().providerUsagePhase === 'unavailable' ? 'unavailable' : supervisor.snapshot().providerUsagePhase),
       progress: supervisor.snapshot(),
       timed_out: providerTimedOut,
       dropped_out,
@@ -3928,7 +4093,10 @@ app.post('/api/agents/:id/tags', (req, res) => {
 // exactly like /api/oneshot. Members that hit the global concurrency cap are
 // queued (bounded retry on admission_limit) instead of failing.
 app.post('/api/broadcast', async (req, res) => {
-  const { prompt, tag, providers, all, dangerous, timeoutMs = TIMEOUT_POLICY.oneShotDefaultMs, cwd } = req.body || {};
+  const {
+    prompt, tag, providers, all, dangerous, timeoutMs = TIMEOUT_POLICY.oneShotDefaultMs, cwd,
+    providerBudget, effort, maxEffortOverride,
+  } = req.body || {};
   const effectiveTimeoutMs = TIMEOUT_POLICY.normalizeOneShotTimeoutMs(timeoutMs);
   if (typeof prompt !== 'string' || !prompt.trim()) {
     return res.status(400).json({ error: 'non-empty prompt required' });
@@ -3977,7 +4145,10 @@ app.post('/api/broadcast', async (req, res) => {
     }
     const captured = new CapturedOneShotResponse();
     activeCaptured.add(captured);
-    executeOneShot({ kind, prompt, timeoutMs: remainingMs, cwd, dangerous }, captured)
+    executeOneShot({
+      kind, prompt, timeoutMs: remainingMs, cwd, dangerous,
+      providerBudget, effort, maxEffortOverride,
+    }, captured)
       .catch((err) => captured.status(500).json({ error: err.message, dropped_out: true }));
     try { return await captured.done; }
     finally { activeCaptured.delete(captured); }

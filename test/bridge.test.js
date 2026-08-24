@@ -58,8 +58,14 @@ test('provider config uses the installed subscription CLIs and safe headless mod
   assert.ok(config.claude.strip_env.includes('ANTHROPIC_API_KEY'));
   assert.equal(config.claude.safe[config.claude.safe.indexOf('--model') + 1], 'opus');
   assert.equal(config.claude_fable.safe[config.claude_fable.safe.indexOf('--model') + 1], 'fable');
-  assert.equal(config.claude_fable.safe[config.claude_fable.safe.indexOf('--effort') + 1], 'max');
-  assert.equal(config.claude_fable.oneshot_safe[config.claude_fable.oneshot_safe.indexOf('--effort') + 1], 'max');
+  assert.equal(config.claude_fable.safe[config.claude_fable.safe.indexOf('--effort') + 1], 'high');
+  assert.equal(config.claude_fable.oneshot_safe[config.claude_fable.oneshot_safe.indexOf('--effort') + 1], 'high');
+  for (const kind of ['claude', 'claude_fable']) {
+    for (const slot of ['safe', 'dangerous', 'oneshot_safe', 'oneshot_dangerous']) {
+      assert.notEqual(config[kind][slot][config[kind][slot].indexOf('--effort') + 1], 'max',
+        `${kind}.${slot} must not infer maximum effort`);
+    }
+  }
   assert.equal(config.claude_fable.oneshot_safe[config.claude_fable.oneshot_safe.indexOf('--output-format') + 1], 'stream-json');
   assert.ok(config.claude_fable.oneshot_safe.includes('--include-partial-messages'));
   assert.equal(config.claude_fable.oneshot_output_parser, 'claude_json');
@@ -399,8 +405,16 @@ test('prompt-file transport preserves long special-character prompts and cleans 
       label: 'Structured Claude Usage',
       safe: [process.execPath, helper, '--version'],
       dangerous: [process.execPath, helper, '--version'],
-      oneshot_safe: [...baseSlot, '--claude-json'],
-      oneshot_dangerous: [...baseSlot, '--claude-json'],
+      oneshot_safe: [...baseSlot, '--claude-json', '--effort', 'high'],
+      oneshot_dangerous: [...baseSlot, '--claude-json', '--effort', 'high'],
+      oneshot_output_parser: 'claude_json',
+    },
+    usage_json_multiturn: {
+      label: 'Incremental Multi-Turn Claude Usage',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--claude-json-multiturn'],
+      oneshot_dangerous: [...baseSlot, '--claude-json-multiturn'],
       oneshot_output_parser: 'claude_json',
     },
     usage_json_malformed_models: {
@@ -912,6 +926,48 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(usageReceipt.actualTotalTokens, 35453);
   assert.equal(usageReceipt.tokenUsageSource, 'provider_reported');
   assert.equal(usageReceipt.provider_reported_cost_usd, 0.32762);
+
+  const multiTurnBudgetResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST',
+    headers: jsonAuth,
+    body: JSON.stringify({
+      kind: 'usage_json_multiturn', prompt: 'enforce multi-turn provider usage', dangerous: false,
+      providerBudget: {
+        maxOutputTokens: null, maxTotalTokens: null, maxCacheReadTokens: null,
+        maxCacheCreationTokens: null, maxTurns: 2,
+      },
+    }),
+  });
+  assert.equal(multiTurnBudgetResponse.status, 200);
+  const multiTurnBudgetResult = await multiTurnBudgetResponse.json();
+  assert.equal(multiTurnBudgetResult.stop_reason, 'token_budget');
+  assert.equal(multiTurnBudgetResult.failureClass, 'token_budget');
+  assert.equal(multiTurnBudgetResult.timed_out, false);
+  assert.equal(multiTurnBudgetResult.dropped_out, true);
+  assert.equal(multiTurnBudgetResult.provider_num_turns, 3);
+  assert.equal(multiTurnBudgetResult.usage.total_tokens, 1995);
+  assert.equal(multiTurnBudgetResult.provider_budget_enforcement, 'incremental');
+
+  const maxEffortRejected = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ kind: 'usage_json', prompt: 'do not infer max', effort: 'max', dangerous: false }),
+  });
+  assert.equal(maxEffortRejected.status, 400);
+  assert.match((await maxEffortRejected.json()).error, /maxEffortOverride=true/);
+
+  const maxEffortExplicit = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({
+      kind: 'usage_json', prompt: 'EXPLICIT_MAX_OK', effort: 'max',
+      maxEffortOverride: true, dangerous: false,
+    }),
+  });
+  assert.equal(maxEffortExplicit.status, 200);
+  const maxEffortExplicitResult = await maxEffortExplicit.json();
+  assert.equal(maxEffortExplicitResult.stdout, 'STRUCTURED_OK');
+  assert.equal(maxEffortExplicitResult.route.requested_effort, 'max');
+  assert.equal(maxEffortExplicitResult.route.effort_explicit, true);
+  assert.equal(maxEffortExplicitResult.route.max_effort_override, true);
 
   const malformedModelsResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST',
@@ -1535,6 +1591,20 @@ test('local Ollama adapter uses loopback HTTP, returns final-only text, and reco
   assert.equal(requestPayload.stream, false);
   assert.equal(requestPayload.think, false);
   assert.equal(requestPayload.options.num_predict, 64);
+
+  const terminalBudgetResponse = await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST', headers,
+    body: JSON.stringify({
+      kind: 'local', prompt: 'terminal budget', dangerous: false,
+      providerBudget: { maxTotalTokens: 10 },
+    }),
+  });
+  const terminalBudget = await terminalBudgetResponse.json();
+  assert.equal(terminalBudget.failureClass, 'token_budget');
+  assert.equal(terminalBudget.stop_reason, 'token_budget');
+  assert.equal(terminalBudget.provider_budget_enforcement, 'terminal');
+  assert.equal(terminalBudget.timed_out, false);
+  assert.equal(terminalBudget.dropped_out, true);
 
   const ambiguousFailureResponse = await fetch(`${baseUrl}/api/oneshot`, {
     method: 'POST',

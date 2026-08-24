@@ -130,6 +130,19 @@ Agentic one-shot providers use bounded multi-turn budgets. Grok receives up to
 answer; the bridge deadline, process-tree cancellation, read-only sandbox, and
 no-subagent rules remain the hard safety limits.
 
+The global `_supervisor.providerBudget` sets provider-reported ceilings for
+output tokens, total tokens (including cache traffic), cache reads, cache
+creation, and turns. Provider entries may override them, and REST/MCP callers
+may supply a sparse `providerBudget` for one run; `null` disables one dimension.
+These gates never use cleaned-output character estimates. Claude stream-json
+assistant usage can stop a run incrementally; terminal-only provider usage is
+classified truthfully as terminal enforcement and cannot recover tokens already
+spent. A `token_budget` stop is not retried or escalated automatically.
+
+Claude and Fable default to `high` effort. Maximum effort is never inferred: a
+caller must send both `effort: "max"` and `maxEffortOverride: true`. Explicit
+human requests using both fields remain supported.
+
 Provider prompts default to a 20-minute deadline and accept an explicit
 `timeoutMs` up to 45 minutes. The liveness supervisor also grants buffered
 print-mode CLIs the full 20-minute default silence window, so a healthy Claude
