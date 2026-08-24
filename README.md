@@ -149,6 +149,13 @@ assistant usage can stop a run incrementally; terminal-only provider usage is
 classified truthfully as terminal enforcement and cannot recover tokens already
 spent. A `token_budget` stop is not retried or escalated automatically.
 
+Antigravity 1.1.19 is an explicit unenforceable boundary: its documented text,
+JSON, and stream-JSON modes expose messages but no authoritative token or turn
+usage. Gemini diagnostics, agent status, and the Fuel panel therefore publish
+`usageCapability.budgetEnforcement: "unenforceable"`; RelayBridge does not turn
+output characters into a token estimate. The version and inspection evidence
+are carried with the capability so a future CLI upgrade can be re-evaluated.
+
 Claude and Fable default to `high` effort. Maximum effort is never inferred: a
 caller must send both `effort: "max"` and `maxEffortOverride: true`. Explicit
 human requests using both fields remain supported.

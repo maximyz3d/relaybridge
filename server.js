@@ -13,6 +13,7 @@ const { resolveModelArgs, applyModelArgs, modelConfigStaleness, modelTierForTask
 const { buildRegistry, parseModelList, pinIsRetired } = require('./lib/model-registry');
 const { buildTaskPlan, EFFORT_ORDER, costClassFor } = require('./lib/task-plan');
 const { buildQuotaSeatGroups } = require('./lib/quota-seat');
+const { providerUsageCapability, providerUsageCapabilities } = require('./lib/provider-usage-capability');
 const { receiptStoreIdentity } = require('./lib/receipt-store-identity.cjs');
 const { WebSocketServer } = require('ws');
 const { spawn, spawnSync } = require('child_process');
@@ -2656,6 +2657,7 @@ function agentSummary(kind, entry) {
     model: entry.model || null,
     tags: Array.isArray(entry.tags) ? entry.tags.filter((tag) => PROVIDER_TAG_RE.test(String(tag))) : [],
     autoRoute: entry.autoRoute !== false,
+    usageCapability: diag?.usageCapability || providerUsageCapability(entry),
     readiness: diag ? {
       found: diag.found ?? null,
       ready: diag.ready ?? null,
@@ -3042,6 +3044,7 @@ app.get('/api/diag', async (req, res) => {
         detail,
         probeExitCode: null,
         runtimeVersion: '',
+        usageCapability: providerUsageCapability(entry),
       }];
     }
     const binary = entry.diagnostic_binary ||
@@ -3082,6 +3085,7 @@ app.get('/api/diag', async (req, res) => {
       detail,
       probeExitCode,
       runtimeVersion,
+      usageCapability: providerUsageCapability(entry, { runtimeVersion }),
     }];
   }));
   const results = Object.fromEntries(pairs);
@@ -4016,7 +4020,15 @@ app.get('/api/usage/gauges', (req, res) => {
   try {
     const windowMs = Number(req.query.windowMs) || 86400000;
     const gauges = usageLedger.gaugeAll(seatCostClasses(), windowMs);
-    res.json({ gauges, balance: fleetBalance(gauges), quotaSeats: quotaSeatRegistry.groups, totals: usageLedger.totals(windowMs) });
+    const runtimeVersions = Object.fromEntries(Object.entries(lastDiagnostics?.results || {})
+      .map(([kind, result]) => [kind, result.runtimeVersion || '']));
+    res.json({
+      gauges,
+      balance: fleetBalance(gauges),
+      quotaSeats: quotaSeatRegistry.groups,
+      providerUsageCapabilities: providerUsageCapabilities(loadConfig(), runtimeVersions),
+      totals: usageLedger.totals(windowMs),
+    });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 app.get('/api/cooldowns', (req, res) => {
