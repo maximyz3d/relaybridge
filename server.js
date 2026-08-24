@@ -658,6 +658,13 @@ function appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt }
     providerErrorDiagnosticTruncated: payload.provider_error_diagnostic_truncated === true,
     providerErrorHash: payload.provider_error_diagnostic
       ? crypto.createHash('sha256').update(String(payload.provider_error_diagnostic)).digest('hex') : null,
+    partialResult: payload.partial_result === true,
+    failureSentinel: normalizeClaudeResultString(payload.failure_sentinel),
+    failureSentinelSource: normalizeClaudeResultString(payload.failure_sentinel_source),
+    partialDiagnosticChars: payload.partial_result === true
+      ? String(payload.partial_diagnostic || '').length : 0,
+    partialDiagnosticHash: payload.partial_result === true
+      ? crypto.createHash('sha256').update(String(payload.partial_diagnostic || '')).digest('hex') : null,
     stopReason: normalizeClaudeResultString(payload.stop_reason),
     supervisorStopReason: normalizeClaudeResultString(payload.supervisor_stop_reason),
     providerTimeoutSource: normalizeClaudeResultString(payload.provider_timeout_source),
@@ -906,12 +913,26 @@ function sendOneShotResult(res, payload, meta) {
     provider: meta?.kind,
     prompt: meta?.prompt,
     stdout: payload.stdout,
+    transportStdout: meta?.transportStdout,
     stderr: payload.stderr,
     exitCode: payload.exitCode,
     elapsedMs: meta?.startedAt ? Date.now() - meta.startedAt : 0,
     stopReason: payload.stop_reason,
   });
-  if (classified.kind === 'incomplete_response' && !payload.dropped_out) {
+  if (classified.partialResult) {
+    payload = {
+      ...payload,
+      stdout: '',
+      failureClass: 'incomplete_response',
+      dropped_out: true,
+      partial_result: true,
+      failure_sentinel: classified.failureSentinel,
+      failure_sentinel_source: classified.failureSentinelSource,
+      partial_diagnostic: cleanOutput(classified.partialDiagnostic),
+      stop_reason: 'provider_incomplete_response',
+      stop_detail: classified.detail,
+    };
+  } else if (classified.kind === 'incomplete_response' && !payload.dropped_out) {
     payload = {
       ...payload,
       failureClass: 'incomplete_response',
@@ -3849,7 +3870,7 @@ async function executeOneShot(body, res) {
       timed_out: providerTimedOut,
       dropped_out,
       model_invocation: true,
-    }, { kind, prompt, route, startedAt, cwd: resolvedCwd });
+    }, { kind, prompt, route, startedAt, cwd: resolvedCwd, transportStdout: stdout });
     // GitHub middleware: only successful runs checkpoint — a dropped-out run
     // may have left half-applied edits, which the human should triage first.
     if (sentPayload && !sentPayload.dropped_out) {

@@ -409,6 +409,14 @@ test('prompt-file transport preserves long special-character prompts and cleans 
       oneshot_safe: [...baseSlot, '--output', 'I will inspect the repository and trace the pipeline.\nNext I will review the tests and report any defects.'],
       oneshot_dangerous: [...baseSlot, '--output', 'I will inspect the repository and trace the pipeline.\nNext I will review the tests and report any defects.'],
     },
+    perplexity: {
+      label: 'Perplexity No-Answer Sentinel Fixture',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--perplexity-fixture'],
+      oneshot_dangerous: [...baseSlot, '--perplexity-fixture'],
+      costClass: 'subscription',
+    },
     grok: {
       label: 'Grok Quota Fixture',
       safe: [process.execPath, helper, '--version'],
@@ -773,6 +781,47 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(narrationReceipt.status, 'dropped');
   assert.equal(narrationReceipt.failureClass, 'incomplete_response');
   assert.equal(narrationReceipt.outputChars, narrationResult.stdout.length, 'receipt retains evidence of the original output');
+
+  const perplexityResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ kind: 'perplexity', prompt: 'Return categorized research evidence.', dangerous: false }),
+  });
+  assert.equal(perplexityResponse.status, 200);
+  const perplexityResult = await perplexityResponse.json();
+  assert.equal(perplexityResult.exitCode, 0, 'the provider transport exited cleanly');
+  assert.equal(perplexityResult.stdout, '', 'partial fragments must not escape as successful stdout');
+  assert.equal(perplexityResult.dropped_out, true);
+  assert.equal(perplexityResult.partial_result, true);
+  assert.equal(perplexityResult.failureClass, 'incomplete_response');
+  assert.equal(perplexityResult.failure_sentinel, 'No answer received');
+  assert.equal(perplexityResult.failure_sentinel_source, 'perplexity_cli_stdout_first_line');
+  assert.equal(perplexityResult.partial_diagnostic, 'https://docs.example.test/one\npartial extracted text');
+  assert.equal(perplexityResult.stop_reason, 'provider_incomplete_response');
+  assert.equal(perplexityResult.provider_retries.count, 0, 'the same seat is not retried');
+  const perplexityReceipt = fs.readFileSync(
+    path.join(tempRoot, 'data', 'receipts', new Date().toISOString().slice(0, 10) + '.jsonl'), 'utf8',
+  ).trim().split(/\r?\n/).map(JSON.parse).find((row) => row.receiptId === perplexityResult.receiptId);
+  assert.equal(perplexityReceipt.status, 'dropped');
+  assert.equal(perplexityReceipt.failureClass, 'incomplete_response');
+  assert.equal(perplexityReceipt.partialResult, true);
+  assert.equal(perplexityReceipt.failureSentinel, 'No answer received');
+  assert.equal(perplexityReceipt.failureSentinelSource, 'perplexity_cli_stdout_first_line');
+  assert.equal(perplexityReceipt.outputChars, 0, 'receipt records normalized stdout separately');
+  assert.equal(perplexityReceipt.partialDiagnosticChars, perplexityResult.partial_diagnostic.length);
+  assert.match(perplexityReceipt.partialDiagnosticHash, /^[0-9a-f]{64}$/);
+  assert.equal(perplexityReceipt.transportOutputChars, 'No answer received\nhttps://docs.example.test/one\npartial extracted text'.length);
+  assert.match(perplexityReceipt.transportOutputHash, /^[0-9a-f]{64}$/);
+
+  const quotedPerplexityResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ kind: 'perplexity', prompt: 'PERPLEXITY_QUOTED_DOCUMENT', dangerous: false }),
+  });
+  const quotedPerplexity = await quotedPerplexityResponse.json();
+  assert.equal(quotedPerplexity.exitCode, 0);
+  assert.equal(quotedPerplexity.dropped_out, false, 'quoted user content is not a sentinel');
+  assert.equal(quotedPerplexity.failureClass, null);
+  assert.match(quotedPerplexity.stdout, /^> No answer received/);
+  assert.equal(quotedPerplexity.partial_result, undefined);
 
   const safeReviewPrompt = 'Review the repository without modifying it.';
   const safeReviewResponse = await fetch(baseUrl + '/api/oneshot', {

@@ -8,8 +8,50 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
   classifyRunFailure, detectCopilotMonthlyQuota,
+  detectPerplexityNoAnswerSentinel,
   isHeadlessCommandPermissionDenial, isNarrationOnlyResponse, seatToleratesLongRuns,
 } = require('../lib/provider-failure');
+
+test('Perplexity exact first-line no-answer sentinel is a non-retryable partial drop', () => {
+  const partialDiagnostic = 'https://example.com/one\nSupporting fragment without a complete answer.';
+  const run = {
+    provider: 'perplexity', exitCode: 0,
+    stdout: `No answer received\n${partialDiagnostic}`,
+  };
+  assert.deepEqual(detectPerplexityNoAnswerSentinel(run), {
+    sentinel: 'No answer received',
+    source: 'perplexity_cli_stdout_first_line',
+    partialDiagnostic,
+  });
+  const classified = classifyRunFailure(run);
+  assert.equal(classified.kind, 'incomplete_response');
+  assert.equal(classified.partialResult, true);
+  assert.equal(classified.partialDiagnostic, partialDiagnostic);
+  assert.equal(classified.retryable, false, 'the same Perplexity seat must not be retried automatically');
+  assert.equal(classified.failUp, true);
+});
+
+test('Perplexity sentinel detector rejects quoted content, later mentions, and exact-line lookalikes', () => {
+  const ordinaryAnswers = [
+    '> No answer received\nThis is a quoted user document.',
+    'The quoted document begins with “No answer received”.',
+    'Normal answer\nNo answer received\nThis phrase appears later.',
+    'No answer received.',
+    ' No answer received',
+    'No answer received extra text',
+  ];
+  for (const stdout of ordinaryAnswers) {
+    const run = { provider: 'perplexity', exitCode: 0, stdout };
+    assert.equal(detectPerplexityNoAnswerSentinel(run), null, stdout);
+    assert.equal(classifyRunFailure(run).kind, 'ok', stdout);
+  }
+  assert.equal(detectPerplexityNoAnswerSentinel({
+    provider: 'grok', exitCode: 0, stdout: 'No answer received\nhttps://example.com',
+  }), null, 'the sentinel is provider-specific');
+  assert.equal(detectPerplexityNoAnswerSentinel({
+    provider: 'perplexity', exitCode: 1, stdout: 'No answer received',
+  }), null, 'non-zero exits keep their existing terminal classification');
+});
 
 test('Grok future-tense process narration is incomplete, preserved, and never retried on the same seat', () => {
   const stdout = 'I will inspect the repository and trace the relevant pipeline.\nNext I will review the tests and report any defects.';

@@ -944,6 +944,7 @@ function sanitizeProviderResponse(response) {
     : response.model_invocation === null ? null : true;
   const rawFailureClass = strictBoundedString(response.failureClass);
   const terminalReason = strictBoundedString(response.provider_terminal_reason);
+  const partialDiagnostic = clip(response.partial_diagnostic || '', 12000);
   const apiErrorStatusCandidate = response.provider_api_error_status === null
     || response.provider_api_error_status === undefined ? null
     : strictTokenCount(response.provider_api_error_status);
@@ -985,6 +986,13 @@ function sanitizeProviderResponse(response) {
     providerErrorObserved: strictTokenCount(response.provider_error_observed),
     providerErrorInvalid: strictTokenCount(response.provider_error_invalid),
     providerErrorDiagnosticTruncated: response.provider_error_diagnostic_truncated === true,
+    partialResult: response.partial_result === true,
+    failureSentinel: strictBoundedString(response.failure_sentinel),
+    failureSentinelSource: strictBoundedString(response.failure_sentinel_source),
+    partialDiagnostic: partialDiagnostic.text,
+    partialDiagnosticChars: partialDiagnostic.originalChars,
+    partialDiagnosticSha256: stableHash(response.partial_diagnostic || ''),
+    partialDiagnosticTruncated: partialDiagnostic.truncated,
     transportOutputChars: strictTokenCount(response.transport_output_chars),
     transportOutputHash: typeof response.transport_output_hash === 'string'
       && /^[0-9a-f]{64}$/.test(response.transport_output_hash) ? response.transport_output_hash : null,
@@ -1271,6 +1279,13 @@ async function callProvider({
     providerErrorObserved: sanitized.providerErrorObserved ?? null,
     providerErrorInvalid: sanitized.providerErrorInvalid ?? null,
     providerErrorDiagnosticTruncated: sanitized.providerErrorDiagnosticTruncated ?? false,
+    partialResult: sanitized.partialResult === true,
+    failureSentinel: sanitized.failureSentinel ?? null,
+    failureSentinelSource: sanitized.failureSentinelSource ?? null,
+    partialDiagnosticChars: sanitized.partialDiagnosticChars ?? 0,
+    partialDiagnosticHash: sanitized.partialResult
+      ? sanitized.partialDiagnosticSha256 : null,
+    partialDiagnosticTruncated: sanitized.partialDiagnosticTruncated === true,
     transportOutputChars: sanitized.transportOutputChars ?? null,
     transportOutputHash: sanitized.transportOutputHash ?? null,
     modelInvocation: sanitized.modelInvocation ?? null,
