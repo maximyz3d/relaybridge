@@ -243,6 +243,13 @@ function Test-SamePath([string]$Left, [string]$Right) {
   return [string]::Equals((Get-NormalizedPath $Left), (Get-NormalizedPath $Right), [StringComparison]::OrdinalIgnoreCase)
 }
 
+function Get-Sha256([string]$Path) {
+  $stream = [IO.File]::OpenRead($Path)
+  $sha = [Security.Cryptography.SHA256]::Create()
+  try { return ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-', '').ToLowerInvariant() }
+  finally { $sha.Dispose(); $stream.Dispose() }
+}
+
 function Merge-JsonDefaults($Defaults, $Existing) {
   if ($null -eq $Existing) { return $Defaults }
   if ($Existing -is [Array]) { return ,$Existing }
@@ -353,6 +360,89 @@ function Restore-ShippedModelPins($Merged, $Defaults, $Existing) {
   return $Merged
 }
 
+# Provider launch arrays are normally preserved atomically so operator model
+# choices, wrapper arguments, and local policy survive an upgrade. A small
+# subset of arguments is nevertheless part of RelayBridge's safety contract:
+# for example, baseline Claude effort must not remain at a legacy `max` after
+# maximum effort becomes an explicit per-run opt-in. The shipped config names
+# those flag/value slices under `_config_merge.managed_provider_args`.
+#
+# Refresh only those declared slices. Never replace a whole launch array, add a
+# missing flag to an operator-authored command, or touch an undeclared/unknown
+# provider. This keeps the migration schema-aware and narrowly reversible.
+function Restore-ShippedManagedProviderArgs($Merged, $Defaults) {
+  if (-not ($Merged -is [pscustomobject]) -or -not ($Defaults -is [pscustomobject])) { return $Merged }
+  $mergeSchema = $Defaults.PSObject.Properties['_config_merge']
+  if (-not $mergeSchema -or -not ($mergeSchema.Value -is [pscustomobject])) { return $Merged }
+  $managedProviders = $mergeSchema.Value.PSObject.Properties['managed_provider_args']
+  if (-not $managedProviders -or -not ($managedProviders.Value -is [pscustomobject])) { return $Merged }
+
+  foreach ($providerSpec in $managedProviders.Value.PSObject.Properties) {
+    $providerName = $providerSpec.Name
+    $spec = $providerSpec.Value
+    if (-not ($spec -is [pscustomobject])) { throw "Invalid managed-provider schema for '$providerName'." }
+    $defaultProvider = $Defaults.PSObject.Properties[$providerName]
+    $mergedProvider = $Merged.PSObject.Properties[$providerName]
+    if (-not $defaultProvider -or -not $mergedProvider -or
+        -not ($defaultProvider.Value -is [pscustomobject]) -or
+        -not ($mergedProvider.Value -is [pscustomobject])) { continue }
+
+    $slotProp = $spec.PSObject.Properties['slots']
+    $argsProp = $spec.PSObject.Properties['args']
+    if (-not $slotProp -or -not $argsProp) { throw "Managed-provider schema for '$providerName' requires slots and args." }
+    foreach ($slotNameValue in @($slotProp.Value)) {
+      $slotName = [string]$slotNameValue
+      $defaultSlot = $defaultProvider.Value.PSObject.Properties[$slotName]
+      $mergedSlot = $mergedProvider.Value.PSObject.Properties[$slotName]
+      if (-not $defaultSlot -or -not $mergedSlot) { continue }
+      $shippedArgs = @($defaultSlot.Value)
+      $candidateArgs = @($mergedSlot.Value)
+      $changed = $false
+
+      foreach ($argSpec in @($argsProp.Value)) {
+        if (-not ($argSpec -is [pscustomobject])) { throw "Invalid managed argument schema for '$providerName.$slotName'." }
+        $flagProp = $argSpec.PSObject.Properties['flag']
+        $countProp = $argSpec.PSObject.Properties['value_count']
+        $flag = if ($flagProp) { [string]$flagProp.Value } else { '' }
+        $valueCount = if ($countProp) { [int]$countProp.Value } else { -1 }
+        if (-not $flag.StartsWith('--') -or $valueCount -lt 0) {
+          throw "Invalid managed argument declaration for '$providerName.$slotName'."
+        }
+
+        $shippedIndex = -1
+        $candidateIndex = -1
+        for ($i = 0; $i -lt $shippedArgs.Count; $i++) {
+          if ([string]$shippedArgs[$i] -ceq $flag) { $shippedIndex = $i; break }
+        }
+        for ($i = 0; $i -lt $candidateArgs.Count; $i++) {
+          if ([string]$candidateArgs[$i] -ceq $flag) { $candidateIndex = $i; break }
+        }
+        if ($shippedIndex -lt 0) { throw "Shipped slot '$providerName.$slotName' is missing managed flag '$flag'." }
+        # A missing managed flag identifies a genuinely custom command shape.
+        # Preserve it instead of guessing where a release argument belongs.
+        if ($candidateIndex -lt 0) { continue }
+        if (($shippedIndex + $valueCount) -ge $shippedArgs.Count -or
+            ($candidateIndex + $valueCount) -ge $candidateArgs.Count) {
+          throw "Managed flag '$flag' has too few values in '$providerName.$slotName'."
+        }
+        for ($offset = 1; $offset -le $valueCount; $offset++) {
+          if ([string]$candidateArgs[$candidateIndex + $offset] -cne [string]$shippedArgs[$shippedIndex + $offset]) {
+            $candidateArgs[$candidateIndex + $offset] = $shippedArgs[$shippedIndex + $offset]
+            $changed = $true
+          }
+        }
+      }
+
+      if ($changed) {
+        $mergedProvider.Value.PSObject.Properties.Remove($slotName)
+        $mergedProvider.Value | Add-Member -NotePropertyName $slotName -NotePropertyValue $candidateArgs -Force
+        Write-Host ("[RelayBridge] {0}.{1}: refreshed release-managed provider arguments." -f $providerName, $slotName)
+      }
+    }
+  }
+  return $Merged
+}
+
 function Merge-JsonFile([string]$DefaultPath, [string]$ExistingPath) {
   if (-not (Test-Path -LiteralPath $ExistingPath -PathType Leaf)) { return }
   if (-not (Test-Path -LiteralPath $DefaultPath -PathType Leaf)) {
@@ -370,6 +460,7 @@ function Merge-JsonFile([string]$DefaultPath, [string]$ExistingPath) {
   $merged = Merge-JsonDefaults $defaults $existing
   if ([IO.Path]::GetFileName($DefaultPath) -ieq 'cli-config.json') {
     $merged = Restore-ShippedModelPins $merged $defaults $existing
+    $merged = Restore-ShippedManagedProviderArgs $merged $defaults
   }
   $tempPath = "$DefaultPath.merge.$([Guid]::NewGuid().ToString('N')).tmp"
   try {
@@ -419,7 +510,7 @@ function Get-ReleaseBuildInfo([string]$StageRoot, [string]$SourceLabel) {
   if ($files.Count -eq 0) { throw 'Release contains no files to identify.' }
   foreach ($file in $files) {
     $relative = $file.FullName.Substring($StageRoot.Length).TrimStart('\', '/').Replace('\', '/')
-    $parts += ($relative + ':' + (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant())
+    $parts += ($relative + ':' + (Get-Sha256 $file.FullName))
   }
   $bytes = [Text.Encoding]::UTF8.GetBytes(($parts -join ':'))
   $sha = [Security.Cryptography.SHA256]::Create()
