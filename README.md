@@ -14,6 +14,8 @@ irm https://raw.githubusercontent.com/maximyz3d/relaybridge/main/install.ps1 | i
 
 That installs RelayBridge to `%LOCALAPPDATA%\RelayBridge`, installs locked Node dependencies in a sibling staging directory, starts `http://127.0.0.1:8787`, verifies the exact staged build, and then opens the dashboard.
 
+The installer also adds that install directory to your user `PATH` and ships a stable `relaybridge.cmd` launcher, so `relaybridge status`, `relaybridge plan`, and the other CLI commands work in new terminals. When the installer runs directly in the current PowerShell process (for example, `irm ... | iex`), it also updates that process's `PATH` immediately. When it is launched through a child `powershell -File` process, open a new terminal afterward so it inherits the updated user `PATH`. Custom `-InstallDir` values are registered the same way.
+
 Updates are transactional. The installer tests the staged release before draining a matching old bridge, atomically promotes it, and restores and restarts the previous build if promotion, startup, health verification, or MCP registration fails. `.bridge-token`, `.state.json`, and `data/` move with the release instead of being copied, while existing `cli-config.json` and `config/*.json` values win a schema-aware merge so operator model pins, tags, routing policy, and unknown providers are preserved. Optional provider installation happens only after the core cutover succeeds.
 
 If PowerShell blocks scripts on a new computer, use:

@@ -45,7 +45,7 @@ function Invoke-TestInstall([string]$FailAt = '', [switch]$Start, [int]$Port = 0
   try {
     $env:RELAYBRIDGE_INSTALL_TEST_FAIL_AT = $FailAt
     $arguments = @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $installer,
-      '-SourceDir', $repoRoot, '-InstallDir', $installRoot, '-SkipProviderSetup', '-NoBrowser', '-Port', [string]$Port)
+      '-SourceDir', $repoRoot, '-InstallDir', $installRoot, '-SkipProviderSetup', '-SkipCliPathRegistration', '-NoBrowser', '-Port', [string]$Port)
     if (-not $Start) { $arguments += '-NoStart' }
     # Do not pipe or redirect the child PowerShell output. On Windows a
     # detached candidate server can inherit the pipeline/file handle, keeping
@@ -158,6 +158,18 @@ server.listen(port, '127.0.0.1');
   if ($success.ExitCode -ne 0) { throw "Installer success case failed with exit code $($success.ExitCode)." }
   $startedPort = $success.Port
   Assert-True (Test-Path -LiteralPath (Join-Path $installRoot 'server.js') -PathType Leaf) 'new server.js must be promoted'
+  Assert-True (Test-Path -LiteralPath (Join-Path $installRoot 'relaybridge.cmd') -PathType Leaf) 'Windows CLI shim must be promoted'
+  $cliHelp = & (Join-Path $installRoot 'relaybridge.cmd') --help 2>&1 | Out-String
+  Assert-True ($LASTEXITCODE -eq 0) 'promoted Windows CLI shim must execute successfully'
+  Assert-True ($cliHelp -match 'relaybridge status') 'promoted Windows CLI shim must invoke bin/relaybridge.js'
+
+  $pathHelper = Join-Path $installRoot 'tools\register-cli-path.ps1'
+  $firstPath = & $pathHelper -InstallDir $installRoot -NoPersist -UserPath 'C:\Windows' -ProcessPath 'C:\Windows\System32'
+  Assert-True ($firstPath.UserPath -eq ('C:\Windows;' + $installRoot)) 'PATH helper must append a custom install root without replacing entries'
+  Assert-True ($firstPath.ProcessPath -eq ('C:\Windows\System32;' + $installRoot)) 'PATH helper must expose the CLI to the current installer process'
+  $secondPath = & $pathHelper -InstallDir $installRoot -NoPersist -UserPath $firstPath.UserPath -ProcessPath $firstPath.ProcessPath
+  Assert-True (-not $secondPath.UserPathChanged -and -not $secondPath.ProcessPathChanged) 'PATH registration must be idempotent'
+  Assert-True ((@($secondPath.UserPath -split ';' | Where-Object { $_ -eq $installRoot })).Count -eq 1) 'PATH registration must not duplicate the install root'
   Assert-True (-not (Test-Path -LiteralPath (Join-Path $installRoot 'stale-code.js'))) 'stale release files must not survive promotion'
   Assert-True ((Get-Content -LiteralPath (Join-Path $installRoot '.bridge-token') -Raw).Trim() -eq ('a' * 64)) 'capability token bytes must be preserved'
   Assert-True (Test-Path -LiteralPath (Join-Path $installRoot 'data\receipts\preserved.jsonl')) 'retained data must be preserved'
