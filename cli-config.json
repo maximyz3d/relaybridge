@@ -475,8 +475,13 @@
     "post_install": "Open a fresh PowerShell and run agent login once to connect your Cursor subscription.",
     "docs_url": "https://cursor.com/docs/cli/overview",
     "_note": "Uses your Cursor subscription via the native Windows agent CLI. No model pinned; the account default applies (run agent models to pin one). Print mode has full write access by default, so the safe one-shot seat pins --mode ask; --trust prevents the headless workspace-trust prompt from hanging bounded calls. CURSOR_API_KEY is stripped so calls never silently fall back to metered API billing.",
-    "model_tiers_locked": true,
-    "model_note": "This plan only allows Auto: named models return \"Named models unavailable\". No model flag is sent so the Cursor seat picks its own. model_tiers_locked keeps an upgrade from restoring the shipped pins over this."
+    "model_tiers_mode": "account_default",
+    "retired_model_pins": [
+      "gpt-5.6-luna-low",
+      "gpt-5.6-terra-medium",
+      "gpt-5.6-sol-high"
+    ],
+    "model_note": "This plan only allows Auto: named models return \"Named models unavailable\". No model flag is sent so the Cursor seat picks its own. The installer removes the retired shipped pins while preserving explicitly locked custom operator pins."
   },
   "gemini": {
     "label": "Gemini (Antigravity)",

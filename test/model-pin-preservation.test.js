@@ -99,4 +99,6 @@ test('an Auto-only shipped seat removes stale installed tiers unless the operato
   const ps = fs.readFileSync(path.join(__dirname, '..', 'install.ps1'), 'utf8');
   assert.match(ps, /removed installed model pins because the shipped seat now requires its account default/);
   assert.match(ps, /Only a lock that existed in the operator's installed config/);
+  assert.match(ps, /onlyKnownRetiredPins/,
+    'a draft-added lock around known retired defaults must not masquerade as an operator override');
 });
