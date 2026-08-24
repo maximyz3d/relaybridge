@@ -200,3 +200,47 @@ test('oversized output is truncated rather than filling the disk', async () => {
   assert.match(t.result, /truncated/);
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+// Regression: the capture response must satisfy the WHOLE Express interface
+// executeOneShot uses, not just json/status. It registered disconnect listeners
+// with res.once, the shim lacked it, and every task failed instantly with
+// "res.once is not a function". The fake executor in the tests above never
+// touched those methods, so nothing caught it.
+test('the capture response supports every response method the real handler uses', async () => {
+  const dir = tmpdir();
+  const used = [];
+  const q = createTaskQueue({
+    dataDir: dir,
+    // Exercise the same surface server.js actually calls on res.
+    executeOneShot: async (body, res) => {
+      res.once('close', () => {});   used.push('once');
+      res.on('aborted', () => {});   used.push('on');
+      res.setHeader('X-Test', '1');  used.push('setHeader');
+      res.type('json');              used.push('type');
+      if (res.writableEnded || res.destroyed) throw new Error('should not be ended yet');
+      res.status(200).json({ stdout: 'ok', exitCode: 0 });
+    },
+  });
+  const { id } = q.submit({ kind: 'claude', prompt: 'x' });
+  const t = await settled(q, id);
+  assert.equal(t.status, 'done', `task failed: ${t.error}`);
+  assert.equal(t.result, 'ok');
+  assert.deepEqual(used, ['once', 'on', 'setHeader', 'type']);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('a handler that writes twice settles the task once', async () => {
+  const dir = tmpdir();
+  const q = createTaskQueue({
+    dataDir: dir,
+    executeOneShot: async (body, res) => {
+      res.json({ stdout: 'first', exitCode: 0 });
+      res.json({ stdout: 'second', exitCode: 1 }); // late write, must be ignored
+    },
+  });
+  const { id } = q.submit({ kind: 'claude', prompt: 'x' });
+  const t = await settled(q, id);
+  assert.equal(t.result, 'first', 'the first response wins, as with a real socket');
+  assert.equal(t.status, 'done');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
