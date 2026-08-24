@@ -228,6 +228,10 @@ Check `stop_reason` before trusting `stdout`:
 - `hard_cap` — hit the absolute ceiling (45 min default). The task is too big
   for one call; split it.
 - `output_cap` — runaway output. Almost always a malformed prompt.
+- `provider_incomplete_response` — the CLI exited cleanly but returned only
+  future-work narration. Do not retry the identical prompt on that seat;
+  narrow the task or switch providers. The original stdout remains in the
+  response and receipt as evidence.
 
 Also check `dropped_out`, plus `rate_limited`, `auth_failed`, and
 `budget_exceeded`. A rate-limited provider should be skipped for the rest of the

@@ -2088,6 +2088,7 @@ async function runTurn(c, targets, phaseLabel, promptFor) {
       } else if (response.dropped_out || response.exitCode !== 0) {
         let why = 'error';
         if (response.rate_limited) why = 'rate limit';
+        else if (response.failureClass === 'incomplete_response') why = 'incomplete response';
         else if (response.budget_exceeded) why = 'budget exceeded';
         else if (response.auth_failed) why = 'not signed in';
         else if (response.permission_denied) why = 'permission denied by safe mode';

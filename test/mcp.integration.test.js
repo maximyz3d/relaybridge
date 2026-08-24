@@ -135,6 +135,14 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
         '--stderr', 'Error: timeout waiting for response', '--exit', '1',
       ],
     },
+    narration_only: {
+      ...echoProvider,
+      label: 'Narration-only Grok fixture',
+      oneshot_safe: [
+        process.execPath, helper, '--prompt-file', '{prompt_file}', '--output',
+        'I will inspect the repository and trace the pipeline.\nNext I will review the tests and report any defects.',
+      ],
+    },
     retry_json: {
       ...echoProvider,
       label: 'Structured Claude retry fixture',
@@ -518,6 +526,16 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   assert.equal(providerTimeout.structuredContent.stopReason, 'provider_internal_timeout');
   assert.equal(providerTimeout.structuredContent.supervisorStopReason, null);
   assert.equal(providerTimeout.structuredContent.providerTimeoutSource, 'provider_cli_diagnostic');
+
+  const narrationOnly = await client.callTool({
+    name: 'ask_provider',
+    arguments: { kind: 'narration_only', prompt: 'Audit this repository and return concrete findings.', useCache: false },
+  });
+  assert.equal(narrationOnly.structuredContent.modelInvocation, true);
+  assert.equal(narrationOnly.structuredContent.droppedOut, true);
+  assert.equal(narrationOnly.structuredContent.failureClass, 'incomplete_response');
+  assert.equal(narrationOnly.structuredContent.stopReason, 'provider_incomplete_response');
+  assert.match(narrationOnly.structuredContent.stdout, /^I will inspect/);
 
   const retryPrompt = 'MCP_RETRY_ACCOUNTING_MARKER';
   const retryProvider = await client.callTool({

@@ -186,7 +186,7 @@ async function main() {
           // it in the directory from which `relaybridge ask` was invoked.
           body: buildAskBody(plan, task),
         });
-        if (json) { console.log(JSON.stringify(result, null, 2)); return result.exitCode === 0 ? 0 : 1; }
+        if (json) { console.log(JSON.stringify(result, null, 2)); return result.exitCode === 0 && !result.dropped_out ? 0 : 1; }
         if (result.stdout) console.log(result.stdout.trim());
         if (result.stop_reason) console.error(`\n# stopped: ${result.stop_reason} — ${result.stop_detail || ''}`);
         return result.exitCode === 0 && !result.dropped_out ? 0 : 1;

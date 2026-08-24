@@ -42,10 +42,11 @@ Response:
 |---|---|
 | `stdout` / `stderr` | Cleaned output. |
 | `exitCode` | Process exit code; `-1` on spawn failure. |
-| `stop_reason` | `null` when the run finished by itself, else `idle_stall`, `loop_detected`, `output_cap`, `hard_cap`. |
+| `stop_reason` | `null` when the run finished normally; supervisor stops include `idle_stall`, `loop_detected`, `output_cap`, and `hard_cap`; `provider_incomplete_response` means only future-work narration was returned. |
 | `stop_detail` | Human-readable explanation of the stop. |
 | `progress` | Snapshot: `bytes`, `lines`, `idleMs`, `repeatPeak`, `cpuMs`, `phase`. |
 | `dropped_out` | True when the call did not produce a usable answer. |
+| `failureClass` | Machine-readable failure class. `incomplete_response` preserves narration-only stdout but prevents it from counting as a result. |
 | `rate_limited` / `budget_exceeded` / `auth_failed` / `permission_denied` | Failure classification. |
 | `model` | The model actually selected, or `null` when the account default applied. |
 | `model_tier` | The weight class used. |

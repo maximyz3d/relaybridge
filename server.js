@@ -893,6 +893,23 @@ function sendOneShotPreAdmissionRejection(res, {
 
 function sendOneShotResult(res, payload, meta) {
   if (res.writableEnded || res.destroyed) return;
+  const classified = classifyRunFailure({
+    prompt: meta?.prompt,
+    stdout: payload.stdout,
+    stderr: payload.stderr,
+    exitCode: payload.exitCode,
+    elapsedMs: meta?.startedAt ? Date.now() - meta.startedAt : 0,
+    stopReason: payload.stop_reason,
+  });
+  if (classified.kind === 'incomplete_response' && !payload.dropped_out) {
+    payload = {
+      ...payload,
+      failureClass: 'incomplete_response',
+      dropped_out: true,
+      stop_reason: 'provider_incomplete_response',
+      stop_detail: classified.detail,
+    };
+  }
   // Usage ledger: every run — CLI, local Ollama, hosted adapter — exits
   // through here, so this single hook catches them all. Wrapped because
   // accounting must never be able to break a response.
@@ -901,14 +918,9 @@ function sendOneShotResult(res, payload, meta) {
       const ok = payload.exitCode === 0 && !payload.dropped_out;
       // Classify once and use it for BOTH accounting and cooldown, so the two
       // can never disagree about why a run ended.
-      const classified = classifyRunFailure({
-        stdout: payload.stdout, stderr: payload.stderr, exitCode: payload.exitCode,
-        elapsedMs: meta.startedAt ? Date.now() - meta.startedAt : 0,
-        stopReason: payload.stop_reason,
-      });
       const failureKind = payload.rate_limited ? 'rate_limited'
         : payload.auth_failed ? 'auth_failed'
-        : (classified.kind !== 'ok' ? classified.kind : null);
+        : payload.failureClass || (classified.kind !== 'ok' ? classified.kind : null);
       recordRunUsage({
         kind: meta.kind, route: payload.route || meta.route, usage: payload.usage,
         startedAt: meta.startedAt, ok, failureKind,
@@ -938,8 +950,10 @@ function sendOneShotResult(res, payload, meta) {
     const receipt = appendBridgeProviderReceipt({ ...meta, payload });
     res._relayReceiptPersisted = receipt.receiptId;
     res.json({ ...payload, receiptId: receipt.receiptId, receiptPersisted: true });
+    return payload;
   } catch (error) {
     res.json({ ...payload, receiptId: `rcpt_unpersisted_${Date.now().toString(36)}`, receiptPersisted: false, receiptPersistenceError: error.message });
+    return payload;
   }
 }
 
@@ -3554,7 +3568,7 @@ async function executeOneShot(body, res) {
     const dropped_out = providerTimedOut || code !== 0 || permission_denied || rate_limited || budget_exceeded
       || auth_failed || parsedOutput.isError || !!parsedOutput.failureClass
       || !!parsedOutput.parseError || !cleanedStdout;
-    sendOneShotResult(res, {
+    const sentPayload = sendOneShotResult(res, {
       kind,
       route,
       exitCode: code,
@@ -3598,7 +3612,7 @@ async function executeOneShot(body, res) {
     }, { kind, prompt, route, startedAt, cwd: resolvedCwd });
     // GitHub middleware: only successful runs checkpoint — a dropped-out run
     // may have left half-applied edits, which the human should triage first.
-    if (!dropped_out) {
+    if (sentPayload && !sentPayload.dropped_out) {
       trackRunAfterResponse({ runId, kind, user: runUser, prompt, cwd: resolvedCwd, intent: runIntent });
     }
   });
