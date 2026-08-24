@@ -212,6 +212,24 @@ relaybridge auth                   # who is installed but signed out
 relaybridge mcp-config             # MCP JSON for any client
 ```
 
+On Windows, use stdin or a UTF-8 file for diffs and other prompts that can
+exceed the command-line limit:
+
+```powershell
+# PowerShell 7 preserves UTF-8 for native pipelines.
+git diff --no-ext-diff | relaybridge ask --kind gemini --stdin
+
+# PowerShell 5.1-safe path when the prompt is already in $prompt.
+$prompt | Set-Content -Encoding utf8 -NoNewline .\review-prompt.txt
+relaybridge plan --prompt-file .\review-prompt.txt
+relaybridge ask --kind claude --prompt-file .\review-prompt.txt
+```
+
+Both `plan` and `ask` require exactly one prompt source: positional text,
+`--stdin`, or `--prompt-file <path>`. The CLI rejects empty, invalid UTF-8,
+missing, or conflicting input before making any bridge request, and it never
+echoes the prompt into process arguments or error output.
+
 `ask` refuses critical-tier tasks unless given `--force`, because those are
 advisory-only by policy.
 
