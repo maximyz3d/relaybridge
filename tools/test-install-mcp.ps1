@@ -61,6 +61,13 @@ try {
     $claudeAfter = [IO.File]::ReadAllText($claudeConfig, [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
     Assert-True ($codexAfter -match '\[mcp_servers\.relaybridge\]') 'Codex canonical registration must be created'
     Assert-True ($codexAfter -match 'tool_timeout_sec = 2745') 'Codex MCP timeout must cover the 45-minute provider cap plus transport and host grace'
+    foreach ($newTool in @(
+      'plan_task', 'list_models', 'list_active_runs', 'bridge_activity',
+      'submit_task', 'get_task', 'list_tasks', 'cancel_task',
+      'provider_cooldowns', 'usage_gauges', 'usage_totals', 'usage_advise'
+    )) {
+      Assert-True ($codexAfter -match ('"' + [regex]::Escape($newTool) + '"')) "Codex allowlist must include PR #40 tool: $newTool"
+    }
     Assert-True ($codexAfter -notmatch '\[mcp_servers\.ps_bridge\]') 'recognized Codex ps_bridge registration must be removed after promotion'
     Assert-True ($codexAfter -match '\[mcp_servers\.ps-bridge\]') 'non-RelayBridge lookalike registration must not be removed'
     Assert-True ($codexAfter -match '\[mcp_servers\.unrelated\]') 'unrelated Codex registration must be preserved'
