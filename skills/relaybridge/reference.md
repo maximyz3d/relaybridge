@@ -53,6 +53,7 @@ Response:
 | `failure_sentinel` / `failure_sentinel_source` | Canonical sentinel and the provider-specific framing rule that detected it. |
 | `partial_diagnostic` | Trailing URL/text fragments retained explicitly as diagnostics; this content is never ordinary successful `stdout`. |
 | `rate_limited` / `budget_exceeded` / `auth_failed` / `permission_denied` | Failure classification. |
+| `provider_action_required` | Narrow structured evidence for a recognized provider account action. Cursor currently reports exact `named_models_unavailable` and `usage_quota_exhausted` diagnostics; named-model remediation is attributed to RelayBridge only when `route.model_flag_sent` proves a model flag was sent. |
 | `policy_reason` | Concrete policy subtype when known; Antigravity command auto-denial is `headless_command_permission_auto_denied`. |
 | `model` | The model actually selected, or `null` when the account default applied. |
 | `model_tier` | The weight class used. |

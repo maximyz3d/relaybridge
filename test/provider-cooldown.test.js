@@ -41,6 +41,16 @@ test('only quota-class failures cool a seat — auth or a bad prompt must not', 
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+test('authoritative usage-quota exhaustion cools a seat but generic budget failures do not', () => {
+  const nowRef = { t: 1_000_000 };
+  const { s, dir } = store(nowRef);
+  assert.ok(s.noteFailure('cursor', 'quota_exhausted'));
+  assert.equal(s.status('cursor').reason, 'quota_exhausted');
+  assert.equal(s.noteFailure('claude', 'budget'), null, 'a per-run USD budget must not cool a subscription seat');
+  assert.equal(s.status('claude').cooling, false);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 test('Retry-After from the provider wins over our guess', () => {
   const nowRef = { t: 1_000_000 };
   const { s, dir } = store(nowRef);

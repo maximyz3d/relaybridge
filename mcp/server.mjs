@@ -652,7 +652,7 @@ const PROVIDER_FAILURE_CLASSES = new Set([
   'tool_deferred', 'aborted_streaming', 'aborted_tools', 'hook_stopped',
   'stop_hook_prevented', 'blocking_limit', 'prompt_too_long',
   'provider_error', 'admission_limit', 'bridge_identity_mismatch',
-  'incomplete_response', 'token_budget',
+  'incomplete_response', 'token_budget', 'plan_restriction',
   'client_cancelled', 'mcp_deadline_cancelled',
 ]);
 
@@ -944,6 +944,29 @@ export function normalizeQuotaEvidence(value) {
   };
 }
 
+export function normalizeProviderActionRequired(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || value.provider !== 'cursor' || typeof value.modelFlagSent !== 'boolean') return null;
+  const source = value.source === 'cursor_cli_stderr' || value.source === 'cursor_cli_stdout'
+    ? value.source : null;
+  if (!source) return null;
+  if (value.kind === 'named_models_unavailable' && value.scope === 'plan'
+    && value.diagnostic === 'Named models unavailable; Free plans can only use Auto') {
+    return {
+      provider: 'cursor', kind: value.kind, scope: 'plan', source,
+      diagnostic: value.diagnostic, modelFlagSent: value.modelFlagSent,
+    };
+  }
+  if (value.kind === 'usage_quota_exhausted' && value.scope === 'seat'
+    && value.diagnostic === "You've hit your usage limit") {
+    return {
+      provider: 'cursor', kind: value.kind, scope: 'seat', source,
+      diagnostic: value.diagnostic, modelFlagSent: value.modelFlagSent,
+    };
+  }
+  return null;
+}
+
 function sanitizeProviderResponse(response) {
   const stdout = clip(response.stdout || '', 24000);
   const stderr = clip(response.stderr || '', 4000);
@@ -1012,6 +1035,7 @@ function sanitizeProviderResponse(response) {
     providerRetries: normalizeProviderRetries(response.provider_retries, modelInvocation),
     vendorQuota: normalizeVendorQuota(response.vendor_quota),
     quotaEvidence: normalizeQuotaEvidence(response.quota_evidence),
+    providerActionRequired: normalizeProviderActionRequired(response.provider_action_required),
     stdout: stdout.text,
     stderr: stderr.text,
     stdoutChars: stdout.originalChars,
@@ -1347,6 +1371,7 @@ async function callProvider({
     modelUsage: sanitized.usage?.model_usage ?? [],
     vendorQuota: sanitized.vendorQuota ?? null,
     quotaEvidence: sanitized.quotaEvidence ?? null,
+    providerActionRequired: sanitized.providerActionRequired ?? null,
     providerRetryCount: sanitized.providerRetries?.count ?? null,
     providerRetryDelayMs: sanitized.providerRetries?.total_delay_ms ?? null,
     providerRetryMaxAttempt: sanitized.providerRetries?.max_attempt ?? null,

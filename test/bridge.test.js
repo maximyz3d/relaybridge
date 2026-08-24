@@ -473,6 +473,19 @@ test('prompt-file transport preserves long special-character prompts and cleans 
       oneshot_dangerous: [...baseSlot, '--stderr', "You have exceeded your monthly quota (Request ID: 393F:279076:21CF7B:277870:6A7E5965)\n\nChanges    +0 -0\nAI Credits 0 (3s)\nResume     copilot --resume=fixture", '--exit', '1'],
       costClass: 'subscription',
     },
+    cursor: {
+      label: 'Cursor ActionRequired Fixture',
+      transport: 'subscription:cursor',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--cursor-action-required'],
+      oneshot_dangerous: [...baseSlot, '--cursor-action-required'],
+      model_arg_index: 2,
+      model_tiers: {
+        standard: { args: ['--model', 'fixture-named-model'], model: 'fixture-named-model' },
+      },
+      costClass: 'subscription',
+    },
     usage_json: {
       label: 'Structured Claude Usage',
       transport: 'subscription:anthropic',
@@ -1136,6 +1149,66 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(copilotQuotaReceipt.quotaEvidence.kind, 'monthly_quota_exhausted');
   assert.equal(copilotQuotaReceipt.quotaEvidence.diagnostic, 'You have exceeded your monthly quota');
   assert.doesNotMatch(JSON.stringify(copilotQuotaReceipt.quotaEvidence), /393F|resume=fixture/i);
+
+  const cursorNamedResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ kind: 'cursor', prompt: 'CURSOR_NAMED_MODELS', dangerous: false }),
+  });
+  assert.equal(cursorNamedResponse.status, 200);
+  const cursorNamed = await cursorNamedResponse.json();
+  assert.equal(cursorNamed.exitCode, 1);
+  assert.equal(cursorNamed.stdout, '');
+  assert.equal(cursorNamed.failureClass, 'plan_restriction');
+  assert.equal(cursorNamed.dropped_out, true);
+  assert.equal(cursorNamed.route.model_flag_sent, '--model');
+  assert.equal(cursorNamed.route.requested_model, 'fixture-named-model');
+  assert.equal(cursorNamed.provider_action_required.kind, 'named_models_unavailable');
+  assert.equal(cursorNamed.provider_action_required.modelFlagSent, true);
+  assert.match(cursorNamed.stop_detail, /remove the model flag/i);
+
+  const cursorUsageResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ kind: 'cursor', prompt: 'CURSOR_USAGE_LIMIT', dangerous: false }),
+  });
+  assert.equal(cursorUsageResponse.status, 200);
+  const cursorUsage = await cursorUsageResponse.json();
+  assert.equal(cursorUsage.exitCode, 1);
+  assert.equal(cursorUsage.failureClass, 'budget');
+  assert.equal(cursorUsage.budget_exceeded, true);
+  assert.equal(cursorUsage.rate_limited, false);
+  assert.equal(cursorUsage.dropped_out, true);
+  assert.equal(cursorUsage.provider_action_required.kind, 'usage_quota_exhausted');
+  assert.equal(cursorUsage.provider_action_required.scope, 'seat');
+
+  const cursorCooldownResponse = await fetch(baseUrl + '/api/cooldowns', { headers: auth });
+  const cursorCooldowns = await cursorCooldownResponse.json();
+  const cursorCooldown = cursorCooldowns.cooling.find((item) => item.seat === 'cursor');
+  assert.ok(cursorCooldown);
+  assert.equal(cursorCooldown.reason, 'quota_exhausted');
+
+  const cursorUnknownResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ kind: 'cursor', prompt: 'CURSOR_UNRELATED_ACTION', dangerous: false }),
+  });
+  const cursorUnknown = await cursorUnknownResponse.json();
+  assert.equal(cursorUnknown.exitCode, 1);
+  assert.equal(cursorUnknown.stdout, '');
+  assert.equal(cursorUnknown.failureClass, 'provider_error', 'zero-output nonzero Cursor exits are never unclassified');
+  assert.equal(cursorUnknown.dropped_out, true);
+  assert.equal(cursorUnknown.provider_action_required, null);
+
+  const cursorReceipts = fs.readFileSync(
+    path.join(tempRoot, 'data', 'receipts', new Date().toISOString().slice(0, 10) + '.jsonl'), 'utf8',
+  ).trim().split(/\r?\n/).map(JSON.parse).filter((row) => row.provider === 'cursor');
+  const cursorNamedReceipt = cursorReceipts.find((row) => row.receiptId === cursorNamed.receiptId);
+  const cursorUsageReceipt = cursorReceipts.find((row) => row.receiptId === cursorUsage.receiptId);
+  assert.equal(cursorNamedReceipt.failureClass, 'plan_restriction');
+  assert.equal(cursorNamedReceipt.providerActionRequired.kind, 'named_models_unavailable');
+  assert.equal(cursorNamedReceipt.route.model_flag_sent, '--model');
+  assert.equal(cursorUsageReceipt.failureClass, 'budget');
+  assert.equal(cursorUsageReceipt.providerActionRequired.kind, 'usage_quota_exhausted');
+  assert.equal(cursorUsageReceipt.outputChars, 0);
+  assert.equal(cursorUsageReceipt.modelInvocation, true);
 
   const geminiAutoResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST',

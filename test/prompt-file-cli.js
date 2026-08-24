@@ -68,6 +68,16 @@ if (process.argv.includes('--claude-json-multiturn')) {
 }
 
 setTimeout(() => {
+  if (process.argv.includes('--cursor-action-required')) {
+    if (prompt.includes('CURSOR_NAMED_MODELS')) {
+      process.stderr.write('ActionRequiredError: Named models unavailable Free plans can only use Auto. Switch to Auto or upgrade plans to continue.\n');
+    } else if (prompt.includes('CURSOR_USAGE_LIMIT')) {
+      process.stderr.write("ActionRequiredError: You've hit your usage limit Get Cursor Pro for more Agent usage, unlimited Tab, and more.\n");
+    } else {
+      process.stderr.write('ActionRequiredError: operator action is required for an unrelated reason\n');
+    }
+    process.exit(1);
+  }
   const stderrIndex = process.argv.indexOf('--stderr');
   if (stderrIndex >= 0) process.stderr.write(String(process.argv[stderrIndex + 1] || '') + '\n');
   const exitIndex = process.argv.indexOf('--exit');

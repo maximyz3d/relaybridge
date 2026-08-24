@@ -644,6 +644,7 @@ function appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt }
     modelUsage: Array.isArray(usage?.model_usage) ? usage.model_usage : [],
     vendorQuota: payload.vendor_quota || null,
     quotaEvidence: payload.quota_evidence || null,
+    providerActionRequired: payload.provider_action_required || null,
     providerRetryCount: nonnegativeUsageNumber(payload.provider_retries?.count),
     providerRetryDelayMs: nonnegativeUsageNumber(payload.provider_retries?.total_delay_ms),
     providerRetryMaxAttempt: nonnegativeUsageNumber(payload.provider_retries?.max_attempt),
@@ -956,6 +957,7 @@ function sendOneShotResult(res, payload, meta) {
     exitCode: payload.exitCode,
     elapsedMs: meta?.startedAt ? Date.now() - meta.startedAt : 0,
     stopReason: payload.stop_reason,
+    modelFlagSent: !!meta?.route?.model_flag_sent,
   });
   if (classified.partialResult) {
     payload = {
@@ -987,7 +989,9 @@ function sendOneShotResult(res, payload, meta) {
       const ok = payload.exitCode === 0 && !payload.dropped_out;
       // Classify once and use it for BOTH accounting and cooldown, so the two
       // can never disagree about why a run ended.
-      const failureKind = payload.rate_limited ? 'rate_limited'
+      const failureKind = payload.provider_action_required?.kind === 'usage_quota_exhausted'
+        ? 'quota_exhausted'
+        : payload.rate_limited ? 'rate_limited'
         : payload.auth_failed ? 'auth_failed'
         : payload.failureClass || (classified.kind !== 'ok' ? classified.kind : null);
       if (failureKind === 'rate_limited') {
@@ -3636,6 +3640,8 @@ async function executeOneShot(body, res) {
     const index = args.indexOf(name);
     return index >= 0 && index + 1 < args.length ? args[index + 1] : null;
   };
+  const modelFlagSent = ['--model', '-m', '--model-id', '--llm', '--model-name']
+    .find((flag) => args.includes(flag)) || null;
   // Return non-secret route metadata with every one-shot response.  This lets
   // committee callers prove which model/effort was requested instead of
   // guessing from a generic "Claude" label.
@@ -3644,7 +3650,8 @@ async function executeOneShot(body, res) {
     transport: entry.transport || 'cli',
     configured_binary: bin,
     resolved_binary: resolvedBin,
-    requested_model: flagValue('--model') || entry.model || null,
+    requested_model: (modelFlagSent ? flagValue(modelFlagSent) : null) || entry.model || null,
+    model_flag_sent: modelFlagSent,
     resolved_model_identity: entry.model
       ? `${entry.model}${ollamaManifestIdentity(entry) ? `@${ollamaManifestIdentity(entry)}` : ''}`
       : null,
@@ -4017,11 +4024,23 @@ async function executeOneShot(body, res) {
       stderr,
       exitCode: code,
     });
+    const runClassification = classifyRunFailure({
+      provider: kind,
+      prompt,
+      stdout: cleanedStdout,
+      stderr: cleanOutput([stderr, parsedOutput.diagnostic].filter(Boolean).join('\n')),
+      exitCode: code,
+      modelFlagSent: !!route.model_flag_sent,
+    });
+    const cursorActionRequired = runClassification.actionRequired || null;
+    const cursorUsageQuotaExhausted = cursorActionRequired?.kind === 'usage_quota_exhausted';
     const rate_limited = parsedOutput.resultSubtype !== 'error_max_budget_usd'
+      && !cursorUsageQuotaExhausted
       && (authoritativeApiFailure === 'rate_limit' || !!copilotQuotaEvidence
         || rate_signals.some(s => failureBlob.includes(s)));
     const budget_exceeded = parsedOutput.resultSubtype === 'error_max_budget_usd'
       || authoritativeApiFailure === 'budget'
+      || cursorUsageQuotaExhausted
       || budget_signals.some(s => failureBlob.includes(s));
     // Some CLIs report unrelated MCP authentication warnings on stderr even
     // after the selected provider completed successfully. Only classify the
@@ -4030,14 +4049,7 @@ async function executeOneShot(body, res) {
     const auth_failed = authoritativeApiFailure === 'auth'
       || (auth_signals.some((pattern) => pattern.test(failureBlob))
         && (code !== 0 || !cleanedStdout || parsedOutput.isError));
-    const permissionClassification = classifyRunFailure({
-      provider: kind,
-      prompt,
-      stdout: cleanedStdout,
-      stderr: cleanOutput([stderr, parsedOutput.diagnostic].filter(Boolean).join('\n')),
-      exitCode: code,
-    });
-    const permission_denied = permissionClassification.kind === 'headless_command_permission_auto_denied';
+    const permission_denied = runClassification.kind === 'headless_command_permission_auto_denied';
     // Provider CLIs can enforce their own request deadline before RelayBridge's
     // progress supervisor fires. Promote only authoritative failed/no-answer
     // diagnostics; healthy model prose that discusses timeouts must remain a
@@ -4049,12 +4061,14 @@ async function executeOneShot(body, res) {
     const finalFailureClass = !isolationCleanup.ok ? 'isolation_cleanup'
       : tokenBudgetExceeded ? 'token_budget'
       : parsedOutput.resultSubtype === 'error_max_budget_usd' ? 'budget'
+      : cursorUsageQuotaExhausted ? 'budget'
+      : runClassification.kind === 'plan_restriction' ? 'plan_restriction'
       : authoritativeApiFailure || (rate_limited ? 'rate_limit'
-      : budget_exceeded ? 'budget'
-        : auth_failed ? 'auth'
-          : providerTimedOut ? 'timeout'
-            : permission_denied ? 'policy'
-              : parsedOutput.failureClass);
+        : budget_exceeded ? 'budget'
+          : auth_failed ? 'auth'
+            : providerTimedOut ? 'timeout'
+              : permission_denied ? 'policy'
+                : parsedOutput.failureClass || (code !== 0 ? runClassification.kind : null));
     const dropped_out = !isolationCleanup.ok || tokenBudgetExceeded || providerTimedOut || code !== 0 || permission_denied || rate_limited || budget_exceeded
       || auth_failed || parsedOutput.isError || !!parsedOutput.failureClass
       || !!parsedOutput.parseError || !cleanedStdout;
@@ -4082,14 +4096,15 @@ async function executeOneShot(body, res) {
       provider_error_diagnostic_truncated: parsedOutput.errorDiagnosticTruncated,
       provider_error_diagnostic: parsedOutput.diagnostic,
       quota_evidence: copilotQuotaEvidence,
+      provider_action_required: cursorActionRequired,
       transport_output_chars: String(stdout).length,
       transport_output_hash: crypto.createHash('sha256').update(String(stdout)).digest('hex'),
       rate_limited,
       budget_exceeded,
       auth_failed,
       permission_denied,
-      policy_reason: permission_denied ? permissionClassification.kind : null,
-      policy_detail: permission_denied ? permissionClassification.detail : null,
+      policy_reason: permission_denied ? runClassification.kind : null,
+      policy_detail: permission_denied ? runClassification.detail : null,
       model: modelChoice.model,
       model_tier: modelChoice.modelTier,
       stop_reason: stopReason || (providerInternalTimedOut ? 'provider_internal_timeout' : null),
@@ -4097,7 +4112,7 @@ async function executeOneShot(body, res) {
       provider_timeout_source: timedOut ? 'relay_supervisor'
         : authoritativeApiFailure === 'timeout' ? 'provider_api_status'
           : providerInternalTimedOut ? 'provider_cli_diagnostic' : null,
-      stop_detail: stopDetail || (permission_denied ? permissionClassification.detail : ''),
+      stop_detail: stopDetail || ((permission_denied || code !== 0) ? runClassification.detail : ''),
       provider_budget: supervisor.snapshot().providerBudget,
       provider_budget_enforcement: tokenBudgetExceeded ? stopBudgetEnforcement
         : (supervisor.snapshot().providerUsagePhase === 'unavailable' ? 'unavailable' : supervisor.snapshot().providerUsagePhase),
