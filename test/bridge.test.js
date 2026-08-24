@@ -622,6 +622,31 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   }
   const unauthenticated = await fetch(baseUrl + '/api/diag');
   assert.equal(unauthenticated.status, 401);
+
+  const datasheetTask = 'Read-only manufacturer-datasheet audit of BNO085 and KX134 exact pins, packages, required support circuits, interrupt/reset/boot topology, and power-domain isolation requirements; no file edits';
+  const datasheetRouteResponse = await fetch(baseUrl + '/api/route', {
+    method: 'POST', headers: jsonAuth, body: JSON.stringify({ task: datasheetTask }),
+  });
+  assert.equal(datasheetRouteResponse.status, 200);
+  const datasheetRoute = await datasheetRouteResponse.json();
+  assert.equal(datasheetRoute.primaryTag, 'research');
+  assert.ok(datasheetRoute.classification.tags.includes('research'));
+  assert.ok(datasheetRoute.selected.every((candidate) => candidate.capabilities.includes('research')));
+
+  const datasheetCli = spawnSync(process.execPath, [path.join(ROOT, 'bin', 'relaybridge.js'), 'plan', datasheetTask, '--json'], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      RELAYBRIDGE_URL: baseUrl,
+      RELAYBRIDGE_TOKEN: fs.readFileSync(tokenPath, 'utf8').trim(),
+    },
+    encoding: 'utf8',
+    windowsHide: true,
+  });
+  assert.equal(datasheetCli.status, 0, datasheetCli.stderr);
+  const datasheetPlan = JSON.parse(datasheetCli.stdout);
+  assert.equal(datasheetPlan.taskTags.includes('research'), true);
+  assert.notEqual(datasheetPlan.primary?.costClass, 'local');
   const hostileOrigin = await fetch(baseUrl + '/api/capability', {
     headers: { Origin: 'https://attacker.example' },
   });

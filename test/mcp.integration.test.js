@@ -415,6 +415,18 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   assert.equal(preview.structuredContent.classification.tier, 'utility');
   assert.match(preview.structuredContent.note, /not a universal model-quality score/);
 
+  const datasheetPreview = await client.callTool({
+    name: 'route_preview',
+    arguments: {
+      task: 'Read-only manufacturer-datasheet audit of BNO085 and KX134 exact pins, packages, required support circuits, interrupt/reset/boot topology, and power-domain isolation requirements; no file edits',
+    },
+  });
+  assert.equal(datasheetPreview.isError, undefined, JSON.stringify(datasheetPreview.structuredContent));
+  assert.equal(datasheetPreview.structuredContent.primaryTag, 'research');
+  assert.ok(datasheetPreview.structuredContent.classification.tags.includes('research'));
+  assert.ok(datasheetPreview.structuredContent.selected.every((candidate) => candidate.capabilities.includes('research')));
+  assert.match(datasheetPreview.structuredContent.receiptId, /^rcpt_/);
+
   const agents = await client.callTool({ name: 'list_agents', arguments: {} });
   assert.equal(agents.isError, undefined, JSON.stringify(agents.structuredContent));
   assert.ok(agents.structuredContent.agents.some((agent) => agent.id === 'echo'));
