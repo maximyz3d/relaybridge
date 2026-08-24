@@ -93,6 +93,10 @@ test('provider config uses the installed subscription CLIs and safe headless mod
   assert.equal(config.gemini.safe[0], 'agy.exe');
   assert.match(config.gemini.label, /Antigravity/);
   assert.deepEqual(config.gemini.probe, ['agy.exe', 'models']);
+  assert.equal(config.gemini.usage_capability.tokens, 'unavailable');
+  assert.equal(config.gemini.usage_capability.turns, 'unavailable');
+  assert.equal(config.gemini.usage_capability.verified_runtime_version, '1.1.19');
+  assert.match(config.gemini.usage_capability.evidence, /no token-usage, turn-usage/);
   assert.ok(config.gemini.safe.includes('--sandbox'));
   assert.equal(config.gemini.oneshot_safe.at(-2), '--print');
   assert.equal(config.gemini.oneshot_safe.at(-1), '{prompt}');
@@ -381,6 +385,10 @@ test('prompt-file transport preserves long special-character prompts and cleans 
     },
     narration_only: {
       label: 'Narration-Only Grok Fixture',
+      usage_capability: {
+        tokens: 'unavailable', turns: 'unavailable', verified_runtime_version: '1.1.19',
+        evidence: 'fixture CLI exposes no authoritative usage',
+      },
       safe: [process.execPath, helper, '--version'],
       dangerous: [process.execPath, helper, '--version'],
       oneshot_safe: [...baseSlot, '--output', 'I will inspect the repository and trace the pipeline.\nNext I will review the tests and report any defects.'],
@@ -652,6 +660,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.match(dashboardHtml, /<script nonce="[A-Za-z0-9+/=]+">\s*const API/);
   assert.match(dashboardHtml, /const ONE_SHOT_DEFAULT_TIMEOUT_MS = 1200000;/);
   assert.doesNotMatch(dashboardHtml, /__ONE_SHOT_DEFAULT_TIMEOUT_MS__/);
+  assert.match(dashboardHtml, /provider budgets are unenforceable and character estimates are disabled/);
   const runningHealth = await (await fetch(baseUrl + '/api/health')).json();
   assert.equal(runningHealth.fullPermissions, false);
   assert.equal(runningHealth.buildId, TEST_BUILD_ID);
@@ -664,6 +673,12 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   }
   const unauthenticated = await fetch(baseUrl + '/api/diag');
   assert.equal(unauthenticated.status, 401);
+  const usageDiagnostics = await (await fetch(baseUrl + '/api/diag', { headers: auth })).json();
+  assert.equal(usageDiagnostics.results.narration_only.usageCapability.budgetEnforcement, 'unenforceable');
+  assert.equal(usageDiagnostics.results.narration_only.usageCapability.characterEstimateFallback, false);
+  const usageAgents = await (await fetch(baseUrl + '/api/agents', { headers: auth })).json();
+  assert.equal(usageAgents.agents.find((agent) => agent.id === 'narration_only')
+    .usageCapability.budgetEnforcement, 'unenforceable');
 
   const datasheetTask = 'Read-only manufacturer-datasheet audit of BNO085 and KX134 exact pins, packages, required support circuits, interrupt/reset/boot topology, and power-domain isolation requirements; no file edits';
   const datasheetRouteResponse = await fetch(baseUrl + '/api/route', {
@@ -812,6 +827,8 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   const gaugeResponse = await fetch(baseUrl + '/api/usage/gauges', { headers: auth });
   assert.equal(gaugeResponse.status, 200);
   const gaugeResult = await gaugeResponse.json();
+  assert.equal(gaugeResult.providerUsageCapabilities.narration_only.budgetEnforcement, 'unenforceable');
+  assert.equal(gaugeResult.providerUsageCapabilities.narration_only.tokenBudgetEnforceable, false);
   assert.equal(gaugeResult.gauges.grok.basis, 'vendor_observed');
   assert.equal(gaugeResult.gauges.grok.percentRemaining, 0);
   assert.equal(gaugeResult.gauges.grok.vendorQuota.evidenceHash, grokQuotaResult.vendor_quota.evidenceHash);

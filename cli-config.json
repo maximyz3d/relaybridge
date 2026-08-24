@@ -555,6 +555,12 @@
     ],
     "company": "Google",
     "transport": "subscription:antigravity",
+    "usage_capability": {
+      "tokens": "unavailable",
+      "turns": "unavailable",
+      "verified_runtime_version": "1.1.19",
+      "evidence": "agy.exe 1.1.19 --help documents text, JSON, and stream-JSON message transport but exposes no token-usage, turn-usage, quota, billing, or usage-status command or flag. RelayBridge therefore cannot enforce Gemini token or turn ceilings and does not estimate them from characters."
+    },
     "color": "#4285f4",
     "safe": [
       "agy.exe",

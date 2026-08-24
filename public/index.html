@@ -690,6 +690,7 @@ function safeTeamSnapshot({ live, diagnostics, sessions, collabs, projects, acti
       ready: !!info.ready,
       detail: info.detail || '',
       runtimeVersion: info.runtimeVersion || '',
+      usageCapability: info.usageCapability || null,
       configuredModel: state.config[kind]?.model || null,
     })),
     sessions: (sessions || []).map((session) => ({
@@ -720,7 +721,7 @@ function renderTeamStatus(snapshot) {
     <div class="team-provider">
       <div><strong>${escapeHtml(provider.label)}</strong><div style="color:var(--muted);font-size:11px">${escapeHtml(provider.configuredModel || provider.kind)}</div></div>
       <div class="${provider.ready ? 'ok' : 'warn'}">${provider.ready ? '✓ ready' : '⚠ setup needed'}</div>
-      <div style="color:var(--muted);font-size:11px">${escapeHtml(provider.runtimeVersion || provider.detail || 'not reported')}</div>
+      <div style="color:var(--muted);font-size:11px">${escapeHtml(provider.runtimeVersion || provider.detail || 'not reported')}${provider.usageCapability?.budgetEnforcement==='unenforceable'?'<br><span class="warn">⚠ token/turn budgets unenforceable</span>':''}</div>
     </div>`).join('');
   const runRows = snapshot.recentRuns.slice(0, 8).map((run) => `
     <div style="display:flex;gap:8px;align-items:center;padding:6px 0;border-bottom:1px solid var(--border)">
@@ -1172,6 +1173,7 @@ $('#diag-btn').onclick = async () => {
         ${where ? `<div style="font-family:monospace; font-size:12px; color:var(--muted); margin-top:4px;">${where}</div>` : ''}
         ${identity ? `<div style="font-size:12px; color:#7cc6ff; margin-top:4px;">${escapeHtml(identity)}</div>` : ''}
         ${info.detail ? `<div style="font-size:12px; color:var(--muted); margin-top:4px;">${escapeHtml(info.detail)}</div>` : ''}
+        ${info.usageCapability?.budgetEnforcement === 'unenforceable' ? `<div style="font-size:12px;color:#facc15;margin-top:4px;">⚠ Token and turn budgets are unenforceable: this CLI reports no authoritative usage. Character estimates are disabled.</div>` : ''}
         ${hint}
       </div>`;
     }).join('');
@@ -2620,7 +2622,7 @@ function fuelBar(pct, basis){
 }
 async function refreshFuel(){
   try {
-    const { gauges, balance, totals } = await api('/api/usage/gauges?windowMs=' + $('#fuel-window').value);
+    const { gauges, balance, totals, providerUsageCapabilities = {} } = await api('/api/usage/gauges?windowMs=' + $('#fuel-window').value);
     // Quota state is separate from fuel: a seat can read 80% and still be
     // unusable because the provider 429'd it.
     let cooling = [];
@@ -2629,7 +2631,11 @@ async function refreshFuel(){
     $('#fuel-balance').innerHTML = balance.advice
       ? `<span style="color:#facc15">⚠ ${esc(balance.advice)}</span>`
       : `<span style="color:#4ade80">✓ fleet balanced${balance.seats?` (${balance.seats} metered, ${balance.spread}pt spread)`:''}</span>`;
-    $('#fuel-totals').innerHTML = `<table style="width:100%;font-size:12px;"><tr>
+    const unenforceable = Object.entries(providerUsageCapabilities).filter(([, capability]) => capability?.budgetEnforcement === 'unenforceable');
+    const usageWarning = unenforceable.length
+      ? `<div style="color:#facc15;margin-bottom:8px;">⚠ Authoritative token/turn usage unavailable for ${unenforceable.map(([kind]) => esc(kind)).join(', ')}; provider budgets are unenforceable and character estimates are disabled.</div>`
+      : '';
+    $('#fuel-totals').innerHTML = usageWarning + `<table style="width:100%;font-size:12px;"><tr>
       <td><b>${totals.runs}</b> runs</td>
       <td><b>${tok(totals.totalTokens)}</b> tokens (${tok(totals.inputTokens)} in / ${tok(totals.outputTokens)} out)</td>
       <td title="what these tokens would have cost at list API rates">plan value: <b>${usd(totals.shadowCostUsd)}</b></td>

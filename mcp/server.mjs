@@ -184,6 +184,7 @@ function providerSummaries(diagnostics = {}) {
       company: cli.company || '',
       transport: cli.transport || (kind === 'powershell' ? 'local:process' : 'cli'),
       configuredModel: cli.model || item.modelIdentity,
+      usageCapability: diag.usageCapability || null,
       readiness: {
         found: diag.found ?? null,
         ready: diag.ready ?? null,
