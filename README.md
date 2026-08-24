@@ -16,6 +16,25 @@ That installs RelayBridge to `%LOCALAPPDATA%\RelayBridge`, installs locked Node 
 
 The installer also adds that install directory to your user `PATH` and ships a stable `relaybridge.cmd` launcher, so `relaybridge status`, `relaybridge plan`, and the other CLI commands work in new terminals. When the installer runs directly in the current PowerShell process (for example, `irm ... | iex`), it also updates that process's `PATH` immediately. When it is launched through a child `powershell -File` process, open a new terminal afterward so it inherits the updated user `PATH`. Custom `-InstallDir` values are registered the same way.
 
+For diff-sized prompts on Windows, do not place the prompt on the command line.
+Pipe UTF-8 text over standard input or read it from a UTF-8 file instead:
+
+```powershell
+# PowerShell 7 preserves UTF-8 for native pipelines.
+git diff --no-ext-diff | relaybridge ask --kind gemini --stdin
+
+# PowerShell 5.1-safe path when the prompt is already in $prompt.
+$prompt | Set-Content -Encoding utf8 -NoNewline .\review-prompt.txt
+relaybridge plan --prompt-file .\review-prompt.txt
+relaybridge ask --kind claude --prompt-file .\review-prompt.txt
+```
+
+`plan` and `ask` accept exactly one prompt source: positional text, `--stdin`,
+or `--prompt-file <path>`. Empty input, invalid UTF-8, missing files, and
+conflicting sources fail locally before RelayBridge plans or starts a provider.
+The prompt body is sent in the HTTP request body; it is never copied into child
+process arguments or error output.
+
 Updates are transactional. The installer tests the staged release before draining a matching old bridge, atomically promotes it, and restores and restarts the previous build if promotion, startup, health verification, or MCP registration fails. `.bridge-token`, `.state.json`, and `data/` move with the release instead of being copied, while existing `cli-config.json` and `config/*.json` values win a schema-aware merge so operator model pins, tags, routing policy, and unknown providers are preserved. Optional provider installation happens only after the core cutover succeeds.
 
 If PowerShell blocks scripts on a new computer, use:

@@ -14,6 +14,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { TextDecoder } = require('util');
 
 const DEFAULT_PORT = process.env.RELAYBRIDGE_PORT || process.env.PS_BRIDGE_PORT || '8787';
 const DEFAULT_HOST = process.env.RELAYBRIDGE_HOST || '127.0.0.1';
@@ -83,11 +84,16 @@ async function call(pathname, { method = 'GET', body = null } = {}) {
 function parseFlags(argv) {
   const flags = {};
   const rest = [];
+  const booleanFlags = new Set(['force', 'json', 'refresh', 'stdin']);
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg.startsWith('--')) {
-      const [name, inline] = arg.slice(2).split('=');
+      const raw = arg.slice(2);
+      const separator = raw.indexOf('=');
+      const name = separator >= 0 ? raw.slice(0, separator) : raw;
+      const inline = separator >= 0 ? raw.slice(separator + 1) : undefined;
       if (inline !== undefined) flags[name] = inline;
+      else if (booleanFlags.has(name)) flags[name] = true;
       else if (argv[i + 1] && !argv[i + 1].startsWith('--')) flags[name] = argv[++i];
       else flags[name] = true;
     } else {
@@ -95,6 +101,62 @@ function parseFlags(argv) {
     }
   }
   return { flags, rest };
+}
+
+class InputError extends Error {}
+
+function decodePromptUtf8(value, source) {
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(value);
+  } catch {
+    throw new InputError(`${source} is not valid UTF-8`);
+  }
+}
+
+function resolveTaskInput(flags, rest, {
+  readFile = (file) => fs.readFileSync(file),
+  readStdin = () => fs.readFileSync(0),
+} = {}) {
+  if (flags.stdin !== undefined && flags.stdin !== true) {
+    throw new InputError('--stdin does not accept a value');
+  }
+  if (flags['prompt-file'] === true || flags['prompt-file'] === '') {
+    throw new InputError('--prompt-file requires a path');
+  }
+
+  const hasPositional = rest.length > 0;
+  const hasStdin = flags.stdin === true;
+  const hasPromptFile = typeof flags['prompt-file'] === 'string';
+  const selected = Number(hasPositional) + Number(hasStdin) + Number(hasPromptFile);
+  if (selected > 1) {
+    throw new InputError('choose exactly one prompt source: positional text, --stdin, or --prompt-file <path>');
+  }
+  if (selected === 0) {
+    throw new InputError('a task description is required (positional text, --stdin, or --prompt-file <path>)');
+  }
+
+  let task;
+  let source;
+  if (hasStdin) {
+    source = 'stdin prompt';
+    task = decodePromptUtf8(readStdin(), source);
+  } else if (hasPromptFile) {
+    const promptFile = path.resolve(flags['prompt-file']);
+    source = 'prompt file';
+    let bytes;
+    try {
+      bytes = readFile(promptFile);
+    } catch (err) {
+      throw new InputError(`cannot read prompt file ${promptFile}: ${err.message}`);
+    }
+    task = decodePromptUtf8(bytes, source);
+  } else {
+    source = 'positional prompt';
+    task = rest.join(' ').trim();
+  }
+
+  if (!task || /^\s*$/u.test(task)) throw new InputError(`${source} is empty`);
+  return task;
 }
 
 function printPlan(plan, { json = false } = {}) {
@@ -131,6 +193,8 @@ function buildAskBody(plan, task, cwd = process.cwd()) {
 const USAGE = `relaybridge — delegate work to AI CLIs on seats you already pay for
 
   relaybridge plan "<task>"            what to run this on: company, model, effort
+  relaybridge plan --stdin              read a UTF-8 task from standard input
+  relaybridge ask --prompt-file <path>  read a UTF-8 task without shell quoting
   relaybridge ask "<task>"             plan it, then actually run it
   relaybridge ask --kind claude "..."  run on a specific provider
   relaybridge status                   bridge health and provider readiness
@@ -141,6 +205,7 @@ const USAGE = `relaybridge — delegate work to AI CLIs on seats you already pay
   relaybridge login <kind>             print the sign-in command for a provider
   relaybridge mcp-config               MCP server JSON for any client
 
+Prompt: positional text | --stdin | --prompt-file <path>  (choose exactly one)
 Flags: --effort minimal|low|medium|high|max   --kind <provider>   --json
 
 Effort exists so a simple edit does not burn a frontier reasoning budget, and a
@@ -162,16 +227,14 @@ async function main() {
         return 0;
 
       case 'plan': {
-        const task = rest.join(' ').trim();
-        if (!task) { console.error('a task description is required'); return 2; }
+        const task = resolveTaskInput(flags, rest);
         const plan = await call('/api/plan', { method: 'POST', body: { task, effort: flags.effort || null, kind: flags.kind || null } });
         printPlan(plan, { json });
         return 0;
       }
 
       case 'ask': {
-        const task = rest.join(' ').trim();
-        if (!task) { console.error('a task description is required'); return 2; }
+        const task = resolveTaskInput(flags, rest);
         const plan = await call('/api/plan', { method: 'POST', body: { task, effort: flags.effort || null, kind: flags.kind || null } });
         if (!plan.primary) { console.error('no ready provider for this task; run: relaybridge status'); return 1; }
         if (plan.humanGate && !flags.force) {
@@ -294,7 +357,7 @@ async function main() {
     }
   } catch (err) {
     console.error(`relaybridge: ${err.message}`);
-    return 1;
+    return err instanceof InputError ? 2 : 1;
   }
 }
 
@@ -316,4 +379,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { parseFlags, findToken, buildAskBody, USAGE };
+module.exports = { parseFlags, resolveTaskInput, findToken, buildAskBody, USAGE };
