@@ -2973,14 +2973,16 @@ app.post('/api/plan', async (req, res) => {
         diagnostics[k] = { found, ready: found, detail: 'path-only check' };
       }
     }
+    const gauges = usageLedger.gaugeAll(seatCostClasses());
     const fleetInput = applyCooldownsToDiagnostics(diagnostics, coolingQuotaStates(), kind ? [kind] : []);
-    const filesystemInput = applyFilesystemEligibilityToDiagnostics(fleetInput.diagnostics, cfg, filesystemAuthority);
+    const vendorQuotaInput = applyVendorQuotaExhaustionToDiagnostics(fleetInput.diagnostics, gauges);
+    const filesystemInput = applyFilesystemEligibilityToDiagnostics(vendorQuotaInput.diagnostics, cfg, filesystemAuthority);
     diagnostics = filesystemInput.diagnostics;
     let route = router.routeTask({ task, diagnostics, dangerous: filesystemAuthority.dangerous });
-    const gauges = usageLedger.gaugeAll(seatCostClasses());
     route = levelRouteSelection(route, gauges, seatCostClassMap());
     route.fleetState = {
       cooldownSkipped: fleetInput.skipped,
+      vendorQuotaSkipped: vendorQuotaInput.skipped,
       balance: fleetBalance(gauges),
       vendorQuota: vendorQuotaFleet(gauges),
       operatorQuota: operatorQuotaFleet(gauges),
@@ -3030,8 +3032,10 @@ app.post('/api/route', async (req, res) => {
       }
     }
     const explicitKinds = Array.isArray(preferKinds) ? preferKinds : [];
+    const gauges = usageLedger.gaugeAll(seatCostClasses());
     const fleetInput = applyCooldownsToDiagnostics(diagnostics, coolingQuotaStates(), explicitKinds);
-    const filesystemInput = applyFilesystemEligibilityToDiagnostics(fleetInput.diagnostics, cfg, filesystemAuthority);
+    const vendorQuotaInput = applyVendorQuotaExhaustionToDiagnostics(fleetInput.diagnostics, gauges);
+    const filesystemInput = applyFilesystemEligibilityToDiagnostics(vendorQuotaInput.diagnostics, cfg, filesystemAuthority);
     diagnostics = filesystemInput.diagnostics;
     let route = router.routeTask({
       task, diagnostics,
@@ -3039,10 +3043,10 @@ app.post('/api/route', async (req, res) => {
       preferredProviders: explicitKinds.length ? explicitKinds : undefined,
       excludedProviders: Array.isArray(excludeKinds) ? excludeKinds : undefined,
     });
-    const gauges = usageLedger.gaugeAll(seatCostClasses());
     route = levelRouteSelection(route, gauges, seatCostClassMap());
     route.fleetState = {
       cooldownSkipped: fleetInput.skipped,
+      vendorQuotaSkipped: vendorQuotaInput.skipped,
       balance: fleetBalance(gauges),
       vendorQuota: vendorQuotaFleet(gauges),
       operatorQuota: operatorQuotaFleet(gauges),
@@ -4198,7 +4202,8 @@ const {
 } = require('./lib/cancellation-state');
 const {
   levelCandidates, suggestTierAdjustment, fleetBalance,
-  applyCooldownsToDiagnostics, levelRouteSelection,
+  applyCooldownsToDiagnostics, applyVendorQuotaExhaustionToDiagnostics,
+  levelRouteSelection,
 } = require('./lib/load-leveller');
 
 function loadUsageBudgets() {
@@ -4397,13 +4402,22 @@ app.post('/api/usage/advise', (req, res) => {
       if (eligibility.eligible) filesystemUsable.push(annotated);
       else filesystemSkipped.push({ ...annotated, blocked: true, reason: eligibility.blockedReason });
     }
+    const candidateDiagnostics = Object.fromEntries(filesystemUsable.map((item) => [item.seat, {
+      found: true, ready: true,
+    }]));
+    const vendorQuotaInput = applyVendorQuotaExhaustionToDiagnostics(candidateDiagnostics, gauges);
+    const vendorQuotaKinds = new Set(vendorQuotaInput.skipped.map((item) => item.kind));
+    const quotaUsable = filesystemUsable.filter((item) => !vendorQuotaKinds.has(item.seat));
+    const vendorQuotaSkipped = vendorQuotaInput.skipped.filter((item) => candidateDiagnostics[item.kind]);
     // Quota state first: a cooling seat cannot do the work at any rank.
     const { usable, skipped, allCooling } = filterCandidatesByQuotaCooldown(
-      filesystemUsable, explicitProvider ? (req.body?.explicitSeat || null) : null);
+      quotaUsable, explicitProvider ? (req.body?.explicitSeat || null) : null);
     const ranked = levelCandidates(usable, gauges);
     const top = ranked[0] ? gauges[ranked[0].seat] : null;
     res.json({
-      ranked, skipped, allCooling, filesystemSkipped, filesystemAuthority,
+      ranked, skipped, allCooling,
+      allVendorQuotaExhausted: quotaUsable.length === 0 && vendorQuotaSkipped.length > 0,
+      vendorQuotaSkipped, filesystemSkipped, filesystemAuthority,
       tierAdjustment: suggestTierAdjustment({ tier, gauge: top, highStakes, explicitProvider }),
       balance: fleetBalance(gauges),
       vendorQuota: vendorQuotaFleet(gauges),

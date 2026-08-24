@@ -141,6 +141,22 @@ When every candidate is cooling, the response says `allCooling: true` — so it
 is not mistaken for "no capable provider," which would send someone chasing a
 config problem that does not exist.
 
+### Vendor-quota route exclusion
+
+A cooldown is a retry heuristic, so an explicit provider request may bypass it.
+An unexpired vendor observation whose bounded allowance is exhausted is a hard
+eligibility fact instead: retrying that quota seat cannot succeed before reset.
+`/api/route` and `/api/plan` therefore mark every affected provider unready and
+exclude it even when it appears in `preferKinds` or `kind`.
+
+The response exposes `fleetState.vendorQuotaSkipped` with a typed
+`vendor_quota_exhausted` reason, quota-seat aliases, scope, actual/limit, and
+`retry.allowedAfter`. Account-scoped evidence blocks every configured alias of
+the shared quota seat; model-scoped evidence blocks only the matching provider
+and model. Expired evidence is ignored automatically, so ordinary readiness
+controls routing again after the recorded reset time. Configured estimates and
+operator-reported percentages never trigger this hard gate.
+
 ## Workspace grounding (issue #16)
 
 An audit task — "inspect the git diff in this cwd and report findings" — was

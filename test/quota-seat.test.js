@@ -8,7 +8,9 @@ const path = require('path');
 
 const { buildQuotaSeatGroups } = require('../lib/quota-seat');
 const { createUsageLedger } = require('../lib/usage-ledger');
-const { fleetBalance, applyCooldownsToDiagnostics } = require('../lib/load-leveller');
+const {
+  fleetBalance, applyCooldownsToDiagnostics, applyVendorQuotaExhaustionToDiagnostics,
+} = require('../lib/load-leveller');
 
 const GROUP = 'subscription:anthropic:default';
 const mapping = { claude: GROUP, claude_fable: GROUP, codex: 'codex' };
@@ -82,6 +84,76 @@ test('account-scoped vendor quota is shared across aliases in one quota seat', (
     assert.equal(gauge.percentRemaining, 25);
     assert.equal(gauge.vendorQuota.scope, 'account');
   }
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('active account-scoped vendor exhaustion hard-blocks every shared-seat alias with typed reset guidance', () => {
+  const dir = tmp();
+  const now = Date.parse('2026-08-24T12:00:00Z');
+  const ledger = createUsageLedger({ dataDir: dir, quotaSeats: mapping, now: () => now });
+  ledger.observeVendorQuota({
+    provider: 'claude', model: 'opus', scope: 'account', unit: 'tokens', actual: 101, limit: 100,
+    overLimit: true, observedAt: new Date(now).toISOString(),
+    reset: { kind: 'vendor_window', expiresAt: new Date(now + 3600000).toISOString() },
+  });
+  const aliases = ['claude', 'claude_fable'];
+  const gauges = ledger.gaugeAll({
+    claude: { costClass: 'subscription', model: 'opus', quotaSeat: GROUP, aliases },
+    claude_fable: { costClass: 'subscription', model: 'fable', quotaSeat: GROUP, aliases },
+    codex: { costClass: 'subscription', quotaSeat: 'codex', aliases: ['codex'] },
+  });
+  const gated = applyVendorQuotaExhaustionToDiagnostics({
+    claude: { found: true, ready: true, detail: 'authenticated' },
+    claude_fable: { found: true, ready: true, detail: 'authenticated' },
+    codex: { found: true, ready: true, detail: 'authenticated' },
+  }, gauges, { now });
+
+  assert.deepEqual(gated.skipped.map((item) => item.kind), aliases);
+  for (const provider of aliases) {
+    assert.equal(gated.diagnostics[provider].found, true, 'quota does not rewrite install readiness');
+    assert.equal(gated.diagnostics[provider].ready, false);
+    assert.equal(gated.diagnostics[provider].vendorQuotaExhausted, true);
+    const block = gated.diagnostics[provider].vendorQuotaBlock;
+    assert.equal(block.reason, 'vendor_quota_exhausted');
+    assert.equal(block.authoritative, true);
+    assert.equal(block.scope, 'account');
+    assert.equal(block.quotaSeat, GROUP);
+    assert.deepEqual(block.aliases, aliases);
+    assert.equal(block.retry.allowedAfter, new Date(now + 3600000).toISOString());
+    assert.equal(block.retry.action, 'use_alternate_quota_seat_until_reset');
+  }
+  assert.equal(gated.diagnostics.codex.ready, true, 'unaffected readiness is preserved');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('model-scoped exhaustion blocks only its matching alias and becomes eligible after expiry', () => {
+  const dir = tmp();
+  let now = Date.parse('2026-08-24T12:00:00Z');
+  const ledger = createUsageLedger({ dataDir: dir, quotaSeats: mapping, now: () => now });
+  ledger.observeVendorQuota({
+    provider: 'claude_fable', model: 'fable', scope: 'model', unit: 'tokens', actual: 100, limit: 100,
+    overLimit: false, observedAt: new Date(now).toISOString(),
+    reset: { kind: 'vendor_window', expiresAt: new Date(now + 3600000).toISOString() },
+  });
+  const configs = {
+    claude: { costClass: 'subscription', model: 'opus', quotaSeat: GROUP, aliases: ['claude', 'claude_fable'] },
+    claude_fable: { costClass: 'subscription', model: 'fable', quotaSeat: GROUP, aliases: ['claude', 'claude_fable'] },
+  };
+  const diagnostics = {
+    claude: { found: true, ready: true },
+    claude_fable: { found: true, ready: true },
+    already_unready: { found: true, ready: false, detail: 'signed out' },
+  };
+  let gated = applyVendorQuotaExhaustionToDiagnostics(diagnostics, ledger.gaugeAll(configs), { now });
+  assert.deepEqual(gated.skipped.map((item) => item.kind), ['claude_fable']);
+  assert.equal(gated.diagnostics.claude.ready, true);
+  assert.equal(gated.diagnostics.claude_fable.ready, false);
+  assert.equal(gated.diagnostics.already_unready.ready, false, 'existing readiness failures remain failures');
+
+  now += 3600001;
+  gated = applyVendorQuotaExhaustionToDiagnostics(diagnostics, ledger.gaugeAll(configs), { now });
+  assert.deepEqual(gated.skipped, []);
+  assert.equal(gated.diagnostics.claude_fable.ready, true, 'routing resumes automatically after vendor expiry');
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
