@@ -390,6 +390,19 @@ zero-invocation receipt and return its identity in the response headers. Use
 `list_runs`, `get_run`, `list_receipts`, and `get_receipt` to recover provenance
 instead of relying on a chat transcript alone.
 
+Every admitted MCP provider call has one canonical `requestId`/`invocationId`,
+one `attemptId` ending in `:attempt:1`, and a preallocated outer receipt ID.
+The REST transport receipt links back through `outerReceiptId`; the MCP outer
+receipt links forward through `transportReceiptId`. If the caller disconnects
+before REST can respond, MCP waits briefly for the late transport receipt and
+reconciles its invocation, route, progress, retry, and token truth into exactly
+one outer attempt. Direct disconnects are `client_cancelled`; a disconnect at
+the MCP transport deadline is `mcp_deadline_cancelled`. Neither is retried.
+`modelInvocation` remains truthful, and token usage stays `unknown` unless the
+provider itself reported usage; raw transport bytes are never treated as billed
+tokens. Completion and sticky supervisor verdicts win races idempotently, and
+process-tree cleanup still drives the active one-shot census back to zero.
+
 Timeout receipts distinguish the causal layer. A Relay liveness stop reports
 `providerTimeoutSource: relay_supervisor`; an upstream HTTP timeout reports
 `provider_api_status`; and a provider CLI that exits with an authoritative

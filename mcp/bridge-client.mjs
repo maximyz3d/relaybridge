@@ -131,6 +131,10 @@ export async function bridgeRequest(route, {
     headers['X-RelayBridge-Expected-Build-Id'] = EXPECTED_BUILD_ID;
     headers['X-RelayBridge-Expected-Receipt-Store-Id'] = EXPECTED_RECEIPT_STORE_IDENTITY.id;
   }
+  const requestTimeoutMs = boundedBridgeRequestTimeoutMs(timeoutMs);
+  if (route === '/api/oneshot') {
+    headers['X-RelayBridge-Client-Deadline-At'] = String(Date.now() + requestTimeoutMs);
+  }
   let response;
   try {
     response = await fetch(new URL(route, BASE_URL), {
@@ -139,8 +143,8 @@ export async function bridgeRequest(route, {
       body: body === undefined ? undefined : JSON.stringify(body),
       redirect: 'error',
       signal: signal
-        ? AbortSignal.any([signal, AbortSignal.timeout(boundedBridgeRequestTimeoutMs(timeoutMs))])
-        : AbortSignal.timeout(boundedBridgeRequestTimeoutMs(timeoutMs)),
+        ? AbortSignal.any([signal, AbortSignal.timeout(requestTimeoutMs)])
+        : AbortSignal.timeout(requestTimeoutMs),
     });
   } catch (error) {
     throw new BridgeError(`RelayBridge request failed: ${error.message}`, { route, cause: error });

@@ -47,6 +47,8 @@ Response:
 | `progress` | Snapshot: `bytes`, `lines`, `idleMs`, `repeatPeak`, `cpuMs`, `phase`. |
 | `dropped_out` | True when the call did not produce a usable answer. |
 | `failureClass` | Machine-readable failure class. `incomplete_response` preserves narration-only stdout but prevents it from counting as a result. |
+| `requestId` / `invocationId` / `attemptId` | Canonical identity shared by the admitted physical attempt and its linked receipts. |
+| `physical_attempt_count` | `1` for an admitted provider attempt; `0` for a pre-admission rejection/cache hit. |
 | `partial_result` | True when a recognized provider sentinel had trailing diagnostic fragments but no usable answer. |
 | `failure_sentinel` / `failure_sentinel_source` | Canonical sentinel and the provider-specific framing rule that detected it. |
 | `partial_diagnostic` | Trailing URL/text fragments retained explicitly as diagnostics; this content is never ordinary successful `stdout`. |
@@ -161,6 +163,16 @@ to read and share. Use them to audit what a session cost and which providers
 actually delivered. A `bridge_provider_rejection` receipt proves that
 RelayBridge rejected the request without starting a provider; it is not
 evidence of model work, token spend, or a transport attempt.
+
+For MCP calls, the outer `provider_call` receipt and REST
+`bridge_provider_call` receipt are bidirectionally linked with
+`transportReceiptId` and `outerReceiptId`. A late receipt after caller
+disconnection is reconciled by canonical request/attempt identity rather than
+recorded as a second physical attempt. `client_cancelled` and
+`mcp_deadline_cancelled` are causal terminal classes, with progress and
+`cleanedOutputUnavailable` recorded when available. Cancellation has zero
+transport/provider retries. `tokenUsageSource` is `unknown` unless the provider
+reported usage; transport byte counts are diagnostic only.
 
 ## Constraints
 

@@ -20,6 +20,7 @@ import {
 import { classifyTask, estimateTokens, loadRoutingData, routeTask } from './router.mjs';
 import {
   appendReceipt as persistReceipt,
+  findReceiptByRequestId,
   listReceiptCursorPage,
   listReceiptPage,
   listReceipts,
@@ -652,6 +653,7 @@ const PROVIDER_FAILURE_CLASSES = new Set([
   'stop_hook_prevented', 'blocking_limit', 'prompt_too_long',
   'provider_error', 'admission_limit', 'bridge_identity_mismatch',
   'incomplete_response', 'token_budget',
+  'client_cancelled', 'mcp_deadline_cancelled',
 ]);
 
 const PROVIDER_BUDGET_SCHEMA = z.object({
@@ -961,6 +963,9 @@ function sanitizeProviderResponse(response) {
     transportReceiptPersistenceError: response.receiptPersistenceError || null,
     actionPreflight: response.actionPreflight || null,
     transportRetryCount: 0,
+    invocationId: strictBoundedString(response.invocationId),
+    attemptId: strictBoundedString(response.attemptId),
+    physicalAttemptCount: strictTokenCount(response.physical_attempt_count),
     exitCode: response.exitCode,
     droppedOut: !!response.dropped_out,
     rateLimited: !!response.rate_limited,
@@ -998,6 +1003,9 @@ function sanitizeProviderResponse(response) {
     partialDiagnosticChars: partialDiagnostic.originalChars,
     partialDiagnosticSha256: stableHash(response.partial_diagnostic || ''),
     partialDiagnosticTruncated: partialDiagnostic.truncated,
+    progressAtCancellation: response.progress_at_cancellation
+      || (response.cancelled ? response.progress || null : null),
+    cleanedOutputUnavailable: response.cleaned_output_unavailable ?? null,
     transportOutputChars: strictTokenCount(response.transport_output_chars),
     transportOutputHash: typeof response.transport_output_hash === 'string'
       && /^[0-9a-f]{64}$/.test(response.transport_output_hash) ? response.transport_output_hash : null,
@@ -1042,8 +1050,11 @@ function bridgeFailureResult(error, { kind, signal }) {
   const transportReceiptId = error instanceof BridgeError
     && /^rcpt_[A-Za-z0-9._:-]{1,180}$/.test(String(error.detail?.receiptId || ''))
     ? String(error.detail.receiptId) : null;
+  const cancellationClass = signal?.aborted
+    ? (signal.reason?.name === 'TimeoutError' ? 'mcp_deadline_cancelled' : 'client_cancelled')
+    : transportTimedOut ? 'mcp_deadline_cancelled' : null;
   return {
-    status: signal?.aborted ? 'cancelled' : transportTimedOut ? 'timed_out' : 'failed',
+    status: cancellationClass ? 'cancelled' : 'failed',
     sanitized: {
       kind,
       exitCode: -1,
@@ -1051,24 +1062,101 @@ function bridgeFailureResult(error, { kind, signal }) {
       stdout: '',
       stderr: validation?.reason || error.message,
       route: {},
-      cancelled: !!signal?.aborted,
-      timedOut: transportTimedOut,
+      cancelled: !!cancellationClass,
+      timedOut: false,
       authFailed: authRequired,
       admissionLimited: bridgeStatus === 429,
       modelInvocation: deterministicPreflightRejection ? false : null,
       tokenUsageSource: deterministicPreflightRejection ? 'not_invoked' : 'unknown',
       transportRetryCount: 0,
-      providerRetries: deterministicPreflightRejection ? zeroProviderRetries() : null,
+      providerRetries: deterministicPreflightRejection || cancellationClass
+        ? zeroProviderRetries() : null,
       transportReceiptId,
       transportReceiptPersisted: transportReceiptId ? error.detail?.receiptPersisted ?? null : null,
       transportReceiptPersistenceError: transportReceiptId
         ? strictBoundedString(error.detail?.receiptPersistenceError, 500) : null,
       failureClass: deterministicPreflightRejection
-        ? (error.detail?.failureClass || 'policy') : null,
+        ? (error.detail?.failureClass || 'policy') : cancellationClass,
+      stopReason: cancellationClass,
       actionPreflight: error.detail?.actionPreflight || null,
       errorCode: validation?.code || null,
       validation,
     },
+  };
+}
+
+function providerRetriesFromReceipt(receipt) {
+  return {
+    count: receipt.providerRetryCount ?? 0,
+    total_delay_ms: receipt.providerRetryDelayMs ?? 0,
+    max_attempt: receipt.providerRetryMaxAttempt ?? 0,
+    declared_max_retries: receipt.providerDeclaredMaxRetries ?? 0,
+    by_error: receipt.providerRetryByError || {},
+    by_status: receipt.providerRetryByStatus || {},
+    events: receipt.providerRetryEvents || [],
+    truncated: receipt.providerRetryEventsTruncated === true,
+    observed_events: receipt.providerRetryObservedEvents ?? 0,
+    invalid_events: receipt.providerRetryInvalidEvents ?? 0,
+    duplicate_events: receipt.providerRetryDuplicateEvents ?? 0,
+  };
+}
+
+function usageFromTransportReceipt(receipt) {
+  if (receipt.tokenUsageSource !== 'provider_reported') return null;
+  return {
+    input_tokens: receipt.actualInputTokens ?? null,
+    output_tokens: receipt.actualOutputTokens ?? null,
+    cache_read_input_tokens: receipt.actualCacheReadInputTokens ?? null,
+    cache_creation_input_tokens: receipt.actualCacheCreationInputTokens ?? null,
+    total_tokens: receipt.actualTotalTokens ?? null,
+    thinking_tokens: receipt.actualThinkingTokens ?? null,
+    cost_usd: receipt.provider_reported_cost_usd ?? null,
+    token_source: 'provider_reported',
+    model_usage: receipt.modelUsage || [],
+  };
+}
+
+async function reconcileCancelledTransportAttempt({ requestId, outerReceiptId, kind, sanitized }) {
+  if (!['client_cancelled', 'mcp_deadline_cancelled'].includes(sanitized.failureClass)) return sanitized;
+  const deadline = Date.now() + 2000;
+  let transportReceipt = null;
+  while (Date.now() < deadline && !transportReceipt) {
+    const candidate = findReceiptByRequestId(requestId, {
+      event: 'bridge_provider_call', provider: kind,
+    });
+    if (candidate && (!candidate.outerReceiptId || candidate.outerReceiptId === outerReceiptId)) {
+      transportReceipt = candidate;
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  if (!transportReceipt) return sanitized;
+  const supervisorWon = !!transportReceipt.supervisorStopReason;
+  const failureClass = supervisorWon
+    ? (transportReceipt.failureClass || 'timeout')
+    : ['client_cancelled', 'mcp_deadline_cancelled'].includes(transportReceipt.failureClass)
+      ? transportReceipt.failureClass : sanitized.failureClass;
+  return {
+    ...sanitized,
+    route: transportReceipt.route || {},
+    failureClass,
+    stopReason: supervisorWon ? transportReceipt.stopReason : failureClass,
+    supervisorStopReason: supervisorWon ? transportReceipt.supervisorStopReason : null,
+    cancelled: !supervisorWon,
+    timedOut: supervisorWon && transportReceipt.status === 'timed_out',
+    modelInvocation: transportReceipt.modelInvocation ?? null,
+    tokenUsageSource: transportReceipt.tokenUsageSource || 'unknown',
+    usage: usageFromTransportReceipt(transportReceipt),
+    providerRetries: providerRetriesFromReceipt(transportReceipt),
+    transportReceiptId: transportReceipt.receiptId,
+    transportReceiptPersisted: true,
+    transportOutputChars: transportReceipt.transportOutputChars ?? null,
+    transportOutputHash: transportReceipt.transportOutputHash ?? null,
+    progressAtCancellation: transportReceipt.progressAtCancellation || null,
+    cleanedOutputUnavailable: transportReceipt.cleanedOutputUnavailable ?? null,
+    invocationId: transportReceipt.invocationId || requestId,
+    attemptId: transportReceipt.attemptId || `${requestId}:attempt:1`,
+    physicalAttemptCount: transportReceipt.physicalAttemptCount ?? 1,
   };
 }
 
@@ -1087,6 +1175,9 @@ async function callProvider({
   maxEffortOverride = false,
 }) {
   const requestId = `mcp:${crypto.randomUUID()}`;
+  const invocationId = requestId;
+  const attemptId = `${requestId}:attempt:1`;
+  const outerReceiptId = `rcpt_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 8)}`;
   const classification = classifyTask(prompt);
   const ttl = cacheTtlFor(classification, cacheTtlMs);
   const configFingerprint = stableHash({
@@ -1209,6 +1300,7 @@ async function callProvider({
         prompt,
         cwd,
         requestId,
+        outerReceiptId,
         expectedCwdIdentityHash: workspaceAdmission.cwdIdentityHash,
         expectedCwdPolicyId: workspaceAdmission.cwdPolicyId,
         timeoutMs: TIMEOUT_POLICY.normalizeOneShotTimeoutMs(timeoutMs),
@@ -1227,9 +1319,15 @@ async function callProvider({
         : sanitized.timedOut ? 'timed_out' : 'dropped';
   } catch (error) {
     ({ sanitized, status } = bridgeFailureResult(error, { kind, signal }));
+    sanitized = await reconcileCancelledTransportAttempt({
+      requestId, outerReceiptId, kind, sanitized,
+    });
+    status = sanitized.cancelled ? 'cancelled'
+      : sanitized.timedOut ? 'timed_out' : status;
   }
 
   const receipt = appendReceipt({
+    receiptId: outerReceiptId,
     event: 'provider_call',
     purpose,
     parentReceiptId,
@@ -1291,6 +1389,8 @@ async function callProvider({
     partialDiagnosticHash: sanitized.partialResult
       ? sanitized.partialDiagnosticSha256 : null,
     partialDiagnosticTruncated: sanitized.partialDiagnosticTruncated === true,
+    progressAtCancellation: sanitized.progressAtCancellation || null,
+    cleanedOutputUnavailable: sanitized.cleanedOutputUnavailable ?? null,
     transportOutputChars: sanitized.transportOutputChars ?? null,
     transportOutputHash: sanitized.transportOutputHash ?? null,
     modelInvocation: sanitized.modelInvocation ?? null,
@@ -1298,8 +1398,10 @@ async function callProvider({
       || (sanitized.modelInvocation === false ? 'not_invoked'
         : sanitized.modelInvocation === null ? 'unknown' : 'chars_div_4'),
     requestId,
-    invocationId: parentReceiptId || requestId,
-    attemptId: requestId,
+    invocationId,
+    attemptId,
+    physicalAttemptCount: sanitized.physicalAttemptCount
+      ?? (sanitized.modelInvocation === false ? 0 : sanitized.modelInvocation === true ? 1 : null),
     transportReceiptId: sanitized.transportReceiptId || null,
     model: sanitized.route?.resolved_model_identity || sanitized.route?.requested_model || null,
     cacheHit: false,
@@ -1310,7 +1412,7 @@ async function callProvider({
     errorCode: sanitized.errorCode || null,
     validation: sanitized.validation || null,
     exitCode: sanitized.exitCode,
-    failureClass: sanitized.cancelled ? 'cancelled'
+    failureClass: sanitized.cancelled ? (sanitized.failureClass || 'client_cancelled')
       : sanitized.failureClass || (sanitized.rateLimited ? 'rate_limit'
       : sanitized.budgetExceeded ? 'budget'
         : sanitized.authFailed ? 'auth'

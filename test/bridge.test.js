@@ -653,6 +653,13 @@ test('prompt-file transport preserves long special-character prompts and cleans 
       diagnostic_binary: process.execPath,
       probe: [process.execPath, helper, '--version'],
     },
+    race_complete: {
+      label: 'Completion Cancellation Race',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--delay', '200', '--output', 'RACE_COMPLETED'],
+      oneshot_dangerous: [...baseSlot, '--delay', '200', '--output', 'RACE_COMPLETED'],
+    },
     env_echo: {
       label: 'Environment Echo',
       safe: [process.execPath, helper, '--version'],
@@ -1753,7 +1760,10 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   const firstSlow = fetch(baseUrl + '/api/oneshot', {
     method: 'POST',
     headers: jsonAuth,
-    body: JSON.stringify({ kind: 'slow', prompt: 'first slow request', dangerous: false }),
+    body: JSON.stringify({
+      kind: 'slow', prompt: 'first slow request', dangerous: false,
+      requestId: 'test:client-cancel:one',
+    }),
     signal: firstController.signal,
   });
   await new Promise((resolve) => setTimeout(resolve, 150));
@@ -1778,13 +1788,101 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(activeOneShotCount, 0);
   const cancellationLedger = fs.readFileSync(path.join(tempRoot, 'data', 'receipts', new Date().toISOString().slice(0, 10) + '.jsonl'), 'utf8')
     .trim().split(/\r?\n/).map((line) => JSON.parse(line));
-  const cancelledReceipts = cancellationLedger.filter((row) => row.provider === 'slow' && row.status === 'cancelled');
+  const cancelledReceipts = cancellationLedger.filter((row) =>
+    row.requestId === 'test:client-cancel:one' && row.status === 'cancelled');
   assert.equal(cancelledReceipts.length, 1, 'client disconnect writes exactly one terminal receipt');
   const cancelledReceipt = cancelledReceipts[0];
   assert.ok(cancelledReceipt, 'client disconnect must persist a terminal provider receipt');
-  assert.equal(cancelledReceipt.failureClass, 'cancelled');
+  assert.equal(cancelledReceipt.failureClass, 'client_cancelled');
+  assert.equal(cancelledReceipt.stopReason, 'client_cancelled');
   assert.equal(cancelledReceipt.modelInvocation, true);
-  assert.equal(cancelledReceipt.tokenUsageSource, 'chars_div_4');
+  assert.equal(cancelledReceipt.tokenUsageSource, 'unknown');
+  assert.equal(cancelledReceipt.invocationId, 'test:client-cancel:one');
+  assert.equal(cancelledReceipt.attemptId, 'test:client-cancel:one:attempt:1');
+  assert.equal(cancelledReceipt.physicalAttemptCount, 1);
+  assert.equal(cancelledReceipt.providerRetryCount, 0);
+  assert.equal(cancelledReceipt.cleanedOutputUnavailable, true);
+  assert.ok(cancelledReceipt.progressAtCancellation);
+
+  const deadlineController = new AbortController();
+  const deadlineRequest = fetch(baseUrl + '/api/oneshot', {
+    method: 'POST',
+    headers: {
+      ...jsonAuth,
+      'X-RelayBridge-Client': 'mcp',
+      'X-RelayBridge-Client-Deadline-At': String(Date.now() - 1000),
+      'X-RelayBridge-Expected-Build-Id': runningHealth.buildId,
+      'X-RelayBridge-Expected-Receipt-Store-Id': runningHealth.receiptStoreId,
+    },
+    body: JSON.stringify({
+      kind: 'slow', prompt: 'MCP deadline cancellation', dangerous: false,
+      requestId: 'test:mcp-deadline:one',
+    }),
+    signal: deadlineController.signal,
+  });
+  const deadlineAdmissionWait = Date.now() + 5000;
+  let deadlineAdmitted = false;
+  while (Date.now() < deadlineAdmissionWait && !deadlineAdmitted) {
+    const health = await (await fetch(baseUrl + '/api/health')).json();
+    deadlineAdmitted = health.activeOneShotCount === 1;
+    if (!deadlineAdmitted) await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.equal(deadlineAdmitted, true, 'deadline fixture must reach provider admission before disconnect');
+  deadlineController.abort();
+  await deadlineRequest.catch(() => {});
+  let deadlineReceipt = null;
+  const deadlineReceiptWait = Date.now() + 5000;
+  while (Date.now() < deadlineReceiptWait && !deadlineReceipt) {
+    const rows = fs.readFileSync(path.join(tempRoot, 'data', 'receipts', new Date().toISOString().slice(0, 10) + '.jsonl'), 'utf8')
+      .trim().split(/\r?\n/).map(JSON.parse);
+    deadlineReceipt = rows.find((row) => row.requestId === 'test:mcp-deadline:one') || null;
+    if (!deadlineReceipt) await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.ok(deadlineReceipt);
+  assert.equal(deadlineReceipt.failureClass, 'mcp_deadline_cancelled');
+  assert.equal(deadlineReceipt.stopReason, 'mcp_deadline_cancelled');
+  assert.equal(deadlineReceipt.modelInvocation, true);
+  assert.equal(deadlineReceipt.tokenUsageSource, 'unknown');
+  assert.equal(deadlineReceipt.physicalAttemptCount, 1);
+  const deadlineCleanupWait = Date.now() + 5000;
+  while (Date.now() < deadlineCleanupWait) {
+    const health = await (await fetch(baseUrl + '/api/health')).json();
+    if (health.activeOneShotCount === 0) break;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+
+  const raceController = new AbortController();
+  const raceRequest = fetch(baseUrl + '/api/oneshot', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({
+      kind: 'race_complete', prompt: 'completion cancellation race', dangerous: false,
+      requestId: 'test:completion-race:one',
+    }),
+    signal: raceController.signal,
+  });
+  setTimeout(() => raceController.abort(), 200);
+  await raceRequest.catch(() => null);
+  const raceReceiptWait = Date.now() + 5000;
+  let raceReceipts = [];
+  while (Date.now() < raceReceiptWait) {
+    raceReceipts = fs.readFileSync(path.join(tempRoot, 'data', 'receipts', new Date().toISOString().slice(0, 10) + '.jsonl'), 'utf8')
+      .trim().split(/\r?\n/).map(JSON.parse)
+      .filter((row) => row.requestId === 'test:completion-race:one');
+    if (raceReceipts.length) break;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.equal(raceReceipts.length, 1, 'completion/cancellation race persists one terminal attempt');
+  assert.ok(['completed', 'cancelled'].includes(raceReceipts[0].status));
+  assert.equal(raceReceipts[0].physicalAttemptCount, 1);
+  assert.equal(raceReceipts[0].providerRetryCount, 0);
+  const raceCleanupWait = Date.now() + 5000;
+  let raceActiveCount = -1;
+  while (Date.now() < raceCleanupWait) {
+    raceActiveCount = (await (await fetch(baseUrl + '/api/health')).json()).activeOneShotCount;
+    if (raceActiveCount === 0) break;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.equal(raceActiveCount, 0, 'completion/cancellation race leaves no provider survivor');
 
   const retryHangController = new AbortController();
   const retryHang = fetch(baseUrl + '/api/oneshot', {
@@ -1812,7 +1910,8 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(retryHangReceipt.providerRetryCount, 1);
   assert.equal(retryHangReceipt.providerRetryDelayMs, 250);
   assert.equal(retryHangReceipt.estimatedOutputTokens, 0, 'wire JSON is not model response text');
-  assert.equal(retryHangReceipt.tokenEstimateScope, 'request_chars_only');
+  assert.equal(retryHangReceipt.tokenUsageSource, 'unknown');
+  assert.equal(retryHangReceipt.tokenEstimateScope, null);
   assert.ok(retryHangReceipt.transportOutputChars > 0);
   assert.match(retryHangReceipt.transportOutputHash, /^[0-9a-f]{64}$/);
 

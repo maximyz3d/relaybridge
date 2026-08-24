@@ -183,6 +183,31 @@ export function readReceipt(receiptId) {
   return null;
 }
 
+export function findReceiptByRequestId(requestId, {
+  event = null, provider = null, maxScanLines = 5000,
+} = {}) {
+  const wanted = String(requestId || '');
+  if (!/^[A-Za-z0-9._:-]{8,160}$/.test(wanted)) return null;
+  const boundedScan = Number.isInteger(maxScanLines) && maxScanLines > 0
+    ? Math.min(MAX_RECEIPT_SCAN_LINES, maxScanLines) : 5000;
+  let scanned = 0;
+  for (const file of receiptFiles()) {
+    const lines = receiptFileLines(file);
+    for (let line = lines.length - 1; line >= 0; line -= 1) {
+      if ((scanned += 1) > boundedScan) return null;
+      if (!lines[line] || !lines[line].includes(wanted)) continue;
+      try {
+        const receipt = JSON.parse(lines[line]);
+        if (receipt.requestId !== wanted) continue;
+        if (event && receipt.event !== event) continue;
+        if (provider && receipt.provider !== provider) continue;
+        return receipt;
+      } catch {}
+    }
+  }
+  return null;
+}
+
 export function countReceipts() {
   let count = 0;
   for (const file of receiptFiles()) {

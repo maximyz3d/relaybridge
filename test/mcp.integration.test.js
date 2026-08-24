@@ -969,8 +969,33 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   const cancelledTransportReceipt = receipts.structuredContent.receipts.find((receipt) =>
     receipt.event === 'bridge_provider_call' && receipt.provider === 'slow' && receipt.status === 'cancelled');
   assert.ok(cancelledTransportReceipt, 'client disconnect must persist a transport cancellation receipt');
-  assert.equal(cancelledTransportReceipt.failureClass, 'cancelled');
-  assert.equal(cancelledTransportReceipt.tokenUsageSource, 'chars_div_4');
+  assert.equal(cancelledTransportReceipt.failureClass, 'client_cancelled');
+  assert.equal(cancelledTransportReceipt.tokenUsageSource, 'unknown');
+  assert.equal(cancelledTransportReceipt.modelInvocation, true);
+  assert.equal(cancelledTransportReceipt.physicalAttemptCount, 1);
+  assert.equal(cancelledTransportReceipt.providerRetryCount, 0);
+  assert.match(cancelledTransportReceipt.outerReceiptId, /^rcpt_/);
+  const cancelledOuterReceipt = receipts.structuredContent.receipts.find((receipt) =>
+    receipt.receiptId === cancelledTransportReceipt.outerReceiptId);
+  assert.ok(cancelledOuterReceipt, 'late transport receipt must reconcile into one linked outer receipt');
+  assert.equal(cancelledOuterReceipt.transportReceiptId, cancelledTransportReceipt.receiptId);
+  assert.equal(cancelledOuterReceipt.failureClass, 'client_cancelled');
+  assert.equal(cancelledOuterReceipt.stopReason, 'client_cancelled');
+  assert.equal(cancelledOuterReceipt.modelInvocation, true);
+  assert.equal(cancelledOuterReceipt.tokenUsageSource, 'unknown');
+  assert.equal(cancelledOuterReceipt.physicalAttemptCount, 1);
+  assert.equal(cancelledOuterReceipt.providerRetryCount, 0);
+  assert.equal(cancelledOuterReceipt.transportRetryCount, 0);
+  assert.equal(cancelledOuterReceipt.invocationId, cancelledTransportReceipt.invocationId);
+  assert.equal(cancelledOuterReceipt.attemptId, cancelledTransportReceipt.attemptId);
+  assert.deepEqual(cancelledOuterReceipt.progressAtCancellation,
+    cancelledTransportReceipt.progressAtCancellation);
+  const linkedCancellationRows = receipts.structuredContent.receipts.filter((receipt) =>
+    receipt.attemptId === cancelledTransportReceipt.attemptId);
+  assert.equal(linkedCancellationRows.length, 2,
+    'one physical attempt has exactly one transport row and one reconciled outer row');
+  assert.deepEqual(new Set(linkedCancellationRows.map((receipt) => receipt.event)),
+    new Set(['bridge_provider_call', 'provider_call']));
   const usageOuterReceipt = receipts.structuredContent.receipts.find((receipt) => receipt.receiptId === usageProvider.structuredContent.receiptId);
   assert.equal(usageOuterReceipt.actualTotalTokens, 35453);
   assert.equal(usageOuterReceipt.tokenUsageSource, 'provider_reported');
