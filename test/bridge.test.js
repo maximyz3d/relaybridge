@@ -3,6 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
+const crypto = require('crypto');
 const http = require('http');
 const os = require('os');
 const path = require('path');
@@ -504,6 +505,15 @@ test('prompt-file transport preserves long special-character prompts and cleans 
       dangerous: [process.execPath, helper, '--version'],
       oneshot_safe: [...baseSlot, '--claude-json-multiturn'],
       oneshot_dangerous: [...baseSlot, '--claude-json-multiturn'],
+      oneshot_output_parser: 'claude_json',
+    },
+    usage_json_multiturn_bounded: {
+      label: 'Bounded Incremental Claude Diagnostic',
+      transport: 'subscription:anthropic',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--claude-json-multiturn-bounded'],
+      oneshot_dangerous: [...baseSlot, '--claude-json-multiturn-bounded'],
       oneshot_output_parser: 'claude_json',
     },
     usage_json_malformed_models: {
@@ -1301,6 +1311,55 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(multiTurnBudgetResult.provider_num_turns, 3);
   assert.equal(multiTurnBudgetResult.usage.total_tokens, 1995);
   assert.equal(multiTurnBudgetResult.provider_budget_enforcement, 'incremental');
+  assert.equal(multiTurnBudgetResult.stdout, '');
+  assert.equal(multiTurnBudgetResult.partial_result, true);
+  assert.equal(multiTurnBudgetResult.partial_diagnostic, 'turn 2\n\nturn 3');
+  assert.equal(multiTurnBudgetResult.partial_diagnostic_truncated, false);
+  assert.equal(multiTurnBudgetResult.cleaned_output_unavailable, true);
+  assert.doesNotMatch(multiTurnBudgetResult.partial_diagnostic,
+    /THINKING_MUST_NOT_ESCAPE|TOOL_INPUT_MUST_NOT_ESCAPE|DUPLICATE_ID_MUST_NOT_ESCAPE/);
+
+  const boundedBudgetResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST',
+    headers: jsonAuth,
+    body: JSON.stringify({
+      kind: 'usage_json_multiturn_bounded', prompt: 'bound recovered provider text', dangerous: false,
+      providerBudget: {
+        maxOutputTokens: null, maxTotalTokens: null, maxCacheReadTokens: null,
+        maxCacheCreationTokens: null, maxTurns: 1,
+      },
+    }),
+  });
+  assert.equal(boundedBudgetResponse.status, 200);
+  const boundedBudgetResult = await boundedBudgetResponse.json();
+  assert.equal(boundedBudgetResult.stop_reason, 'token_budget');
+  assert.equal(boundedBudgetResult.supervisor_stop_reason, 'token_budget');
+  assert.equal(boundedBudgetResult.failureClass, 'token_budget');
+  assert.equal(boundedBudgetResult.dropped_out, true);
+  assert.equal(boundedBudgetResult.stdout, '');
+  assert.equal(boundedBudgetResult.partial_result, true);
+  assert.equal(boundedBudgetResult.partial_diagnostic.length, 12000);
+  assert.equal(boundedBudgetResult.partial_diagnostic_truncated, true);
+  assert.match(boundedBudgetResult.partial_diagnostic, /TAIL_KEPT\n\nfinal bounded turn$/);
+  assert.doesNotMatch(boundedBudgetResult.partial_diagnostic,
+    /HEAD_SHOULD_TRUNCATE|BOUNDED_THINKING_MUST_NOT_ESCAPE|BOUNDED_TOOL_INPUT_MUST_NOT_ESCAPE/);
+  assert.equal(boundedBudgetResult.cleaned_output_unavailable, true);
+
+  const budgetReceipts = fs.readFileSync(
+    path.join(tempRoot, 'data', 'receipts', new Date().toISOString().slice(0, 10) + '.jsonl'), 'utf8',
+  ).trim().split(/\r?\n/).map(JSON.parse);
+  const multiTurnReceipt = budgetReceipts.find((row) => row.receiptId === multiTurnBudgetResult.receiptId);
+  const boundedReceipt = budgetReceipts.find((row) => row.receiptId === boundedBudgetResult.receiptId);
+  assert.equal(multiTurnReceipt.partialResult, true);
+  assert.equal(multiTurnReceipt.partialDiagnosticChars, multiTurnBudgetResult.partial_diagnostic.length);
+  assert.equal(multiTurnReceipt.partialDiagnosticTruncated, false);
+  assert.equal(multiTurnReceipt.cleanedOutputUnavailable, true);
+  assert.equal(boundedReceipt.partialResult, true);
+  assert.equal(boundedReceipt.partialDiagnosticChars, 12000);
+  assert.equal(boundedReceipt.partialDiagnosticTruncated, true);
+  assert.equal(boundedReceipt.partialDiagnosticHash,
+    crypto.createHash('sha256').update(boundedBudgetResult.partial_diagnostic).digest('hex'));
+  assert.equal(boundedReceipt.stopReason, 'token_budget');
 
   const groupedUsage = await (await fetch(baseUrl + '/api/usage/gauges', { headers: auth })).json();
   const usageGauge = groupedUsage.gauges.usage_json;
@@ -1563,6 +1622,8 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(invalidResult.stdout, '');
   assert.equal(invalidResult.dropped_out, true);
   assert.equal(invalidResult.failureClass, 'provider_error');
+  assert.equal(invalidResult.partial_result, undefined);
+  assert.equal(invalidResult.partial_diagnostic, undefined);
   assert.match(invalidResult.stderr, /document type is not result/);
 
   const retriesResponse = await fetch(baseUrl + '/api/oneshot', {

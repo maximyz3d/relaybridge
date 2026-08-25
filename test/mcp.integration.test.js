@@ -153,6 +153,14 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
       oneshot_safe: [process.execPath, helper, '--prompt-file', '{prompt_file}', '--claude-json'],
       oneshot_output_parser: 'claude_json',
     },
+    usage_json_multiturn: {
+      ...echoProvider,
+      label: 'Structured Claude budget-stop fixture',
+      oneshot_safe: [
+        process.execPath, helper, '--prompt-file', '{prompt_file}', '--claude-json-multiturn',
+      ],
+      oneshot_output_parser: 'claude_json',
+    },
     schema_disagreement: {
       ...echoProvider,
       label: 'Structured Claude schema disagreement fixture',
@@ -605,6 +613,28 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   assert.equal(providerTimeout.structuredContent.stopReason, 'provider_internal_timeout');
   assert.equal(providerTimeout.structuredContent.supervisorStopReason, null);
   assert.equal(providerTimeout.structuredContent.providerTimeoutSource, 'provider_cli_diagnostic');
+
+  const claudeBudgetPartial = await client.callTool({
+    name: 'ask_provider',
+    arguments: {
+      kind: 'usage_json_multiturn', prompt: 'MCP_CLAUDE_BUDGET_PARTIAL', useCache: false,
+      providerBudget: {
+        maxOutputTokens: null, maxTotalTokens: null, maxCacheReadTokens: null,
+        maxCacheCreationTokens: null, maxTurns: 2,
+      },
+    },
+  });
+  assert.equal(claudeBudgetPartial.structuredContent.stdout, '');
+  assert.equal(claudeBudgetPartial.structuredContent.droppedOut, true);
+  assert.equal(claudeBudgetPartial.structuredContent.partialResult, true);
+  assert.equal(claudeBudgetPartial.structuredContent.failureClass, 'token_budget');
+  assert.equal(claudeBudgetPartial.structuredContent.stopReason, 'token_budget');
+  assert.equal(claudeBudgetPartial.structuredContent.supervisorStopReason, 'token_budget');
+  assert.equal(claudeBudgetPartial.structuredContent.partialDiagnostic, 'turn 2\n\nturn 3');
+  assert.equal(claudeBudgetPartial.structuredContent.partialDiagnosticTruncated, false);
+  assert.equal(claudeBudgetPartial.structuredContent.cleanedOutputUnavailable, true);
+  assert.doesNotMatch(claudeBudgetPartial.structuredContent.partialDiagnostic,
+    /THINKING_MUST_NOT_ESCAPE|TOOL_INPUT_MUST_NOT_ESCAPE|DUPLICATE_ID_MUST_NOT_ESCAPE/);
 
   const narrationOnly = await client.callTool({
     name: 'ask_provider',

@@ -1025,7 +1025,8 @@ function sanitizeProviderResponse(response) {
     partialDiagnostic: partialDiagnostic.text,
     partialDiagnosticChars: partialDiagnostic.originalChars,
     partialDiagnosticSha256: stableHash(response.partial_diagnostic || ''),
-    partialDiagnosticTruncated: partialDiagnostic.truncated,
+    partialDiagnosticTruncated: response.partial_diagnostic_truncated === true
+      || partialDiagnostic.truncated,
     progressAtCancellation: response.progress_at_cancellation
       || (response.cancelled ? response.progress || null : null),
     cleanedOutputUnavailable: response.cleaned_output_unavailable ?? null,
