@@ -677,6 +677,8 @@ function appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt }
       ? String(payload.partial_diagnostic || '').length : 0,
     partialDiagnosticHash: payload.partial_result === true
       ? crypto.createHash('sha256').update(String(payload.partial_diagnostic || '')).digest('hex') : null,
+    partialDiagnosticTruncated: payload.partial_result === true
+      ? payload.partial_diagnostic_truncated === true : false,
     stopReason: normalizeClaudeResultString(payload.stop_reason),
     supervisorStopReason: normalizeClaudeResultString(payload.supervisor_stop_reason),
     providerTimeoutSource: normalizeClaudeResultString(payload.provider_timeout_source),
@@ -696,8 +698,9 @@ function appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt }
     transportOutputHash: normalizeClaudeResultString(payload.transport_output_hash, 64),
     progressAtCancellation: payload.cancelled && payload.progress
       ? payload.progress : null,
-    cleanedOutputUnavailable: payload.cancelled
-      ? !String(payload.stdout || '').trim() : null,
+    cleanedOutputUnavailable: typeof payload.cleaned_output_unavailable === 'boolean'
+      ? payload.cleaned_output_unavailable
+      : payload.cancelled ? !String(payload.stdout || '').trim() : null,
     durationMs: Date.now() - startedAt,
     failureClass: payload.cancelled ? (payload.failureClass || 'cancelled')
       : payload.failureClass || (payload.rate_limited ? 'rate_limit'
@@ -1385,6 +1388,46 @@ const CLAUDE_TERMINAL_REASONS = new Set([
   'structured_output_retry_exhausted', 'api_error', 'background_requested',
   'turn_setup_failed', 'tool_deferred_unavailable',
 ]);
+const CLAUDE_PARTIAL_DIAGNOSTIC_MAX_CHARS = 12000;
+
+function extractClaudeAssistantDiagnostic(events, maxChars = CLAUDE_PARTIAL_DIAGNOSTIC_MAX_CHARS) {
+  const messages = new Map();
+  for (const event of Array.isArray(events) ? events : []) {
+    if (event?.type !== 'assistant' || !event.message || typeof event.message !== 'object') continue;
+    const id = typeof event.message.id === 'string' ? event.message.id.trim() : '';
+    if (!id || !Array.isArray(event.message.content)) continue;
+    const text = event.message.content
+      .filter((block) => block && block.type === 'text' && typeof block.text === 'string')
+      .map((block) => block.text)
+      .join('\n');
+    const cleaned = cleanOutput(text);
+    if (!messages.has(id)) {
+      messages.set(id, { text: cleaned, conflicted: false });
+      continue;
+    }
+    const state = messages.get(id);
+    if (state.conflicted || !cleaned) continue;
+    const previous = state.text;
+    // With --include-partial-messages Claude can emit the same message ID first
+    // with no text and later with the cumulative text. Accept only monotonic
+    // extensions; contradictory duplicate records remain ignored fail-closed.
+    if (!previous || (cleaned.length > previous.length && cleaned.startsWith(previous))) {
+      state.text = cleaned;
+    } else if (previous !== cleaned && !previous.startsWith(cleaned)) state.conflicted = true;
+  }
+  const chunks = [...messages.values()]
+    .filter((state) => !state.conflicted && state.text)
+    .map((state) => state.text);
+  const diagnostic = cleanOutput(chunks.join('\n\n'));
+  if (!diagnostic || diagnostic.length <= maxChars) {
+    return { text: diagnostic, truncated: false, originalChars: diagnostic.length };
+  }
+  return {
+    text: diagnostic.slice(-maxChars),
+    truncated: true,
+    originalChars: diagnostic.length,
+  };
+}
 
 function normalizeClaudeRetryEvents(events) {
   const retained = [];
@@ -1609,6 +1652,7 @@ function parseConfiguredOneShotOutput(entry, rawOutput) {
       permissionDenials: normalizeClaudePermissionDenials([]),
       numTurns: null, providerDurationMs: null, providerApiDurationMs: null,
       resultSchemaDisagreement: false,
+      partialDiagnostic: '', partialDiagnosticTruncated: false,
       parseError: `unsupported oneshot output parser: ${parser}`,
     };
   }
@@ -1677,9 +1721,11 @@ function parseConfiguredOneShotOutput(entry, rawOutput) {
       providerDurationMs: nonnegativeUsageNumber(document.duration_ms),
       providerApiDurationMs: nonnegativeUsageNumber(document.duration_api_ms),
       resultSchemaDisagreement,
+      partialDiagnostic: '', partialDiagnosticTruncated: false,
       parseError: null,
     };
   } catch (error) {
+    const partial = extractClaudeAssistantDiagnostic(events);
     return {
       output: '', usage: null, isError: true,
       resultSubtype: null, failureClass: 'provider_error',
@@ -1690,6 +1736,8 @@ function parseConfiguredOneShotOutput(entry, rawOutput) {
       numTurns: null, providerDurationMs: null, providerApiDurationMs: null,
       resultSchemaDisagreement: false,
       retries: normalizeClaudeRetryEvents(events),
+      partialDiagnostic: partial.text,
+      partialDiagnosticTruncated: partial.truncated,
       parseError: `claude_json parse failed: ${error.message}`,
     };
   }
@@ -3816,6 +3864,8 @@ async function executeOneShot(body, res) {
   let settled = false;
   res._relayCancellationPayload = () => {
     const parsedOutput = parseConfiguredOneShotOutput(entry, stdout);
+    const retainedPartial = stopReason === 'token_budget' && !!parsedOutput.parseError
+      && !!parsedOutput.partialDiagnostic;
     const cancellationState = resolveCancellationTerminalState({
       stopReason,
       timedOut,
@@ -3847,6 +3897,13 @@ async function executeOneShot(body, res) {
       provider_error_invalid: parsedOutput.errorInvalid,
       provider_error_diagnostic_truncated: parsedOutput.errorDiagnosticTruncated,
       provider_error_diagnostic: parsedOutput.diagnostic,
+      ...(retainedPartial ? {
+        partial_result: true,
+        partial_diagnostic: parsedOutput.partialDiagnostic,
+        partial_diagnostic_truncated: parsedOutput.partialDiagnosticTruncated === true,
+      } : {}),
+      ...(stopReason === 'token_budget'
+        ? { cleaned_output_unavailable: !parsedOutput.output } : {}),
       transport_output_chars: String(stdout).length,
       transport_output_hash: crypto.createHash('sha256').update(String(stdout)).digest('hex'),
       stop_reason: cancellationState.stopReason,
@@ -4062,6 +4119,8 @@ async function executeOneShot(body, res) {
       && hasProviderInternalTimeoutDiagnostic(failureBlob);
     const providerTimedOut = timedOut || authoritativeApiFailure === 'timeout' || providerInternalTimedOut;
     const tokenBudgetExceeded = stopReason === 'token_budget';
+    const retainedPartial = tokenBudgetExceeded && !!parsedOutput.parseError
+      && !!parsedOutput.partialDiagnostic;
     const finalFailureClass = !isolationCleanup.ok ? 'isolation_cleanup'
       : tokenBudgetExceeded ? 'token_budget'
       : parsedOutput.resultSubtype === 'error_max_budget_usd' ? 'budget'
@@ -4099,6 +4158,12 @@ async function executeOneShot(body, res) {
       provider_error_invalid: parsedOutput.errorInvalid,
       provider_error_diagnostic_truncated: parsedOutput.errorDiagnosticTruncated,
       provider_error_diagnostic: parsedOutput.diagnostic,
+      ...(retainedPartial ? {
+        partial_result: true,
+        partial_diagnostic: parsedOutput.partialDiagnostic,
+        partial_diagnostic_truncated: parsedOutput.partialDiagnosticTruncated === true,
+      } : {}),
+      ...(tokenBudgetExceeded ? { cleaned_output_unavailable: !cleanedStdout } : {}),
       quota_evidence: copilotQuotaEvidence,
       provider_action_required: cursorActionRequired,
       transport_output_chars: String(stdout).length,

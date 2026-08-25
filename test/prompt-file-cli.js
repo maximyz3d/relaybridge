@@ -45,9 +45,46 @@ if (process.argv.includes('--claude-json-multiturn')) {
         cache_read_input_tokens: 500,
         cache_creation_input_tokens: 25,
       },
-      content: [{ type: 'text', text: `turn ${turn}` }],
+      content: turn === 1 ? [
+        { type: 'text', text: `turn ${turn}` },
+        { type: 'thinking', thinking: 'THINKING_MUST_NOT_ESCAPE' },
+        { type: 'tool_use', name: 'Read', input: { secret: 'TOOL_INPUT_MUST_NOT_ESCAPE' } },
+      ] : [{ type: 'text', text: `turn ${turn}` }],
     },
   }));
+  events.splice(0, 0, {
+    type: 'assistant',
+    message: {
+      id: 'fixture-turn-1',
+      usage: {
+        input_tokens: 100,
+        output_tokens: 40,
+        cache_read_input_tokens: 500,
+        cache_creation_input_tokens: 25,
+      },
+      content: [],
+    },
+  }, {
+    type: 'assistant',
+    message: {
+      id: 'fixture-turn-1',
+      usage: { input_tokens: 999, output_tokens: 999 },
+      content: [{ type: 'text', text: 'DUPLICATE_ID_MUST_NOT_ESCAPE' }],
+    },
+  });
+  events.splice(3, 0, {
+    type: 'assistant',
+    message: {
+      id: 'fixture-turn-2',
+      usage: {
+        input_tokens: 100,
+        output_tokens: 40,
+        cache_read_input_tokens: 500,
+        cache_creation_input_tokens: 25,
+      },
+      content: [],
+    },
+  });
   let index = 0;
   const interval = setInterval(() => {
     if (index < events.length) {
@@ -55,14 +92,52 @@ if (process.argv.includes('--claude-json-multiturn')) {
       return;
     }
     clearInterval(interval);
-    process.stdout.write(JSON.stringify({
+    setTimeout(() => process.stdout.write(JSON.stringify({
       type: 'result', is_error: false, subtype: 'success', result: 'MULTITURN_OK',
       num_turns: 3,
       usage: {
         input_tokens: 300, output_tokens: 120,
         cache_read_input_tokens: 1500, cache_creation_input_tokens: 75,
       },
-    }));
+    })), 500);
+  }, 30);
+  return;
+}
+
+if (process.argv.includes('--claude-json-multiturn-bounded')) {
+  const events = [
+    {
+      type: 'assistant',
+      message: {
+        id: 'bounded-turn-1',
+        usage: { input_tokens: 1, output_tokens: 1 },
+        content: [
+          { type: 'text', text: `HEAD_SHOULD_TRUNCATE${'x'.repeat(14000)}TAIL_KEPT` },
+          { type: 'thinking', thinking: 'BOUNDED_THINKING_MUST_NOT_ESCAPE' },
+          { type: 'tool_use', name: 'Write', input: { secret: 'BOUNDED_TOOL_INPUT_MUST_NOT_ESCAPE' } },
+        ],
+      },
+    },
+    {
+      type: 'assistant',
+      message: {
+        id: 'bounded-turn-2',
+        usage: { input_tokens: 1, output_tokens: 1 },
+        content: [{ type: 'text', text: 'final bounded turn' }],
+      },
+    },
+  ];
+  let index = 0;
+  const interval = setInterval(() => {
+    if (index < events.length) {
+      process.stdout.write(JSON.stringify(events[index++]) + '\n');
+      return;
+    }
+    clearInterval(interval);
+    setTimeout(() => process.stdout.write(JSON.stringify({
+      type: 'result', is_error: false, subtype: 'success', result: 'MUST_BE_KILLED',
+      num_turns: 2, usage: { input_tokens: 2, output_tokens: 2 },
+    })), 500);
   }, 30);
   return;
 }
