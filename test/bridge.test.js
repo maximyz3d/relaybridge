@@ -697,6 +697,13 @@ test('prompt-file transport preserves long special-character prompts and cleans 
       oneshot_safe: [...baseSlot, '--delay', '200', '--output', 'RACE_COMPLETED'],
       oneshot_dangerous: [...baseSlot, '--delay', '200', '--output', 'RACE_COMPLETED'],
     },
+    correlation_slow: {
+      label: 'Concurrent Correlation Slow Fixture',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--delay', '1000'],
+      oneshot_dangerous: [...baseSlot, '--delay', '1000'],
+    },
     env_echo: {
       label: 'Environment Echo',
       safe: [process.execPath, helper, '--version'],
@@ -900,6 +907,66 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(result.route.effective_timeout_ms, 600001);
   assert.equal(result.route.timeout_clamped, false);
   assert.deepEqual(fs.readdirSync(promptTemp), []);
+
+  // Raw callers own the response matching through their unique requestId.
+  // The slower request starts first but completes last, so selecting the
+  // newest receipt would misattribute the fast caller even though the store
+  // itself preserved two distinct request -> invocation -> receipt tuples.
+  const slowRequestId = 'test:correlation:slow-0001';
+  const fastRequestId = 'test:correlation:fast-0001';
+  const slowPrompt = 'concurrent correlation slow';
+  const fastPrompt = 'concurrent correlation fast';
+  const slowCorrelationRequest = fetch(baseUrl + '/api/oneshot', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({
+      kind: 'correlation_slow', prompt: slowPrompt, dangerous: false,
+      requestId: slowRequestId,
+    }),
+  });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  const fastCorrelationRequest = fetch(baseUrl + '/api/oneshot', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({
+      kind: 'echo', prompt: fastPrompt, dangerous: false,
+      requestId: fastRequestId,
+    }),
+  });
+  const [slowCorrelationResponse, fastCorrelationResponse] = await Promise.all([
+    slowCorrelationRequest,
+    fastCorrelationRequest,
+  ]);
+  assert.equal(slowCorrelationResponse.status, 200);
+  assert.equal(fastCorrelationResponse.status, 200);
+  const slowCorrelation = await slowCorrelationResponse.json();
+  const fastCorrelation = await fastCorrelationResponse.json();
+  assert.equal(slowCorrelation.requestId, slowRequestId);
+  assert.equal(slowCorrelation.invocationId, slowRequestId);
+  assert.equal(fastCorrelation.requestId, fastRequestId);
+  assert.equal(fastCorrelation.invocationId, fastRequestId);
+  assert.notEqual(slowCorrelation.receiptId, fastCorrelation.receiptId);
+
+  const correlationRows = fs.readFileSync(
+    path.join(tempRoot, 'data', 'receipts', new Date().toISOString().slice(0, 10) + '.jsonl'),
+    'utf8',
+  ).trim().split(/\r?\n/).map(JSON.parse).filter((row) =>
+    [slowRequestId, fastRequestId].includes(row.requestId));
+  assert.deepEqual(correlationRows.map((row) => row.requestId), [fastRequestId, slowRequestId]);
+  for (const [requestId, promptText, responseBody] of [
+    [slowRequestId, slowPrompt, slowCorrelation],
+    [fastRequestId, fastPrompt, fastCorrelation],
+  ]) {
+    const receipt = correlationRows.find((row) => row.receiptId === responseBody.receiptId);
+    assert.ok(receipt, `direct response receipt must retrieve ${requestId}`);
+    assert.equal(receipt.requestId, requestId);
+    assert.equal(receipt.invocationId, requestId);
+    assert.equal(receipt.attemptId, `${requestId}:attempt:1`);
+    assert.equal(receipt.inputHash, crypto.createHash('sha256').update(promptText).digest('hex'));
+  }
+  assert.equal(
+    correlationRows.at(-1).requestId,
+    slowRequestId,
+    'the newest receipt belongs only to the slow request and is not provenance for the fast caller',
+  );
 
   const isolatedResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST', headers: jsonAuth,

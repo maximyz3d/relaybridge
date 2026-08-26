@@ -182,10 +182,39 @@ test('the CLI ask payload preserves the caller working directory', () => {
     { primary: { kind: 'claude' }, tier: 'standard' },
     'review the repo',
     'C:\\review\\repo',
+    'cli:test-request-0001',
   );
   assert.equal(body.cwd, 'C:\\review\\repo');
   assert.equal(body.kind, 'claude');
   assert.equal(body.dangerous, false);
+  assert.equal(body.requestId, 'cli:test-request-0001');
+});
+
+test('the CLI generates unique request IDs and rejects mismatched response attribution', () => {
+  const {
+    newCliRequestId,
+    requireCorrelationTuple,
+  } = require('../bin/relaybridge.js');
+  const first = newCliRequestId();
+  const second = newCliRequestId();
+  assert.match(first, /^cli:[0-9a-f-]{36}$/);
+  assert.notEqual(first, second);
+  assert.deepEqual(
+    requireCorrelationTuple({
+      requestId: first,
+      invocationId: first,
+      receiptId: 'rcpt_exact_1',
+    }, first),
+    { requestId: first, invocationId: first, receiptId: 'rcpt_exact_1' },
+  );
+  assert.throws(
+    () => requireCorrelationTuple({
+      requestId: second,
+      invocationId: second,
+      receiptId: 'rcpt_newest_but_wrong',
+    }, first),
+    /do not attribute this result from receipt ordering/,
+  );
 });
 
 test('the CLI never force-exits while sockets are in flight', () => {

@@ -12,6 +12,7 @@
 // between surfaces.
 
 const fs = require('fs');
+const crypto = require('crypto');
 const os = require('os');
 const path = require('path');
 const { TextDecoder } = require('util');
@@ -180,14 +181,36 @@ function printPlan(plan, { json = false } = {}) {
   for (const line of plan.guidance || []) console.log(`note      ${line}`);
 }
 
-function buildAskBody(plan, task, cwd = process.cwd()) {
+function newCliRequestId() {
+  return `cli:${crypto.randomUUID()}`;
+}
+
+function buildAskBody(plan, task, cwd = process.cwd(), requestId = newCliRequestId()) {
   return {
     kind: plan.primary.kind,
     prompt: task,
     taskTier: plan.tier,
     dangerous: false,
     cwd,
+    requestId,
   };
+}
+
+function requireCorrelationTuple(result, expectedRequestId) {
+  const tuple = {
+    requestId: result?.requestId,
+    invocationId: result?.invocationId,
+    receiptId: result?.receiptId,
+  };
+  if (tuple.requestId !== expectedRequestId
+    || tuple.invocationId !== expectedRequestId
+    || !/^rcpt_[A-Za-z0-9_-]+$/.test(String(tuple.receiptId || ''))) {
+    throw new Error(
+      `bridge returned an invalid correlation tuple for ${expectedRequestId}; `
+      + 'do not attribute this result from receipt ordering',
+    );
+  }
+  return tuple;
 }
 
 const USAGE = `relaybridge — delegate work to AI CLIs on seats you already pay for
@@ -207,6 +230,7 @@ const USAGE = `relaybridge — delegate work to AI CLIs on seats you already pay
 
 Prompt: positional text | --stdin | --prompt-file <path>  (choose exactly one)
 Flags: --effort minimal|low|medium|high|max   --kind <provider>   --json
+Correlation: ask prints its unique request ID, then the exact returned receipt tuple.
 
 Effort exists so a simple edit does not burn a frontier reasoning budget, and a
 hard problem is not starved. Prefer 'plan' before 'ask' when unsure.`;
@@ -242,13 +266,16 @@ async function main() {
           console.error('\nthis task is critical tier: re-run with --force if you accept advisory-only output');
           return 1;
         }
-        if (!json) console.error(`# ${plan.primary.kind} · ${plan.primary.model || 'default'} · effort ${plan.effort}`);
+        const askBody = buildAskBody(plan, task);
+        console.error(`# request ${askBody.requestId} · ${plan.primary.kind} · ${plan.primary.model || 'default'} · effort ${plan.effort}`);
         const result = await call('/api/oneshot', {
           method: 'POST',
           // A CLI provider is only workspace-grounded when the bridge spawns
           // it in the directory from which `relaybridge ask` was invoked.
-          body: buildAskBody(plan, task),
+          body: askBody,
         });
+        const correlation = requireCorrelationTuple(result, askBody.requestId);
+        console.error(`# correlation requestId=${correlation.requestId} invocationId=${correlation.invocationId} receiptId=${correlation.receiptId}`);
         if (json) { console.log(JSON.stringify(result, null, 2)); return result.exitCode === 0 && !result.dropped_out ? 0 : 1; }
         if (result.stdout) console.log(result.stdout.trim());
         if (result.partial_result && result.partial_diagnostic) {
@@ -387,4 +414,12 @@ if (require.main === module) {
   });
 }
 
-module.exports = { parseFlags, resolveTaskInput, findToken, buildAskBody, USAGE };
+module.exports = {
+  parseFlags,
+  resolveTaskInput,
+  findToken,
+  newCliRequestId,
+  buildAskBody,
+  requireCorrelationTuple,
+  USAGE,
+};

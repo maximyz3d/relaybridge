@@ -84,6 +84,7 @@ test('usage documents stdin and prompt-file for both planning and asking', () =>
   assert.match(USAGE, /relaybridge plan --stdin/);
   assert.match(USAGE, /relaybridge ask --prompt-file/);
   assert.match(USAGE, /choose exactly one/);
+  assert.match(USAGE, /unique request ID/);
 });
 
 test('ask transports a long stdin prompt in request bodies, never argv', async (t) => {
@@ -102,6 +103,12 @@ test('ask transports a long stdin prompt in request bodies, never argv', async (
   assert.equal(requests[0].body.task, prompt);
   assert.equal(requests[1].url, '/api/oneshot');
   assert.equal(requests[1].body.prompt, prompt);
+  assert.match(requests[1].body.requestId, /^cli:[0-9a-f-]{36}$/);
+  assert.match(result.stderr, new RegExp(`# request ${requests[1].body.requestId}`));
+  assert.match(
+    result.stderr,
+    new RegExp(`requestId=${requests[1].body.requestId} invocationId=${requests[1].body.requestId} receiptId=rcpt_stub_1`),
+  );
   assert.ok(Buffer.byteLength(prompt, 'utf8') > 32767);
   assert.ok(!result.spawnArgs.some((arg) => arg.includes('const value')));
 });
@@ -161,6 +168,7 @@ test('empty and conflicting CLI input fails before any bridge request', async (t
 });
 
 async function startBridgeStub(t, requests, oneShotResult = null) {
+  let receiptCounter = 0;
   const server = http.createServer(async (req, res) => {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
@@ -179,7 +187,14 @@ async function startBridgeStub(t, requests, oneShotResult = null) {
       return;
     }
     if (req.url === '/api/oneshot') {
-      res.end(JSON.stringify(oneShotResult || { exitCode: 0, dropped_out: false, stdout: 'ok' }));
+      receiptCounter += 1;
+      const result = oneShotResult || { exitCode: 0, dropped_out: false, stdout: 'ok' };
+      res.end(JSON.stringify({
+        ...result,
+        requestId: requests.at(-1).body.requestId,
+        invocationId: requests.at(-1).body.requestId,
+        receiptId: result.receiptId || `rcpt_stub_${receiptCounter}`,
+      }));
       return;
     }
     res.statusCode = 404;

@@ -17,7 +17,11 @@ Confirm the bridge is up with `GET /api/health` before routing anything.
 
 ## Delegating
 
-`POST /api/oneshot` with `{"kind":"<provider>","prompt":"<text>"}`.
+`POST /api/oneshot` with
+`{"kind":"<provider>","prompt":"<text>","requestId":"rest:<unique-uuid>"}`.
+For concurrent raw calls, generate a different request ID per call and retain
+the direct response's `requestId`/`invocationId`/`receiptId` tuple. Never infer
+ownership from the newest receipt after a shell detaches.
 
 **Do not send `timeoutMs`.** It is an optional hard ceiling, not a kill clock.
 Runs are supervised by progress — a call producing new content is left alone to

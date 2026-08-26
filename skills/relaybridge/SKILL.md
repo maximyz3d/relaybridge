@@ -41,13 +41,20 @@ retrying.
 ## Delegating a task
 
 ```bash
+REQUEST_ID="rest:$(node -e 'process.stdout.write(require("crypto").randomUUID())')"
 curl -s -X POST http://127.0.0.1:8787/api/oneshot \
   -H "X-RelayBridge-Token: $TOKEN" -H "Content-Type: application/json" \
-  -d '{"kind":"ollama_coder","prompt":"Explain what this regex matches: ^\\d{3}-\\d{4}$"}'
+  -d "$(jq -nc --arg requestId "$REQUEST_ID" \
+    --arg prompt 'Explain what this regex matches: ^\\d{3}-\\d{4}$' \
+    '{kind:"ollama_coder",prompt:$prompt,requestId:$requestId}')"
 ```
 
 `kind` is the provider key from `cli-config.json`. The response carries
-`stdout`, `exitCode`, `stop_reason`, `progress`, and a `receiptId`.
+`stdout`, `exitCode`, `stop_reason`, `progress`, and the exact
+`requestId`/`invocationId`/`receiptId` correlation tuple. Concurrent raw
+callers must generate a unique `requestId` and retain the direct tuple
+atomically. Never attribute a detached response by selecting the newest
+receipt; find the exact request ID or treat provenance as unknown.
 
 **Do not pass `timeoutMs`.** It is an optional hard ceiling, not a kill clock.
 Runs are supervised by progress: a call that keeps producing new content is left

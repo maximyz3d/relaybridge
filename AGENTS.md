@@ -14,6 +14,10 @@ When connected through MCP, call `get_context_bundle` first. It returns the boun
 4. Use `run_committee` for independent advisory responses from multiple providers.
 5. Use `list_runs`, `get_run`, `list_receipts`, and `get_receipt` for provenance.
 
+For concurrent raw REST calls, generate a unique `requestId` per call and keep
+the direct `requestId`/`invocationId`/`receiptId` tuple together. Never assign a
+detached response by selecting the newest receipt.
+
 ## Terminal Control
 
 `start_safe_session(kind:"powershell")` opens a real host PowerShell process. `send_session_input` can execute arbitrary commands under the user's account after host approval. RelayBridge is not a filesystem sandbox.
