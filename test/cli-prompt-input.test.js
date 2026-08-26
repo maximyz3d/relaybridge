@@ -151,6 +151,23 @@ test('ask CLI exits failed and labels partial diagnostics instead of printing su
   assert.match(result.stderr, /# stopped: provider_incomplete_response/);
 });
 
+test('ask CLI rejects a mismatched response correlation tuple', async (t) => {
+  const requests = [];
+  const server = await startBridgeStub(t, requests, {
+    exitCode: 0,
+    dropped_out: false,
+    stdout: 'must not be trusted',
+    correlationOverride: {
+      invocationId: 'cli:wrong-invocation',
+    },
+  });
+  const result = await runCli(['ask', '--kind', 'fake', 'review task'], '', server.port);
+  assert.equal(result.code, 1);
+  assert.equal(result.stdout, '');
+  assert.match(result.stderr, /bridge returned an invalid correlation tuple/);
+  assert.match(result.stderr, /do not attribute this result from receipt ordering/);
+});
+
 test('empty and conflicting CLI input fails before any bridge request', async (t) => {
   const requests = [];
   const server = await startBridgeStub(t, requests);
@@ -188,12 +205,14 @@ async function startBridgeStub(t, requests, oneShotResult = null) {
     }
     if (req.url === '/api/oneshot') {
       receiptCounter += 1;
-      const result = oneShotResult || { exitCode: 0, dropped_out: false, stdout: 'ok' };
+      const { correlationOverride = {}, ...result } = oneShotResult
+        || { exitCode: 0, dropped_out: false, stdout: 'ok' };
+      const expectedRequestId = requests.at(-1).body.requestId;
       res.end(JSON.stringify({
         ...result,
-        requestId: requests.at(-1).body.requestId,
-        invocationId: requests.at(-1).body.requestId,
-        receiptId: result.receiptId || `rcpt_stub_${receiptCounter}`,
+        requestId: correlationOverride.requestId || expectedRequestId,
+        invocationId: correlationOverride.invocationId || expectedRequestId,
+        receiptId: correlationOverride.receiptId || result.receiptId || `rcpt_stub_${receiptCounter}`,
       }));
       return;
     }

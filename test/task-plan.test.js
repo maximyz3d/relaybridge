@@ -215,6 +215,24 @@ test('the CLI generates unique request IDs and rejects mismatched response attri
     }, first),
     /do not attribute this result from receipt ordering/,
   );
+  assert.throws(
+    () => requireCorrelationTuple({
+      requestId: first,
+      invocationId: second,
+      receiptId: 'rcpt_exact_but_wrong_invocation',
+    }, first),
+    /do not attribute this result from receipt ordering/,
+  );
+  for (const receiptId of [null, '', 'newest_but_untyped']) {
+    assert.throws(
+      () => requireCorrelationTuple({
+        requestId: first,
+        invocationId: first,
+        receiptId,
+      }, first),
+      /do not attribute this result from receipt ordering/,
+    );
+  }
 });
 
 test('the CLI never force-exits while sockets are in flight', () => {
