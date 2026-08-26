@@ -84,6 +84,7 @@ test('usage documents stdin and prompt-file for both planning and asking', () =>
   assert.match(USAGE, /relaybridge plan --stdin/);
   assert.match(USAGE, /relaybridge ask --prompt-file/);
   assert.match(USAGE, /choose exactly one/);
+  assert.match(USAGE, /unique request ID/);
 });
 
 test('ask transports a long stdin prompt in request bodies, never argv', async (t) => {
@@ -102,6 +103,12 @@ test('ask transports a long stdin prompt in request bodies, never argv', async (
   assert.equal(requests[0].body.task, prompt);
   assert.equal(requests[1].url, '/api/oneshot');
   assert.equal(requests[1].body.prompt, prompt);
+  assert.match(requests[1].body.requestId, /^cli:[0-9a-f-]{36}$/);
+  assert.match(result.stderr, new RegExp(`# request ${requests[1].body.requestId}`));
+  assert.match(
+    result.stderr,
+    new RegExp(`requestId=${requests[1].body.requestId} invocationId=${requests[1].body.requestId} receiptId=rcpt_stub_1`),
+  );
   assert.ok(Buffer.byteLength(prompt, 'utf8') > 32767);
   assert.ok(!result.spawnArgs.some((arg) => arg.includes('const value')));
 });
@@ -144,6 +151,23 @@ test('ask CLI exits failed and labels partial diagnostics instead of printing su
   assert.match(result.stderr, /# stopped: provider_incomplete_response/);
 });
 
+test('ask CLI rejects a mismatched response correlation tuple', async (t) => {
+  const requests = [];
+  const server = await startBridgeStub(t, requests, {
+    exitCode: 0,
+    dropped_out: false,
+    stdout: 'must not be trusted',
+    correlationOverride: {
+      invocationId: 'cli:wrong-invocation',
+    },
+  });
+  const result = await runCli(['ask', '--kind', 'fake', 'review task'], '', server.port);
+  assert.equal(result.code, 1);
+  assert.equal(result.stdout, '');
+  assert.match(result.stderr, /bridge returned an invalid correlation tuple/);
+  assert.match(result.stderr, /do not attribute this result from receipt ordering/);
+});
+
 test('empty and conflicting CLI input fails before any bridge request', async (t) => {
   const requests = [];
   const server = await startBridgeStub(t, requests);
@@ -161,6 +185,7 @@ test('empty and conflicting CLI input fails before any bridge request', async (t
 });
 
 async function startBridgeStub(t, requests, oneShotResult = null) {
+  let receiptCounter = 0;
   const server = http.createServer(async (req, res) => {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
@@ -179,7 +204,16 @@ async function startBridgeStub(t, requests, oneShotResult = null) {
       return;
     }
     if (req.url === '/api/oneshot') {
-      res.end(JSON.stringify(oneShotResult || { exitCode: 0, dropped_out: false, stdout: 'ok' }));
+      receiptCounter += 1;
+      const { correlationOverride = {}, ...result } = oneShotResult
+        || { exitCode: 0, dropped_out: false, stdout: 'ok' };
+      const expectedRequestId = requests.at(-1).body.requestId;
+      res.end(JSON.stringify({
+        ...result,
+        requestId: correlationOverride.requestId || expectedRequestId,
+        invocationId: correlationOverride.invocationId || expectedRequestId,
+        receiptId: correlationOverride.receiptId || result.receiptId || `rcpt_stub_${receiptCounter}`,
+      }));
       return;
     }
     res.statusCode = 404;

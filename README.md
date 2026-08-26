@@ -318,9 +318,59 @@ $jsonHeaders = @{
   'X-RelayBridge-Token' = $bridgeToken
   'Content-Type' = 'application/json'
 }
-$body = @{ kind = 'ollama_fast'; prompt = 'Define deterministic.'; dangerous = $false } | ConvertTo-Json
-Invoke-RestMethod -Uri 'http://127.0.0.1:8787/api/oneshot' -Method Post -Headers $jsonHeaders -Body $body
+$requestId = 'rest:' + [guid]::NewGuid().ToString('D')
+$body = @{
+  kind = 'ollama_fast'
+  prompt = 'Define deterministic.'
+  dangerous = $false
+  requestId = $requestId
+} | ConvertTo-Json
+$result = Invoke-RestMethod -Uri 'http://127.0.0.1:8787/api/oneshot' -Method Post -Headers $jsonHeaders -Body $body
+if ($result.requestId -ne $requestId -or $result.invocationId -ne $requestId -or -not $result.receiptId) {
+  throw 'RelayBridge returned an invalid correlation tuple; do not infer provenance from receipt ordering.'
+}
+$correlation = [ordered]@{
+  requestId = $result.requestId
+  invocationId = $result.invocationId
+  receiptId = $result.receiptId
+}
+$correlation | ConvertTo-Json -Compress
 ```
+
+### Concurrent raw-call provenance
+
+Every concurrent raw caller must generate its own `requestId` and retain the
+direct response's `requestId`, `invocationId`, and `receiptId` as one atomic
+tuple. Persist that tuple before launching or collecting another call. Never
+attribute work by reading the newest/latest receipt: a slower request can start
+first and append its receipt after a faster request has already completed.
+
+If the direct response is lost, provenance is unknown until the exact caller
+`requestId` is found in `list_receipts`; then pass that row's exact `receiptId`
+to `get_receipt`. Do not substitute the first or newest row. The CLI applies
+this rule automatically: `relaybridge ask` generates and prints its request ID
+before waiting, then rejects any response whose correlation tuple does not
+match.
+
+Shell/curl callers should retain the response itself, not a later receipt-list
+snapshot:
+
+```bash
+request_id="rest:$(node -e 'process.stdout.write(require("crypto").randomUUID())')"
+response_file="$(mktemp)"
+jq -n --arg kind ollama_fast --arg prompt 'Define deterministic.' \
+  --arg requestId "$request_id" \
+  '{kind:$kind,prompt:$prompt,dangerous:false,requestId:$requestId}' |
+  curl -sS -X POST http://127.0.0.1:8787/api/oneshot \
+    -H "X-RelayBridge-Token: $TOKEN" -H 'Content-Type: application/json' \
+    --data-binary @- > "$response_file"
+jq -e --arg requestId "$request_id" \
+  'select(.requestId==$requestId and .invocationId==$requestId and (.receiptId|type=="string")) |
+   {requestId,invocationId,receiptId}' "$response_file"
+```
+
+Use the emitted `receiptId` for exact `get_receipt` retrieval. If the final
+`jq` check fails, do not attribute the output to that caller.
 
 Core routes:
 

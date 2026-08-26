@@ -30,6 +30,7 @@ The main delegation call.
 |---|---|---|
 | `kind` | string | Provider key from `cli-config.json`. Required. |
 | `prompt` | string | Required, non-empty. |
+| `requestId` | string | Caller-generated unique identity (`[A-Za-z0-9._:-]`, 8-160 characters). Mandatory for concurrent raw callers; retain it with the direct response tuple. |
 | `dangerous` | boolean | Optional. `false` (default) runs the read-only/plan slot. `true` allows the CLI to act agentically — only with explicit human intent. |
 | `cwd` | string | Optional working directory, validated against the allow list. |
 | `timeoutMs` | number | Optional **hard ceiling only**. Omit it; supervision decides when a run is stuck. |
@@ -67,6 +68,13 @@ transport retries. The error response exposes the same identity through
 `X-RelayBridge-Receipt-Id`, `X-RelayBridge-Request-Id`,
 `X-RelayBridge-Build-Id`, and `X-RelayBridge-Receipt-Store-Id`. Reusing one
 `requestId` reuses the original receipt; it does not imply an automatic retry.
+
+Concurrent raw callers must generate a different `requestId` per logical call
+and retain the direct response's `{requestId, invocationId, receiptId}` tuple
+atomically. A late response may append after a faster call, so the newest or
+latest receipt is never evidence of ownership. If a response is lost, locate
+the exact caller `requestId` with `list_receipts`, then dereference only that
+row's `receiptId` with `get_receipt`; otherwise treat provenance as unknown.
 
 ### `GET /api/runs/active`
 Live supervision state for in-flight calls: `phase`, `assessment`, `idleMs`,
