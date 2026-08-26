@@ -10,6 +10,7 @@ const os = require('os');
 const crypto = require('crypto');
 const { RunSupervisor, resolveSupervisorOptions, normalizeProviderBudget } = require('./lib/run-supervisor');
 const { extractClaudeAssistantCheckpoint, redactCheckpointSecrets } = require('./lib/partial-checkpoint');
+const { guardProviderInput } = require('./lib/provider-input-guard');
 const {
   captureWriterWorkspaceSnapshot,
   summarizeWriterWorkspaceDiff,
@@ -700,6 +701,8 @@ function appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt }
       ? payload.partial_checkpoint_message_id_hash : null,
     partialCheckpointUnavailableReason: payload.partial_result === true
       ? normalizeClaudeResultString(payload.partial_checkpoint_unavailable_reason) : null,
+    partialCheckpointSelectionReason: payload.partial_result === true
+      ? normalizeClaudeResultString(payload.partial_checkpoint_selection_reason) : null,
     cleanedOutputUnavailableReason: normalizeClaudeResultString(payload.cleaned_output_unavailable_reason),
     gracefulFinalization: payload.graceful_finalization && typeof payload.graceful_finalization === 'object'
       ? payload.graceful_finalization : null,
@@ -3857,6 +3860,9 @@ async function executeOneShot(body, res) {
   const isWindows = process.platform === 'win32';
   let proc;
   let writerWorkspaceBaseline = null;
+  let providerInputWriteError = false;
+  let gracefulFinalization = null;
+  let providerExited = false;
   try {
     // Re-check both the startup-pinned allowed-root identity and the selected
     // directory immediately before child creation. Node's spawn API has no
@@ -3888,6 +3894,16 @@ async function executeOneShot(body, res) {
       spawnOpts.windowsVerbatimArguments = true;
     }
     proc = trackChild(spawn(spawnBin, spawnArgs, spawnOpts));
+    // ChildProcess stdin errors are emitted asynchronously and are not caught
+    // by try/catch around write(). Always consume them so an early provider
+    // exit (EPIPE) cannot crash the bridge process.
+    guardProviderInput(proc.stdin, () => {
+      providerInputWriteError = true;
+      if (gracefulFinalization?.requested) {
+        gracefulFinalization.sent = false;
+        gracefulFinalization.reason = 'provider_input_write_failed';
+      }
+    });
     // executeOneShot returns after wiring the child events; the response is
     // delivered by proc.on('close'). Background-task capture must distinguish
     // that intentional deferred response from a handler that forgot to reply.
@@ -3916,7 +3932,7 @@ async function executeOneShot(body, res) {
     providerInputClosed = true;
     try { proc.stdin.end(); } catch {}
   };
-  const gracefulFinalization = {
+  gracefulFinalization = {
     supported: supportsClaudeStreamFinalization,
     requested: false,
     sent: false,
@@ -3929,9 +3945,12 @@ async function executeOneShot(body, res) {
     gracefulFinalization.requested = true;
     gracefulFinalization.reserve = verdict?.reserve || null;
     if (!supportsClaudeStreamFinalization || providerInputClosed
+      || providerInputWriteError
       || proc.stdin.destroyed || proc.stdin.writableEnded) {
-      gracefulFinalization.reason = providerInputClosed
-        ? 'provider_input_already_closed' : 'provider_transport_does_not_support_mid_run_input';
+      gracefulFinalization.reason = providerInputWriteError
+        ? 'provider_input_write_failed'
+        : providerInputClosed
+          ? 'provider_input_already_closed' : 'provider_transport_does_not_support_mid_run_input';
       return;
     }
     const message = [
@@ -3940,7 +3959,12 @@ async function executeOneShot(body, res) {
       'Do not include secrets, credentials, raw tool arguments, or raw command output.',
     ].join(' ');
     try {
-      proc.stdin.write(claudeStreamUserMessage(message));
+      proc.stdin.write(claudeStreamUserMessage(message), (error) => {
+        if (!error) return;
+        providerInputWriteError = true;
+        gracefulFinalization.sent = false;
+        gracefulFinalization.reason = 'provider_input_write_failed';
+      });
       gracefulFinalization.sent = true;
       gracefulFinalization.reason = null;
     } catch (error) {
@@ -3949,6 +3973,15 @@ async function executeOneShot(body, res) {
   };
   const collectWriterDiffSummary = () => {
     if (!useDanger) return null;
+    if (!providerExited) {
+      return {
+        available: false,
+        reason: 'provider_still_running',
+        changedFileCount: 0,
+        files: [],
+        filesTruncated: false,
+      };
+    }
     if (!writerDiffSummary) {
       writerDiffSummary = summarizeWriterWorkspaceDiff(
         writerWorkspaceBaseline,
@@ -4005,6 +4038,7 @@ async function executeOneShot(body, res) {
         partial_checkpoint_event_type: checkpoint?.eventType || null,
         partial_checkpoint_message_id_hash: checkpoint?.messageIdHash || null,
         partial_checkpoint_unavailable_reason: checkpoint?.unavailableReason || null,
+        partial_checkpoint_selection_reason: checkpoint?.selectionReason || null,
       } : {}),
       ...(stopReason === 'token_budget'
         ? {
@@ -4115,6 +4149,7 @@ async function executeOneShot(body, res) {
   proc.stderr.on('data', (d) => { if (supervisor.recordOutput(d)) stderr += d; });
   proc.on('error', (err) => {
     if (settled) return;
+    providerExited = true;
     settled = true;
     finishSupervision();
     cleanupPromptFile();
@@ -4127,6 +4162,7 @@ async function executeOneShot(body, res) {
   });
   proc.on('close', (code) => {
     if (settled) return;
+    providerExited = true;
     settled = true;
     finishSupervision();
     cleanupPromptFile();
@@ -4291,6 +4327,7 @@ async function executeOneShot(body, res) {
         partial_checkpoint_event_type: checkpoint?.eventType || null,
         partial_checkpoint_message_id_hash: checkpoint?.messageIdHash || null,
         partial_checkpoint_unavailable_reason: checkpoint?.unavailableReason || null,
+        partial_checkpoint_selection_reason: checkpoint?.selectionReason || null,
       } : {}),
       ...(tokenBudgetExceeded ? {
         cleaned_output_unavailable: !cleanedStdout,
@@ -4337,7 +4374,16 @@ async function executeOneShot(body, res) {
   // Providers without a placeholder (Claude/Codex/Perplexity wrapper) read
   // stdin. Antigravity consumes {prompt}; Grok consumes {prompt_file}.
   if (promptTransport === 'stdin_stream_json') {
-    try { proc.stdin.write(claudeStreamUserMessage(effectivePrompt)); } catch { closeProviderInput(); }
+    try {
+      proc.stdin.write(claudeStreamUserMessage(effectivePrompt), (error) => {
+        if (!error) return;
+        providerInputWriteError = true;
+        closeProviderInput();
+      });
+    } catch {
+      providerInputWriteError = true;
+      closeProviderInput();
+    }
   } else if (promptTransport === 'stdin') {
     try { proc.stdin.write(effectivePrompt); proc.stdin.end(); } catch {}
   } else {

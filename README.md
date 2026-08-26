@@ -491,8 +491,10 @@ byte count, SHA-256, truncation state, event type, and explicit unavailable
 reason when no assistant text exists. Thinking blocks, tool inputs, credential-
 shaped text, and raw transport never enter the checkpoint. Authorized writer
 runs also receive a bounded `writer_diff_summary` of git status/head changes;
-secret-shaped paths are replaced with a marker and path hash. These fields are
-continuation evidence, not a successful answer or an automatic commit.
+secret-shaped paths are replaced with a marker and their low-entropy path hash
+is omitted. Dirty-file content fingerprints are computed in one bounded git
+process, with truncation disclosed. These fields are continuation evidence,
+not a successful answer or an automatic commit.
 
 ## License
 

@@ -11,6 +11,7 @@ if (process.argv.includes('--version')) {
 }
 
 const finalize = process.argv.includes('--finalize');
+const healthy = process.argv.includes('--healthy');
 const writerBudget = process.argv.includes('--writer-budget');
 let messages = 0;
 
@@ -36,6 +37,26 @@ lines.on('line', (line) => {
   try { event = JSON.parse(line); } catch { process.exit(3); }
   if (event?.type !== 'user' || event.message?.role !== 'user') process.exit(4);
   messages += 1;
+
+  if (healthy && messages === 1) {
+    assistant('healthy-1', 'healthy checkpoint', {
+      input_tokens: 10,
+      output_tokens: 5,
+      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+    });
+    process.stdout.write(`${JSON.stringify({
+      type: 'result', is_error: false, subtype: 'success', result: 'HEALTHY_STREAM_OK',
+      num_turns: 1,
+      usage: {
+        input_tokens: 10,
+        output_tokens: 5,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+    })}\n`);
+    return;
+  }
 
   if (writerBudget && messages === 1) {
     fs.writeFileSync(path.join(process.cwd(), 'writer-change.txt'), 'partial writer output\n', 'utf8');
@@ -82,4 +103,5 @@ lines.on('line', (line) => {
 
 process.stdin.on('end', () => {
   if (finalize && messages >= 2) process.exit(0);
+  if (healthy && messages >= 1) process.exit(0);
 });

@@ -361,6 +361,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   fs.mkdirSync(realProviderHome);
   const helper = path.join(ROOT, 'test', 'prompt-file-cli.js');
   const streamHelper = path.join(ROOT, 'test', 'claude-stream-cli.js');
+  const closedStreamHelper = path.join(ROOT, 'test', 'claude-stdin-closed-cli.js');
   const configPath = path.join(tempRoot, 'config.json');
   const tokenPath = path.join(tempRoot, 'capability.token');
   const baseSlot = [process.execPath, helper, '--prompt-file', '{prompt_file}'];
@@ -533,6 +534,26 @@ test('prompt-file transport preserves long special-character prompts and cleans 
       dangerous: [process.execPath, streamHelper, '--version'],
       oneshot_safe: [process.execPath, streamHelper, '--finalize', '--input-format', 'stream-json'],
       oneshot_dangerous: [process.execPath, streamHelper, '--finalize', '--input-format', 'stream-json'],
+      oneshot_output_parser: 'claude_json',
+      oneshot_graceful_finalize: 'claude_stream_json',
+    },
+    usage_json_stream_healthy: {
+      label: 'Claude Healthy Stream Fixture',
+      transport: 'subscription:anthropic',
+      safe: [process.execPath, streamHelper, '--version'],
+      dangerous: [process.execPath, streamHelper, '--version'],
+      oneshot_safe: [process.execPath, streamHelper, '--healthy', '--input-format', 'stream-json'],
+      oneshot_dangerous: [process.execPath, streamHelper, '--healthy', '--input-format', 'stream-json'],
+      oneshot_output_parser: 'claude_json',
+      oneshot_graceful_finalize: 'claude_stream_json',
+    },
+    usage_json_stream_finalize_epipe: {
+      label: 'Claude Stream Finalization EPIPE Fixture',
+      transport: 'subscription:anthropic',
+      safe: [process.execPath, closedStreamHelper, '--version'],
+      dangerous: [process.execPath, closedStreamHelper, '--version'],
+      oneshot_safe: [process.execPath, closedStreamHelper, '--input-format', 'stream-json'],
+      oneshot_dangerous: [process.execPath, closedStreamHelper, '--input-format', 'stream-json'],
       oneshot_output_parser: 'claude_json',
       oneshot_graceful_finalize: 'claude_stream_json',
     },
@@ -1499,6 +1520,20 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(boundedBudgetResult.partial_checkpoint, 'final bounded turn');
   assert.equal(boundedBudgetResult.partial_checkpoint_truncated, false);
 
+  const healthyStreamResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST',
+    headers: jsonAuth,
+    body: JSON.stringify({
+      kind: 'usage_json_stream_healthy', prompt: 'finish one healthy stream turn', dangerous: false,
+    }),
+  });
+  assert.equal(healthyStreamResponse.status, 200);
+  const healthyStream = await healthyStreamResponse.json();
+  assert.equal(healthyStream.stdout, 'HEALTHY_STREAM_OK');
+  assert.equal(healthyStream.dropped_out, false);
+  assert.equal(healthyStream.route.prompt_transport, 'stdin_stream_json');
+  assert.equal(healthyStream.graceful_finalization, null);
+
   const gracefulFinalizeResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST',
     headers: jsonAuth,
@@ -1520,7 +1555,30 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(gracefulFinalize.graceful_finalization.requested, true);
   assert.equal(gracefulFinalize.graceful_finalization.sent, true);
   assert.equal(gracefulFinalize.graceful_finalization.method, 'claude_stream_json_user_message');
+  assert.equal(gracefulFinalize.graceful_finalization.reserve.budgetField, 'maxTotalTokens');
+  assert.equal(gracefulFinalize.graceful_finalization.reserve.usageField, 'total_tokens');
+  assert.equal(gracefulFinalize.graceful_finalization.reserve.threshold, 900);
+  assert.equal(gracefulFinalize.graceful_finalization.reserve.limit, 1000);
   assert.equal(gracefulFinalize.usage.total_tokens, 910);
+
+  const epipeResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST',
+    headers: jsonAuth,
+    body: JSON.stringify({
+      kind: 'usage_json_stream_finalize_epipe', prompt: 'provider closes before reserve message', dangerous: false,
+      providerBudget: {
+        maxOutputTokens: null, maxTotalTokens: 1000, maxCacheReadTokens: null,
+        maxCacheCreationTokens: null, maxTurns: null,
+      },
+    }),
+  });
+  assert.equal(epipeResponse.status, 200, 'an asynchronous stdin EPIPE must not crash the bridge');
+  const epipe = await epipeResponse.json();
+  assert.equal(epipe.dropped_out, true);
+  assert.equal(epipe.graceful_finalization.requested, true);
+  assert.ok(epipe.graceful_finalization.sent === true
+    || epipe.graceful_finalization.reason === 'provider_input_write_failed',
+  'Windows may acknowledge a buffered pipe write before surfacing EPIPE; either state must remain nonfatal');
 
   const writerRepo = path.join(tempRoot, 'writer-repo');
   fs.mkdirSync(writerRepo);

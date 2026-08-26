@@ -41,6 +41,14 @@ test('duplicate partial assistant messages must extend monotonically or fail clo
   ]);
   assert.equal(conflicted.text, '');
   assert.equal(conflicted.unavailableReason, 'no_complete_assistant_text');
+
+  const fallback = extractClaudeAssistantCheckpoint([
+    { type: 'assistant', message: { id: 'm1', content: [{ type: 'text', text: 'safe older turn' }] } },
+    { type: 'assistant', message: { id: 'm2', content: [{ type: 'text', text: 'new path' }] } },
+    { type: 'assistant', message: { id: 'm2', content: [{ type: 'text', text: 'conflicting path' }] } },
+  ]);
+  assert.equal(fallback.text, 'safe older turn');
+  assert.equal(fallback.selectionReason, 'latest_assistant_conflicted_using_previous');
 });
 
 test('checkpoint truncation is byte bounded and retains valid UTF-8 tail', () => {
@@ -58,10 +66,24 @@ test('credential-shaped assistant prose is redacted without exposing values', ()
     'X-RelayBridge-Token: bridge-secret-value',
     'password="hunter2"',
     'github_pat_abcdefghijklmnopqrstuvwxyz123456',
+    'AWS_SECRET_ACCESS_KEY=aws-secret-value',
+    'AKIAIOSFODNN7EXAMPLE',
+    'xoxb-12345678901234567890',
   ].join('\n');
   const cleaned = redactCheckpointSecrets(raw);
-  assert.doesNotMatch(cleaned, /thisisaverylongsecret|bridge-secret-value|hunter2|abcdefghijklmnopqrstuvwxyz/);
+  assert.doesNotMatch(cleaned, /thisisaverylongsecret|bridge-secret-value|hunter2|abcdefghijklmnopqrstuvwxyz|aws-secret-value|AKIA|xoxb/);
   assert.match(cleaned, /\[REDACTED/);
+});
+
+test('redaction is bounded before credential regexes scan large model text', () => {
+  const checkpoint = extractClaudeAssistantCheckpoint([{
+    type: 'assistant',
+    message: { id: 'large', content: [{ type: 'text', text: `${'x'.repeat(2_000_000)}\napi_key=tail-secret` }] },
+  }], 1024);
+  assert.ok(checkpoint.bytes <= 1024);
+  assert.equal(checkpoint.truncated, true);
+  assert.ok(checkpoint.originalBytes > 2_000_000);
+  assert.doesNotMatch(checkpoint.text, /tail-secret/);
 });
 
 test('no assistant text yields explicit unavailable metadata', () => {
