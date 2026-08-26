@@ -50,6 +50,11 @@ test('transactional installer does not mistake a stale native exit code for MCP 
 
 test('provider config uses the installed subscription CLIs and safe headless modes', () => {
   const config = readConfig();
+  assert.deepEqual(config._config_merge.managed_supervisor_budget_fields, {
+    maxTurns: { retired_values: [24] },
+  });
+  assert.equal(config._supervisor.providerBudget.maxTurns, null,
+    'progress and token ceilings, not a fixed provider turn count, supervise normal runs');
   assert.deepEqual(config._config_merge.managed_provider_args, {
     claude: {
       slots: ['safe', 'dangerous', 'oneshot_safe', 'oneshot_dangerous'],
@@ -514,6 +519,15 @@ test('prompt-file transport preserves long special-character prompts and cleans 
       dangerous: [process.execPath, helper, '--version'],
       oneshot_safe: [...baseSlot, '--claude-json-multiturn-bounded'],
       oneshot_dangerous: [...baseSlot, '--claude-json-multiturn-bounded'],
+      oneshot_output_parser: 'claude_json',
+    },
+    usage_json_longrun: {
+      label: 'Healthy Long Agentic Claude Run',
+      transport: 'subscription:anthropic',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--claude-json-longrun'],
+      oneshot_dangerous: [...baseSlot, '--claude-json-longrun'],
       oneshot_output_parser: 'claude_json',
     },
     usage_json_malformed_models: {
@@ -1290,6 +1304,43 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(usageReceipt.actualTotalTokens, 35453);
   assert.equal(usageReceipt.tokenUsageSource, 'provider_reported');
   assert.equal(usageReceipt.provider_reported_cost_usd, 0.32762);
+
+  // Issue #82: the shipped providerBudget stopped a healthy agentic run at 24
+  // turns. Turns count tool calls, not spend, so a complete 36-turn result must
+  // now come back whole under the shipped default, and only an explicit ceiling
+  // may stop it.
+  const longRunResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST',
+    headers: jsonAuth,
+    body: JSON.stringify({ kind: 'usage_json_longrun', prompt: 'a long healthy agentic run', dangerous: false }),
+  });
+  assert.equal(longRunResponse.status, 200);
+  const longRunResult = await longRunResponse.json();
+  assert.equal(longRunResult.stdout, 'LONGRUN_OK', 'a finished run past 24 turns must return its answer');
+  assert.equal(longRunResult.stop_reason, null);
+  assert.equal(longRunResult.failureClass, null);
+  assert.equal(longRunResult.dropped_out, false);
+  assert.equal(longRunResult.timed_out, false);
+  assert.ok(!longRunResult.partial_result);
+  assert.equal(longRunResult.provider_num_turns, 36);
+  assert.equal(longRunResult.usage.total_tokens, 39960);
+
+  const longRunCappedResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST',
+    headers: jsonAuth,
+    body: JSON.stringify({
+      kind: 'usage_json_longrun', prompt: 'an explicitly capped agentic run', dangerous: false,
+      providerBudget: { maxTurns: 24 },
+    }),
+  });
+  assert.equal(longRunCappedResponse.status, 200);
+  const longRunCappedResult = await longRunCappedResponse.json();
+  assert.equal(longRunCappedResult.stop_reason, 'token_budget',
+    'an operator who asks for a turn ceiling still gets one');
+  assert.equal(longRunCappedResult.failureClass, 'token_budget');
+  assert.equal(longRunCappedResult.dropped_out, true);
+  assert.equal(longRunCappedResult.provider_budget_enforcement, 'incremental');
+  assert.notEqual(longRunCappedResult.stdout, 'LONGRUN_OK');
 
   const multiTurnBudgetResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST',

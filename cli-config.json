@@ -1,7 +1,14 @@
 {
   "_comment": "Per-CLI config. 'safe'/'dangerous' launch interactive sessions. 'oneshot_safe'/'oneshot_dangerous' power Collab Mode. Every safe one-shot requires oneshot_safe_filesystem_policy: read_only_enforced, isolated_home, or unverified_provider_policy (fail closed). Use {prompt} for a bounded inline prompt, {prompt_file} when the CLI supports a file, or no placeholder to pipe stdin. 'oneshot_env' applies validated string environment overrides only to one-shot children. 'probe' is a non-mutating readiness check. Edit freely.",
   "_config_merge": {
-    "_note": "Installer-owned argument values that must follow shipped safety policy across upgrades. Only the named flag/value slices are refreshed; operator models, extra arguments, provider fields, and unknown providers remain preserved.",
+    "_note": "Installer-owned values that must follow shipped safety policy across upgrades. managed_provider_args refreshes only the named flag/value slices of a launch array. managed_supervisor_budget_fields replaces a _supervisor.providerBudget field only when the installed value is exactly one of that field's retired shipped defaults; any other installed value is an operator choice and is preserved. Operator models, extra arguments, provider fields, and unknown providers remain preserved.",
+    "managed_supervisor_budget_fields": {
+      "maxTurns": {
+        "retired_values": [
+          24
+        ]
+      }
+    },
     "managed_provider_args": {
       "claude": {
         "slots": [
@@ -34,7 +41,7 @@
     }
   },
   "_supervisor": {
-    "_note": "Liveness policy for provider runs. Runs are judged by progress, not by the clock: while new content keeps arriving a run is left alone to finish, and it is stopped early with a reason when it goes silent or starts repeating. idleMs is generous because print-mode CLIs buffer their whole answer and emit nothing until the end. Any provider entry may override these with its own \"supervisor\" object.",
+    "_note": "Liveness policy for provider runs. Runs are judged by progress, not by the clock: while new content keeps arriving a run is left alone to finish, and it is stopped early with a reason when it goes silent or starts repeating. idleMs is generous because print-mode CLIs buffer their whole answer and emit nothing until the end. providerBudget gates on authoritative provider-reported usage only; null disables one dimension. maxTurns ships as null because an agentic CLI spends a turn per tool call, so a turn count measures neither cost nor liveness. Set a positive number here, on a provider entry, or per request when you do want a turn ceiling. Any provider entry may override these with its own \"supervisor\" object.",
     "idleMs": 1200000,
     "hardCapMs": 2700000,
     "graceExtensions": 3,
@@ -47,7 +54,7 @@
       "maxTotalTokens": 3000000,
       "maxCacheReadTokens": 2500000,
       "maxCacheCreationTokens": 500000,
-      "maxTurns": 24
+      "maxTurns": null
     }
   },
   "_models": {

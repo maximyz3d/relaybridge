@@ -189,6 +189,15 @@ The global `_supervisor.providerBudget` sets provider-reported ceilings for
 output tokens, total tokens (including cache traffic), cache reads, cache
 creation, and turns. Provider entries may override them, and REST/MCP callers
 may supply a sparse `providerBudget` for one run; `null` disables one dimension.
+`maxTurns` ships as `null`. An agentic CLI spends one turn per tool call, so a
+turn count measures how many files a model read rather than what the run cost
+or whether it is still alive; a fixed shipped ceiling stopped healthy, complete
+terminal results while every token ceiling stayed far from tripping. Set a
+positive `maxTurns` globally, on a provider entry, or per request when a turn
+ceiling is genuinely wanted, and it is enforced exactly as before. Upgrades
+replace only the exact retired shipped value declared in
+`_config_merge.managed_supervisor_budget_fields` and report the replacement;
+any other installed value is kept as an operator choice.
 These gates never use cleaned-output character estimates. Claude stream-json
 assistant usage can stop a run incrementally; terminal-only provider usage is
 classified truthfully as terminal enforcement and cannot recover tokens already

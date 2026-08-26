@@ -104,6 +104,46 @@ if (process.argv.includes('--claude-json-multiturn')) {
   return;
 }
 
+// Issue #82: an agentic run spends one turn per tool call, so a healthy report
+// runs far past the retired 24-turn ceiling while staying well inside every
+// token ceiling. Emits 36 distinct turns and a successful terminal result.
+if (process.argv.includes('--claude-json-longrun')) {
+  const TURNS = 36;
+  const events = [];
+  for (let turn = 1; turn <= TURNS; turn++) {
+    events.push({
+      type: 'assistant',
+      message: {
+        id: `longrun-turn-${turn}`,
+        usage: {
+          input_tokens: 120,
+          output_tokens: 60,
+          cache_read_input_tokens: 900,
+          cache_creation_input_tokens: 30,
+        },
+        content: [{ type: 'text', text: `inspected module ${turn} of ${TURNS}` }],
+      },
+    });
+  }
+  let index = 0;
+  const interval = setInterval(() => {
+    if (index < events.length) {
+      process.stdout.write(JSON.stringify(events[index++]) + '\n');
+      return;
+    }
+    clearInterval(interval);
+    setTimeout(() => process.stdout.write(JSON.stringify({
+      type: 'result', is_error: false, subtype: 'success', result: 'LONGRUN_OK',
+      num_turns: TURNS,
+      usage: {
+        input_tokens: 120 * TURNS, output_tokens: 60 * TURNS,
+        cache_read_input_tokens: 900 * TURNS, cache_creation_input_tokens: 30 * TURNS,
+      },
+    })), 500);
+  }, 30);
+  return;
+}
+
 if (process.argv.includes('--claude-json-multiturn-bounded')) {
   const events = [
     {

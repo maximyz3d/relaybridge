@@ -68,6 +68,73 @@ function Invoke-TestInstall([string]$FailAt = '', [switch]$Start, [int]$Port = 0
   }
 }
 
+# Issue #82: the shipped provider turn ceiling has to be correctable by an
+# upgrade, because config preservation otherwise keeps the installed copy
+# forever. The migration must be exactly as narrow as it claims: it may replace
+# the retired shipped value and nothing else. The full install below proves the
+# end-to-end path; these cases exercise the branches one install cannot reach
+# at once, by loading the real functions straight out of install.ps1.
+function Get-InstallerFunctionText([string[]]$Names) {
+  # Dot-sourcing has to happen in the script scope, so hand the caller the text
+  # rather than defining the functions inside this one and losing them on return.
+  $ast = [System.Management.Automation.Language.Parser]::ParseFile($installer, [ref]$null, [ref]$null)
+  $blocks = @()
+  foreach ($name in $Names) {
+    $found = $ast.FindAll({
+      param($node)
+      $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
+    }, $true)
+    if ($found.Count -ne 1) { throw "install.ps1 must define exactly one $name function (found $($found.Count))." }
+    $blocks += $found[0].Extent.Text
+  }
+  return ($blocks -join "`n")
+}
+
+function Test-BudgetMigration([string]$InstalledBudgetJson) {
+  # $Merged is what the generic merge produces: the installed scalar wins, which
+  # is precisely why the retired ceiling could never be corrected by a release.
+  $defaults = @'
+{
+  "_config_merge": { "managed_supervisor_budget_fields": { "maxTurns": { "retired_values": [24] } } },
+  "_supervisor": { "providerBudget": { "maxOutputTokens": 100000, "maxTurns": null } }
+}
+'@ | ConvertFrom-Json
+  $installedJson = '{ "_supervisor": { "providerBudget": ' + $InstalledBudgetJson + ' } }'
+  $existing = $installedJson | ConvertFrom-Json
+  $merged = $installedJson | ConvertFrom-Json
+  return (Restore-ShippedManagedSupervisorBudget $merged $defaults $existing)._supervisor.providerBudget
+}
+
+. ([scriptblock]::Create((Get-InstallerFunctionText @('Test-RetiredJsonNumber', 'Format-JsonScalar', 'Restore-ShippedManagedSupervisorBudget'))))
+
+$retired = Test-BudgetMigration '{ "maxOutputTokens": 100000, "maxTurns": 24 }'
+Assert-True ($null -eq $retired.maxTurns) 'the exact retired shipped turn ceiling must migrate to the release default'
+Assert-True ($retired.maxOutputTokens -eq 100000) 'migrating one field must not disturb the other budget dimensions'
+Assert-True (((@($retired.PSObject.Properties.Name)) -join ',') -eq 'maxOutputTokens,maxTurns') 'migrating a value must not reorder the operator file'
+
+$override = Test-BudgetMigration '{ "maxTurns": 40 }'
+Assert-True ($override.maxTurns -eq 40) 'an operator turn ceiling this release never shipped must be preserved'
+
+$disabled = Test-BudgetMigration '{ "maxTurns": null }'
+Assert-True ($null -eq $disabled.maxTurns) 'an operator who already disabled turns must stay disabled'
+
+$adjacent = Test-BudgetMigration '{ "maxTurns": 25 }'
+Assert-True ($adjacent.maxTurns -eq 25) 'a value one away from the retired default is an operator choice, not the retired default'
+
+$stringly = Test-BudgetMigration '{ "maxTurns": "24" }'
+Assert-True ($stringly.maxTurns -eq '24') 'a value this release never shipped must not be coerced into the retired number'
+
+$absent = Test-BudgetMigration '{ "maxOutputTokens": 100000 }'
+Assert-True ($null -eq $absent.PSObject.Properties['maxTurns']) 'a field the operator never set must not be invented by the migration'
+
+Assert-True (Test-RetiredJsonNumber ([long]24) ([int]24)) 'JSON numeric widths must compare numerically'
+Assert-True (-not (Test-RetiredJsonNumber $true ([int]1))) 'a boolean must never match a retired number'
+Assert-True (-not (Test-RetiredJsonNumber '24' ([int]24))) 'a string must never match a retired number'
+Assert-True (-not (Test-RetiredJsonNumber ([datetime]'2024-01-01') ([int]24))) 'a date-like string parsed by ConvertFrom-Json must be rejected, not cast'
+Assert-True (Test-RetiredJsonNumber ([decimal]24) ([int]24)) 'a decimal literal must still match its retired integer'
+Assert-True ((Format-JsonScalar $null) -eq 'null') 'the migration report must name the shipped null explicitly'
+Write-Host '[RelayBridge] Managed supervisor budget migration cases passed.' -ForegroundColor DarkGray
+
 New-Item -ItemType Directory -Path (Join-Path $installRoot 'data\receipts'), (Join-Path $installRoot 'config') -Force | Out-Null
 try {
   $legacyServer = @'
@@ -98,6 +165,11 @@ server.listen(port, '127.0.0.1');
 
   $operatorConfig = [ordered]@{
     _comment = "operator-owned config $emDash UTF-8 survives every merge"
+    _supervisor = [ordered]@{
+      providerBudget = [ordered]@{
+        maxTurns = 24
+      }
+    }
     cursor = [ordered]@{
       label = 'Cursor Operator Seat'
       tags = @('custom-routing')
@@ -193,6 +265,7 @@ server.listen(port, '127.0.0.1');
 
   $merged = [IO.File]::ReadAllText((Join-Path $installRoot 'cli-config.json'), [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
   Assert-True ($merged._comment -eq "operator-owned config $emDash UTF-8 survives every merge") 'operator UTF-8 text must survive config merge byte-exactly'
+  Assert-True ($null -eq $merged._supervisor.providerBudget.maxTurns) 'retired shipped maxTurns=24 must migrate to the release default instead of killing healthy terminal results'
   $mergedBytes = [IO.File]::ReadAllBytes((Join-Path $installRoot 'cli-config.json'))
   Assert-True (([BitConverter]::ToString($mergedBytes)) -match 'E2-80-94') 'merged JSON must contain the exact UTF-8 em-dash byte sequence'
   Assert-True ($merged.cursor.model -eq 'operator-pinned-model') 'operator model pin must win over release defaults'
