@@ -443,6 +443,117 @@ function Restore-ShippedManagedProviderArgs($Merged, $Defaults) {
   return $Merged
 }
 
+# JSON numbers survive ConvertFrom-Json as Int32/Int64/Decimal/Double depending
+# on the literal, so a retired default written as 24 must still match an
+# installed 24 read back as any of those. PowerShell's -contains would go
+# further and coerce the string "24", or a boolean into 1; that would silently
+# rewrite a value this release never shipped. Compare numerically, and only
+# after both sides are confirmed to be one of the numeric types JSON can
+# produce - "is a ValueType" would also admit the DateTime that
+# ConvertFrom-Json makes out of a date-like string, whose [double] cast throws.
+function Test-RetiredJsonNumber($Candidate, $Retired) {
+  $numericTypes = @([byte], [int16], [int32], [int64], [single], [double], [decimal])
+  foreach ($value in @($Candidate, $Retired)) {
+    if ($null -eq $value -or $value -is [bool] -or $numericTypes -notcontains $value.GetType()) { return $false }
+  }
+  return ([double]$Candidate -eq [double]$Retired)
+}
+
+function Format-JsonScalar($Value) {
+  if ($null -eq $Value) { return 'null' }
+  return [string]$Value
+}
+
+# Some supervisor ceilings are release policy rather than operator taste, and a
+# shipped default that turns out to be wrong cannot be corrected by an upgrade
+# while the installed copy keeps winning the merge. Provider turn counts are
+# the case in point: an agentic CLI spends one turn per tool call, so a healthy
+# Claude run reports a terminal num_turns far above any small ceiling while
+# staying well inside every token ceiling, and the shipped cap killed complete,
+# successful results.
+#
+# The migration stays deliberately narrow. A field is rewritten only when the
+# installed value is exactly one of the retired shipped defaults declared in
+# `_config_merge.managed_supervisor_budget_fields`. Any other installed value -
+# including one an operator chose after the retired default shipped - is
+# preserved, and every replacement is reported with both values so it can be
+# put back. Only the global `_supervisor.providerBudget` is in scope: a
+# per-provider `supervisor` block was never shipped, so anything found there is
+# operator-authored by construction.
+function Restore-ShippedManagedSupervisorBudget($Merged, $Defaults, $Existing) {
+  if (-not ($Merged -is [pscustomobject]) -or
+      -not ($Defaults -is [pscustomobject]) -or
+      -not ($Existing -is [pscustomobject])) { return $Merged }
+  $mergeSchema = $Defaults.PSObject.Properties['_config_merge']
+  if (-not $mergeSchema -or -not ($mergeSchema.Value -is [pscustomobject])) { return $Merged }
+  $managed = $mergeSchema.Value.PSObject.Properties['managed_supervisor_budget_fields']
+  if (-not $managed -or -not ($managed.Value -is [pscustomobject])) { return $Merged }
+
+  $budgets = @{}
+  foreach ($source in @(@{ Key = 'default'; Root = $Defaults }, @{ Key = 'merged'; Root = $Merged }, @{ Key = 'existing'; Root = $Existing })) {
+    $supervisor = $source.Root.PSObject.Properties['_supervisor']
+    if (-not $supervisor -or -not ($supervisor.Value -is [pscustomobject])) { continue }
+    $budget = $supervisor.Value.PSObject.Properties['providerBudget']
+    if (-not $budget -or -not ($budget.Value -is [pscustomobject])) { continue }
+    $budgets[$source.Key] = $budget.Value
+  }
+  # A release that declares managed budget fields must ship them.
+  if (-not $budgets.ContainsKey('default')) {
+    throw 'Shipped cli-config.json declares managed supervisor budget fields but has no _supervisor.providerBudget object.'
+  }
+  # No installed block, or an operator who replaced it with something that is
+  # not an object: nothing to migrate. The merge already supplied the default.
+  if (-not $budgets.ContainsKey('merged') -or -not $budgets.ContainsKey('existing')) { return $Merged }
+  $defaultBudget = $budgets['default']
+  $mergedBudget = $budgets['merged']
+  $existingBudget = $budgets['existing']
+
+  foreach ($fieldSpec in $managed.Value.PSObject.Properties) {
+    $fieldName = $fieldSpec.Name
+    if (-not ($fieldSpec.Value -is [pscustomobject])) {
+      throw "Invalid managed supervisor budget schema for '$fieldName'."
+    }
+    $retiredProp = $fieldSpec.Value.PSObject.Properties['retired_values']
+    $defaultField = $defaultBudget.PSObject.Properties[$fieldName]
+    if (-not $retiredProp -or -not $defaultField) {
+      throw "Managed supervisor budget field '$fieldName' requires retired_values and a shipped default."
+    }
+    $retiredValues = @($retiredProp.Value)
+    if ($retiredValues.Count -lt 1) {
+      throw "Managed supervisor budget field '$fieldName' declares no retired values."
+    }
+    foreach ($retired in $retiredValues) {
+      # A supported number is the only thing that matches itself, so this is
+      # the same admissibility test the comparison below will apply.
+      if (-not (Test-RetiredJsonNumber $retired $retired)) {
+        throw "Managed supervisor budget field '$fieldName' declares a non-numeric retired value."
+      }
+      # Retiring the value still being shipped would rewrite every install to
+      # the number this migration exists to remove.
+      if (Test-RetiredJsonNumber $defaultField.Value $retired) {
+        throw "Managed supervisor budget field '$fieldName' retires the value it still ships as its default."
+      }
+    }
+
+    $existingField = $existingBudget.PSObject.Properties[$fieldName]
+    if (-not $existingField) { continue }
+    $isRetired = $false
+    foreach ($retired in $retiredValues) {
+      if (Test-RetiredJsonNumber $existingField.Value $retired) { $isRetired = $true; break }
+    }
+    if (-not $isRetired) { continue }
+
+    # Assign in place rather than remove-and-re-add: rewriting the property
+    # would move it to the end of the object and reorder the operator's file
+    # for a value change.
+    if ($mergedBudget.PSObject.Properties[$fieldName]) { $mergedBudget.$fieldName = $defaultField.Value }
+    else { $mergedBudget | Add-Member -NotePropertyName $fieldName -NotePropertyValue $defaultField.Value -Force }
+    Write-Host ("[RelayBridge] _supervisor.providerBudget.{0}: replaced retired shipped value {1} with this release's default {2} (set your own value to override)." -f `
+      $fieldName, (Format-JsonScalar $existingField.Value), (Format-JsonScalar $defaultField.Value))
+  }
+  return $Merged
+}
+
 function Merge-JsonFile([string]$DefaultPath, [string]$ExistingPath) {
   if (-not (Test-Path -LiteralPath $ExistingPath -PathType Leaf)) { return }
   if (-not (Test-Path -LiteralPath $DefaultPath -PathType Leaf)) {
@@ -461,6 +572,7 @@ function Merge-JsonFile([string]$DefaultPath, [string]$ExistingPath) {
   if ([IO.Path]::GetFileName($DefaultPath) -ieq 'cli-config.json') {
     $merged = Restore-ShippedModelPins $merged $defaults $existing
     $merged = Restore-ShippedManagedProviderArgs $merged $defaults
+    $merged = Restore-ShippedManagedSupervisorBudget $merged $defaults $existing
   }
   $tempPath = "$DefaultPath.merge.$([Guid]::NewGuid().ToString('N')).tmp"
   try {

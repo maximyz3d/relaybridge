@@ -264,3 +264,95 @@ test('a sparse per-run override retains provider-specific ceilings', () => {
   assert.equal(opts.providerBudget.maxTurns, 3);
   assert.equal(opts.providerBudget.maxOutputTokens, 4000);
 });
+
+// ---- issue #82: a turn count is not a budget ------------------------------
+// The shipped providerBudget.maxTurns of 24 stopped healthy agentic runs. An
+// agentic CLI spends one turn per tool call, so num_turns tracks how many
+// files a model read, not what the run cost. Turns therefore ship disabled,
+// while every token ceiling and every liveness check stays exactly as it was.
+
+test('the shipped default no longer imposes a turn ceiling on normal runs', () => {
+  assert.equal(DEFAULTS.providerBudget.maxTurns, null,
+    'a fixed turn cap killed complete, successful terminal results');
+  for (const field of ['maxOutputTokens', 'maxTotalTokens', 'maxCacheReadTokens', 'maxCacheCreationTokens']) {
+    assert.ok(Number.isSafeInteger(DEFAULTS.providerBudget[field]) && DEFAULTS.providerBudget[field] > 0,
+      `${field} must still bound cost`);
+  }
+});
+
+test('a healthy run reporting far more than 24 turns runs to completion by default', () => {
+  const s = make();
+  let now = T0;
+  // One turn per tool call: 36 file reads is an ordinary review, not a runaway.
+  for (let turn = 1; turn <= 36; turn++) {
+    now += 5000;
+    s.recordOutput(`turn ${turn}: read module ${turn} and summarised its exports\n`, now);
+    assert.equal(s.recordProviderUsage({
+      output_tokens: turn * 400,
+      total_tokens: turn * 9000,
+      cache_read_input_tokens: turn * 20000,
+      cache_creation_input_tokens: turn * 2000,
+      turns: turn,
+    }, { phase: 'incremental' }), true);
+    const verdict = s.evaluate(now);
+    assert.equal(verdict.action, 'continue', `stopped at turn ${turn}: ${verdict.reason} ${verdict.detail}`);
+  }
+  s.recordProviderUsage({
+    output_tokens: 14400, total_tokens: 324000,
+    cache_read_input_tokens: 720000, cache_creation_input_tokens: 72000, turns: 36,
+  }, { phase: 'terminal' });
+  assert.equal(s.evaluate(now).action, 'continue', 'the terminal report of a finished run must survive');
+  assert.equal(s.snapshot(now).providerBudget.maxTurns, null);
+});
+
+test('disabling turns does not disable the token ceilings that bound real cost', () => {
+  const cacheStop = make();
+  cacheStop.recordProviderUsage({
+    turns: 400, cache_read_input_tokens: DEFAULTS.providerBudget.maxCacheReadTokens + 1,
+  }, { phase: 'incremental' });
+  const cacheVerdict = cacheStop.evaluate(T0 + 1000);
+  assert.equal(cacheVerdict.reason, 'token_budget');
+  assert.match(cacheVerdict.detail, /cache_read_input_tokens/,
+    'the dimension that actually measures spend must be the one named');
+
+  for (const [budgetField, usageField] of Object.entries({
+    maxOutputTokens: 'output_tokens',
+    maxTotalTokens: 'total_tokens',
+    maxCacheCreationTokens: 'cache_creation_input_tokens',
+  })) {
+    const s = make();
+    s.recordProviderUsage({ [usageField]: DEFAULTS.providerBudget[budgetField] + 1 }, { phase: 'incremental' });
+    assert.equal(s.evaluate(T0 + 1000).reason, 'token_budget', budgetField);
+  }
+});
+
+test('an explicit turn ceiling is still enforced, from any of the three layers', () => {
+  const layers = [
+    { label: 'globals', options: { globals: { providerBudget: { maxTurns: 24 } } } },
+    { label: 'provider entry', options: { entry: { supervisor: { providerBudget: { maxTurns: 24 } } } } },
+    { label: 'request', options: { providerBudget: { maxTurns: 24 } } },
+  ];
+  for (const layer of layers) {
+    const opts = resolveSupervisorOptions({ globals: { providerBudget: { maxTurns: null } }, ...layer.options });
+    assert.equal(opts.providerBudget.maxTurns, 24, layer.label);
+    const s = new RunSupervisor({ startedAt: T0, ...opts });
+    s.recordProviderUsage({ turns: 24 }, { phase: 'incremental' });
+    assert.equal(s.evaluate(T0 + 1000).action, 'continue', `${layer.label}: the limit itself is allowed`);
+    s.recordProviderUsage({ turns: 25 }, { phase: 'incremental' });
+    const verdict = s.evaluate(T0 + 2000);
+    assert.equal(verdict.reason, 'token_budget', layer.label);
+    assert.match(verdict.detail, /provider-reported turns 25 exceeded maxTurns 24/);
+  }
+});
+
+test('a global turn ceiling can still be lifted per provider or per request', () => {
+  const globals = { providerBudget: { maxTurns: 24 } };
+  assert.equal(resolveSupervisorOptions({
+    globals, entry: { supervisor: { providerBudget: { maxTurns: null } } },
+  }).providerBudget.maxTurns, null, 'a provider entry may opt out');
+  assert.equal(resolveSupervisorOptions({
+    globals, providerBudget: { maxTurns: null },
+  }).providerBudget.maxTurns, null, 'one request may opt out');
+  assert.equal(resolveSupervisorOptions({ globals }).providerBudget.maxTurns, 24,
+    'and an operator ceiling still applies when nobody overrides it');
+});
