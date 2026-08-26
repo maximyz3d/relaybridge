@@ -50,9 +50,14 @@ Response:
 | `failureClass` | Machine-readable failure class. `incomplete_response` preserves narration-only stdout but prevents it from counting as a result. |
 | `requestId` / `invocationId` / `attemptId` | Canonical identity shared by the admitted physical attempt and its linked receipts. |
 | `physical_attempt_count` | `1` for an admitted provider attempt; `0` for a pre-admission rejection/cache hit. |
-| `partial_result` | True when a recognized provider sentinel had trailing diagnostic fragments but no usable answer. |
+| `partial_result` | True when a recognized provider sentinel or token-budget stop retained diagnostic/checkpoint evidence but no usable answer. |
 | `failure_sentinel` / `failure_sentinel_source` | Canonical sentinel and the provider-specific framing rule that detected it. |
 | `partial_diagnostic` | Trailing URL/text fragments retained explicitly as diagnostics; this content is never ordinary successful `stdout`. |
+| `partial_checkpoint` | Latest complete, sanitized Claude assistant text retained after an incomplete token-budget stop. Bounded and explicitly partial. |
+| `partial_checkpoint_bytes` / `partial_checkpoint_hash` / `partial_checkpoint_truncated` / `partial_checkpoint_event_type` | Integrity and truncation metadata for the retained checkpoint. |
+| `cleaned_output_unavailable_reason` | Why no normal terminal answer could be returned. |
+| `graceful_finalization` | Whether the provider supported, received, and completed a reserve-triggered finalization request. The hard budget is unchanged. |
+| `writer_diff_summary` | Bounded git head/status summary for an authorized writer stopped by token budget; never contains diff contents or secret-shaped paths. |
 | `rate_limited` / `budget_exceeded` / `auth_failed` / `permission_denied` | Failure classification. |
 | `provider_action_required` | Narrow structured evidence for a recognized provider account action. Cursor currently reports exact `named_models_unavailable` and `usage_quota_exhausted` diagnostics; named-model remediation is attributed to RelayBridge only when `route.model_flag_sent` proves a model flag was sent. |
 | `policy_reason` | Concrete policy subtype when known; Antigravity command auto-denial is `headless_command_permission_auto_denied`. |

@@ -975,6 +975,7 @@ function sanitizeProviderResponse(response) {
   const rawFailureClass = strictBoundedString(response.failureClass);
   const terminalReason = strictBoundedString(response.provider_terminal_reason);
   const partialDiagnostic = clip(response.partial_diagnostic || '', 12000);
+  const partialCheckpoint = clip(response.partial_checkpoint || '', 12000);
   const apiErrorStatusCandidate = response.provider_api_error_status === null
     || response.provider_api_error_status === undefined ? null
     : strictTokenCount(response.provider_api_error_status);
@@ -1027,9 +1028,55 @@ function sanitizeProviderResponse(response) {
     partialDiagnosticSha256: stableHash(response.partial_diagnostic || ''),
     partialDiagnosticTruncated: response.partial_diagnostic_truncated === true
       || partialDiagnostic.truncated,
+    partialCheckpoint: partialCheckpoint.text,
+    partialCheckpointBytes: strictTokenCount(response.partial_checkpoint_bytes),
+    partialCheckpointOriginalBytes: strictTokenCount(response.partial_checkpoint_original_bytes),
+    partialCheckpointSha256: typeof response.partial_checkpoint_hash === 'string'
+      && /^[0-9a-f]{64}$/.test(response.partial_checkpoint_hash)
+      ? response.partial_checkpoint_hash : stableHash(response.partial_checkpoint || ''),
+    partialCheckpointTruncated: response.partial_checkpoint_truncated === true
+      || partialCheckpoint.truncated,
+    partialCheckpointEventType: response.partial_checkpoint_event_type === 'assistant'
+      ? 'assistant' : null,
+    partialCheckpointMessageIdHash: typeof response.partial_checkpoint_message_id_hash === 'string'
+      && /^[0-9a-f]{64}$/.test(response.partial_checkpoint_message_id_hash)
+      ? response.partial_checkpoint_message_id_hash : null,
+    partialCheckpointUnavailableReason: strictBoundedString(response.partial_checkpoint_unavailable_reason),
     progressAtCancellation: response.progress_at_cancellation
       || (response.cancelled ? response.progress || null : null),
     cleanedOutputUnavailable: response.cleaned_output_unavailable ?? null,
+    cleanedOutputUnavailableReason: strictBoundedString(response.cleaned_output_unavailable_reason),
+    gracefulFinalization: response.graceful_finalization && typeof response.graceful_finalization === 'object'
+      ? {
+        supported: response.graceful_finalization.supported === true,
+        requested: response.graceful_finalization.requested === true,
+        sent: response.graceful_finalization.sent === true,
+        method: strictBoundedString(response.graceful_finalization.method),
+        reason: strictBoundedString(response.graceful_finalization.reason),
+      } : null,
+    writerDiffSummary: response.writer_diff_summary && typeof response.writer_diff_summary === 'object'
+      ? {
+        available: response.writer_diff_summary.available === true,
+        reason: strictBoundedString(response.writer_diff_summary.reason),
+        beforeHead: /^[0-9a-f]{40,64}$/.test(String(response.writer_diff_summary.beforeHead || ''))
+          ? response.writer_diff_summary.beforeHead : null,
+        afterHead: /^[0-9a-f]{40,64}$/.test(String(response.writer_diff_summary.afterHead || ''))
+          ? response.writer_diff_summary.afterHead : null,
+        headChanged: response.writer_diff_summary.headChanged === true,
+        changedFileCount: strictTokenCount(response.writer_diff_summary.changedFileCount),
+        filesTruncated: response.writer_diff_summary.filesTruncated === true,
+        statusHash: /^[0-9a-f]{64}$/.test(String(response.writer_diff_summary.statusHash || ''))
+          ? response.writer_diff_summary.statusHash : null,
+        files: Array.isArray(response.writer_diff_summary.files)
+          ? response.writer_diff_summary.files.slice(0, 50).map((file) => ({
+            path: file?.sensitivePath === true ? '[redacted-sensitive-path]'
+              : clip(String(file?.path || ''), 500).text,
+            pathHash: /^[0-9a-f]{64}$/.test(String(file?.pathHash || '')) ? file.pathHash : null,
+            beforeStatus: strictBoundedString(file?.beforeStatus, 32),
+            afterStatus: strictBoundedString(file?.afterStatus, 32),
+            sensitivePath: file?.sensitivePath === true,
+          })) : [],
+      } : null,
     transportOutputChars: strictTokenCount(response.transport_output_chars),
     transportOutputHash: typeof response.transport_output_hash === 'string'
       && /^[0-9a-f]{64}$/.test(response.transport_output_hash) ? response.transport_output_hash : null,
@@ -1415,8 +1462,18 @@ async function callProvider({
     partialDiagnosticHash: sanitized.partialResult
       ? sanitized.partialDiagnosticSha256 : null,
     partialDiagnosticTruncated: sanitized.partialDiagnosticTruncated === true,
+    partialCheckpointBytes: sanitized.partialCheckpointBytes ?? 0,
+    partialCheckpointOriginalBytes: sanitized.partialCheckpointOriginalBytes ?? 0,
+    partialCheckpointHash: sanitized.partialResult ? sanitized.partialCheckpointSha256 : null,
+    partialCheckpointTruncated: sanitized.partialCheckpointTruncated === true,
+    partialCheckpointEventType: sanitized.partialCheckpointEventType ?? null,
+    partialCheckpointMessageIdHash: sanitized.partialCheckpointMessageIdHash ?? null,
+    partialCheckpointUnavailableReason: sanitized.partialCheckpointUnavailableReason ?? null,
     progressAtCancellation: sanitized.progressAtCancellation || null,
     cleanedOutputUnavailable: sanitized.cleanedOutputUnavailable ?? null,
+    cleanedOutputUnavailableReason: sanitized.cleanedOutputUnavailableReason ?? null,
+    gracefulFinalization: sanitized.gracefulFinalization ?? null,
+    writerDiffSummary: sanitized.writerDiffSummary ?? null,
     transportOutputChars: sanitized.transportOutputChars ?? null,
     transportOutputHash: sanitized.transportOutputHash ?? null,
     modelInvocation: sanitized.modelInvocation ?? null,

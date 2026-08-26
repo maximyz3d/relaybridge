@@ -481,6 +481,19 @@ raw transport and normalized partial diagnostic. MCP exposes the same fields in
 camelCase, and the CLI labels partial diagnostics on stderr and exits nonzero.
 The bridge never retries this failure automatically on the same seat.
 
+Claude token-budget stops are recoverable without weakening the configured
+ceiling. A bounded reserve requests a concise final handoff over Claude's
+stream-JSON input channel; the original hard budget still wins if finalization
+does not finish in time. When the terminal JSON envelope is incomplete, the
+response remains `dropped_out: true` and `partial_result: true`, but includes
+only the latest complete assistant text block as `partial_checkpoint`, plus its
+byte count, SHA-256, truncation state, event type, and explicit unavailable
+reason when no assistant text exists. Thinking blocks, tool inputs, credential-
+shaped text, and raw transport never enter the checkpoint. Authorized writer
+runs also receive a bounded `writer_diff_summary` of git status/head changes;
+secret-shaped paths are replaced with a marker and path hash. These fields are
+continuation evidence, not a successful answer or an automatic commit.
+
 ## License
 
 MIT.
