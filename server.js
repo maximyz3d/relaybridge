@@ -15,6 +15,7 @@ const { buildRegistry, parseModelList, pinIsRetired } = require('./lib/model-reg
 const { buildTaskPlan, EFFORT_ORDER, costClassFor } = require('./lib/task-plan');
 const { buildQuotaSeatGroups } = require('./lib/quota-seat');
 const { providerUsageCapability, providerUsageCapabilities } = require('./lib/provider-usage-capability');
+const platform = require('./lib/platform');
 const { receiptStoreIdentity } = require('./lib/receipt-store-identity.cjs');
 const {
   resolveFilesystemPolicy, providerFilesystemEligibility,
@@ -2130,20 +2131,12 @@ function trackChild(proc) {
 // shims can leave the actual AI CLI running and consuming quota.  Kill the
 // verified wrapper tree on timeout or client disconnect.
 function killProcessTree(proc) {
-  if (!proc || !proc.pid) return;
-  try {
-    if (process.platform === 'win32') {
-      const killer = spawn('taskkill.exe', ['/PID', String(proc.pid), '/T', '/F'], {
-        windowsHide: true,
-        stdio: 'ignore',
-      });
-      killer.unref();
-    } else {
-      proc.kill('SIGTERM');
-    }
-  } catch {
-    try { proc.kill(); } catch {}
-  }
+  // Delegated to lib/platform.js. The old POSIX branch was proc.kill('SIGTERM')
+  // — the CLI died but the subprocesses it spawned (node shims, MCP servers)
+  // survived, holding ports and file locks. killTree signals the whole tree,
+  // group-kill first, ps-walk fallback, SIGKILL escalation after 3s.
+  try { platform.killTree(proc); }
+  catch { try { proc?.kill(); } catch { /* already gone */ } }
 }
 
 // ---- session management ----
@@ -2161,44 +2154,7 @@ let modelRegistry = null;
 let discoveryInFlight = null;
 const MODEL_REGISTRY_FILE = path.join(DATA_DIR, 'model-registry.json');
 
-// Cumulative CPU milliseconds for a process tree. This separates "the model is
-// thinking and has not printed yet" from "the stage is wedged": print-mode CLIs
-// buffer their whole answer, so silence alone proves nothing. Best effort â€”
-// resolves null when it cannot be read.
-function sampleTreeCpuMs(rootPid) {
-  return new Promise((resolve) => {
-    if (process.platform !== 'win32' || !rootPid) return resolve(null);
-    const script = [
-      "$ErrorActionPreference='SilentlyContinue';",
-      `$root=${Number(rootPid)};`,
-      '$all=Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,KernelModeTime,UserModeTime;',
-      'if(-not $all){exit 0};',
-      '$byId=@{};foreach($p in $all){$byId[[int]$p.ProcessId]=$p};',
-      '$kids=@{};foreach($p in $all){$k=[int]$p.ParentProcessId;if(-not $kids.ContainsKey($k)){$kids[$k]=@()};$kids[$k]+=[int]$p.ProcessId};',
-      '$stack=New-Object System.Collections.Stack;$stack.Push($root);$seen=@{};$total=0.0;',
-      'while($stack.Count -gt 0){$cur=[int]$stack.Pop();if($seen.ContainsKey($cur)){continue};$seen[$cur]=$true;',
-      '$proc=$byId[$cur];if($proc){$total+=([double]$proc.KernelModeTime+[double]$proc.UserModeTime)/10000.0};',
-      'if($kids.ContainsKey($cur)){foreach($c in $kids[$cur]){$stack.Push($c)}}};',
-      '[math]::Round($total)',
-    ].join('');
-    let done = false;
-    let out = '';
-    let child;
-    const finish = (value) => { if (done) return; done = true; try { child?.kill(); } catch {} resolve(value); };
-    try {
-      child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script], { windowsHide: true });
-    } catch { return resolve(null); }
-    const guard = setTimeout(() => finish(null), 8000);
-    if (typeof guard.unref === 'function') guard.unref();
-    child.stdout.on('data', (d) => { out += d.toString(); });
-    child.on('error', () => { clearTimeout(guard); finish(null); });
-    child.on('close', () => {
-      clearTimeout(guard);
-      const parsed = Number(String(out).trim());
-      finish(Number.isFinite(parsed) ? parsed : null);
-    });
-  });
-}
+const sampleTreeCpuMs = platform.sampleTreeCpuMs;
 
 async function discoverModels() {
   if (discoveryInFlight) return discoveryInFlight;
@@ -2397,7 +2353,16 @@ class Session {
 
 function createSessionFromKind(kind, opts = {}) {
   const cfg = loadConfig();
-  const entry = cfg[kind];
+  let entry = cfg[kind];
+  // The terminal kind is platform-resolved: on Windows it is PowerShell as
+  // configured; on WSL/Linux/macOS the same request opens the platform shell.
+  // Aliasing here (not in config) keeps one cli-config.json valid everywhere
+  // and keeps every existing client that sends kind:"powershell" working.
+  if ((kind === 'powershell' || kind === 'shell') && process.platform !== 'win32') {
+    entry = platform.platformShellEntry();
+  } else if (kind === 'shell' && !entry) {
+    entry = cfg.powershell;
+  }
   if (!entry) throw new Error(`unknown CLI kind: ${kind}`);
   const useDanger = typeof opts.dangerous === 'boolean' ? opts.dangerous : state.fullPermissions;
   // Sign-in mode runs the provider's own interactive login flow in a real PTY.
@@ -3378,7 +3343,7 @@ app.post('/api/exec', (req, res) => {
   proc.stderr.on('data', (d) => { stderr += d; });
   proc.on('close', (code) => {
     clearTimeout(t);
-    res.json({ stdout, stderr, exitCode: code });
+    res.json({ stdout, stderr, exitCode: code, shell: built.shellKind, shellNote: built.fallbackNote || undefined });
   });
   proc.on('error', (err) => {
     clearTimeout(t);
