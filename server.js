@@ -9,6 +9,7 @@ const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
 const { RunSupervisor, resolveSupervisorOptions, normalizeProviderBudget } = require('./lib/run-supervisor');
+const { validateProviderBudget } = require('./lib/provider-budget');
 const { resolveModelArgs, applyModelArgs, modelConfigStaleness, modelTierForTaskTier } = require('./lib/model-tiers');
 const { buildRegistry, parseModelList, pinIsRetired } = require('./lib/model-registry');
 const { buildTaskPlan, EFFORT_ORDER, costClassFor } = require('./lib/task-plan');
@@ -1345,22 +1346,6 @@ function createProviderUsageObserver(parserName, supervisor) {
     },
     flush() { if (partial.trim()) consume(partial); partial = ''; },
   };
-}
-
-function validateProviderBudgetRequest(value) {
-  if (value === undefined) return undefined;
-  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('providerBudget must be an object');
-  const allowed = new Set(['maxOutputTokens', 'maxTotalTokens', 'maxCacheReadTokens', 'maxCacheCreationTokens', 'maxTurns']);
-  for (const [key, candidate] of Object.entries(value)) {
-    if (!allowed.has(key)) throw new Error(`unknown providerBudget field: ${key}`);
-    if (candidate !== null && (!Number.isSafeInteger(candidate) || candidate <= 0)) {
-      throw new Error(`providerBudget.${key} must be a positive safe integer or null`);
-    }
-  }
-  // Keep the validated request sparse. resolveSupervisorOptions performs the
-  // precedence merge; eagerly filling defaults here would erase provider-
-  // specific limits whenever a caller overrides only one dimension.
-  return { ...value };
 }
 
 const CLAUDE_RETRY_ERROR_CATEGORIES = new Set([
@@ -2995,12 +2980,18 @@ app.post('/api/models/refresh', async (req, res) => {
 // costs real money for no gain. This returns the cheapest capable combination
 // and says why, so callers do not have to guess.
 app.post('/api/plan', async (req, res) => {
-  const { task, effort, kind } = req.body || {};
+  const { task, effort, kind, providerBudget: rawBudget } = req.body || {};
   if (!task || typeof task !== 'string' || !task.trim()) {
     return res.status(400).json({ error: 'task (non-empty string) required' });
   }
   if (effort && !EFFORT_ORDER.includes(String(effort).toLowerCase())) {
     return res.status(400).json({ error: `effort must be one of: ${EFFORT_ORDER.join(', ')}` });
+  }
+  let requestedProviderBudget;
+  try {
+    requestedProviderBudget = validateProviderBudget(rawBudget);
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
   }
   let filesystemAuthority;
   try { filesystemAuthority = planningFilesystemAuthority(req.body || {}); }
@@ -3045,6 +3036,7 @@ app.post('/api/plan', async (req, res) => {
       resolveModelArgs,
       requestedEffort: effort || null,
       requestedKind: kind || null,
+      requestedProviderBudget,
     });
     res.json({ ok: true, task: task.slice(0, 400), ...plan, fleetState: route.fleetState });
   } catch (err) {
@@ -3053,11 +3045,17 @@ app.post('/api/plan', async (req, res) => {
 });
 
 // Delegation: classify a task, rank providers by tier, and pick the model
-// weight class inside each. Advisory â€” it returns a plan, it does not dispatch.
+// weight class inside each. Advisory — it returns a plan, it does not dispatch.
 app.post('/api/route', async (req, res) => {
-  const { task, diagnostics: supplied, preferKinds, excludeKinds } = req.body || {};
+  const { task, diagnostics: supplied, preferKinds, excludeKinds, providerBudget: rawBudget } = req.body || {};
   if (!task || typeof task !== 'string' || !task.trim()) {
     return res.status(400).json({ error: 'task (non-empty string) required' });
+  }
+  let requestedProviderBudget;
+  try {
+    requestedProviderBudget = validateProviderBudget(rawBudget);
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
   }
   let filesystemAuthority;
   try { filesystemAuthority = planningFilesystemAuthority(req.body || {}); }
@@ -3104,8 +3102,15 @@ app.post('/api/route', async (req, res) => {
     };
     const taskTier = route.classification?.tier;
     const selected = (route.selected || []).map((pick) => {
-      const resolved = resolveModelArgs({ entry: cfg[pick.kind] || {}, taskTier });
+      const entry = cfg[pick.kind] || {};
+      const resolved = resolveModelArgs({ entry, taskTier });
       const retired = resolved.model ? pinIsRetired(modelRegistry, pick.kind, resolved.model) : false;
+      const budget = resolveSupervisorOptions({
+        entry,
+        globals: cfg._supervisor || {},
+        providerBudget: requestedProviderBudget,
+        taskTier,
+      }).providerBudget;
       return {
         ...pick,
         modelTier: resolved.modelTier,
@@ -3113,6 +3118,7 @@ app.post('/api/route', async (req, res) => {
         modelArgs: retired ? [] : resolved.args,
         modelSource: retired ? 'account_default_retired_pin' : resolved.source,
         modelNote: retired ? `configured model "${resolved.model}" is no longer offered by this account` : resolved.note,
+        providerBudget: budget,
       };
     });
     res.json({ ok: true, ...route, selected, modelTier: modelTierForTaskTier(taskTier), modelConfig: modelConfigStaleness(cfg._models || {}) });
@@ -3469,7 +3475,7 @@ async function executeOneShot(body, res) {
   if (!entry) return rejectBeforeAdmission(400, 'validation', { error: 'unknown kind: ' + kind });
   let requestedProviderBudget;
   try {
-    requestedProviderBudget = validateProviderBudgetRequest(body?.providerBudget);
+    requestedProviderBudget = validateProviderBudget(body?.providerBudget);
   } catch (err) {
     return rejectBeforeAdmission(400, 'validation', { error: err.message });
   }
@@ -3799,7 +3805,12 @@ async function executeOneShot(body, res) {
     persistCancellationReceipt();
   });
   const resolvedProviderBudget = resolveSupervisorOptions({
-    entry, globals: cfg._supervisor || {}, providerBudget: requestedProviderBudget,
+    entry,
+    globals: cfg._supervisor || {},
+    providerBudget: requestedProviderBudget,
+    taskTier: typeof body?.budgetTaskTier === 'string'
+      ? body.budgetTaskTier
+      : (typeof body?.taskTier === 'string' ? body.taskTier : null),
   }).providerBudget;
   if (entry.oneshot_adapter === 'ollama_api') {
     cleanupPromptFile();
@@ -4222,8 +4233,16 @@ const taskQueue = createTaskQueue({
   log: (m) => console.log(m),
 });
 
-app.post('/api/tasks', (req, res) => {
-  try { res.json(taskQueue.submit(req.body || {})); }
+app.post('/api/tasks', async (req, res) => {
+  try {
+    const input = req.body || {};
+    const providerBudget = validateProviderBudget(input.providerBudget);
+    const { classifyTask } = await import('./mcp/router.mjs');
+    const budgetTaskTier = typeof input.prompt === 'string'
+      ? classifyTask(input.prompt).tier
+      : undefined;
+    res.json(taskQueue.submit({ ...input, providerBudget, budgetTaskTier }));
+  }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 app.get('/api/tasks', (req, res) => {
@@ -4604,6 +4623,7 @@ app.post('/api/broadcast', async (req, res) => {
   if (typeof prompt !== 'string' || !prompt.trim()) {
     return res.status(400).json({ error: 'non-empty prompt required' });
   }
+  const { classifyTask } = await import('./mcp/router.mjs');
   const cfg = loadConfig();
   let targets;
   try {
@@ -4618,6 +4638,7 @@ app.post('/api/broadcast', async (req, res) => {
     });
   }
   const startedAt = Date.now();
+  const budgetTaskTier = classifyTask(prompt).tier;
   const deadlineAt = startedAt + effectiveTimeoutMs;
   const queueDeadline = Math.min(deadlineAt, startedAt + TIMEOUT_POLICY.broadcastQueueWaitMs);
   const activeCaptured = new Set();
@@ -4650,7 +4671,7 @@ app.post('/api/broadcast', async (req, res) => {
     activeCaptured.add(captured);
     executeOneShot({
       kind, prompt, timeoutMs: remainingMs, cwd, dangerous,
-      providerBudget, effort, maxEffortOverride,
+      providerBudget, budgetTaskTier, effort, maxEffortOverride,
     }, captured)
       .catch((err) => captured.status(500).json({ error: err.message, dropped_out: true }));
     try { return await captured.done; }

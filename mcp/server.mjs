@@ -1330,6 +1330,7 @@ async function callProvider({
         expectedCwdPolicyId: workspaceAdmission.cwdPolicyId,
         timeoutMs: TIMEOUT_POLICY.normalizeOneShotTimeoutMs(timeoutMs),
         providerBudget,
+        budgetTaskTier: classification.tier,
         effort,
         maxEffortOverride,
         dangerous: false,
@@ -2548,6 +2549,7 @@ export function buildServer() {
       kind: z.string().min(1).max(64), prompt: z.string().min(1).max(100000),
       collab: z.string().max(64).optional(), title: z.string().max(120).optional(),
       cwd: z.string().max(1024).optional(), user: z.string().max(64).optional(),
+      providerBudget: PROVIDER_BUDGET_SCHEMA.optional(),
     }),
     annotations: ACTION,
   }, safeHandler(async (input) => {

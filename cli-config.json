@@ -92,6 +92,22 @@
   "claude": {
     "label": "Claude Code",
     "oneshot_safe_filesystem_policy": "unverified_provider_policy",
+    "supervisor": {
+      "providerBudgetByTaskTier": {
+        "standard": {
+          "maxTotalTokens": 12000000,
+          "maxCacheReadTokens": 10000000
+        },
+        "complex": {
+          "maxTotalTokens": 12000000,
+          "maxCacheReadTokens": 10000000
+        },
+        "critical": {
+          "maxTotalTokens": 12000000,
+          "maxCacheReadTokens": 10000000
+        }
+      }
+    },
     "login_command": [
       "claude",
       "/login"
@@ -206,6 +222,22 @@
   "claude_fable": {
     "label": "Claude Fable 5",
     "oneshot_safe_filesystem_policy": "unverified_provider_policy",
+    "supervisor": {
+      "providerBudgetByTaskTier": {
+        "standard": {
+          "maxTotalTokens": 12000000,
+          "maxCacheReadTokens": 10000000
+        },
+        "complex": {
+          "maxTotalTokens": 12000000,
+          "maxCacheReadTokens": 10000000
+        },
+        "critical": {
+          "maxTotalTokens": 12000000,
+          "maxCacheReadTokens": 10000000
+        }
+      }
+    },
     "login_command": [
       "claude",
       "/login"

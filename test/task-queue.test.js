@@ -55,6 +55,29 @@ test('submit returns immediately with an id; the result arrives later', async ()
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+test('background tasks preserve provider budget and budget-only task tier', async () => {
+  const dir = tmpdir();
+  let executedBody;
+  const q = createTaskQueue({
+    dataDir: dir,
+    executeOneShot: fakeExecutor(async (body) => {
+      executedBody = body;
+      return { payload: { stdout: 'done', exitCode: 0 } };
+    }),
+  });
+  const { id } = q.submit({
+    kind: 'claude',
+    prompt: 'review a repository',
+    providerBudget: { maxCacheReadTokens: 10000000 },
+    budgetTaskTier: 'complex',
+  });
+  await settled(q, id);
+  assert.deepEqual(executedBody.providerBudget, { maxCacheReadTokens: 10000000 });
+  assert.equal(executedBody.budgetTaskTier, 'complex');
+  assert.equal(executedBody.taskTier, undefined, 'budget classification must not change model selection');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 test('a result written by one caller is readable by any other (durable on disk)', async () => {
   const dir = tmpdir();
   const q = createTaskQueue({ dataDir: dir, executeOneShot: fakeExecutor(async () => ({ payload: { stdout: 'persisted', exitCode: 0 } })) });

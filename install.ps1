@@ -477,9 +477,11 @@ function Format-JsonScalar($Value) {
 # `_config_merge.managed_supervisor_budget_fields`. Any other installed value -
 # including one an operator chose after the retired default shipped - is
 # preserved, and every replacement is reported with both values so it can be
-# put back. Only the global `_supervisor.providerBudget` is in scope: a
-# per-provider `supervisor` block was never shipped, so anything found there is
-# operator-authored by construction.
+# put back. Only the global `_supervisor.providerBudget` is in scope. Shipped
+# provider/task-tier defaults are added by the normal deep merge when missing;
+# existing provider-specific values remain operator-owned. Retiring a shipped
+# provider/task-tier value would require an explicit managed migration schema
+# rather than silently broadening this global-only migration.
 function Restore-ShippedManagedSupervisorBudget($Merged, $Defaults, $Existing) {
   if (-not ($Merged -is [pscustomobject]) -or
       -not ($Defaults -is [pscustomobject]) -or

@@ -16,6 +16,7 @@ const crypto = require('crypto');
 const os = require('os');
 const path = require('path');
 const { TextDecoder } = require('util');
+const { validateProviderBudget } = require('../lib/provider-budget');
 
 const DEFAULT_PORT = process.env.RELAYBRIDGE_PORT || process.env.PS_BRIDGE_PORT || '8787';
 const DEFAULT_HOST = process.env.RELAYBRIDGE_HOST || '127.0.0.1';
@@ -171,6 +172,12 @@ function printPlan(plan, { json = false } = {}) {
     console.log(`model     ${p.model || 'account default'}${p.modelTier ? `  [${p.modelTier}]` : ''}`);
     console.log(`cost      ${p.costNote}`);
     if (p.args && p.args.length) console.log(`args      ${p.args.join(' ')}`);
+    if (p.providerBudget) {
+      const rendered = Object.entries(p.providerBudget)
+        .map(([key, value]) => `${key}=${value === null ? 'off' : value}`)
+        .join(' ');
+      console.log(`budget    ${rendered}`);
+    }
   } else {
     console.log('provider  (none ready — check relaybridge status)');
   }
@@ -185,8 +192,32 @@ function newCliRequestId() {
   return `cli:${crypto.randomUUID()}`;
 }
 
-function buildAskBody(plan, task, cwd = process.cwd(), requestId = newCliRequestId()) {
-  return {
+function parseProviderBudgetFlag(raw) {
+  if (raw === undefined || raw === null || raw === false) return undefined;
+  if (raw === true || raw === '') {
+    throw new InputError('--provider-budget requires a JSON object string');
+  }
+  let parsed;
+  if (typeof raw === 'string') {
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new InputError('invalid --provider-budget JSON format');
+    }
+  } else if (typeof raw === 'object') {
+    parsed = raw;
+  } else {
+    throw new InputError('--provider-budget requires a JSON object string');
+  }
+  try {
+    return validateProviderBudget(parsed);
+  } catch (err) {
+    throw new InputError(err.message);
+  }
+}
+
+function buildAskBody(plan, task, cwd = process.cwd(), requestId = newCliRequestId(), providerBudget = null) {
+  const body = {
     kind: plan.primary.kind,
     prompt: task,
     taskTier: plan.tier,
@@ -194,6 +225,8 @@ function buildAskBody(plan, task, cwd = process.cwd(), requestId = newCliRequest
     cwd,
     requestId,
   };
+  if (providerBudget) body.providerBudget = providerBudget;
+  return body;
 }
 
 function requireCorrelationTuple(result, expectedRequestId) {
@@ -229,7 +262,7 @@ const USAGE = `relaybridge — delegate work to AI CLIs on seats you already pay
   relaybridge mcp-config               MCP server JSON for any client
 
 Prompt: positional text | --stdin | --prompt-file <path>  (choose exactly one)
-Flags: --effort minimal|low|medium|high|max   --kind <provider>   --json
+Flags: --effort minimal|low|medium|high|max   --kind <provider>   --provider-budget '<json>'   --json
 Correlation: ask prints its unique request ID, then the exact returned receipt tuple.
 
 Effort exists so a simple edit does not burn a frontier reasoning budget, and a
@@ -251,22 +284,24 @@ async function main() {
         return 0;
 
       case 'plan': {
+        const providerBudget = parseProviderBudgetFlag(flags['provider-budget'] ?? flags.providerBudget);
         const task = resolveTaskInput(flags, rest);
-        const plan = await call('/api/plan', { method: 'POST', body: { task, effort: flags.effort || null, kind: flags.kind || null } });
+        const plan = await call('/api/plan', { method: 'POST', body: { task, effort: flags.effort || null, kind: flags.kind || null, providerBudget } });
         printPlan(plan, { json });
         return 0;
       }
 
       case 'ask': {
+        const providerBudget = parseProviderBudgetFlag(flags['provider-budget'] ?? flags.providerBudget);
         const task = resolveTaskInput(flags, rest);
-        const plan = await call('/api/plan', { method: 'POST', body: { task, effort: flags.effort || null, kind: flags.kind || null } });
+        const plan = await call('/api/plan', { method: 'POST', body: { task, effort: flags.effort || null, kind: flags.kind || null, providerBudget } });
         if (!plan.primary) { console.error('no ready provider for this task; run: relaybridge status'); return 1; }
         if (plan.humanGate && !flags.force) {
           printPlan(plan, { json: false });
           console.error('\nthis task is critical tier: re-run with --force if you accept advisory-only output');
           return 1;
         }
-        const askBody = buildAskBody(plan, task);
+        const askBody = buildAskBody(plan, task, process.cwd(), newCliRequestId(), providerBudget);
         console.error(`# request ${askBody.requestId} · ${plan.primary.kind} · ${plan.primary.model || 'default'} · effort ${plan.effort}`);
         const result = await call('/api/oneshot', {
           method: 'POST',
@@ -417,6 +452,8 @@ if (require.main === module) {
 module.exports = {
   parseFlags,
   resolveTaskInput,
+  parseProviderBudgetFlag,
+  printPlan,
   findToken,
   newCliRequestId,
   buildAskBody,
