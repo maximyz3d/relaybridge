@@ -4238,9 +4238,11 @@ app.post('/api/tasks', async (req, res) => {
     const input = req.body || {};
     const providerBudget = validateProviderBudget(input.providerBudget);
     const { classifyTask } = await import('./mcp/router.mjs');
-    const budgetTaskTier = typeof input.prompt === 'string'
-      ? classifyTask(input.prompt).tier
-      : undefined;
+    const classifiedTaskTier = typeof input.prompt === 'string'
+      ? classifyTask(input.prompt).tier : undefined;
+    const budgetTaskTier = typeof input.budgetTaskTier === 'string'
+      ? input.budgetTaskTier
+      : (typeof input.taskTier === 'string' ? input.taskTier : classifiedTaskTier);
     res.json(taskQueue.submit({ ...input, providerBudget, budgetTaskTier }));
   }
   catch (err) { res.status(400).json({ error: err.message }); }

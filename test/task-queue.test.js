@@ -55,7 +55,7 @@ test('submit returns immediately with an id; the result arrives later', async ()
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test('background tasks preserve provider budget and budget-only task tier', async () => {
+test('background tasks preserve every supported one-shot execution control', async () => {
   const dir = tmpdir();
   let executedBody;
   const q = createTaskQueue({
@@ -70,11 +70,45 @@ test('background tasks preserve provider budget and budget-only task tier', asyn
     prompt: 'review a repository',
     providerBudget: { maxCacheReadTokens: 10000000 },
     budgetTaskTier: 'complex',
+    taskTier: 'complex',
+    modelTier: 'heavy',
+    effort: 'max',
+    maxEffortOverride: true,
+    groundingOverride: true,
   });
   await settled(q, id);
   assert.deepEqual(executedBody.providerBudget, { maxCacheReadTokens: 10000000 });
   assert.equal(executedBody.budgetTaskTier, 'complex');
-  assert.equal(executedBody.taskTier, undefined, 'budget classification must not change model selection');
+  assert.equal(executedBody.taskTier, 'complex');
+  assert.equal(executedBody.modelTier, 'heavy');
+  assert.equal(executedBody.effort, 'max');
+  assert.equal(executedBody.maxEffortOverride, true);
+  assert.equal(executedBody.groundingOverride, true);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('background tasks preserve invalid explicit controls so execution rejects instead of defaulting', async () => {
+  const dir = tmpdir();
+  let executedBody;
+  const q = createTaskQueue({
+    dataDir: dir,
+    executeOneShot: fakeExecutor(async (body) => {
+      executedBody = body;
+      return { statusCode: 400, payload: { error: 'providerBudget must be an object', dropped_out: true } };
+    }),
+  });
+  const { id } = q.submit({
+    kind: 'claude', prompt: 'x', providerBudget: null, effort: 'invalid',
+    taskTier: 7, modelTier: null, maxEffortOverride: 'true', groundingOverride: 1,
+  });
+  const failed = await settled(q, id);
+  assert.equal(executedBody.providerBudget, null, 'explicit invalid null must not be erased into an inherited default');
+  assert.equal(executedBody.effort, 'invalid', 'execution owns final validation of direct one-shot controls');
+  assert.equal(executedBody.taskTier, 7);
+  assert.equal(executedBody.modelTier, null);
+  assert.equal(executedBody.maxEffortOverride, 'true');
+  assert.equal(executedBody.groundingOverride, 1);
+  assert.equal(failed.status, 'failed');
   fs.rmSync(dir, { recursive: true, force: true });
 });
 

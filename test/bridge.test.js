@@ -502,6 +502,18 @@ test('prompt-file transport preserves long special-character prompts and cleans 
       oneshot_dangerous: [...baseSlot, '--claude-json', '--effort', 'high'],
       oneshot_output_parser: 'claude_json',
     },
+    queued_controls: {
+      label: 'Queued Claude Control Forwarding',
+      transport: 'subscription:anthropic',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--claude-json', '--model', 'standard-fixture', '--effort', 'high'],
+      oneshot_dangerous: [...baseSlot, '--claude-json', '--model', 'standard-fixture', '--effort', 'high'],
+      oneshot_output_parser: 'claude_json',
+      model_tiers: {
+        heavy: { args: ['--model', 'heavy-fixture'], model: 'heavy-fixture' },
+      },
+    },
     usage_json_multiturn: {
       label: 'Incremental Multi-Turn Claude Usage',
       transport: 'subscription:anthropic',
@@ -1985,6 +1997,33 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   }
   assert.equal(completedTask.status, 'done', completedTask.error || 'CLI background task did not complete');
   assert.equal(completedTask.result, tempRoot);
+
+  // Regression: the durable queue used to whitelist only prompt/cwd/user.
+  // A caller explicitly requested Claude heavy/max plus a low test budget,
+  // but the queued execution silently fell back to Sonnet/default ceilings.
+  const controlledTaskResponse = await fetch(baseUrl + '/api/tasks', {
+    method: 'POST',
+    headers: jsonAuth,
+    body: JSON.stringify({
+      kind: 'queued_controls', prompt: 'cross-module architecture debugging',
+      taskTier: 'complex', modelTier: 'heavy', effort: 'max', maxEffortOverride: true,
+      providerBudget: { maxTotalTokens: 10 },
+    }),
+  });
+  assert.equal(controlledTaskResponse.status, 200);
+  const controlledTask = await controlledTaskResponse.json();
+  let completedControlledTask = null;
+  for (let attempt = 0; attempt < 80; attempt++) {
+    const taskResponse = await fetch(`${baseUrl}/api/tasks/${controlledTask.id}`, { headers: auth });
+    completedControlledTask = await taskResponse.json();
+    if (['done', 'failed', 'cancelled', 'interrupted'].includes(completedControlledTask.status)) break;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.equal(completedControlledTask.status, 'failed');
+  assert.match(completedControlledTask.error, /total_tokens/);
+  assert.equal(completedControlledTask.route.requested_model, 'heavy-fixture');
+  assert.equal(completedControlledTask.route.requested_effort, 'max');
+  assert.equal(completedControlledTask.route.max_effort_override, true);
 
   const healthyRateDiscussion = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST',

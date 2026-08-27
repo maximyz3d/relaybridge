@@ -2550,6 +2550,11 @@ export function buildServer() {
       collab: z.string().max(64).optional(), title: z.string().max(120).optional(),
       cwd: z.string().max(1024).optional(), user: z.string().max(64).optional(),
       providerBudget: PROVIDER_BUDGET_SCHEMA.optional(),
+      taskTier: z.enum(['utility', 'standard', 'complex', 'critical']).optional(),
+      modelTier: z.enum(['light', 'standard', 'heavy']).optional(),
+      effort: z.enum(['low', 'medium', 'high', 'max']).optional(),
+      maxEffortOverride: z.boolean().default(false),
+      groundingOverride: z.boolean().default(false),
     }),
     annotations: ACTION,
   }, safeHandler(async (input) => {
