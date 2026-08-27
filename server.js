@@ -9,7 +9,7 @@ const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
 const { RunSupervisor, resolveSupervisorOptions, normalizeProviderBudget } = require('./lib/run-supervisor');
-const { validateProviderBudget, validateProviderBudgetRequest } = require('./lib/provider-budget');
+const { validateProviderBudget } = require('./lib/provider-budget');
 const { resolveModelArgs, applyModelArgs, modelConfigStaleness, modelTierForTaskTier } = require('./lib/model-tiers');
 const { buildRegistry, parseModelList, pinIsRetired } = require('./lib/model-registry');
 const { buildTaskPlan, EFFORT_ORDER, costClassFor } = require('./lib/task-plan');
@@ -4625,7 +4625,7 @@ app.post('/api/broadcast', async (req, res) => {
   }
   let validatedProviderBudget;
   try {
-    validatedProviderBudget = validateProviderBudgetRequest(providerBudget);
+    validatedProviderBudget = validateProviderBudget(providerBudget);
   } catch (err) {
     return res.status(400).json({ error: err.message });
   }
