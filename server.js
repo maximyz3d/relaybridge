@@ -9,7 +9,7 @@ const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
 const { RunSupervisor, resolveSupervisorOptions, normalizeProviderBudget } = require('./lib/run-supervisor');
-const { validateProviderBudget } = require('./lib/provider-budget');
+const { validateProviderBudget, validateProviderBudgetRequest } = require('./lib/provider-budget');
 const { resolveModelArgs, applyModelArgs, modelConfigStaleness, modelTierForTaskTier } = require('./lib/model-tiers');
 const { buildRegistry, parseModelList, pinIsRetired } = require('./lib/model-registry');
 const { buildTaskPlan, EFFORT_ORDER, costClassFor } = require('./lib/task-plan');
@@ -4623,6 +4623,12 @@ app.post('/api/broadcast', async (req, res) => {
   if (typeof prompt !== 'string' || !prompt.trim()) {
     return res.status(400).json({ error: 'non-empty prompt required' });
   }
+  let validatedProviderBudget;
+  try {
+    validatedProviderBudget = validateProviderBudgetRequest(providerBudget);
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
   const { classifyTask } = await import('./mcp/router.mjs');
   const cfg = loadConfig();
   let targets;
@@ -4671,7 +4677,7 @@ app.post('/api/broadcast', async (req, res) => {
     activeCaptured.add(captured);
     executeOneShot({
       kind, prompt, timeoutMs: remainingMs, cwd, dangerous,
-      providerBudget, budgetTaskTier, effort, maxEffortOverride,
+      providerBudget: validatedProviderBudget, budgetTaskTier, effort, maxEffortOverride,
     }, captured)
       .catch((err) => captured.status(500).json({ error: err.message, dropped_out: true }));
     try { return await captured.done; }

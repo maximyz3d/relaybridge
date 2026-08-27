@@ -2544,6 +2544,15 @@ test('agents listing, tag updates, and broadcast fan-out respect auth, autoRoute
   assert.equal((await broadcast({ prompt: 'x' })).status, 400);
   assert.equal((await broadcast({ prompt: 'x', providers: ['shell'] })).status, 400);
 
+  const malformedBudgetRes = await broadcast({ prompt: 'test budget', providers: ['alpha_one'], providerBudget: { maxTurns: -5 } });
+  assert.equal(malformedBudgetRes.status, 400);
+  const malformedBudgetJson = await malformedBudgetRes.json();
+  assert.match(malformedBudgetJson.error, /providerBudget\.maxTurns must be a positive safe integer or null/);
+  const healthAfterMalformed = await (await fetch(baseUrl + '/api/health')).json();
+  assert.equal(healthAfterMalformed.activeTaskCount, 0);
+  assert.equal(healthAfterMalformed.activeOneShotCount, 0);
+
+
   const tagged = await (await broadcast({ prompt: 'tag fan-out', tag: 'alpha' })).json();
   assert.deepEqual(tagged.targets.sort(), ['alpha_one', 'alpha_two']);
   assert.ok(tagged.results.every((member) => member.ok && member.output === 'tag fan-out'));
