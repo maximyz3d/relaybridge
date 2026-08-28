@@ -187,8 +187,11 @@ by itself.
 
 The global `_supervisor.providerBudget` sets provider-reported ceilings for
 output tokens, total tokens (including cache traffic), cache reads, cache
-creation, and turns. Provider entries may override them, and REST/MCP callers
-may supply a sparse `providerBudget` for one run; `null` disables one dimension.
+creation, and turns. Provider entries may override them generally with
+`supervisor.providerBudget` or by task tier with
+`supervisor.providerBudgetByTaskTier`. REST/MCP callers may supply a sparse
+`providerBudget` for one run; `null` disables one dimension. The CLI exposes
+the same override as `--provider-budget '<json>'` on `plan` and `ask`.
 `maxTurns` ships as `null`. An agentic CLI spends one turn per tool call, so a
 turn count measures how many files a model read rather than what the run cost
 or whether it is still alive; a fixed shipped ceiling stopped healthy, complete
