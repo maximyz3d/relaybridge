@@ -25,6 +25,10 @@ const { WebSocketServer } = require('ws');
 const { spawn, spawnSync } = require('child_process');
 const TIMEOUT_POLICY = require('./timeout-policy.cjs');
 const ROOT = __dirname;
+// USERPROFILE is Windows-only. On POSIX the same idea is HOME; without this
+// fallback the allowed roots collapse to ROOT and the bridge can only reach
+// its own source tree.
+const USER_HOME = process.env.USERPROFILE || process.env.HOME || os.homedir() || ROOT;
 const BRIDGE_VERSION = require('./package.json').version;
 function loadBuildId() {
   const testValue = process.env.NODE_ENV === 'test' ? process.env.RELAYBRIDGE_TEST_BUILD_ID : '';
@@ -176,8 +180,8 @@ const ALLOWED_ROOTS_SETTING = firstDefinedEnv(
 );
 const ALLOWED_ROOTS_VALUE = ALLOWED_ROOTS_SETTING.value;
 const ALLOWED_ROOTS = (ALLOWED_ROOTS_SETTING.defined
-  ? ALLOWED_ROOTS_VALUE.split(';')
-  : [process.env.USERPROFILE || ROOT, ROOT])
+  ? ALLOWED_ROOTS_VALUE.split(';')  // ';' is the bridge's own cross-platform convention, not path.delimiter
+  : [USER_HOME, ROOT])
   .map((value) => String(value).trim())
   .filter(Boolean)
   .map((value) => path.resolve(value));
@@ -327,7 +331,7 @@ function isInsideAllowedRoot(candidate) {
 }
 
 function defaultAllowedCwd() {
-  const preferred = path.resolve(process.env.USERPROFILE || ROOT);
+  const preferred = path.resolve(USER_HOME);
   const candidates = [preferred, ...ALLOWED_ROOTS];
   const seen = new Set();
   for (const candidate of candidates) {
@@ -397,7 +401,7 @@ function workspacePolicy() {
   let error = null;
   try { defaultCwd = defaultAllowedCwd(); }
   catch (err) { error = err.message; }
-  const userProfile = path.resolve(process.env.USERPROFILE || ROOT);
+  const userProfile = path.resolve(USER_HOME);
   return {
     explicit: ALLOWED_ROOTS_SETTING.defined,
     allowedRoots: [...ALLOWED_ROOTS],
@@ -1089,8 +1093,8 @@ function buildEnv(extras = {}, stripNames = []) {
     const candidates = [
       path.join(process.env.LOCALAPPDATA || '', 'agy', 'bin'),
       path.join(process.env.LOCALAPPDATA || '', 'cursor-agent'),
-      path.join(process.env.USERPROFILE || '', '.local', 'bin'),
-      path.join(process.env.USERPROFILE || '', '.cursor', 'bin'),
+      path.join(USER_HOME, '.local', 'bin'),
+      path.join(USER_HOME, '.cursor', 'bin'),
       path.join(process.env.APPDATA || '', 'npm'),
       path.join(process.env.LOCALAPPDATA || '', 'npm'),
       path.join(process.env.LOCALAPPDATA || '', 'RelayBridge', 'tools', 'perplexity-web-mcp', '.venv', 'Scripts'),
@@ -1121,9 +1125,24 @@ function normalizeEnvOverrides(raw, fieldName = 'oneshot_env') {
 }
 
 function resolveExecutable(command, env = buildEnv()) {
-  if (!command || process.platform !== 'win32') return command;
+  if (!command) return command;
   if (path.isAbsolute(command)) return command;
   const pathKey = Object.keys(env).find((k) => k.toUpperCase() === 'PATH') || 'Path';
+  // POSIX: no PATHEXT and no case-folding — walk PATH and take the first entry
+  // that is a file with an execute bit. Returning `command` unchanged here (the
+  // old non-win32 early return) made seat discovery's `resolved !== binary`
+  // test permanently false, so every CLI reported "not installed" on Linux.
+  if (process.platform !== 'win32') {
+    if (command.includes('/')) return command;
+    for (const dir of String(env[pathKey] || '').split(path.delimiter).filter(Boolean)) {
+      const candidate = path.join(dir, command);
+      try {
+        const st = fs.statSync(candidate);
+        if (st.isFile() && (st.mode & 0o111)) return candidate;
+      } catch {}
+    }
+    return command;
+  }
   const dirs = String(env[pathKey] || '').split(';').filter(Boolean);
   const hasExt = !!path.extname(command);
   const pathExt = String(env.PATHEXT || '.COM;.EXE;.BAT;.CMD').split(';').filter(Boolean);
@@ -1730,11 +1749,11 @@ function parseConfiguredOneShotOutput(entry, rawOutput) {
 }
 
 function ollamaManifestIdentity(entry) {
-  if (entry?.transport !== 'local:ollama' || !entry.model || !process.env.USERPROFILE) return null;
+  if (entry?.transport !== 'local:ollama' || !entry.model || !USER_HOME) return null;
   const match = /^([A-Za-z0-9._-]+)(?::([A-Za-z0-9._-]+))?$/.exec(String(entry.model));
   if (!match) return null;
   const manifestPath = path.join(
-    process.env.USERPROFILE,
+    USER_HOME,
     '.ollama', 'models', 'manifests', 'registry.ollama.ai', 'library',
     match[1], match[2] || 'latest',
   );
@@ -2213,7 +2232,7 @@ class Session {
     this.label = label;
     this.command = command;
     this.args = args;
-    this.cwd = cwd || process.env.USERPROFILE || ROOT;
+    this.cwd = cwd || USER_HOME || ROOT;
     this.buffer = []; // ring buffer of recent output
     this.bufferMax = 2000; // lines
     this.clients = new Set(); // WebSocket clients

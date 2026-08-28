@@ -6,7 +6,11 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PORT="${RELAYBRIDGE_PORT:-8787}"
+PORT="${RELAYBRIDGE_PORT:-${PORT:-8787}}"
+# server.js reads PORT, not RELAYBRIDGE_PORT. Without exporting it, passing
+# only RELAYBRIDGE_PORT started the server on 8787 while this script
+# health-checked the other port and then declared a healthy bridge dead.
+export PORT
 LOG="$ROOT/bridge.start.out.log"
 ERR="$ROOT/bridge.start.err.log"
 PIDFILE="$ROOT/.bridge.pid"
