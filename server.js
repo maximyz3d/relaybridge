@@ -2297,6 +2297,13 @@ class Session {
       this._onData(`\r\n[RelayBridge] spawn error: ${err.message}\r\n`);
       this._onExit(-1);
     });
+    // The child has an 'error' handler; its stdin stream does not. Writing to a
+    // CLI that has already exited raises EPIPE as an 'error' event ON THE
+    // STREAM, and an unhandled one exits the whole bridge. Keystrokes into a
+    // dead pipe-mode tab are the normal way to hit this.
+    this.proc.stdin.on('error', (err) => {
+      this._onData(`\r\n[RelayBridge] input not delivered: ${err.code || err.message}\r\n`);
+    });
   }
 
   _onData(text) {
@@ -2324,10 +2331,15 @@ class Session {
 
   write(input) {
     if (this.exited) return false;
-    if (this._mode === 'pty') {
-      this.proc.write(input);
-    } else {
-      this.proc.stdin.write(input);
+    try {
+      if (this._mode === 'pty') {
+        this.proc.write(input);
+      } else {
+        if (!this.proc.stdin || this.proc.stdin.destroyed) return false;
+        this.proc.stdin.write(input);
+      }
+    } catch {
+      return false; // stream torn down between the exited check and the write
     }
     return true;
   }
@@ -3340,21 +3352,29 @@ app.post('/api/exec', (req, res) => {
   if (!command || typeof command !== 'string') {
     return res.status(400).json({ error: 'command (string) required' });
   }
-  const exe = shell === 'pwsh' ? 'pwsh.exe' : 'powershell.exe';
-  const args = ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', command];
   let execCwd;
   try { execCwd = resolveAllowedCwd(cwd); }
   catch (err) { return res.status(400).json({ error: err.message }); }
-  const proc = trackChild(spawn(exe, args, {
+  // Route through the platform abstraction rather than hardcoding
+  // powershell.exe: off Windows that name only resolves through WSL interop,
+  // which runs the caller's command as Win32 PowerShell against a POSIX cwd.
+  // buildExecSpawn also sets detached on POSIX, which killProcessTree needs to
+  // signal the whole group instead of orphaning grandchildren.
+  const built = platform.buildExecSpawn(command, {
+    shell,
     cwd: execCwd,
     env: buildEnv(),
-    windowsHide: true,
-  }));
+  });
+  const proc = trackChild(spawn(built.exe, built.args, built.options));
   let stdout = '';
   let stderr = '';
+  // 'error' and 'close' can both fire for one spawn (ENOENT emits error, then
+  // close), so a single reply guard keeps the second one from throwing
+  // ERR_HTTP_HEADERS_SENT out of an EventEmitter callback.
+  let settled = false;
   const t = setTimeout(() => {
     killProcessTree(proc);
-  }, timeoutMs);
+  }, TIMEOUT_POLICY.normalizeOneShotTimeoutMs(timeoutMs));
   res.on('close', () => { if (!res.writableEnded) killProcessTree(proc); });
   proc.stdout.setEncoding('utf8');
   proc.stderr.setEncoding('utf8');
@@ -3362,10 +3382,14 @@ app.post('/api/exec', (req, res) => {
   proc.stderr.on('data', (d) => { stderr += d; });
   proc.on('close', (code) => {
     clearTimeout(t);
+    if (settled) return;
+    settled = true;
     res.json({ stdout, stderr, exitCode: code, shell: built.shellKind, shellNote: built.fallbackNote || undefined });
   });
   proc.on('error', (err) => {
     clearTimeout(t);
+    if (settled) return;
+    settled = true;
     res.status(500).json({ error: err.message, stdout, stderr });
   });
 });
@@ -4789,21 +4813,48 @@ app.post('/api/open-url', (req, res) => {
   const { url } = req.body || {};
   if (!url || typeof url !== 'string') return res.status(400).json({ error: 'url required' });
   if (!/^https?:\/\//i.test(url)) return res.status(400).json({ error: 'only http(s) urls allowed' });
-  const isWindows = process.platform === 'win32';
-  const isMac = process.platform === 'darwin';
-  try {
-    if (isWindows) {
-      // 'start "" "url"' â€” the "" is an empty title arg required by start when the url is quoted
-      spawn('explorer.exe', [url], { windowsHide: true, detached: true, stdio: 'ignore' }).unref();
-    } else if (isMac) {
-      spawn('open', [url], { detached: true }).unref();
-    } else {
-      spawn('xdg-open', [url], { detached: true }).unref();
+  const plat = platform.detectPlatform();
+  // Openers to try, in order. A spawn ENOENT is an ASYNC 'error' event, not a
+  // throw, so the try/catch below cannot see it — an unhandled 'error' on a
+  // ChildProcess takes the whole bridge down. Every candidate gets a handler
+  // and we fall through to the next one instead.
+  //
+  // On WSL a Linux-side xdg-open cannot reach the user's Windows browser even
+  // when xdg-utils is installed, so interop openers come first there.
+  let openers;
+  if (plat.isWindows) openers = ['explorer.exe'];
+  else if (plat.isMac) openers = ['open'];
+  else if (plat.isWSL) openers = ['wslview', 'explorer.exe', 'xdg-open'];
+  else openers = ['xdg-open', 'gio', 'x-www-browser'];
+
+  let replied = false;
+  const reply = (fn) => { if (replied) return; replied = true; fn(); };
+
+  const tryOpener = (i) => {
+    if (i >= openers.length) {
+      return reply(() => res.status(501).json({
+        error: `no URL opener available on ${plat.label} (tried: ${openers.join(', ')})`,
+        hint: plat.isWSL
+          ? 'install wslu for wslview, or open the URL manually'
+          : 'install xdg-utils, or open the URL manually',
+        url,
+      }));
     }
-    res.json({ ok: true, url });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+    const bin = openers[i];
+    const args = bin === 'gio' ? ['open', url] : [url];
+    let child;
+    try {
+      child = spawn(bin, args, { windowsHide: true, detached: true, stdio: 'ignore' });
+    } catch (err) {
+      return tryOpener(i + 1); // synchronous failure (e.g. EACCES on the path)
+    }
+    child.on('error', () => { tryOpener(i + 1); });
+    child.on('spawn', () => {
+      child.unref();
+      reply(() => res.json({ ok: true, url, opener: bin }));
+    });
+  };
+  tryOpener(0);
 });
 
 
@@ -4987,3 +5038,19 @@ function shutdown() {
 }
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
+
+// Last-resort backstop. This bridge holds every live PTY session, every
+// in-flight provider run and the background task queue in one process, so a
+// stray throw from an EventEmitter callback — where Express cannot catch it —
+// costs far more than the bad request that triggered it. Three such paths were
+// found and fixed above (/api/exec, /api/open-url, pipe-mode stdin); this
+// catches the fourth nobody has found yet.
+//
+// Deliberately NOT a silent swallow: it logs the full stack so the defect stays
+// visible and reportable, and it does not re-enter shutdown().
+process.on('uncaughtException', (err) => {
+  console.error('[RelayBridge] uncaught exception — staying up:', err && err.stack ? err.stack : err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[RelayBridge] unhandled rejection — staying up:', reason && reason.stack ? reason.stack : reason);
+});

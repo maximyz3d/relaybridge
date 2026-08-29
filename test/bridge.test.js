@@ -899,6 +899,38 @@ test('prompt-file transport preserves long special-character prompts and cleans 
     body: JSON.stringify({ command: 'Write-Output MUST_NOT_RUN' }),
   });
   assert.equal(proxiedExec.status, 403);
+  // The 403 above never reaches the spawn, which is how a ReferenceError in the
+  // close handler ("built is not defined") shipped under a green suite and
+  // killed the process on the first real call. Exercise the success path, and
+  // assert the bridge is still alive afterwards.
+  // AbortSignal.timeout matters here: when this route kills the process, the
+  // socket dies mid-request and an untimed fetch hangs the whole run instead of
+  // failing. A hung suite is an ambiguous CI signal; this makes the defect
+  // report as a fast, attributable failure on this assertion.
+  let realExec;
+  try {
+    realExec = await fetch(baseUrl + '/api/exec', {
+      method: 'POST',
+      headers: { ...auth, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        command: process.platform === 'win32' ? 'Write-Output EXEC_OK' : 'echo EXEC_OK',
+        shell: process.platform === 'win32' ? 'powershell' : 'bash',
+      }),
+      signal: AbortSignal.timeout(20000),
+    });
+  } catch (err) {
+    assert.fail(`/api/exec did not answer (${err.code || err.name}: ${err.message}) — `
+      + 'the bridge most likely died handling it; check for an uncaught throw in the child close handler');
+  }
+  assert.equal(realExec.status, 200);
+  const execBody = await realExec.json();
+  assert.equal(execBody.exitCode, 0);
+  assert.match(execBody.stdout, /EXEC_OK/);
+  // The requested shell must be honoured, not silently replaced by powershell.
+  assert.equal(execBody.shell, process.platform === 'win32' ? 'powershell' : 'bash');
+  const stillAlive = await fetch(baseUrl + '/api/health');
+  assert.equal(stillAlive.status, 200);
+
   const traversal = await fetch(baseUrl + '/api/collabs/..%2F..%2Fpackage', { headers: auth });
   assert.notEqual(traversal.status, 200);
 
