@@ -3030,7 +3030,11 @@ app.post('/api/plan', async (req, res) => {
         let found = false;
         try {
           const probeBin = (cfg[k].version_probe || cfg[k].probe || cfg[k].safe || [])[0];
-          found = !!(probeBin && resolveExecutable(probeBin, env));
+          // See the note in /api/auth/status: resolveExecutable echoes the
+          // command back when it cannot resolve it, so a truthiness test marked
+          // every provider found — and this path feeds `ready` straight from it.
+          const resolvedProbe = probeBin ? resolveExecutable(probeBin, env) : '';
+          found = !!probeBin && (resolvedProbe !== probeBin || path.isAbsolute(resolvedProbe));
         } catch { found = false; }
         diagnostics[k] = { found, ready: found, detail: 'path-only check' };
       }
@@ -3095,7 +3099,13 @@ app.post('/api/route', async (req, res) => {
         let found = false;
         try {
           const probeBin = (entry.version_probe || entry.probe || entry.safe || [])[0];
-          found = !!(probeBin && resolveExecutable(probeBin, env));
+          // resolveExecutable returns the command UNCHANGED when it cannot
+          // resolve it, and a non-empty string is truthy — so the old
+          // `!!resolveExecutable(...)` was true for every provider, including
+          // ones that are not installed. Compare against the input the way the
+          // main /api/diag sweep does.
+          const resolvedProbe = probeBin ? resolveExecutable(probeBin, env) : '';
+          found = !!probeBin && (resolvedProbe !== probeBin || path.isAbsolute(resolvedProbe));
         } catch { found = false; }
         diagnostics[kind] = { found, ready: found, detail: 'path-only check; run /api/diag for auth status' };
       }
@@ -3187,7 +3197,13 @@ app.get('/api/auth/status', async (req, res) => {
         let found = false;
         try {
           const probeBin = (entry.version_probe || entry.probe || entry.safe || [])[0];
-          found = !!(probeBin && resolveExecutable(probeBin, env));
+          // resolveExecutable returns the command UNCHANGED when it cannot
+          // resolve it, and a non-empty string is truthy — so the old
+          // `!!resolveExecutable(...)` was true for every provider, including
+          // ones that are not installed. Compare against the input the way the
+          // main /api/diag sweep does.
+          const resolvedProbe = probeBin ? resolveExecutable(probeBin, env) : '';
+          found = !!probeBin && (resolvedProbe !== probeBin || path.isAbsolute(resolvedProbe));
         } catch { found = false; }
         if (!found) return [kind, { found: false, ready: false, detail: 'not installed' }];
         const result = await runProbe(entry.probe, Number(entry.probe_timeout_ms || 30000), entry.strip_env || []);
@@ -5099,6 +5115,39 @@ server.listen(PORT, HOST, () => {
     } else {
       console.log(`[RelayBridge] model registry loaded from cache (${Math.round(cachedAge / 3600000)}h old)`);
     }
+  }
+  // Optional readiness warm-up, OFF by default.
+  //
+  // Why it exists: the router penalises a seat it knows is down by -10000, but
+  // readinessFor() yields null when nothing has been probed yet, and null is
+  // neutral — so on a bridge nobody has opened the dashboard against, a dead
+  // seat is fully selectable. That is the normal case for a headless / MCP-only
+  // deployment, which is exactly where a silent route to a dead provider is
+  // hardest to notice.
+  //
+  // Why it is not the default: a readiness sweep spawns one process per
+  // provider (the same reason /api/auth/status only probes on demand), and
+  // those probes occupy one-shot admission slots, so a bridge that warms on
+  // boot reports a non-zero activeOneShotCount for its first seconds — the
+  // metric operators watch as the canary for slot leaks. Opt in on headless
+  // deployments; leave it off where a dashboard will populate readiness anyway.
+  if (String(process.env.RELAYBRIDGE_WARM_DIAG || '') === '1') {
+    setTimeout(() => {
+      const req = http.request({
+        host: HOST, port: PORT, path: '/api/diag', method: 'GET',
+        headers: { 'X-RelayBridge-Token': CAPABILITY_TOKEN },
+      }, (resp) => {
+        resp.resume();
+        resp.on('end', () => {
+          const n = lastDiagnostics?.results
+            ? Object.values(lastDiagnostics.results).filter((r) => r && r.ready).length
+            : 0;
+          if (lastDiagnostics) console.log(`[RelayBridge] readiness warmed — ${n} seat(s) ready`);
+        });
+      });
+      req.on('error', (err) => console.warn('[RelayBridge] readiness warm-up skipped: ' + err.message));
+      req.end();
+    }, 250).unref();
   }
 });
 

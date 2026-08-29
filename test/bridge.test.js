@@ -2307,6 +2307,14 @@ test('local Ollama adapter uses loopback HTTP, returns final-only text, and reco
   const ollama = http.createServer(async (req, res) => {
     let body = '';
     for await (const chunk of req) body += chunk;
+    // A real ollama daemon also serves GET /api/tags, which readiness probing
+    // uses to tell "daemon up" from "daemon down" without shelling out to the
+    // CLI. It carries no request body, so parsing one here threw.
+    if (req.method === 'GET' && req.url.startsWith('/api/tags')) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ models: [{ name: 'qwen2.5:1.5b' }] }));
+      return;
+    }
     requestPayload = JSON.parse(body);
     if (requestPayload.prompt === 'upstream-500') {
       res.writeHead(500, { 'Content-Type': 'application/json' });
