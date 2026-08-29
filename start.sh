@@ -13,24 +13,51 @@ PORT="${RELAYBRIDGE_PORT:-${PORT:-8787}}"
 export PORT
 LOG="$ROOT/bridge.start.out.log"
 ERR="$ROOT/bridge.start.err.log"
-PIDFILE="$ROOT/.bridge.pid"
+# Port-scoped. The old shared "$ROOT/.bridge.pid" was written by whichever
+# bridge started last regardless of its port, so running two bridges (the
+# documented Windows-8787 / WSL-8788 topology) left one file naming the other
+# port's process.
+PIDFILE="$ROOT/.bridge.$PORT.pid"
+LEGACY_PIDFILE="$ROOT/.bridge.pid"
+
+# Does $1 actually own $PORT? A pidfile is a hint, never proof: it can be stale,
+# left over from the pre-port-scoped layout, or name a recycled pid.
+pid_owns_port() {
+  local p="${1:-}"
+  [[ -n "$p" ]] || return 1
+  kill -0 "$p" 2>/dev/null || return 1
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltnp 2>/dev/null | grep ":$PORT " | grep -q "pid=$p,"
+    return
+  fi
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -ti "tcp:$PORT" -sTCP:LISTEN 2>/dev/null | grep -qx "$p"
+    return
+  fi
+  return 0  # nothing to verify with; trust the port-scoped file
+}
 
 listening_pid() {
-  # Three sources, most reliable first. NOTE: no gawk-isms — Ubuntu's default
-  # awk is mawk, and the 3-arg match() silently returns nothing there, which
-  # made --stop report "nothing listening" while the bridge was demonstrably up.
-  # 1. Our own pidfile, verified against a live process
-  if [[ -f "$PIDFILE" ]]; then
-    local p; p="$(cat "$PIDFILE" 2>/dev/null || true)"
-    if [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null; then echo "$p"; return; fi
-  fi
-  # 2. ss (Linux) — parse pid= with sed, portable across awks
+  # The PORT is the identity, so ask the kernel first and treat the pidfile as
+  # the last resort. The old order asked the pidfile first, which is how
+  # `./start.sh --stop` (PORT defaulting to 8787) killed a bridge on 8788 and
+  # then reported success. NOTE: no gawk-isms — Ubuntu's default awk is mawk,
+  # and the 3-arg match() silently returns nothing there.
+  local p
   if command -v ss >/dev/null 2>&1; then
-    local p; p="$(ss -ltnp 2>/dev/null | grep ":$PORT " | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1)"
+    p="$(ss -ltnp 2>/dev/null | grep ":$PORT " | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1)"
     if [[ -n "$p" ]]; then echo "$p"; return; fi
   fi
-  # 3. lsof (macOS, and Linux fallback)
-  lsof -ti "tcp:$PORT" -sTCP:LISTEN 2>/dev/null | head -1
+  if command -v lsof >/dev/null 2>&1; then
+    p="$(lsof -ti "tcp:$PORT" -sTCP:LISTEN 2>/dev/null | head -1)"
+    if [[ -n "$p" ]]; then echo "$p"; return; fi
+  fi
+  local f
+  for f in "$PIDFILE" "$LEGACY_PIDFILE"; do
+    [[ -f "$f" ]] || continue
+    p="$(cat "$f" 2>/dev/null || true)"
+    if pid_owns_port "$p"; then echo "$p"; return; fi
+  done
 }
 
 if [[ "${1:-}" == "--stop" ]]; then
@@ -38,7 +65,12 @@ if [[ "${1:-}" == "--stop" ]]; then
   if [[ -n "${pid:-}" ]]; then
     kill "$pid" 2>/dev/null || true
     rm -f "$PIDFILE"
-    echo "[RelayBridge] stopped pid $pid"
+    # Only clear the shared legacy file if it named THIS bridge; another port's
+    # bridge may still be relying on it.
+    if [[ -f "$LEGACY_PIDFILE" && "$(cat "$LEGACY_PIDFILE" 2>/dev/null || true)" == "$pid" ]]; then
+      rm -f "$LEGACY_PIDFILE"
+    fi
+    echo "[RelayBridge] stopped pid $pid on :$PORT"
   else
     echo "[RelayBridge] nothing listening on :$PORT"
   fi
@@ -64,11 +96,18 @@ fi
 # trap the Windows side fell into twice: a restart initiated through the
 # bridge's own exec channel died with its parent.
 nohup setsid node "$ROOT/server.js" >>"$LOG" 2>>"$ERR" < /dev/null &
+# $! is the pid of `nohup`/`setsid`, and setsid forks when it is not already a
+# process group leader — so this can name a wrapper that exits immediately. Keep
+# it only as a stopgap for the seconds before the health check, then overwrite
+# it with the pid the bridge reports for itself.
 echo $! > "$PIDFILE"
 
 for _ in $(seq 1 30); do
   if curl -fsS "http://127.0.0.1:$PORT/api/health" >/dev/null 2>&1; then
-    ver="$(curl -fsS "http://127.0.0.1:$PORT/api/health" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const j=JSON.parse(d);console.log(j.version+" (pid "+j.pid+")")}catch{console.log("?")}})')"
+    health="$(curl -fsS "http://127.0.0.1:$PORT/api/health")"
+    realpid="$(printf '%s' "$health" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{process.stdout.write(String(JSON.parse(d).pid||""))}catch{}})')"
+    [[ -n "$realpid" ]] && echo "$realpid" > "$PIDFILE"
+    ver="$(printf '%s' "$health" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const j=JSON.parse(d);console.log(j.version+" (pid "+j.pid+")")}catch{console.log("?")}})')"
     echo "[RelayBridge] healthy at http://127.0.0.1:$PORT — $ver"
     exit 0
   fi
