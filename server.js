@@ -1124,25 +1124,52 @@ function normalizeEnvOverrides(raw, fieldName = 'oneshot_env') {
   return normalized;
 }
 
-function resolveExecutable(command, env = buildEnv()) {
-  if (!command) return command;
-  if (path.isAbsolute(command)) return command;
+// Windows interop binaries are executable-by-mode on WSL, so a naive POSIX PATH
+// walk happily "finds" them. Opt back in with RELAYBRIDGE_ALLOW_WIN_INTEROP=1.
+const ALLOW_WIN_INTEROP = /^(1|true|yes)$/i.test(String(process.env.RELAYBRIDGE_ALLOW_WIN_INTEROP || ''));
+const WIN_EXEC_SUFFIX = /\.(exe|cmd|bat|ps1|com)$/i;
+
+// Like resolveExecutable, but also reports what it deliberately walked past, so
+// the dashboard can say WHY a seemingly-installed CLI is not on offer.
+function resolveExecutableInfo(command, env = buildEnv()) {
+  const none = { resolved: command, interopSkipped: [] };
+  if (!command) return none;
+  if (path.isAbsolute(command)) return { resolved: command, interopSkipped: [] };
   const pathKey = Object.keys(env).find((k) => k.toUpperCase() === 'PATH') || 'Path';
   // POSIX: no PATHEXT and no case-folding — walk PATH and take the first entry
   // that is a file with an execute bit. Returning `command` unchanged here (the
   // old non-win32 early return) made seat discovery's `resolved !== binary`
   // test permanently false, so every CLI reported "not installed" on Linux.
   if (process.platform !== 'win32') {
-    if (command.includes('/')) return command;
+    if (command.includes('/')) return { resolved: command, interopSkipped: [] };
+    // A .exe/.cmd name cannot be a native POSIX seat. On WSL it resolves
+    // through /mnt interop and launches a Win32 process that cannot chdir into
+    // the POSIX workspace; on plain Linux it never resolves at all.
+    const namedWindowsBinary = !ALLOW_WIN_INTEROP && WIN_EXEC_SUFFIX.test(command);
+    const interopSkipped = [];
     for (const dir of String(env[pathKey] || '').split(path.delimiter).filter(Boolean)) {
       const candidate = path.join(dir, command);
       try {
         const st = fs.statSync(candidate);
-        if (st.isFile() && (st.mode & 0o111)) return candidate;
+        if (!st.isFile() || !(st.mode & 0o111)) continue;
+        // /mnt is the Windows filesystem reached over 9p. Everything there is
+        // mode 777, so the execute bit proves nothing, and the Windows npm
+        // prefix on the inherited PATH shadows real Linux installs.
+        const isInterop = !ALLOW_WIN_INTEROP && candidate.startsWith('/mnt/');
+        if (isInterop || namedWindowsBinary) { interopSkipped.push(candidate); continue; }
+        return { resolved: candidate, interopSkipped };
       } catch {}
     }
-    return command;
+    return { resolved: command, interopSkipped };
   }
+  return { resolved: resolveExecutableWin32(command, env, pathKey), interopSkipped: [] };
+}
+
+function resolveExecutable(command, env = buildEnv()) {
+  return resolveExecutableInfo(command, env).resolved;
+}
+
+function resolveExecutableWin32(command, env, pathKey) {
   const dirs = String(env[pathKey] || '').split(';').filter(Boolean);
   const hasExt = !!path.extname(command);
   const pathExt = String(env.PATHEXT || '.COM;.EXE;.BAT;.CMD').split(';').filter(Boolean);
@@ -3245,14 +3272,67 @@ app.get('/api/diag', async (req, res) => {
         usageCapability: providerUsageCapability(entry),
       }];
     }
+    // Probe the transport that actually executes. These seats run over
+    // localOllamaUrl() HTTP, but their configured probe shells out to the
+    // ollama binary — so a machine with the CLI installed and the daemon down
+    // reported ready and then failed every dispatch with "fetch failed". Worse,
+    // routing-policy scores local seats +30 and a "live diagnostic ready" seat
+    // +20, so those dead seats won the default utility route.
+    if (entry.oneshot_adapter === 'ollama_api') {
+      let found = false;
+      let ready = false;
+      let detail = '';
+      let runtimeVersion = '';
+      const model = entry.oneshot_model || (Array.isArray(entry.safe) ? entry.safe[2] : '') || '';
+      try {
+        const base = localOllamaUrl();
+        const tagsUrl = new URL('/api/tags', base.origin);
+        const resp = await fetch(tagsUrl, { signal: AbortSignal.timeout(4000) });
+        found = true; // the daemon answered, so the seat's transport exists
+        if (!resp.ok) {
+          detail = `ollama daemon at ${base.origin} returned HTTP ${resp.status}`;
+        } else {
+          const body = await resp.json();
+          const names = Array.isArray(body?.models) ? body.models.map((m) => String(m?.name || '')) : [];
+          runtimeVersion = `${names.length} model(s) loaded`;
+          // Ollama reports "qwen2.5:1.5b"; a seat may be configured without the tag.
+          ready = !model || names.some((n) => n === model || n.split(':')[0] === String(model).split(':')[0]);
+          detail = ready
+            ? `daemon up at ${base.origin} with ${model || 'any model'}`
+            : `daemon up at ${base.origin} but ${model} is not pulled (have: ${names.slice(0, 4).join(', ') || 'none'})`;
+        }
+      } catch (err) {
+        detail = err.name === 'TimeoutError'
+          ? `no ollama daemon answering at ${String(envFirst('RELAYBRIDGE_OLLAMA_URL', 'PS_BRIDGE_OLLAMA_URL') || 'http://127.0.0.1:11434')} (timed out)`
+          : `no ollama daemon reachable: ${err.message}`;
+      }
+      return [kind, {
+        binary: null,
+        found,
+        ready,
+        paths: [],
+        label: entry.label,
+        detail,
+        probeExitCode: null,
+        runtimeVersion,
+        usageCapability: providerUsageCapability(entry, { runtimeVersion }),
+      }];
+    }
     const binary = entry.diagnostic_binary ||
       (entry.safe && entry.safe[0]) || (entry.dangerous && entry.dangerous[0]);
     if (!binary) return [kind, { binary: null, found: false, ready: false, paths: [], label: entry.label }];
-    const resolved = resolveExecutable(binary, env);
+    const resolvedInfo = resolveExecutableInfo(binary, env);
+    const resolved = resolvedInfo.resolved;
     const found = resolved !== binary || path.isAbsolute(resolved) && fs.existsSync(resolved);
     let ready = found;
     let detail = '';
     let probeExitCode = null;
+    // Say WHY a CLI that is plainly on PATH is not being offered, instead of
+    // reporting a bare "not installed" the operator cannot act on.
+    if (!found && resolvedInfo.interopSkipped.length) {
+      detail = `found only as a Windows binary (${resolvedInfo.interopSkipped[0]}) — `
+        + 'install the native Linux CLI, or set RELAYBRIDGE_ALLOW_WIN_INTEROP=1 to use it over WSL interop';
+    }
     if (found && Array.isArray(entry.probe) && entry.probe.length) {
       const probe = await runProbe(entry.probe, Number(entry.probe_timeout_ms || 30000), entry.strip_env || [], controller.signal);
       probeExitCode = probe.exitCode;
