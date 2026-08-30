@@ -99,6 +99,10 @@ export async function getCapabilityToken({ refresh = false } = {}) {
   return null;
 }
 
+// Routes server.js exempts from the MCP action-identity check so a mismatched
+// MCP can still shut down or restart the bridge it is talking to.
+const LIFECYCLE_ROUTES = new Set(['/api/admin/shutdown', '/api/admin/restart']);
+
 export async function bridgeRequest(route, {
   method = 'GET',
   body,
@@ -117,8 +121,16 @@ export async function bridgeRequest(route, {
   // that invariant automatic for non-read HTTP methods so a newly added MCP
   // POST cannot accidentally omit the preflight and fail with a 409 (or, on an
   // older bridge, bypass the intended split-brain guard).
+  //
+  // The lifecycle routes are the one exception, and server.js already codes it
+  // (requiresMcpActionIdentity: "Lifecycle endpoints are the recovery path for
+  // replacing a stale build"). Without the same exemption here the preflight
+  // fires client-side and stop_bridge/restart_bridge fail with the very 409
+  // whose remedy is "restart RelayBridge" - the MCP surface would have no way
+  // out of a mismatch and the server-side exemption would be unreachable.
   const normalizedMethod = String(method || 'GET').toUpperCase();
-  const identityRequired = actionIdentity || !['GET', 'HEAD', 'OPTIONS'].includes(normalizedMethod);
+  const identityRequired = (actionIdentity || !['GET', 'HEAD', 'OPTIONS'].includes(normalizedMethod))
+    && !LIFECYCLE_ROUTES.has(route);
   let actionPreflight = null;
   if (identityRequired) actionPreflight = await requireExpectedActionIdentity({ signal });
 
@@ -185,6 +197,11 @@ function actionIdentityDetail(live) {
     currentReceiptStoreId,
     buildMatches,
     receiptStoreMatches,
+    // The mismatch a second checkout produces is otherwise undiagnosable: the
+    // ids are salted hashes and the remedy text may not name any path, so the
+    // operator gets no way to tell WHICH process owns the port. The pid is the
+    // one non-secret handle that leads to it.
+    currentPid: Number.isInteger(live?.pid) ? live.pid : null,
   };
 }
 
@@ -193,7 +210,9 @@ export async function requireExpectedActionIdentity({ signal } = {}) {
   const actionPreflight = actionIdentityDetail(live);
   if (live?.capabilityAuth && actionPreflight.ok) return actionPreflight;
   throw new BridgeError(
-    'RelayBridge action identity mismatch; restart/reinstall so MCP and REST use the same build and receipt store',
+    'RelayBridge action identity mismatch: the bridge answering this port reports a different build or receipt store. '
+    + 'Restart/reinstall so MCP and REST use the same build and receipt store, or - if a second RelayBridge installation '
+    + 'owns the port (its pid is actionPreflight.currentPid) - point RELAYBRIDGE_URL and RELAYBRIDGE_DATA_DIR at the one this MCP was installed from',
     {
       route: '/api/health',
       status: 409,

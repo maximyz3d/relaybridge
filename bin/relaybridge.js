@@ -419,7 +419,15 @@ async function main() {
             relaybridge: {
               command: process.execPath,
               args: [serverPath],
-              env: { RELAYBRIDGE_PORT: String(DEFAULT_PORT) },
+              // RELAYBRIDGE_URL is the variable mcp/bridge-client.mjs actually
+              // reads; it ignores RELAYBRIDGE_PORT entirely. Emitting only the
+              // port left every client registered from this command pointed at
+              // the default 8787 no matter which port was configured — on a
+              // two-bridge box (Windows 8787 + WSL 8788) that silently talks to
+              // the other checkout's bridge and every mutating MCP call comes
+              // back 409 bridge_identity_mismatch. install-mcp-clients.ps1
+              // writes the same pair for the same reason.
+              env: { RELAYBRIDGE_URL: BASE, RELAYBRIDGE_PORT: String(DEFAULT_PORT) },
             },
           },
         };

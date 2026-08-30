@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -60,6 +61,15 @@ const ACTION = {
   idempotentHint: false,
   openWorldHint: false,
 };
+// ask_provider, route_and_ask and run_committee spawn a real provider process,
+// spend a seat or metered credits, and append receipts - exactly what broadcast
+// does, and broadcast is annotated as an action. Annotating them read-only was
+// not merely inaccurate: install-mcp.ps1 writes Codex's
+// default_tools_approval_mode = "writes", so a read annotation auto-approved
+// them and a model could burn quota (and, via run_committee, four seats at
+// once) with no prompt. idempotentHint:false likewise: a repeat call is a
+// second paid invocation unless the cache answers it.
+const EXTERNAL_ACTION = { ...ACTION, openWorldHint: true };
 const DESTRUCTIVE = {
   readOnlyHint: false,
   destructiveHint: true,
@@ -71,13 +81,20 @@ function loadCliConfig() {
   return JSON.parse(fs.readFileSync(CLI_CONFIG_PATH, 'utf8'));
 }
 
+// USERPROFILE is Windows-only. On POSIX the same idea is HOME, and without the
+// fallback this returned '' for every local-Ollama seat on Linux/macOS: the
+// receipt's configFingerprint then carried no model-weight binding and could no
+// longer prove which weights answered. server.js resolves the identical
+// manifest path through USER_HOME; the two copies had diverged.
+const USER_HOME = process.env.USERPROFILE || process.env.HOME || os.homedir() || '';
+
 function providerIdentityMaterial(kind) {
   const entry = loadCliConfig()[kind];
-  if (entry?.transport !== 'local:ollama' || !entry.model || !process.env.USERPROFILE) return '';
+  if (entry?.transport !== 'local:ollama' || !entry.model || !USER_HOME) return '';
   const match = /^([A-Za-z0-9._-]+)(?::([A-Za-z0-9._-]+))?$/.exec(String(entry.model));
   if (!match) return '';
   const manifestPath = path.join(
-    process.env.USERPROFILE,
+    USER_HOME,
     '.ollama', 'models', 'manifests', 'registry.ollama.ai', 'library',
     match[1], match[2] || 'latest',
   );
@@ -322,7 +339,7 @@ async function buildContextBundle({
   ]);
   // Read health after diagnostics so the bundle does not count its own short-
   // lived readiness probes as active delegated work.
-  const live = await capture('health', () => health(), {});
+  const live = await capture('health', () => health({ signal }), {});
 
   const sessionList = (Array.isArray(sessionsRaw) ? sessionsRaw : []).slice(0, maxSessions);
   const sessions = await Promise.all(sessionList.map(async (session) => {
@@ -1614,7 +1631,7 @@ export function buildServer() {
     inputSchema: z.object({ includeDiagnostics: z.boolean().default(true) }),
     annotations: READ_ONLY,
   }, safeHandler(async ({ includeDiagnostics }, context) => {
-    const live = await health();
+    const live = await health({ signal: context?.mcpReq?.signal });
     const diagnostics = includeDiagnostics ? await getDiagnostics(context?.mcpReq?.signal) : {};
     return result({ ok: true, baseUrl: BASE_URL.href, health: live, providers: providerSummaries(diagnostics) });
   }));
@@ -1679,11 +1696,12 @@ export function buildServer() {
       acknowledgeFilesystemWrites: z.boolean().default(false).describe('required with dangerous=true; confirms persistent writes are authorized'),
     }),
     annotations: READ_ONLY,
-  }, safeHandler(async ({ task, effort, kind, dangerous, acknowledgeFilesystemWrites }) => {
+  }, safeHandler(async ({ task, effort, kind, dangerous, acknowledgeFilesystemWrites }, context) => {
     const plan = await bridgeRequest('/api/plan', {
       method: 'POST',
       body: { task, effort: effort ?? null, kind: kind ?? null, dangerous, acknowledgeFilesystemWrites },
       timeoutMs: 20000,
+      signal: context?.mcpReq?.signal,
     });
     return result(plan);
   }));
@@ -1693,8 +1711,11 @@ export function buildServer() {
     description: 'Model registry discovered from each CLI at boot: models a provider can actually run, each with a weight tier and a best-at note, plus warnings for configured pins the account no longer offers. Set refresh to re-probe after installing or upgrading a CLI.',
     inputSchema: z.object({ refresh: z.boolean().default(false) }),
     annotations: READ_ONLY,
-  }, safeHandler(async ({ refresh }) => {
-    const registry = await bridgeRequest(refresh ? '/api/models?refresh=1' : '/api/models', { timeoutMs: refresh ? 60000 : 15000 });
+  }, safeHandler(async ({ refresh }, context) => {
+    const registry = await bridgeRequest(refresh ? '/api/models?refresh=1' : '/api/models', {
+      timeoutMs: refresh ? 60000 : 15000,
+      signal: context?.mcpReq?.signal,
+    });
     return result(registry);
   }));
 
@@ -1703,8 +1724,8 @@ export function buildServer() {
     description: 'Supervision snapshots for in-flight provider calls: phase (streaming/working/quiet/suspect_loop), idle time, CPU evidence, and which limit fires next. Use this to tell a long-thinking run from a wedged one instead of cancelling on suspicion.',
     inputSchema: z.object({}),
     annotations: READ_ONLY,
-  }, safeHandler(async () => {
-    const runs = await bridgeRequest('/api/runs/active', { timeoutMs: 10000 });
+  }, safeHandler(async (_args, context) => {
+    const runs = await bridgeRequest('/api/runs/active', { timeoutMs: 10000, signal: context?.mcpReq?.signal });
     return result(runs);
   }));
 
@@ -1713,8 +1734,8 @@ export function buildServer() {
     description: 'Recent bridge API calls from every client (dashboard UI and this MCP server), with method, path, status, duration, and provider kind. The same log the dashboard Activity panel shows — both sides see the same picture.',
     inputSchema: z.object({ limit: z.number().int().min(1).max(500).default(120), sinceId: z.number().int().min(0).default(0) }),
     annotations: READ_ONLY,
-  }, safeHandler(async ({ limit, sinceId }) => {
-    const activity = await bridgeRequest(`/api/telemetry?limit=${limit}&sinceId=${sinceId}`, { timeoutMs: 10000 });
+  }, safeHandler(async ({ limit, sinceId }, context) => {
+    const activity = await bridgeRequest(`/api/telemetry?limit=${limit}&sinceId=${sinceId}`, { timeoutMs: 10000, signal: context?.mcpReq?.signal });
     return result(activity);
   }));
 
@@ -1723,15 +1744,15 @@ export function buildServer() {
     description: 'List current PowerShell and AI CLI terminal sessions owned by the singleton bridge.',
     inputSchema: z.object({}),
     annotations: READ_ONLY,
-  }, safeHandler(async () => result({ sessions: await bridgeRequest('/api/sessions') })));
+  }, safeHandler(async (_args, context) => result({ sessions: await bridgeRequest('/api/sessions', { signal: context?.mcpReq?.signal }) })));
 
   server.registerTool('read_session_output', {
     title: 'Read terminal output',
     description: 'Read a bounded tail of an existing terminal session buffer.',
     inputSchema: z.object({ sessionId: z.string().min(1).max(64), tailChars: z.number().int().min(1).max(65536).default(12000) }),
     annotations: READ_ONLY,
-  }, safeHandler(async ({ sessionId, tailChars }) => {
-    const data = await bridgeRequest(`/api/sessions/${encodeURIComponent(sessionId)}/buffer`);
+  }, safeHandler(async ({ sessionId, tailChars }, context) => {
+    const data = await bridgeRequest(`/api/sessions/${encodeURIComponent(sessionId)}/buffer`, { signal: context?.mcpReq?.signal });
     const text = String(data.text || '');
     return result({ sessionId, exited: data.exited, exitCode: data.exitCode, text: text.slice(-tailChars), originalChars: text.length });
   }));
@@ -1741,7 +1762,7 @@ export function buildServer() {
     description: 'List saved RelayBridge collaboration rooms and message counts.',
     inputSchema: z.object({}),
     annotations: READ_ONLY,
-  }, safeHandler(async () => result(await bridgeRequest('/api/collabs'))));
+  }, safeHandler(async (_args, context) => result(await bridgeRequest('/api/collabs', { signal: context?.mcpReq?.signal }))));
 
   server.registerTool('read_collab', {
     title: 'Read a saved collaboration',
@@ -1753,8 +1774,8 @@ export function buildServer() {
       maxChars: z.number().int().min(1000).max(100000).default(30000),
     }),
     annotations: READ_ONLY,
-  }, safeHandler(async ({ collabId, maxMessages, offsetFromEnd, maxChars }) => {
-    const data = await bridgeRequest(`/api/collabs/${encodeURIComponent(collabId)}`);
+  }, safeHandler(async ({ collabId, maxMessages, offsetFromEnd, maxChars }, context) => {
+    const data = await bridgeRequest(`/api/collabs/${encodeURIComponent(collabId)}`, { signal: context?.mcpReq?.signal });
     const original = Array.isArray(data.transcript) ? data.transcript : [];
     const end = Math.max(0, original.length - offsetFromEnd);
     const start = Math.max(0, end - maxMessages);
@@ -1783,7 +1804,7 @@ export function buildServer() {
     description: 'List project labels saved by the bridge collaboration UI.',
     inputSchema: z.object({}),
     annotations: READ_ONLY,
-  }, safeHandler(async () => result(await bridgeRequest('/api/projects'))));
+  }, safeHandler(async (_args, context) => result(await bridgeRequest('/api/projects', { signal: context?.mcpReq?.signal }))));
 
   server.registerTool('list_runs', {
     title: 'List routing and committee runs',
@@ -1923,6 +1944,15 @@ export function buildServer() {
     annotations: DESTRUCTIVE,
   }, safeHandler(async () => result(await stopBridge())));
 
+  // The context bundle promises "aborting an MCP call aborts its HTTP requests",
+  // so every read-only tool above threads context.mcpReq.signal into
+  // bridgeRequest - a cancelled list_models with refresh:true used to leave a
+  // 60s request and its model re-probe running with nobody to receive them.
+  // The mutating session/agent/task/github tools below deliberately do NOT
+  // carry the signal: aborting one mid-flight would leave the bridge holding a
+  // mutation it had already applied while the MCP-side receipt was never
+  // appended. Provider calls are the exception - they carry the signal because
+  // callProvider reconciles a cancelled attempt against its transport receipt.
   server.registerTool('start_safe_session', {
     title: 'Start a terminal session with bypass flags off',
     description: 'Start a PowerShell or AI CLI terminal with the vendor dangerous/full-permission flags forced off, independent of the sticky browser toggle. This is not a sandbox: kind="powershell" opens a real host PowerShell shell with your account\'s privileges, and every kind runs as a normal host process under RELAYBRIDGE_ALLOWED_ROOTS only for its starting directory. Nothing executes until send_session_input is approved.',
@@ -1972,7 +2002,7 @@ export function buildServer() {
       maxEffortOverride: z.boolean().default(false),
       acknowledgeHumanGate: z.boolean().default(false),
     }),
-    annotations: EXTERNAL_READ,
+    annotations: EXTERNAL_ACTION,
   }, safeHandler(async (args, context) => {
     const classification = classifyTask(args.prompt);
     const { policy } = loadRoutingData();
@@ -2008,7 +2038,7 @@ export function buildServer() {
       effort: z.enum(['low', 'medium', 'high', 'max']).optional(),
       maxEffortOverride: z.boolean().default(false),
     }),
-    annotations: EXTERNAL_READ,
+    annotations: EXTERNAL_ACTION,
   }, safeHandler(async (args, context) => {
     const signal = context?.mcpReq?.signal;
     const requestedDeadlineAt = Date.now() + args.timeoutMs;
@@ -2029,6 +2059,9 @@ export function buildServer() {
         taskHash: route.classification.taskHash,
         status: 'deterministic_gate',
       });
+      // isError, like every other gate here: without it a caller that branches
+      // on the MCP failure flag reads the refusal as a successful call with no
+      // winner, and never sees the recommendation that explains the remedy.
       return result({
         ok: false,
         blocked: true,
@@ -2036,7 +2069,7 @@ export function buildServer() {
         route,
         receiptId: receipt.receiptId,
         recommendation: 'Use the host deterministic shell/file/process tool. Set allowModelForDeterministic=true only when interpretation is actually needed.',
-      });
+      }, { isError: true });
     }
     const { policy } = loadRoutingData();
     const tierPolicy = policy.tiers[route.classification.tier];
@@ -2153,7 +2186,7 @@ export function buildServer() {
       effort: z.enum(['low', 'medium', 'high', 'max']).optional(),
       maxEffortOverride: z.boolean().default(false),
     }),
-    annotations: EXTERNAL_READ,
+    annotations: EXTERNAL_ACTION,
   }, safeHandler(async (args, context) => {
     const signal = context?.mcpReq?.signal;
     const requestedDeadlineAt = Date.now() + args.timeoutMs;
@@ -2374,7 +2407,7 @@ export function buildServer() {
     description: 'List the configured AI providers (PowerShell excluded) with label, model, routing tags, autoRoute opt-in flag, and the last cached readiness snapshot. Never spawns readiness probes.',
     inputSchema: z.object({}),
     annotations: READ_ONLY,
-  }, safeHandler(async () => result(await bridgeRequest('/api/agents'))));
+  }, safeHandler(async (_args, context) => result(await bridgeRequest('/api/agents', { signal: context?.mcpReq?.signal }))));
 
   server.registerTool('set_agent_tags', {
     title: 'Set an agent\'s routing tags',
@@ -2470,21 +2503,21 @@ export function buildServer() {
     description: 'Recent GitHub-integration activity for enrolled repos: checkpoint commits, devlog entries, pushes, draft PRs, bump labels, skipped secrets, and dry-run plans, newest first.',
     inputSchema: z.object({ limit: z.number().int().min(1).max(200).default(50) }),
     annotations: READ_ONLY,
-  }, safeHandler(async ({ limit }) => result(await bridgeRequest(`/api/github/activity?limit=${limit}`))));
+  }, safeHandler(async ({ limit }, context) => result(await bridgeRequest(`/api/github/activity?limit=${limit}`, { signal: context?.mcpReq?.signal }))));
 
   server.registerTool('github_list_versions', {
     title: 'List repo versions',
     description: 'Read the append-only version history of an enrolled repo from its GitHub tags (vX.Y.Z). GitHub is the source of truth; RelayBridge only mirrors it.',
     inputSchema: z.object({ repo: z.string().regex(/^[\w.-]+\/[\w.-]+$/) }),
     annotations: EXTERNAL_READ,
-  }, safeHandler(async ({ repo }) => result(await bridgeRequest(`/api/github/versions?repo=${encodeURIComponent(repo)}`))));
+  }, safeHandler(async ({ repo }, context) => result(await bridgeRequest(`/api/github/versions?repo=${encodeURIComponent(repo)}`, { signal: context?.mcpReq?.signal }))));
 
   server.registerTool('github_show_version', {
     title: 'Show one version',
     description: 'Show commit, author, date, and diffstat for one vX.Y.Z tag of an enrolled repo.',
     inputSchema: z.object({ repo: z.string().regex(/^[\w.-]+\/[\w.-]+$/), tag: z.string().regex(/^v\d+\.\d+\.\d+$/) }),
     annotations: EXTERNAL_READ,
-  }, safeHandler(async ({ repo, tag }) => result(await bridgeRequest(`/api/github/versions/show?repo=${encodeURIComponent(repo)}&tag=${encodeURIComponent(tag)}`))));
+  }, safeHandler(async ({ repo, tag }, context) => result(await bridgeRequest(`/api/github/versions/show?repo=${encodeURIComponent(repo)}&tag=${encodeURIComponent(tag)}`, { signal: context?.mcpReq?.signal }))));
 
   server.registerTool('github_checkout_version', {
     title: 'Roll back to a version (new branch)',
@@ -2568,7 +2601,7 @@ export function buildServer() {
     description: 'Fetch one task by id: status (queued/running/done/failed/cancelled/interrupted), full result text, exit code, route and usage. Poll this to collect work submitted earlier from any surface.',
     inputSchema: z.object({ id: z.string().regex(/^t_[A-Za-z0-9_]+$/) }),
     annotations: READ_ONLY,
-  }, safeHandler(async ({ id }) => result(await bridgeRequest(`/api/tasks/${encodeURIComponent(id)}`))));
+  }, safeHandler(async ({ id }, context) => result(await bridgeRequest(`/api/tasks/${encodeURIComponent(id)}`, { signal: context?.mcpReq?.signal }))));
 
   server.registerTool('list_tasks', {
     title: 'List tasks',
@@ -2579,12 +2612,12 @@ export function buildServer() {
       limit: z.number().int().min(1).max(200).default(50),
     }),
     annotations: READ_ONLY,
-  }, safeHandler(async ({ collab, status, limit }) => {
+  }, safeHandler(async ({ collab, status, limit }, context) => {
     const q = new URLSearchParams();
     if (collab) q.set('collab', collab);
     if (status) q.set('status', status);
     q.set('limit', String(limit));
-    return result(await bridgeRequest(`/api/tasks?${q.toString()}`));
+    return result(await bridgeRequest(`/api/tasks?${q.toString()}`, { signal: context?.mcpReq?.signal }));
   }));
 
   server.registerTool('cancel_task', {
@@ -2603,7 +2636,7 @@ export function buildServer() {
     description: 'Seats currently in cooldown after a 429 or overload, with how long is left, why, and whether the window came from the provider\'s Retry-After or our backoff. A readiness probe only proves authentication — this is the quota picture, and it is shared by every client and survives a bridge restart.',
     inputSchema: z.object({}),
     annotations: READ_ONLY,
-  }, safeHandler(async () => result(await bridgeRequest('/api/cooldowns'))));
+  }, safeHandler(async (_args, context) => result(await bridgeRequest('/api/cooldowns', { signal: context?.mcpReq?.signal }))));
 
   // ---- Fuel gauge / usage ------------------------------------------------
 
@@ -2612,14 +2645,14 @@ export function buildServer() {
     description: 'Per quota-seat fuel with provider aliases: percent remaining, burn rate (tokens/hour), projected hours to empty, runs, tokens and shadow cost, plus fleet balance. Provider/model receipts remain separate. Basis is disclosed as vendor_observed, operator_observed, configured estimate, metered, or unmetered; observations include provenance and expiry.',
     inputSchema: z.object({ windowMs: z.number().int().min(60000).max(2592000000).default(86400000) }),
     annotations: READ_ONLY,
-  }, safeHandler(async ({ windowMs }) => result(await bridgeRequest(`/api/usage/gauges?windowMs=${windowMs}`))));
+  }, safeHandler(async ({ windowMs }, context) => result(await bridgeRequest(`/api/usage/gauges?windowMs=${windowMs}`, { signal: context?.mcpReq?.signal }))));
 
   server.registerTool('usage_totals', {
     title: 'Token and cost totals',
     description: 'Aggregate tokens and runs, with cost split into shadowCostUsd (what subscription runs WOULD have cost at list API rates — the value the plans return) and meteredCostUsd (what actually billed).',
     inputSchema: z.object({ windowMs: z.number().int().min(60000).max(2592000000).default(86400000) }),
     annotations: READ_ONLY,
-  }, safeHandler(async ({ windowMs }) => result(await bridgeRequest(`/api/usage/totals?windowMs=${windowMs}`))));
+  }, safeHandler(async ({ windowMs }, context) => result(await bridgeRequest(`/api/usage/totals?windowMs=${windowMs}`, { signal: context?.mcpReq?.signal }))));
 
   server.registerTool('usage_advise', {
     title: 'Which seat should take this work',
@@ -2632,7 +2665,7 @@ export function buildServer() {
       explicitSeat: z.string().min(1).max(64).optional(),
     }),
     annotations: READ_ONLY,
-  }, safeHandler(async (input) => result(await bridgeRequest('/api/usage/advise', { method: 'POST', body: input }))));
+  }, safeHandler(async (input, context) => result(await bridgeRequest('/api/usage/advise', { method: 'POST', body: input, signal: context?.mcpReq?.signal }))));
 
   return server;
 }

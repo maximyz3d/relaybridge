@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import TIMEOUT_POLICY from '../timeout-policy.cjs';
 import receiptStoreIdentityModule from '../lib/receipt-store-identity.cjs';
 
 const { receiptStoreIdentity } = receiptStoreIdentityModule;
@@ -243,11 +244,20 @@ export function listReceiptPage(limit = 50, offset = 0) {
 
 export function writeRun(run) {
   const runId = run.runId || `run_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 8)}`;
+  const now = new Date().toISOString();
   const record = {
     runId,
-    createdAt: run.createdAt || new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
+    createdAt: run.createdAt || now,
     ...run,
+    // `updatedAt` has to be applied AFTER the spread. Every caller re-writes the
+    // record it got back from the previous writeRun (`writeRun({ ...run, status,
+    // members })`), so a fresh timestamp placed before the spread was overwritten
+    // by the stale one the caller was carrying: updatedAt stayed equal to
+    // createdAt for the whole life of a run. That froze the list_runs sort
+    // (allRunSummaries orders by updatedAt, so it ordered by creation) and made
+    // the stale-lease check below measure age-since-creation instead of
+    // age-since-progress.
+    updatedAt: now,
     runId,
   };
   writeJsonAtomic(path.join(RUNS_DIR, `${runId}.json`), record);
@@ -261,19 +271,43 @@ export function readRun(runId) {
   return JSON.parse(fs.readFileSync(filePath, 'utf8'));
 }
 
+// The moment after which a run still marked `running` can only be one whose
+// process died: no live executor can still be working on it. Runs are written by
+// every MCP process sharing this data dir, so the lease has to be time-based --
+// but it must be measured against the run's OWN deadline. The previous rule (15
+// minutes since the last write) was shorter than the runs it was judging:
+// config/timeout-policy.json allows a 20-minute one-shot by default and 45 at
+// most, and run_committee's seats execute in parallel and write no progress
+// record while they wait, so healthy runs were being rewritten to 'interrupted'
+// -- with a fabricated reason -- while their providers were still answering.
+function staleRunHorizon(run) {
+  const deadline = Date.parse(run.deadlineAt || '');
+  if (Number.isFinite(deadline)) return deadline + TIMEOUT_POLICY.mcpHostGraceMs;
+  // Records written before deadlineAt was persisted: no run can legitimately
+  // outlive the maximum one-shot deadline measured from its last progress write.
+  const lastProgress = Date.parse(run.updatedAt || run.createdAt || '');
+  if (!Number.isFinite(lastProgress)) return null;
+  return lastProgress + TIMEOUT_POLICY.oneShotMaxMs + TIMEOUT_POLICY.mcpHostGraceMs;
+}
+
 function allRunSummaries() {
-  const staleBefore = Date.now() - 15 * 60 * 1000;
   return fs.readdirSync(RUNS_DIR)
     .filter((name) => /^run_[A-Za-z0-9_-]+\.json$/.test(name))
     .map((name) => {
       try {
         let run = JSON.parse(fs.readFileSync(path.join(RUNS_DIR, name), 'utf8'));
-        if (run.status === 'running' && Date.parse(run.updatedAt || run.createdAt || 0) < staleBefore) {
+        const horizon = run.status === 'running' ? staleRunHorizon(run) : null;
+        if (horizon !== null && Date.now() > horizon) {
+          // This is a write inside a listing, which the read-only tool
+          // annotations on list_runs / psbridge://runs do not advertise. It is
+          // kept because nothing else can reconcile a run whose owning process
+          // is gone, and it now only ever touches a record that is provably past
+          // its own recorded deadline -- never one still in flight.
           run = writeRun({
             ...run,
             status: 'interrupted',
             interruptedAt: new Date().toISOString(),
-            interruptionReason: 'stale running lease reconciled after 15 minutes',
+            interruptionReason: 'no process reported completion before the run passed its recorded deadline',
           });
         }
         return {

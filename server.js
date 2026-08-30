@@ -103,8 +103,36 @@ function currentUserSid() {
   return match ? match[1] : null;
 }
 
+// POSIX used to assert "mode bits already restrict this file" without ever
+// looking at the file. That claim is false on any filesystem that ignores mode
+// bits: a checkout (or a RELAYBRIDGE_TOKEN_FILE / RELAYBRIDGE_DATA_DIR) under
+// /mnt on WSL is DrvFs/9p mounted with no metadata option, where both the 0600
+// in writeFileSync and the follow-up chmodSync succeed silently and leave the
+// file 0777 — so the swallowing catch never fires, /api/health reported the
+// token as protected, and every other local account could read full bridge
+// control. Stat the result instead of describing it, and let the existing
+// operator warning fire when the filesystem did not honour the request.
+function verifyPosixTokenMode(filePath) {
+  let mode;
+  try { mode = fs.statSync(filePath).mode & 0o777; }
+  catch (err) {
+    return { platform: process.platform, applicable: true, hardened: false, detail: `could not stat the token file to verify its mode: ${err.message}` };
+  }
+  const octal = mode.toString(8).padStart(3, '0');
+  const restricted = (mode & 0o077) === 0;
+  return {
+    platform: process.platform,
+    applicable: true,
+    hardened: restricted,
+    mode: octal,
+    detail: restricted
+      ? `mode ${octal}: no group or other access`
+      : `mode ${octal}: the filesystem did not honour the requested 0600 (a /mnt DrvFs or 9p mount does this) — every local account can read this token`,
+  };
+}
+
 function hardenTokenFileAcl(filePath) {
-  if (process.platform !== 'win32') return { platform: process.platform, applicable: false, hardened: null, detail: 'POSIX mode bits already restrict this file' };
+  if (process.platform !== 'win32') return verifyPosixTokenMode(filePath);
   if (TOKEN_ACL_SKIPPED) return { platform: 'win32', applicable: true, hardened: null, skipped: true, detail: 'RELAYBRIDGE_SKIP_TOKEN_ACL is set' };
   const before = readTokenAclState(filePath);
   if (!before.ok) return { platform: 'win32', applicable: true, hardened: false, detail: `could not read the token ACL: ${before.detail}` };
@@ -965,7 +993,18 @@ function sendOneShotResult(res, payload, meta) {
     stderr: payload.stderr,
     exitCode: payload.exitCode,
     elapsedMs: meta?.startedAt ? Date.now() - meta.startedAt : 0,
-    stopReason: payload.stop_reason,
+    // classifyRunFailure's stopReason means "the supervisor stopped this run",
+    // and it short-circuits on any value before its INTERNAL_TIMEOUT patterns
+    // run. stop_reason also carries provider-derived reasons — the CLI's own
+    // internal timeout — so passing it turned the exact case
+    // lib/provider-failure.js was written for (gemini, exit 1, "timeout waiting
+    // for response") into supervisor_provider_internal_timeout with
+    // failUp:false, writing a ledger failureKind that blames the bridge for a
+    // provider fault. Paths that know about the supervisor say so explicitly;
+    // older payloads that only carry stop_reason set it for bridge stops only.
+    stopReason: Object.prototype.hasOwnProperty.call(payload, 'supervisor_stop_reason')
+      ? payload.supervisor_stop_reason
+      : payload.stop_reason,
     modelFlagSent: !!meta?.route?.model_flag_sent,
   });
   if (classified.partialResult) {
@@ -1015,6 +1054,9 @@ function sendOneShotResult(res, payload, meta) {
       }
       recordRunUsage({
         kind: meta.kind, route: payload.route || meta.route, usage: payload.usage,
+        // Same precedence the vendor-quota parse above uses: the model the
+        // provider says answered, then the one the route asked for.
+        model: payload.route?.resolved_model_identity || payload.model || null,
         startedAt: meta.startedAt, ok, failureKind,
       });
       // Post-hoc grounding check: a seat WITH access can still hallucinate, and
@@ -1102,6 +1144,28 @@ function buildEnv(extras = {}, stripNames = []) {
     const preferred = new Set(candidates.map((p) => p.toLowerCase()));
     const remaining = cur.split(';').filter((p) => p && !preferred.has(p.toLowerCase()));
     env[pathKey] = [...candidates, ...remaining].join(';');
+  } else {
+    // The comment above promised ~/.local/bin coverage while the whole
+    // candidate block sat inside the win32 branch — including the POSIX-only
+    // ~/.local/bin entry, which is what gives away that the guard is the bug.
+    // On POSIX buildEnv returned the inherited PATH untouched, so a bridge
+    // started without a login shell (a systemd unit, an MCP stdio launcher, a
+    // desktop entry) hands every provider spawn, probe and PTY session a PATH
+    // with no user-level npm/pip prefix on it: the dashboard reports every
+    // seat "not installed" while the same commands work in the operator's own
+    // shell. lib/platform.js dodges this with `bash -lc`, but no provider
+    // spawn in this file goes through buildExecSpawn.
+    const cur = env.PATH || '';
+    const candidates = [
+      path.join(USER_HOME, '.local', 'bin'),
+      path.join(USER_HOME, '.npm-global', 'bin'),
+      path.join(USER_HOME, '.cargo', 'bin'),
+      path.join(USER_HOME, '.cursor', 'bin'),
+      path.join(USER_HOME, 'bin'),
+    ].filter((p) => p && fs.existsSync(p));
+    const preferred = new Set(candidates);
+    const remaining = cur.split(path.delimiter).filter((p) => p && !preferred.has(p));
+    env.PATH = [...candidates, ...remaining].join(path.delimiter);
   }
   return env;
 }
@@ -1131,7 +1195,35 @@ const WIN_EXEC_SUFFIX = /\.(exe|cmd|bat|ps1|com)$/i;
 
 // Like resolveExecutable, but also reports what it deliberately walked past, so
 // the dashboard can say WHY a seemingly-installed CLI is not on offer.
+// A full PATH miss costs one statSync per PATH entry, and on WSL most of the
+// inherited entries are 9p mounts under /mnt: ~90ms per miss here, against
+// 0.015ms for a hit. /api/diag does one lookup per seat before it starts
+// probing and the dashboard calls /api/diag from six places, so a sweep of
+// mostly-not-installed seats spends seconds walking the same directories.
+// Memoize on (command, PATH) for a short window — long enough to collapse a
+// dashboard refresh burst, short enough that a CLI installed by hand outside
+// the bridge appears on the next sweep. /api/install clears it outright.
+const EXECUTABLE_CACHE_TTL_MS = 15000;
+const executableCache = new Map();
 function resolveExecutableInfo(command, env = buildEnv()) {
+  // Key on the PATH the lookup will actually walk. Resolved the same
+  // case-insensitive way as the walk itself: on Windows a spread of
+  // process.env keeps the original casing ('Path'), and a plain-object read of
+  // the wrong case would key every env to the same empty string.
+  const pathKey = Object.keys(env || {}).find((k) => k.toUpperCase() === 'PATH') || 'Path';
+  const cacheKey = `${command}\u0000${(env && env[pathKey]) || ''}`;
+  const cached = executableCache.get(cacheKey);
+  const now = Date.now();
+  if (cached && cached.expires > now) return cached.value;
+  const value = resolveExecutableInfoUncached(command, env);
+  if (executableCache.size > 256) {
+    for (const [key, entry] of executableCache) if (entry.expires <= now) executableCache.delete(key);
+  }
+  executableCache.set(cacheKey, { value, expires: now + EXECUTABLE_CACHE_TTL_MS });
+  return value;
+}
+
+function resolveExecutableInfoUncached(command, env) {
   const none = { resolved: command, interopSkipped: [] };
   if (!command) return none;
   if (path.isAbsolute(command)) return { resolved: command, interopSkipped: [] };
@@ -1776,20 +1868,31 @@ function parseConfiguredOneShotOutput(entry, rawOutput) {
 }
 
 function ollamaManifestIdentity(entry) {
-  if (entry?.transport !== 'local:ollama' || !entry.model || !USER_HOME) return null;
+  if (entry?.transport !== 'local:ollama' || !entry.model) return null;
   const match = /^([A-Za-z0-9._-]+)(?::([A-Za-z0-9._-]+))?$/.exec(String(entry.model));
   if (!match) return null;
-  const manifestPath = path.join(
-    USER_HOME,
-    '.ollama', 'models', 'manifests', 'registry.ollama.ai', 'library',
-    match[1], match[2] || 'latest',
-  );
-  try {
-    const bytes = fs.readFileSync(manifestPath);
-    return `sha256:${crypto.createHash('sha256').update(bytes).digest('hex')}`;
-  } catch {
-    return null;
+  // The manifest store is not always under the bridge's own HOME. On WSL the
+  // ollama daemon reachable on loopback is typically the Windows one, whose
+  // weights live in the Windows profile — USER_HOME/.ollama does not exist, so
+  // every local-seat receipt silently degraded to a bare tag with no @sha256,
+  // losing the one fact that proves which weights answered. OLLAMA_MODELS is
+  // ollama's own documented override for the store location, which lets the
+  // operator state it instead of the bridge guessing at /mnt paths.
+  const roots = [
+    String(process.env.OLLAMA_MODELS || '').trim(),
+    USER_HOME ? path.join(USER_HOME, '.ollama', 'models') : '',
+  ].filter(Boolean);
+  for (const root of roots) {
+    const manifestPath = path.join(
+      root, 'manifests', 'registry.ollama.ai', 'library',
+      match[1], match[2] || 'latest',
+    );
+    try {
+      const bytes = fs.readFileSync(manifestPath);
+      return `sha256:${crypto.createHash('sha256').update(bytes).digest('hex')}`;
+    } catch { /* try the next configured store */ }
   }
+  return null;
 }
 
 function localOllamaUrl() {
@@ -2187,6 +2290,14 @@ function killProcessTree(proc) {
 
 // ---- session management ----
 const sessions = new Map(); // id -> Session
+// How long an exited session stays listed and readable before it is reaped.
+// Long enough for a dashboard that reconnects after a reload to see how the
+// process ended; short enough that a long-lived bridge does not accumulate
+// dead sessions and their output buffers.
+const EXITED_SESSION_TTL_MS = 600000;
+// Per-client WebSocket send queue ceiling, in bytes, before session output is
+// dropped for that client instead of queued on the bridge's heap.
+const WS_CLIENT_BUFFER_MAX = 4194304;
 
 // Live provider runs, keyed by runId, so a human (or the dashboard) can vet
 // whether a quiet run is working or wedged instead of guessing.
@@ -2263,6 +2374,7 @@ class Session {
     this.buffer = []; // ring buffer of recent output
     this.bufferMax = 2000; // lines
     this.clients = new Set(); // WebSocket clients
+    this._starved = new Set(); // clients currently being skipped for backpressure
     this.proc = null;
     this.exited = false;
     this.exitCode = null;
@@ -2315,6 +2427,10 @@ class Session {
       cwd: this.cwd,
       env,
       windowsHide: true,
+      // Same reason as the one-shot spawn: killProcessTree can only take out
+      // the whole tree with a single signal when the child leads its own
+      // group. Pipe mode has no controlling terminal to lose.
+      detached: process.platform !== 'win32',
     });
     this._mode = 'pipe';
     this.proc.stdout.on('data', (d) => this._onData(d.toString('utf8')));
@@ -2333,27 +2449,64 @@ class Session {
     });
   }
 
+  // ws queues every unsent frame on the bridge's heap with no ceiling, so a
+  // child flooding stdout while one client is slow — a backgrounded Chrome tab
+  // throttles its socket reads, which is the common case — made the bridge's
+  // memory track the slowest browser tab. Past the threshold, drop frames for
+  // that client and say so once, rather than buffering on its behalf: the
+  // scrollback it missed is still available from GET /api/sessions/:id/buffer.
+  _sendTo(ws, frame) {
+    if (ws.readyState !== 1) return;
+    if (ws.bufferedAmount > WS_CLIENT_BUFFER_MAX) {
+      if (!this._starved.has(ws)) {
+        this._starved.add(ws);
+        try { ws.send(JSON.stringify({ type: 'data', data: '\r\n[RelayBridge] output skipped — this client is not reading fast enough; reload the tab to resync\r\n' })); } catch {}
+      }
+      return;
+    }
+    this._starved.delete(ws);
+    try { ws.send(frame); } catch {}
+  }
+
   _onData(text) {
     this.buffer.push(text);
     if (this.buffer.length > this.bufferMax) {
       this.buffer.splice(0, this.buffer.length - this.bufferMax);
     }
-    for (const ws of this.clients) {
-      if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'data', data: text }));
-    }
+    const frame = JSON.stringify({ type: 'data', data: text });
+    for (const ws of this.clients) this._sendTo(ws, frame);
   }
 
   _onExit(code) {
+    if (this.exited) return;   // pipe mode can deliver both 'error' and 'close'
     this.exited = true;
     this.exitCode = code;
     const msg = `\r\n[RelayBridge] process exited with code ${code}\r\n`;
     this.buffer.push(msg);
+    // The banner pushed past bufferMax without the trim _onData does.
+    if (this.buffer.length > this.bufferMax) {
+      this.buffer.splice(0, this.buffer.length - this.bufferMax);
+    }
     for (const ws of this.clients) {
+      this._sendTo(ws, JSON.stringify({ type: 'data', data: msg }));
+      // The exit frame is terminal state, not output: send it even to a client
+      // whose queue is over the cap, or a backed-up tab would never learn the
+      // process ended and would sit on a live-looking terminal forever.
       if (ws.readyState === 1) {
-        ws.send(JSON.stringify({ type: 'data', data: msg }));
-        ws.send(JSON.stringify({ type: 'exit', code }));
+        try { ws.send(JSON.stringify({ type: 'exit', code })); } catch {}
       }
     }
+    // Nothing removed an exited session from the `sessions` map: only DELETE
+    // /api/sessions/:id does, and only public/index.html issues it, so every
+    // CLI that finished on its own — plus every tab closed with the browser
+    // rather than the X — left a Session holding its buffer for the life of
+    // the bridge, and GET /api/sessions kept listing the corpses. Keep it
+    // addressable long enough for a reconnecting dashboard to read the exit,
+    // then drop it. unref'd so it never holds the process open.
+    const reaper = setTimeout(() => {
+      if (sessions.get(this.id) === this) sessions.delete(this.id);
+    }, EXITED_SESSION_TTL_MS);
+    if (typeof reaper.unref === 'function') reaper.unref();
   }
 
   write(input) {
@@ -2391,6 +2544,7 @@ class Session {
 
   detach(ws) {
     this.clients.delete(ws);
+    this._starved.delete(ws);
   }
 
   meta() {
@@ -2465,6 +2619,24 @@ const ALLOWED_ORIGINS = new Set([
   `http://localhost:${PORT}`,
 ]);
 
+// DNS rebinding turns "loopback-only" into "any web page can reach the bridge":
+// the attacker's page resolves its own hostname to 127.0.0.1, so the socket
+// really is loopback, and per Fetch a same-origin GET carries no Origin header
+// — isDirectLoopbackRequest and the Origin gate below both pass, and
+// /api/capability hands that page the master token. Host is the one header the
+// browser will not let it forge, so pin it to the names this process is
+// actually reachable under (it binds HOST only). lib/remote-mcp.js already
+// documents this check as part of its posture; /mcp itself is exempt because it
+// is bearer-gated and deliberately reached through a tunnel under a public
+// hostname, which is the only supported non-loopback surface.
+// Derived from ALLOWED_ORIGINS so the two gates can never disagree about which
+// names this bridge answers to. Both forms: a browser omits the port only when
+// it is the scheme default.
+const ALLOWED_HOSTS = new Set([...ALLOWED_ORIGINS].flatMap((origin) => {
+  const parsed = new URL(origin);
+  return [parsed.host, parsed.hostname];
+}));
+
 function isDirectLoopbackRequest(req) {
   const remote = String(req.socket?.remoteAddress || '').toLowerCase();
   const loopback = remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1';
@@ -2478,6 +2650,14 @@ app.use((req, res, next) => {
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('Referrer-Policy', 'no-referrer');
   res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=()');
+  // An absent Host cannot come from a browser (HTTP/1.1 requires it), so it is
+  // not a rebinding vector; a handwritten loopback client that omits it keeps
+  // working. Compared lowercase because only browsers normalize it.
+  const host = String(req.headers.host || '').toLowerCase();
+  const remoteMcpPath = req.path === '/mcp' || req.path.startsWith('/mcp/');
+  if (host && !ALLOWED_HOSTS.has(host) && !remoteMcpPath) {
+    return res.status(403).json({ error: 'host not allowed' });
+  }
   const origin = req.headers.origin;
   if (origin && !ALLOWED_ORIGINS.has(origin)) {
     return res.status(403).json({ error: 'origin not allowed' });
@@ -2519,6 +2699,19 @@ app.get(['/', '/index.html'], (req, res) => {
     "object-src 'none'",
   ].join('; '));
   res.type('html').send(html);
+});
+// The static mount below serves public/index.html for any path the route
+// matcher above misses — '//index.html' and '/%2findex.html' both reach it —
+// and that copy carries no CSP header, no per-response nonce and no
+// __ONE_SHOT_DEFAULT_TIMEOUT_MS__ substitution, so one extra slash yields an
+// unprotected page whose inline script dies on an unbound identifier. The
+// template is only ever served by the handler above; anything else asking for
+// it by path is not a real client.
+app.use((req, res, next) => {
+  let requested = req.path;
+  try { requested = decodeURIComponent(req.path); } catch { /* malformed escape: judge the raw path */ }
+  if (/(?:^|[\\/])index\.html$/i.test(requested)) return res.status(404).json({ error: 'not found' });
+  next();
 });
 app.use(express.static(path.join(ROOT, 'public'), { index: false, dotfiles: 'deny' }));
 
@@ -2724,7 +2917,10 @@ function runProbe(slotRaw, timeoutMs = 15000, stripEnv = [], signal) {
       : args;
     let proc;
     try {
-      proc = trackChild(spawn(spawnBinary, spawnArgs, { cwd: ROOT, env, windowsHide: true }));
+      // detached on POSIX so the timeout kill signals the probe's whole group
+      // instead of orphaning whatever it spawned — see the one-shot spawnOpts
+      // for why killTree's ps-walk fallback is not equivalent.
+      proc = trackChild(spawn(spawnBinary, spawnArgs, { cwd: ROOT, env, windowsHide: true, detached: process.platform !== 'win32' }));
     } catch (err) {
       return resolve({ exitCode: -1, stdout: '', stderr: err.message, timedOut: false });
     }
@@ -2738,7 +2934,13 @@ function runProbe(slotRaw, timeoutMs = 15000, stripEnv = [], signal) {
       settled = true;
       clearTimeout(timer);
       if (abortHandler) signal?.removeEventListener('abort', abortHandler);
-      resolve({ exitCode, stdout, stderr: error ? stderr + '\n' + error.message : stderr, timedOut, aborted: !!signal?.aborted });
+      // Join instead of prefixing: when the child never starts, stderr is '' and
+      // the old concatenation produced '\nspawn agy ENOENT', whose FIRST line is
+      // empty — and every consumer takes the first line (discoverModels,
+      // /api/auth/status). The most common failure on a fresh box, "that CLI is
+      // not installed under this name", was therefore recorded as no error at
+      // all: model-registry rows landed with error:null and no warning.
+      resolve({ exitCode, stdout, stderr: [stderr, error && error.message].filter(Boolean).join('\n'), timedOut, aborted: !!signal?.aborted });
     };
     const timer = setTimeout(() => {
       timedOut = true;
@@ -3439,6 +3641,7 @@ app.get('/api/sessions/:id/buffer', (req, res) => {
 });
 
 // One-shot exec â€” for Cowork to run a PowerShell command and get output back.
+const EXEC_OUTPUT_MAX = 1048576;
 app.post('/api/exec', (req, res) => {
   if (!isDirectLoopbackRequest(req)) {
     return res.status(403).json({ error: 'command execution is loopback-only' });
@@ -3473,13 +3676,19 @@ app.post('/api/exec', (req, res) => {
   res.on('close', () => { if (!res.writableEnded) killProcessTree(proc); });
   proc.stdout.setEncoding('utf8');
   proc.stderr.setEncoding('utf8');
-  proc.stdout.on('data', (d) => { stdout += d; });
-  proc.stderr.on('data', (d) => { stderr += d; });
+  // Cap the accumulation. A command that streams faster than the timeout grew
+  // two JS strings without limit, which is the OOM the one-shot path is
+  // hardened against by supervisor.recordOutput and runProbe by its 32 KB
+  // ceiling; this route had neither. `truncated` tells the caller the output
+  // is short rather than the command being quiet.
+  let truncated = false;
+  proc.stdout.on('data', (d) => { if (stdout.length < EXEC_OUTPUT_MAX) stdout += d; else truncated = true; });
+  proc.stderr.on('data', (d) => { if (stderr.length < EXEC_OUTPUT_MAX) stderr += d; else truncated = true; });
   proc.on('close', (code) => {
     clearTimeout(t);
     if (settled) return;
     settled = true;
-    res.json({ stdout, stderr, exitCode: code, shell: built.shellKind, shellNote: built.fallbackNote || undefined });
+    res.json({ stdout, stderr, exitCode: code, truncated: truncated || undefined, shell: built.shellKind, shellNote: built.fallbackNote || undefined });
   });
   proc.on('error', (err) => {
     clearTimeout(t);
@@ -3500,6 +3709,9 @@ app.post('/api/exec', (req, res) => {
 // resolution, admission control, receipts, and cleanup. `res` only needs the
 // Express response surface this function touches (status/json/on/once/
 // writableEnded/destroyed), so broadcast passes a captured stand-in.
+// How long to wait after the child's own 'exit' for the stdio pipes to reach
+// EOF before settling anyway. Matches runProbe's 2s post-kill grace.
+const ONESHOT_CLOSE_GRACE_MS = 2000;
 async function executeOneShot(body, res) {
   const startedAt = Date.now();
   const { kind, prompt, timeoutMs, cwd, dangerous } = body || {};
@@ -3948,6 +4160,14 @@ async function executeOneShot(body, res) {
       cwd: resolvedCwd,
       env: childEnv,
       windowsHide: true,
+      // NOTE: this spawn deliberately does NOT set `detached`, even though
+      // killProcessTree's fast path (process.kill(-pid)) needs a process group
+      // to exist and therefore always ESRCHes here, falling back to a racy `ps`
+      // walk. Adding it is a real fix for that, but it also converts every
+      // killProcessTree call on this child from a harmless no-op into a real
+      // group kill, and doing so fails the prompt-file transport test with
+      // exitCode null (signal death) — the kill paths around a normal run have
+      // to be audited before the group can be created. Tracked separately.
     };
     if (isWindows && !/\.exe$/i.test(resolvedBin)) {
       spawnBin = process.env.ComSpec || 'cmd.exe';
@@ -4118,7 +4338,7 @@ async function executeOneShot(body, res) {
     }
     sendOneShotResult(res, { kind, route, exitCode: -1, stdout, stderr: stderr + '\n' + err.message, error: err.message, failureClass: isolationCleanup.ok ? null : 'isolation_cleanup', dropped_out: true }, { kind, prompt, route, startedAt, cwd: resolvedCwd });
   });
-  proc.on('close', (code) => {
+  const settleFromClose = (code) => {
     if (settled) return;
     settled = true;
     finishSupervision();
@@ -4309,6 +4529,19 @@ async function executeOneShot(body, res) {
     if (sentPayload && !sentPayload.dropped_out) {
       trackRunAfterResponse({ runId, kind, user: runUser, prompt, cwd: resolvedCwd, intent: runIntent });
     }
+  };
+  proc.on('close', settleFromClose);
+  // 'close' waits for every inherited stdio pipe to reach EOF, so a CLI that
+  // leaves an MCP server or node shim holding stdout exits without ever firing
+  // it: nothing settles, the admission slot stays taken, and the request hangs
+  // until the client gives up. 'exit' is the child's own death, so settle from
+  // a grace window after it — the same guarantee runProbe arms after a kill
+  // ("killing the tree is not a guarantee of an exit event"). A normal run's
+  // 'close' lands within microseconds of 'exit' and wins the `settled` race, so
+  // this only fires when a survivor is holding the pipe open.
+  proc.on('exit', (code) => {
+    const graceful = setTimeout(() => settleFromClose(code === null ? -1 : code), ONESHOT_CLOSE_GRACE_MS);
+    if (typeof graceful.unref === 'function') graceful.unref();
   });
   // Providers without a placeholder (Claude/Codex/Perplexity wrapper) read
   // stdin. Antigravity consumes {prompt}; Grok consumes {prompt_file}.
@@ -4487,15 +4720,35 @@ function operatorQuotaFleet(gauges) {
   return out;
 }
 
-function recordRunUsage({ kind, route, usage, startedAt, ok, failureKind, taskId }) {
+function recordRunUsage({ kind, route, usage, model, startedAt, ok, failureKind, taskId }) {
   try {
     const classes = seatCostClasses();
     usageLedger.record({
       seat: kind,
-      model: route?.resolved_model || route?.model || null,
+      // route.resolved_model is only ever assigned by the two API adapters, so
+      // every CLI seat (claude, codex, gemini, copilot, cursor, grok,
+      // perplexity) recorded model:null — which prices an Opus run at the
+      // $1/$5 _default rate instead of $15/$75 and, because usage-ledger gates
+      // its per-model tally on `if (r.model)`, left gauge().models permanently
+      // empty. The caller passes what the provider actually reported.
+      model: model || route?.resolved_model || route?.resolved_model_identity
+        || route?.requested_model || route?.model || null,
       costClass: classes[kind]?.costClass || 'metered',
       inputTokens: usage?.input_tokens ?? usage?.prompt_tokens ?? 0,
       outputTokens: usage?.output_tokens ?? usage?.completion_tokens ?? 0,
+      // Claude reports single-digit input_tokens against tens of thousands of
+      // cache-read tokens on a resumed session, so input+output alone books a
+      // tiny fraction of the real draw for the seat with the largest budget.
+      // normalizeClaudeJsonUsage already computes all four counts, an
+      // authoritative total and the provider's own cost, and they were dropped
+      // here. Forwarded so the ledger can book the real draw and prefer the
+      // provider's cost over the list-rate estimate; lib/usage-ledger.js's
+      // record() still recomputes totalTokens = input + output and ignores
+      // these until it is taught to read them.
+      cacheReadTokens: usage?.cache_read_input_tokens ?? 0,
+      cacheCreationTokens: usage?.cache_creation_input_tokens ?? 0,
+      totalTokens: Number.isFinite(Number(usage?.total_tokens)) ? Number(usage.total_tokens) : null,
+      providerCostUsd: Number.isFinite(Number(usage?.cost_usd)) ? Number(usage.cost_usd) : null,
       elapsedMs: startedAt ? Date.now() - startedAt : 0,
       ok, failureKind: failureKind || null, taskId: taskId || null,
     });
@@ -4874,6 +5127,9 @@ app.post('/api/install', (req, res) => {
     cwd: installCwd,
     env,
     windowsHide: true,
+    // npm/pip fan out into their own children; group-kill them when the
+    // 5-minute cap fires instead of leaving a half-finished install running.
+    detached: process.platform !== 'win32',
   }));
   let stdout = '';
   let stderr = '';
@@ -4894,6 +5150,10 @@ app.post('/api/install', (req, res) => {
     if (settled) return;
     settled = true;
     clearTimeout(t);
+    // An install is the one event that makes a PATH lookup stale on purpose:
+    // the seat the caller just installed must not stay "not installed" for the
+    // rest of the memo's TTL.
+    executableCache.clear();
     res.json({ kind, package: pkg, installer: entry.install_display, success: code === 0, exitCode: code, stdout, stderr });
   });
 });
@@ -5048,7 +5308,16 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
 
 wss.on('connection', (ws, req) => {
-  const url = new URL(req.url, `http://${req.headers.host}`);
+  // Same DNS-rebinding guard as the HTTP middleware, applied before the URL
+  // parse: a rebound page's socket really is loopback and only its Host names
+  // the attacker. Parsing an arbitrary Host into the base URL also throws for a
+  // malformed value, and a throw in this event handler costs the whole bridge.
+  const host = String(req.headers.host || '').toLowerCase();
+  if (host && !ALLOWED_HOSTS.has(host)) {
+    ws.close(1008, 'unauthorized');
+    return;
+  }
+  const url = new URL(req.url, `http://${host || `${HOST}:${PORT}`}`);
   const origin = req.headers.origin;
   const token = url.searchParams.get('token');
   if ((origin && !ALLOWED_ORIGINS.has(origin)) || !tokenMatches(token)) {
@@ -5097,6 +5366,25 @@ let remoteMcpStatus = { enabled: false, reason: 'initializing' };
   }
 })();
 app.get('/api/remote-mcp/status', (req, res) => res.json(remoteMcpStatus));
+
+// Terminal error handler. Without one, Express's finalhandler answers with
+// err.stack whenever NODE_ENV is unset — and express.json() runs ahead of the
+// /api token gate, so an UNAUTHENTICATED malformed body returned the absolute
+// checkout path, the Node version and the whole dependency layout in an HTML
+// 400. Log the stack locally, and answer with the message only when the error
+// marks itself safe to expose (body-parser's 400s do; a thrown handler bug
+// does not). Registered last because Express only reaches an error handler
+// that sits after the layer that failed; the remote-MCP route is mounted
+// asynchronously after this point and carries its own try/catch. The unused
+// 4th parameter is load-bearing: arity is how Express recognizes this as an
+// error handler rather than ordinary middleware.
+app.use((err, req, res, next) => {
+  console.error('[RelayBridge] request failed: ' + (err && err.stack ? err.stack : err));
+  if (res.headersSent) return next(err);
+  const status = Number(err && (err.status || err.statusCode)) || 500;
+  res.status(status >= 400 && status <= 599 ? status : 500)
+    .json({ error: err && err.expose && err.message ? err.message : 'request failed' });
+});
 
 
 server.listen(PORT, HOST, () => {

@@ -1,4 +1,4 @@
-# rb-template v1
+# rb-template v2
 # .github/workflows/version-on-merge.yml
 #
 # GitHub-native version tracking. This is the SOURCE OF TRUTH for versions —
@@ -105,7 +105,14 @@ jobs:
         if: vars.CREATE_RELEASE == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_NOTES: Auto-release for #${{ github.event.pull_request.number }}: ${{ github.event.pull_request.title }}
+          # Quoted deliberately. In an unquoted YAML plain scalar the " #"
+          # that opens the PR reference starts a COMMENT, so this value
+          # parsed as the bare string "Auto-release for" and every auto-cut
+          # Release shipped with no PR number and no title — the archive is
+          # the documented rollback point, and its provenance was empty.
+          # The notes still reach the shell as an env var and are never
+          # interpolated into the run: script, so a PR title cannot inject.
+          RELEASE_NOTES: "Auto-release for #${{ github.event.pull_request.number }}: ${{ github.event.pull_request.title }}"
         run: |
           gh release create "v$NEW_VERSION" \
             --title "v$NEW_VERSION" \

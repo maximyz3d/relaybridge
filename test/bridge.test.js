@@ -754,6 +754,12 @@ test('prompt-file transport preserves long special-character prompts and cleans 
       PS_BRIDGE_CONFIG_FILE: configPath,
       PS_BRIDGE_TOKEN_FILE: tokenPath,
       PS_BRIDGE_DATA_DIR: path.join(tempRoot, 'data'),
+      // TMPDIR as well as TEMP/TMP: on POSIX os.tmpdir() reads TMPDIR FIRST, so
+      // with TMPDIR exported (always on macOS, common in CI) the server wrote
+      // its prompt files and isolated provider homes to the system temp dir and
+      // promptTemp stayed empty — the cleanup assertions below then passed
+      // without testing anything, and would keep passing if every prompt leaked.
+      TMPDIR: promptTemp,
       TEMP: promptTemp,
       TMP: promptTemp,
       HOME: realProviderHome,

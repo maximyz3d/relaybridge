@@ -141,7 +141,17 @@ if (-not $SkipCodex) {
     'ask_provider', 'route_and_ask', 'run_committee',
     'list_agents', 'set_agent_tags', 'broadcast',
     'submit_task', 'get_task', 'list_tasks', 'cancel_task',
-    'provider_cooldowns', 'usage_gauges', 'usage_totals', 'usage_advise'
+    'provider_cooldowns', 'usage_gauges', 'usage_totals', 'usage_advise',
+    # The GitHub tools landed after this list was last extended, so a Codex user
+    # installed through this script silently lost the whole integration: the
+    # tools are registered by mcp/server.mjs but never advertised, with no error
+    # to notice. This is the local stdio adapter, which already exposes the
+    # mutating surface (restart_bridge, stop_bridge, set_agent_tags) - the
+    # read/write split in docs/CONNECTOR.md governs the remote profiles, not
+    # this list.
+    'github_repo_activity', 'github_list_versions', 'github_show_version',
+    'github_checkout_version', 'github_track_run', 'github_link_issue',
+    'github_onboard_repo'
   )
   $toolList = ($toolNames | ForEach-Object { '"' + $_ + '"' }) -join ', '
   $settings = @(

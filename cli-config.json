@@ -856,7 +856,7 @@
     ],
     "pip_package": "perplexity-web-mcp-cli",
     "install_command": [
-      "uv.exe",
+      "uv",
       "tool",
       "install",
       "--upgrade",
