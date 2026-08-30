@@ -6,6 +6,8 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 const { spawn } = require('child_process');
 
 const P = require('../lib/platform');
@@ -21,6 +23,12 @@ test('platform detection is coherent', () => {
     'exactly one OS flag is set');
   if (d.isWSL) assert.ok(d.isLinux, 'WSL is Linux to Node');
   assert.ok(d.label.length > 0);
+});
+
+test('WSL bootstrap installs the active Linux port, not the retired fuel-gauge branch', () => {
+  const setup = fs.readFileSync(path.join(__dirname, '..', 'setup-wsl.sh'), 'utf8');
+  assert.doesNotMatch(setup, /BRANCH=.*feat\/usage-fuel-gauge/);
+  assert.match(setup, /BRANCH="\$\{RELAYBRIDGE_BRANCH:-feat\/wsl-port-on-main\}"/);
 });
 
 // ---- shells ----------------------------------------------------------------

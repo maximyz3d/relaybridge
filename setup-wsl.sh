@@ -10,7 +10,10 @@ set -euo pipefail
 
 REPO_URL="https://github.com/maximyz3d/relaybridge.git"
 REPO_DIR="$HOME/projects/relaybridge"
-BRANCH="feat/usage-fuel-gauge"
+# Until the port lands on main, default to the branch that actually contains
+# the WSL/Linux implementation. Operators can still test another ref without
+# editing the bootstrap by setting RELAYBRIDGE_BRANCH.
+BRANCH="${RELAYBRIDGE_BRANCH:-feat/wsl-port-on-main}"
 NODE_MAJOR=22
 
 step() { printf '\n\033[36m== %s ==\033[0m\n' "$*"; }
