@@ -14,6 +14,7 @@ const { resolveModelArgs, applyModelArgs, modelConfigStaleness, modelTierForTask
 const { buildRegistry, parseModelList, pinIsRetired } = require('./lib/model-registry');
 const { buildTaskPlan, EFFORT_ORDER, costClassFor } = require('./lib/task-plan');
 const { buildQuotaSeatGroups } = require('./lib/quota-seat');
+const providerAccounts = require('./lib/provider-accounts');
 const { providerUsageCapability, providerUsageCapabilities } = require('./lib/provider-usage-capability');
 const platform = require('./lib/platform');
 const { receiptStoreIdentity } = require('./lib/receipt-store-identity.cjs');
@@ -4007,7 +4008,20 @@ async function executeOneShot(body, res) {
     promptFileDir = null;
   };
   const [bin, ...args] = slotResolved;
-  const childEnv = buildEnv({ ...oneShotEnv, ...(isolatedProviderHome?.env || {}) }, entry.strip_env || []);
+  // Multi-account: point the CLI's credential directory at the selected
+  // account before anything resolves the binary or builds the route metadata.
+  const dispatchAccount = resolveDispatchAccount(kind, entry);
+  const childEnv = buildEnv(
+    { ...oneShotEnv, ...(isolatedProviderHome?.env || {}) },
+    entry.strip_env || [],
+  );
+  // Applied AFTER buildEnv, never through it. strip_env is applied last inside
+  // buildEnv, so a seat that ever listed its own credential variable there
+  // would have it silently removed — and the run would then execute against
+  // whichever account the operator's own config directory holds. Running work
+  // on the wrong plan is worse than failing, so this assignment is not
+  // strippable.
+  Object.assign(childEnv, dispatchAccount.env);
   const resolvedBin = resolveExecutable(bin, childEnv);
   const flagValue = (name) => {
     const index = args.indexOf(name);
@@ -4020,6 +4034,11 @@ async function executeOneShot(body, res) {
   // guessing from a generic "Claude" label.
   const route = {
     provider: kind,
+    // Which of the provider's accounts paid for this run. Null for a seat with
+    // a single sign-in, so existing receipts are unchanged. It rides on the
+    // route because that is what reaches both the receipt and the ledger.
+    account: dispatchAccount.account ? dispatchAccount.account.id : null,
+    quota_seat: dispatchAccount.quotaSeat || null,
     transport: entry.transport || 'cli',
     configured_binary: bin,
     resolved_binary: resolvedBin,
@@ -4676,19 +4695,76 @@ const usageLedger = createUsageLedger({
   log: (m) => console.log(m),
 });
 
+// Which account should this dispatch run on, and what env makes the CLI use it?
+//
+// Returns the implicit single-account shape for every seat the operator has not
+// added a second plan to, so this is a no-op for an ordinary install: no env is
+// injected and the quotaSeat is exactly the one configured in cli-config.json.
+function resolveDispatchAccount(kind, entry) {
+  try {
+    const registry = accountRegistry();
+    const cooling = new Set(coolingQuotaStates().map((s) => s.quotaSeat).filter(Boolean));
+    let gauges = {};
+    try {
+      // Keyed by seat; re-key by quotaSeat so a per-account gauge can be found.
+      for (const gauge of Object.values(usageLedger.gaugeAll(seatCostClasses()) || {})) {
+        if (gauge && gauge.quotaSeat) gauges[gauge.quotaSeat] = gauge;
+      }
+    } catch { gauges = {}; }
+    const account = providerAccounts.selectAccount({
+      kind, entry, registry, dataDir: DATA_DIR, gauges, coolingQuotaSeats: cooling,
+    });
+    if (!account) return { account: null, env: {}, quotaSeat: null, exhausted: true };
+    return {
+      account,
+      env: providerAccounts.envForAccount({ entry, account, dataDir: DATA_DIR, kind }),
+      quotaSeat: account.quotaSeat,
+      exhausted: false,
+    };
+  } catch (err) {
+    // Never let account resolution break a dispatch that used to work.
+    console.log('[RelayBridge] account resolution failed, using the default sign-in: ' + err.message);
+    return { account: null, env: {}, quotaSeat: null, exhausted: false };
+  }
+}
+
 function seatCostClasses() {
   const cfg = loadConfig();
   const out = {};
   for (const [seat, entry] of Object.entries(cfg)) {
     if (seat.startsWith('_')) continue;
-    out[seat] = {
+    const base = {
       costClass: costClassFor(entry, seat),
       model: entry.model || null,
       quotaSeat: quotaSeatForProvider(seat),
       aliases: quotaSeatRegistry.groups[quotaSeatForProvider(seat)]?.providers || [seat],
     };
+    out[seat] = base;
+    // One gauge per linked account. gauge() already filters ledger rows by
+    // quotaSeat and looks its budget up by quotaSeat first, so emitting an
+    // extra seat config per account is all that separate allowances need —
+    // without this, three plans drain one bar and the operator cannot see
+    // which of them is nearly empty. Keyed 'seat#account' so it never collides
+    // with the seat's own entry, which stays exactly as it was.
+    try {
+      for (const account of providerAccounts.accountsFor(seat, entry, accountRegistry())) {
+        if (account.implicit) continue;
+        out[`${seat}#${account.id}`] = { ...base, quotaSeat: account.quotaSeat, aliases: [seat] };
+      }
+    } catch { /* a malformed registry must not break fleet accounting */ }
   }
   return out;
+}
+
+// Cached per call-site rather than per seat: seatCostClasses() runs on the
+// routing path and re-reading the registry once per provider would put 14 file
+// reads on it.
+let _accountRegistryCache = { at: 0, value: { providers: {} } };
+function accountRegistry() {
+  const now = Date.now();
+  if (now - _accountRegistryCache.at < 2000) return _accountRegistryCache.value;
+  _accountRegistryCache = { at: now, value: providerAccounts.loadRegistry(DATA_DIR) };
+  return _accountRegistryCache.value;
 }
 
 function seatCostClassMap() {
@@ -4725,6 +4801,10 @@ function recordRunUsage({ kind, route, usage, model, startedAt, ok, failureKind,
     const classes = seatCostClasses();
     usageLedger.record({
       seat: kind,
+      // Per-account attribution: three plans on one provider are three
+      // allowances, and pooling them back into one gauge would hide the fact
+      // that one of them is nearly drained.
+      quotaSeat: route?.quota_seat || null,
       // route.resolved_model is only ever assigned by the two API adapters, so
       // every CLI seat (claude, codex, gemini, copilot, cursor, grok,
       // perplexity) recorded model:null — which prices an Opus run at the
@@ -4754,6 +4834,96 @@ function recordRunUsage({ kind, route, usage, model, startedAt, ok, failureKind,
     });
   } catch (err) { console.log('[RelayBridge] usage record failed: ' + err.message); }
 }
+
+// ---- Multiple accounts per provider ----
+//
+// Link several subscriptions to one seat: each account gets its own credential
+// directory and its own quotaSeat, so the ledger, the cooldown store and the
+// load leveller treat them as separate allowances that the router drains in
+// turn. Three Claude plans behave as three seats to spend, not one.
+app.get('/api/accounts', (req, res) => {
+  const cfg = loadConfig();
+  const registry = providerAccounts.loadRegistry(DATA_DIR);
+  const cooling = new Set(coolingQuotaStates().map((s) => s.quotaSeat).filter(Boolean));
+  let gauges = {};
+  try {
+    for (const g of Object.values(usageLedger.gaugeAll(seatCostClasses()) || {})) {
+      if (g && g.quotaSeat) gauges[g.quotaSeat] = g;
+    }
+  } catch { gauges = {}; }
+  const out = {};
+  for (const [kind, entry] of Object.entries(cfg)) {
+    if (kind.startsWith('_') || !entry || typeof entry !== 'object') continue;
+    const credentialEnv = providerAccounts.credentialEnvFor(entry);
+    const accounts = providerAccounts.accountsFor(kind, entry, registry).map((a) => ({
+      id: a.id,
+      label: a.label,
+      quotaSeat: a.quotaSeat,
+      enabled: a.enabled,
+      implicit: a.implicit,
+      provisioned: providerAccounts.accountIsProvisioned({ entry, account: a, dataDir: DATA_DIR, kind }),
+      cooling: cooling.has(a.quotaSeat),
+      percentRemaining: Number.isFinite(Number(gauges[a.quotaSeat]?.percentRemaining))
+        ? Number(gauges[a.quotaSeat].percentRemaining) : null,
+    }));
+    // Only report seats that can actually hold more than one account, so the
+    // dashboard does not offer to link a second plan to a seat whose CLI has
+    // no way to relocate its credentials.
+    out[kind] = {
+      label: entry.label || kind,
+      credentialEnv,
+      supportsMultipleAccounts: !!credentialEnv,
+      accounts,
+    };
+  }
+  res.json({ providers: out, dataDir: path.join(DATA_DIR, 'accounts') });
+});
+
+app.post('/api/accounts/:kind', (req, res) => {
+  const kind = String(req.params.kind);
+  const entry = loadConfig()[kind];
+  if (!entry || kind.startsWith('_')) return res.status(404).json({ error: `unknown provider '${kind}'` });
+  if (!providerAccounts.credentialEnvFor(entry)) {
+    return res.status(400).json({
+      error: `${kind} does not declare credential_env, so its credentials cannot be separated per account`,
+      hint: 'add "credential_env": "<ENV_VAR>" to this provider in cli-config.json',
+    });
+  }
+  try {
+    providerAccounts.addAccount(DATA_DIR, kind, { id: req.body?.id, label: req.body?.label });
+  } catch (err) { return res.status(400).json({ error: err.message }); }
+  const dir = providerAccounts.accountDir(DATA_DIR, kind, String(req.body.id));
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const login = Array.isArray(entry.login_command) ? entry.login_command : null;
+  res.json({
+    ok: true, kind, id: String(req.body.id), credentialDir: dir,
+    // The bridge cannot complete an interactive OAuth flow on the operator's
+    // behalf, so hand back the exact command that signs THIS account in.
+    signInCommand: login
+      ? `${providerAccounts.credentialEnvFor(entry)}=${dir} ${login.join(' ')}`
+      : `${providerAccounts.credentialEnvFor(entry)}=${dir} <this provider's login command>`,
+    note: 'Run that command in a terminal, complete the sign-in, then this account becomes selectable.',
+  });
+});
+
+app.post('/api/accounts/:kind/:id/enabled', (req, res) => {
+  try {
+    providerAccounts.setAccountEnabled(DATA_DIR, String(req.params.kind), String(req.params.id), !!req.body?.enabled);
+    res.json({ ok: true });
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+app.delete('/api/accounts/:kind/:id', (req, res) => {
+  const kind = String(req.params.kind);
+  const id = String(req.params.id);
+  try {
+    // Removing the registry entry alone would leave a live session token on
+    // disk, so forget the credentials too unless the caller asks to keep them.
+    if (req.query.keepCredentials !== '1') providerAccounts.forgetAccountCredentials(DATA_DIR, kind, id);
+    providerAccounts.removeAccount(DATA_DIR, kind, id);
+    res.json({ ok: true, credentialsRemoved: req.query.keepCredentials !== '1' });
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
 
 app.get('/api/usage/gauges', (req, res) => {
   try {

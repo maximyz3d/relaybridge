@@ -90,6 +90,7 @@
     ]
   },
   "claude": {
+    "credential_env": "CLAUDE_CONFIG_DIR",
     "label": "Claude Code",
     "oneshot_safe_filesystem_policy": "unverified_provider_policy",
     "supervisor": {
@@ -220,6 +221,7 @@
     "npm_package": "@anthropic-ai/claude-code"
   },
   "claude_fable": {
+    "credential_env": "CLAUDE_CONFIG_DIR",
     "label": "Claude Fable 5",
     "oneshot_safe_filesystem_policy": "unverified_provider_policy",
     "supervisor": {
@@ -324,6 +326,7 @@
     "_note": "Fable 5 is an explicit lower-cost/review seat on the same Claude subscription. Readiness proves the installed CLI and login; an actual receipt is required before claiming end-to-end model availability."
   },
   "codex": {
+    "credential_env": "CODEX_HOME",
     "label": "Codex",
     "oneshot_safe_filesystem_policy": "unverified_provider_policy",
     "effort_flags": {
@@ -428,6 +431,7 @@
     "npm_package": "@openai/codex"
   },
   "copilot": {
+    "credential_env": "GH_CONFIG_DIR",
     "label": "GitHub Copilot CLI",
     "oneshot_safe_filesystem_policy": "unverified_provider_policy",
     "login_command": [
