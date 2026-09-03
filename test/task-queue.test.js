@@ -32,6 +32,20 @@ const settled = async (q, id, tries = 60) => {
   throw new Error(`task ${id} never settled (status ${q.get(id)?.status})`);
 };
 
+test('a caller-reserved task id is persisted exactly once', async () => {
+  const dir = tmpdir();
+  const q = createTaskQueue({
+    dataDir: dir,
+    executeOneShot: fakeExecutor(async () => ({ payload: { stdout: 'reserved', exitCode: 0 } })),
+  });
+  const task = q.submitReserved('t_reserved_1', { kind: 'claude', prompt: 'bounded work' });
+  assert.equal(task.id, 't_reserved_1');
+  assert.throws(() => q.submitReserved('t_reserved_1', { kind: 'claude', prompt: 'duplicate' }),
+    /task id already exists/);
+  assert.equal((await settled(q, task.id)).status, 'done');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 test('submit returns immediately with an id; the result arrives later', async () => {
   const dir = tmpdir();
   let released;

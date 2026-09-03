@@ -12,11 +12,14 @@ const { RunSupervisor, resolveSupervisorOptions, normalizeProviderBudget } = req
 const { validateProviderBudget } = require('./lib/provider-budget');
 const { resolveModelArgs, applyModelArgs, modelConfigStaleness, modelTierForTaskTier } = require('./lib/model-tiers');
 const { buildRegistry, parseModelList, pinIsRetired } = require('./lib/model-registry');
-const { buildTaskPlan, EFFORT_ORDER, costClassFor } = require('./lib/task-plan');
+const { buildTaskPlan, costClassFor } = require('./lib/task-plan');
+const { createWorkflowPipeline } = require('./lib/workflow-pipeline');
+const { createWorkflowController } = require('./lib/workflow-controller');
 const { buildQuotaSeatGroups } = require('./lib/quota-seat');
 const providerAccounts = require('./lib/provider-accounts');
 const { providerUsageCapability, providerUsageCapabilities } = require('./lib/provider-usage-capability');
 const platform = require('./lib/platform');
+const { validateBrowserUrl, browserOpeners } = require('./lib/browser-launch');
 const { receiptStoreIdentity } = require('./lib/receipt-store-identity.cjs');
 const {
   resolveFilesystemPolicy, providerFilesystemEligibility,
@@ -41,6 +44,21 @@ function loadBuildId() {
   return BRIDGE_VERSION;
 }
 const BRIDGE_BUILD_ID = loadBuildId();
+
+// Cross-provider effort vocabulary.  `max` is deliberately an intent rather
+// than a value we blindly pass to every CLI: Codex's highest normal value is
+// `xhigh`, while other providers may expose a literal `max` flag.  The adapter
+// below resolves the intent through provider-declared controls and records the
+// value that was actually sent.
+const SUPPORTED_EFFORTS = Object.freeze(['minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
+const EXTREME_EFFORTS = new Set(['xhigh', 'max']);
+const EFFORT_BY_TASK_TIER = Object.freeze({
+  deterministic: 'minimal',
+  utility: 'low',
+  standard: 'medium',
+  complex: 'high',
+  critical: 'high',
+});
 
 // ---- config ----
 const PORT = parseInt(process.env.PORT || '8787', 10);
@@ -462,13 +480,15 @@ if (ptyMode !== 'none') {
 
 // ---- persisted state (permissions toggle) ----
 function loadState() {
+  const stickyDangerous = envFirst('RELAYBRIDGE_ALLOW_STICKY_DANGEROUS', 'PS_BRIDGE_ALLOW_STICKY_DANGEROUS') === '1';
+  const startDangerous = envFirst('RELAYBRIDGE_START_FULL_PERMISSIONS', 'PS_BRIDGE_START_FULL_PERMISSIONS') === '1';
   try {
     const saved = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
     return {
-      fullPermissions: envFirst('RELAYBRIDGE_ALLOW_STICKY_DANGEROUS', 'PS_BRIDGE_ALLOW_STICKY_DANGEROUS') === '1' && saved.fullPermissions === true,
+      fullPermissions: stickyDangerous && (startDangerous || saved.fullPermissions === true),
     };
   } catch {
-    return { fullPermissions: false };
+    return { fullPermissions: stickyDangerous && startDangerous };
   }
 }
 function saveState(s) {
@@ -478,6 +498,20 @@ let state = loadState();
 
 // ---- Persistent collabs (group chats) + projects -----------------------
 const DATA_DIR = path.resolve(envFirst('RELAYBRIDGE_DATA_DIR', 'PS_BRIDGE_DATA_DIR') || path.join(ROOT, 'data'));
+const WSL_NATIVE_RUNTIME = platform.wslNativeRuntimeStatus({
+  checkout: ROOT,
+  data: DATA_DIR,
+  token: TOKEN_FILE,
+  config: CONFIG_FILE,
+  node: process.execPath,
+});
+if (!WSL_NATIVE_RUNTIME.ok) {
+  throw new Error(
+    `RelayBridge refuses slow WSL /mnt execution for: ${WSL_NATIVE_RUNTIME.issues.join(', ')}. `
+    + 'Move the checkout and runtime files under the Linux home directory, use Linux-native Node/CLIs, '
+    + 'or explicitly set RELAYBRIDGE_ALLOW_SLOW_WSL_FS=1 to override.',
+  );
+}
 const COLLABS_DIR = path.join(DATA_DIR, 'collabs');
 const RUNS_DIR = path.join(DATA_DIR, 'runs');
 const RECEIPTS_DIR = path.join(DATA_DIR, 'receipts');
@@ -1151,6 +1185,237 @@ function resolveSlot(slot) {
     const candidate = path.join(ROOT, arg);
     return fs.existsSync(candidate) ? candidate : arg;
   });
+}
+
+function normalizeEffort(value) {
+  const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  return SUPPORTED_EFFORTS.includes(normalized) ? normalized : null;
+}
+
+function parseReasoningEffortAssignment(value) {
+  const match = /^(model_reasoning_effort|reasoning_effort)\s*=\s*(.+)$/i.exec(String(value || '').trim());
+  if (!match) return null;
+  const rawValue = match[2].trim().replace(/^(["'])(.*)\1$/, '$2').toLowerCase();
+  const effort = normalizeEffort(rawValue);
+  return effort ? { key: match[1], effort } : null;
+}
+
+// Inspect only the explicit, documented effort forms RelayBridge knows how to
+// reason about.  Unknown config assignments are left alone rather than being
+// guessed at and then reported as an applied control.
+function findEffortControl(args) {
+  if (!Array.isArray(args)) return null;
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if ((arg === '--effort' || arg === '--reasoning-effort') && index + 1 < args.length) {
+      const effort = normalizeEffort(String(args[index + 1]));
+      if (effort) return { index, width: 2, effort, flag: arg, method: 'flag' };
+    }
+    if ((arg === '--config' || arg === '-c') && index + 1 < args.length) {
+      const assignment = parseReasoningEffortAssignment(args[index + 1]);
+      if (assignment) {
+        return {
+          index, width: 2, effort: assignment.effort, flag: arg,
+          configKey: assignment.key, method: 'config',
+        };
+      }
+    }
+    const inlineConfig = /^--config=(.*)$/i.exec(String(arg || ''));
+    const assignment = inlineConfig ? parseReasoningEffortAssignment(inlineConfig[1]) : null;
+    if (assignment) {
+      return {
+        index, width: 1, effort: assignment.effort, flag: '--config',
+        configKey: assignment.key, method: 'config',
+      };
+    }
+  }
+  return null;
+}
+
+function stripEffortControls(args) {
+  const out = [];
+  let firstRemovedAt = null;
+  for (let index = 0; index < args.length;) {
+    const control = findEffortControl(args.slice(index));
+    if (!control) {
+      out.push(...args.slice(index));
+      break;
+    }
+    const absoluteIndex = index + control.index;
+    out.push(...args.slice(index, absoluteIndex));
+    if (firstRemovedAt == null) firstRemovedAt = out.length;
+    index = absoluteIndex + control.width;
+  }
+  return { args: out, firstRemovedAt };
+}
+
+function effortArgsInsertIndex(slot, entry = {}, preferredIndex = null) {
+  if (Number.isInteger(preferredIndex)) return Math.max(1, Math.min(preferredIndex, slot.length));
+  if (Number.isInteger(entry.effort_arg_index)) {
+    return Math.max(1, Math.min(entry.effort_arg_index, slot.length));
+  }
+  const promptFileAt = slot.findIndex((arg) => typeof arg === 'string' && arg.includes('{prompt_file}'));
+  if (promptFileAt >= 0) {
+    // Keep `--prompt-file {prompt_file}` together.  This also leaves a script
+    // path immediately after `node`, which makes deterministic CLI fixtures a
+    // faithful stand-in for real providers.
+    return promptFileAt > 0 && String(slot[promptFileAt - 1]).startsWith('-')
+      ? promptFileAt - 1 : promptFileAt;
+  }
+  const inlinePromptAt = slot.findIndex((arg) => typeof arg === 'string' && arg.includes('{prompt}'));
+  if (inlinePromptAt >= 0) return inlinePromptAt;
+  if (slot.length > 1 && slot.at(-1) === '-') return slot.length - 1;
+  return slot.length;
+}
+
+function insertEffortArgs(slot, effortArgs, entry = {}, preferredIndex = null) {
+  const out = slot.slice();
+  const at = effortArgsInsertIndex(out, entry, preferredIndex);
+  out.splice(at, 0, ...effortArgs);
+  return out;
+}
+
+function configuredEffortArgs(entry, requestedEffort) {
+  const configured = entry?.effort_flags?.[requestedEffort];
+  if (!Array.isArray(configured) || !configured.length || configured.some((arg) => typeof arg !== 'string')) {
+    return null;
+  }
+  return configured.slice();
+}
+
+function configuredReasoningEffortFamily(entry) {
+  const values = entry?.effort_flags && typeof entry.effort_flags === 'object'
+    ? Object.values(entry.effort_flags) : [];
+  for (const args of values) {
+    const control = findEffortControl(args);
+    if (control?.method === 'config' && control.configKey) {
+      return { flag: control.flag === '-c' ? '-c' : '--config', key: control.configKey };
+    }
+  }
+  return null;
+}
+
+function modelImpliedEffort(modelChoice, entry = {}) {
+  if (!modelChoice?.model) return null;
+  const suffix = /(?:^|-)(minimal|low|medium|high|xhigh|max)$/i.exec(String(modelChoice.model));
+  if (suffix) return suffix[1].toLowerCase();
+  // A configured weight class is the only effort expression for several local
+  // providers.  Do not make this claim for Codex-style seats, where model size
+  // and reasoning effort are independent controls.
+  if (entry.effort_flags && Object.keys(entry.effort_flags).length) return null;
+  return { light: 'low', standard: 'medium', heavy: 'high' }[modelChoice.modelTier] || null;
+}
+
+function applyProviderEffort({ slot, entry = {}, modelChoice = {}, requestedEffort = null }) {
+  const existing = findEffortControl(slot);
+  if (!requestedEffort) {
+    if (existing) {
+      return {
+        slot, appliedEffort: existing.effort,
+        method: existing.method === 'config' ? 'effort_flags' : 'flag',
+        control: existing.configKey ? `${existing.flag} ${existing.configKey}` : existing.flag,
+      };
+    }
+    const implied = modelImpliedEffort(modelChoice, entry);
+    return {
+      slot, appliedEffort: implied,
+      method: implied ? 'model_choice' : 'account_default',
+      control: implied ? 'model' : null,
+    };
+  }
+
+  let effortArgs = configuredEffortArgs(entry, requestedEffort);
+  let method = effortArgs ? 'effort_flags' : null;
+
+  // Current Codex accepts xhigh through model_reasoning_effort, but older
+  // configurations may predate an explicit xhigh row.  Seeing that exact
+  // configuration family is enough to construct xhigh safely.  Never perform
+  // the same synthesis for max: Codex does not accept a literal max and must
+  // use the provider's declared max fallback instead.
+  const configFamily = configuredReasoningEffortFamily(entry)
+    || (existing?.method === 'config' && existing.configKey
+      ? { flag: existing.flag, key: existing.configKey } : null);
+  if (!effortArgs && requestedEffort === 'xhigh' && configFamily) {
+    effortArgs = [configFamily.flag, `${configFamily.key}=xhigh`];
+    method = 'effort_flags';
+  }
+
+  if (!effortArgs && existing?.method === 'flag') {
+    effortArgs = [existing.flag, requestedEffort];
+    method = 'flag';
+  }
+  if (!effortArgs && existing?.method === 'config' && requestedEffort !== 'max') {
+    effortArgs = [existing.flag, `${existing.configKey}=${requestedEffort}`];
+    method = 'effort_flags';
+  }
+
+  if (effortArgs) {
+    const actual = findEffortControl(effortArgs);
+    if (!actual) {
+      return { error: 'configured effort_flags do not contain a recognized effort control' };
+    }
+    const stripped = stripEffortControls(slot);
+    return {
+      slot: insertEffortArgs(stripped.args, effortArgs, entry, stripped.firstRemovedAt),
+      appliedEffort: actual.effort,
+      method,
+      control: actual.configKey ? `${actual.flag} ${actual.configKey}` : actual.flag,
+    };
+  }
+
+  const implied = modelImpliedEffort(modelChoice, entry);
+  if (implied === requestedEffort) {
+    return { slot, appliedEffort: implied, method: 'model_choice', control: 'model' };
+  }
+  return {
+    error: `provider cannot express requested effort=${requestedEffort}`
+      + (implied ? `; selected model tier applies ${implied}` : ''),
+  };
+}
+
+function annotateRequestedPlanEffort(plan, config, requestedEffort) {
+  plan.effort = requestedEffort;
+  const candidates = new Set([
+    plan.primary,
+    ...(Array.isArray(plan.alternates) ? plan.alternates : []),
+    plan.cheapestCapable,
+  ].filter(Boolean));
+  for (const candidate of candidates) {
+    candidate.effort = requestedEffort;
+    const entry = config?.[candidate.kind] || {};
+    let effortArgs = configuredEffortArgs(entry, requestedEffort);
+    const family = configuredReasoningEffortFamily(entry);
+    if (!effortArgs && requestedEffort === 'xhigh' && family) {
+      effortArgs = [family.flag, `${family.key}=xhigh`];
+    }
+    const baseSlot = Array.isArray(entry.oneshot_safe) ? entry.oneshot_safe : [];
+    const baseControl = findEffortControl(baseSlot);
+    if (!effortArgs && baseControl?.method === 'flag') {
+      effortArgs = [baseControl.flag, requestedEffort];
+    }
+    if (!effortArgs && baseControl?.method === 'config' && requestedEffort !== 'max') {
+      effortArgs = [baseControl.flag, `${baseControl.configKey}=${requestedEffort}`];
+    }
+    const actual = findEffortControl(effortArgs || []);
+    if (actual) {
+      candidate.args = stripEffortControls(Array.isArray(candidate.args) ? candidate.args : []).args
+        .concat(effortArgs);
+      candidate.effortMethod = actual.method === 'config' ? 'effort_flags' : 'flag';
+      candidate.appliedEffort = actual.effort;
+      candidate.effortSupported = true;
+      continue;
+    }
+    const implied = modelImpliedEffort({ model: candidate.model, modelTier: candidate.modelTier }, entry);
+    candidate.appliedEffort = implied;
+    candidate.effortSupported = implied === requestedEffort;
+    if (candidate.effortSupported) candidate.effortMethod = 'model_choice';
+  }
+  if (plan.primary?.effortSupported === false) {
+    plan.guidance = [
+      ...(Array.isArray(plan.guidance) ? plan.guidance : []),
+      `${plan.primary.label || plan.primary.kind} cannot express effort=${requestedEffort} with its selected model/control; execution will reject before spending provider quota.`,
+    ];
+  }
 }
 
 function buildEnv(extras = {}, stripNames = []) {
@@ -2767,6 +3032,12 @@ app.get('/api/health', (req, res) => {
     capabilityAuth: true,
     tokenAcl: TOKEN_ACL,
     stickyDangerousEnabled: envFirst('RELAYBRIDGE_ALLOW_STICKY_DANGEROUS', 'PS_BRIDGE_ALLOW_STICKY_DANGEROUS') === '1',
+    startFullPermissionsEnabled: envFirst('RELAYBRIDGE_START_FULL_PERMISSIONS', 'PS_BRIDGE_START_FULL_PERMISSIONS') === '1',
+    runtime: {
+      platform: platform.detectPlatform().label,
+      wslNative: WSL_NATIVE_RUNTIME,
+      nativeProviderBinariesOnly: !ALLOW_WIN_INTEROP,
+    },
     pid: process.pid,
     instanceId: INSTANCE_ID,
     startedAt: STARTED_AT,
@@ -3388,8 +3659,9 @@ app.post('/api/plan', async (req, res) => {
   if (!task || typeof task !== 'string' || !task.trim()) {
     return res.status(400).json({ error: 'task (non-empty string) required' });
   }
-  if (effort && !EFFORT_ORDER.includes(String(effort).toLowerCase())) {
-    return res.status(400).json({ error: `effort must be one of: ${EFFORT_ORDER.join(', ')}` });
+  const requestedEffort = effort ? normalizeEffort(String(effort)) : null;
+  if (effort && !requestedEffort) {
+    return res.status(400).json({ error: `effort must be one of: ${SUPPORTED_EFFORTS.join(', ')}` });
   }
   let requestedProviderBudget;
   try {
@@ -3436,10 +3708,14 @@ app.post('/api/plan', async (req, res) => {
       config: cfg,
       registry: modelRegistry,
       resolveModelArgs,
-      requestedEffort: effort || null,
+      // lib/task-plan predates xhigh.  Use its conservative high mechanics to
+      // choose the same provider/model, then restore the caller's explicit
+      // xhigh intent below; execution performs the provider capability check.
+      requestedEffort: requestedEffort === 'xhigh' ? 'high' : requestedEffort,
       requestedKind: kind || null,
       requestedProviderBudget,
     });
+    if (requestedEffort) annotateRequestedPlanEffort(plan, cfg, requestedEffort);
     res.json({ ok: true, task: task.slice(0, 400), ...plan, fleetState: route.fleetState });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -3996,17 +4272,25 @@ async function executeOneShot(body, res) {
     return rejectBeforeAdmission(400, 'validation', { error: err.message });
   }
   const requestedEffort = typeof body?.effort === 'string' ? body.effort.trim().toLowerCase() : null;
-  if (requestedEffort && !['low', 'medium', 'high', 'max'].includes(requestedEffort)) {
-    return rejectBeforeAdmission(400, 'validation', { error: 'effort must be low, medium, high, or max' });
-  }
-  if (requestedEffort === 'max' && body?.maxEffortOverride !== true) {
+  if (requestedEffort && !SUPPORTED_EFFORTS.includes(requestedEffort)) {
     return rejectBeforeAdmission(400, 'validation', {
-      error: 'effort=max requires maxEffortOverride=true; RelayBridge never infers maximum effort',
+      error: `effort must be one of: ${SUPPORTED_EFFORTS.join(', ')}`,
     });
   }
-  if (body?.maxEffortOverride === true && requestedEffort !== 'max') {
-    return rejectBeforeAdmission(400, 'validation', { error: 'maxEffortOverride is valid only with effort=max' });
+  if (EXTREME_EFFORTS.has(requestedEffort) && body?.maxEffortOverride !== true) {
+    return rejectBeforeAdmission(400, 'validation', {
+      error: `effort=${requestedEffort} requires maxEffortOverride=true; RelayBridge never infers xhigh/max effort`,
+    });
   }
+  if (body?.maxEffortOverride === true && !EXTREME_EFFORTS.has(requestedEffort)) {
+    return rejectBeforeAdmission(400, 'validation', {
+      error: 'maxEffortOverride is valid only with effort=xhigh or effort=max',
+    });
+  }
+  const tierEffort = !requestedEffort && typeof body?.taskTier === 'string'
+    ? EFFORT_BY_TASK_TIER[body.taskTier.trim().toLowerCase()] || null
+    : null;
+  const effectiveEffort = requestedEffort || tierEffort;
   // A provider-wide readiness probe describes the operator's implicit/default
   // login. Linked credential directories are separate authority domains, so a
   // positive signed-out result excludes only that implicit account; account
@@ -4075,14 +4359,40 @@ async function executeOneShot(body, res) {
     entry,
     modelChoice.suppressArgs,
   );
-  if (requestedEffort) {
-    const effortFlagIndex = slot.findIndex((arg) => arg === '--effort' || arg === '--reasoning-effort');
-    if (effortFlagIndex < 0 || effortFlagIndex + 1 >= slot.length) {
-      return rejectBeforeAdmission(400, 'validation', { error: `${kind} does not expose an explicit effort control` });
-    }
-    slot = [...slot];
-    slot[effortFlagIndex + 1] = requestedEffort;
+  let effortResolution = applyProviderEffort({
+    slot, entry, modelChoice, requestedEffort: effectiveEffort,
+  });
+  let effortFallbackReason = null;
+  // A task tier is a routing preference, not an assertion that every custom
+  // provider exposes an effort knob. Apply the inferred value when the
+  // provider can express it; otherwise run on its honest account default.
+  // An explicit caller request remains strict and still fails before launch.
+  if (effortResolution.error && !requestedEffort && tierEffort) {
+    effortFallbackReason = effortResolution.error;
+    effortResolution = applyProviderEffort({
+      slot, entry, modelChoice, requestedEffort: null,
+    });
   }
+  if (effortResolution.error) {
+    return rejectBeforeAdmission(400, 'validation', {
+      error: `${kind} ${effortResolution.error}`,
+      requestedEffort: effectiveEffort,
+      appliedEffort: null,
+    }, {
+      provider: kind,
+      task_tier: typeof body?.taskTier === 'string' ? body.taskTier : null,
+      model_tier: modelChoice.modelTier,
+      requested_effort: requestedEffort,
+      target_effort: effectiveEffort,
+      applied_effort: null,
+      effort_explicit: !!requestedEffort,
+      effort_source: requestedEffort ? 'request' : (tierEffort ? 'task_tier' : 'provider_default'),
+      max_effort_override: EXTREME_EFFORTS.has(requestedEffort) && body?.maxEffortOverride === true,
+      effort_method: 'unsupported',
+      request_id: requestId,
+    });
+  }
+  slot = effortResolution.slot;
   const safePromptPrefix = !useDanger && typeof entry.oneshot_safe_prompt_prefix === 'string'
     ? entry.oneshot_safe_prompt_prefix.trim() : '';
   if (safePromptPrefix.length > 4096) {
@@ -4305,17 +4615,23 @@ async function executeOneShot(body, res) {
     transport: entry.transport || 'cli',
     configured_binary: bin,
     resolved_binary: resolvedBin,
+    task_tier: typeof body?.taskTier === 'string' ? body.taskTier : null,
+    requested_model_tier: typeof body?.modelTier === 'string' ? body.modelTier : null,
+    model_tier: modelChoice.modelTier,
     requested_model: (modelFlagSent ? flagValue(modelFlagSent) : null) || entry.model || null,
     model_flag_sent: modelFlagSent,
     resolved_model_identity: entry.model
       ? `${entry.model}${ollamaManifestIdentity(entry) ? `@${ollamaManifestIdentity(entry)}` : ''}`
       : null,
-    requested_effort: flagValue('--effort') || flagValue('--reasoning-effort'),
+    requested_effort: requestedEffort,
+    target_effort: effectiveEffort,
+    applied_effort: effortResolution.appliedEffort,
     effort_explicit: !!requestedEffort,
-    max_effort_override: requestedEffort === 'max' && body?.maxEffortOverride === true,
-    effort_method: (flagValue('--effort') || flagValue('--reasoning-effort'))
-      ? 'flag'
-      : (modelChoice.model ? 'model_choice' : 'account_default'),
+    effort_source: requestedEffort ? 'request' : (tierEffort ? 'task_tier' : 'provider_default'),
+    max_effort_override: EXTREME_EFFORTS.has(requestedEffort) && body?.maxEffortOverride === true,
+    effort_method: effortResolution.method,
+    effort_control: effortResolution.control,
+    effort_fallback_reason: effortFallbackReason,
     suppressed_cli_flags: (modelChoice.suppressArgs || []).map((spec) => spec.flag),
     dangerous: useDanger,
     filesystem_policy: filesystemPolicy,
@@ -4864,10 +5180,13 @@ app.post('/api/tasks', async (req, res) => {
     const { classifyTask } = await import('./mcp/router.mjs');
     const classifiedTaskTier = typeof input.prompt === 'string'
       ? classifyTask(input.prompt).tier : undefined;
+    const taskTier = typeof input.taskTier === 'string' ? input.taskTier : classifiedTaskTier;
+    const modelTier = typeof input.modelTier === 'string'
+      ? input.modelTier : modelTierForTaskTier(taskTier);
     const budgetTaskTier = typeof input.budgetTaskTier === 'string'
       ? input.budgetTaskTier
-      : (typeof input.taskTier === 'string' ? input.taskTier : classifiedTaskTier);
-    res.json(taskQueue.submit({ ...input, providerBudget, budgetTaskTier }));
+      : taskTier;
+    res.json(taskQueue.submit({ ...input, providerBudget, budgetTaskTier, taskTier, modelTier }));
   }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
@@ -4885,6 +5204,119 @@ app.get('/api/tasks/:id', (req, res) => {
 app.post('/api/tasks/:id/cancel', (req, res) => {
   try { res.json(taskQueue.cancel(req.params.id)); }
   catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// ---- Codex -> Claude staged workflows -----------------------------------
+// The controller owns phase dispatch; the pipeline owns durable artifacts and
+// the single canonical-workspace writer lease.  Provider tasks stay in the
+// existing queue so they survive client disconnects and retain normal receipt,
+// quota, timeout, and filesystem-policy handling.
+const workflowPipeline = createWorkflowPipeline({ dataDir: DATA_DIR });
+const workflowController = createWorkflowController({
+  pipeline: workflowPipeline,
+  taskQueue,
+  loadConfig,
+  log: (message) => console.log(message),
+});
+
+const WORKFLOW_NOT_FOUND_CODES = new Set(['WORKFLOW_NOT_FOUND', 'NOT_FOUND']);
+const WORKFLOW_CONFLICT_CODES = new Set([
+  'WORKFLOW_EXISTS', 'WORKFLOW_TERMINAL', 'INVALID_TRANSITION',
+  'WRITER_CONFLICT', 'WRITER_TASK_RUNNING', 'LEASE_MISMATCH', 'LEASE_MISSING',
+  'LEASE_EXPIRED', 'LEASE_NOT_REQUIRED', 'REVISION_NOT_REQUESTED',
+  'REVISION_REQUIRED', 'PROVIDER_TASK_ACTIVE', 'PROVIDER_TASK_MISMATCH',
+  'PROVIDER_TASK_REUSED', 'FULL_PERMISSION_REQUIRED',
+]);
+
+function sendWorkflowError(res, error) {
+  const code = typeof error?.code === 'string' ? error.code : 'WORKFLOW_ERROR';
+  const status = WORKFLOW_NOT_FOUND_CODES.has(code) ? 404
+    : WORKFLOW_CONFLICT_CODES.has(code) ? 409
+      : code === 'PROVIDER_UNAVAILABLE' ? 503
+        : code.startsWith('INVALID_') || code === 'PATH_ESCAPE' ? 400 : 500;
+  return res.status(status).json({
+    ok: false,
+    code,
+    error: status === 500 ? 'workflow operation failed' : error.message,
+    ...(status !== 500 && error?.details ? { details: error.details } : {}),
+  });
+}
+
+function workflowCreationInput(body) {
+  const permissionMode = body.permissionMode == null ? 'safe' : body.permissionMode;
+  const acknowledged = body.acknowledgeFilesystemWrites === true;
+  if (permissionMode === 'full' && !acknowledged) {
+    const error = new Error('permissionMode=full requires acknowledgeFilesystemWrites=true');
+    error.code = 'INVALID_ARGUMENT';
+    throw error;
+  }
+  if (permissionMode !== 'full' && acknowledged) {
+    const error = new Error('acknowledgeFilesystemWrites is valid only with permissionMode=full');
+    error.code = 'INVALID_ARGUMENT';
+    throw error;
+  }
+  return {
+    ...body,
+    cwd: resolveAllowedCwd(body.cwd),
+    permissionMode,
+  };
+}
+
+app.post('/api/workflows', (req, res) => {
+  try {
+    const workflow = workflowController.create(workflowCreationInput(req.body || {}));
+    res.status(201).json({ workflow, nextActions: workflowController.nextActions(workflow) });
+  } catch (error) { sendWorkflowError(res, error); }
+});
+
+app.get('/api/workflows', (req, res) => {
+  try {
+    const limit = req.query.limit == null ? 50 : Number(req.query.limit);
+    res.json({ workflows: workflowController.list({ phase: req.query.phase || undefined, limit }) });
+  } catch (error) { sendWorkflowError(res, error); }
+});
+
+app.get('/api/workflows/:runId', (req, res) => {
+  try {
+    res.json(workflowController.view(req.params.runId, {
+      includeArtifacts: req.query.includeArtifacts !== 'false',
+    }));
+  } catch (error) { sendWorkflowError(res, error); }
+});
+
+app.post('/api/workflows/:runId/research', (req, res) => {
+  try { res.status(202).json(workflowController.submitResearch(req.params.runId, req.body || {})); }
+  catch (error) { sendWorkflowError(res, error); }
+});
+
+app.post('/api/workflows/:runId/implementation/claim', (req, res) => {
+  try { res.json(workflowController.startImplementation(req.params.runId, req.body || {})); }
+  catch (error) { sendWorkflowError(res, error); }
+});
+
+app.post('/api/workflows/:runId/implementation/complete', (req, res) => {
+  try { res.status(202).json(workflowController.completeImplementation(req.params.runId, req.body || {})); }
+  catch (error) { sendWorkflowError(res, error); }
+});
+
+app.post('/api/workflows/:runId/revision/start', (req, res) => {
+  try { res.status(202).json(workflowController.startRevision(req.params.runId, req.body || {})); }
+  catch (error) { sendWorkflowError(res, error); }
+});
+
+app.post('/api/workflows/:runId/final-review/start', (req, res) => {
+  try { res.status(202).json(workflowController.startFinalReview(req.params.runId)); }
+  catch (error) { sendWorkflowError(res, error); }
+});
+
+app.post('/api/workflows/:runId/lease/renew', (req, res) => {
+  try { res.json(workflowController.renewWriterLease(req.params.runId, req.body || {})); }
+  catch (error) { sendWorkflowError(res, error); }
+});
+
+app.post('/api/workflows/:runId/cancel', (req, res) => {
+  try { res.json(workflowController.cancel(req.params.runId, req.body || {})); }
+  catch (error) { sendWorkflowError(res, error); }
 });
 
 // ---- Usage ledger + fuel gauge (lib/usage-ledger.js) ---------------------
@@ -5952,7 +6384,9 @@ app.post('/api/broadcast', async (req, res) => {
     activeCaptured.add(captured);
     executeOneShot({
       kind, prompt, timeoutMs: remainingMs, cwd, dangerous,
-      providerBudget: validatedProviderBudget, budgetTaskTier, effort, maxEffortOverride,
+      providerBudget: validatedProviderBudget, budgetTaskTier,
+      taskTier: budgetTaskTier, modelTier: modelTierForTaskTier(budgetTaskTier),
+      effort, maxEffortOverride,
     }, captured)
       .catch((err) => captured.status(500).json({ error: err.message, dropped_out: true }));
     try { return await captured.done; }
@@ -6082,9 +6516,10 @@ app.post('/api/install', (req, res) => {
 // shows the answer; you copy it into the Collab's Shared Context box.
 // Localhost-only server, only http(s) URLs allowed.
 app.post('/api/open-url', (req, res) => {
-  const { url } = req.body || {};
-  if (!url || typeof url !== 'string') return res.status(400).json({ error: 'url required' });
-  if (!/^https?:\/\//i.test(url)) return res.status(400).json({ error: 'only http(s) urls allowed' });
+  const { browser = 'default' } = req.body || {};
+  let url;
+  try { url = validateBrowserUrl(req.body?.url); }
+  catch (error) { return res.status(400).json({ error: error.message }); }
   const plat = platform.detectPlatform();
   // Openers to try, in order. A spawn ENOENT is an ASYNC 'error' event, not a
   // throw, so the try/catch below cannot see it — an unhandled 'error' on a
@@ -6094,10 +6529,8 @@ app.post('/api/open-url', (req, res) => {
   // On WSL a Linux-side xdg-open cannot reach the user's Windows browser even
   // when xdg-utils is installed, so interop openers come first there.
   let openers;
-  if (plat.isWindows) openers = ['explorer.exe'];
-  else if (plat.isMac) openers = ['open'];
-  else if (plat.isWSL) openers = ['wslview', 'explorer.exe', 'xdg-open'];
-  else openers = ['xdg-open', 'gio', 'x-www-browser'];
+  try { openers = browserOpeners(browser, plat, url); }
+  catch (error) { return res.status(400).json({ error: error.message }); }
 
   let replied = false;
   const reply = (fn) => { if (replied) return; replied = true; fn(); };
@@ -6105,15 +6538,14 @@ app.post('/api/open-url', (req, res) => {
   const tryOpener = (i) => {
     if (i >= openers.length) {
       return reply(() => res.status(501).json({
-        error: `no URL opener available on ${plat.label} (tried: ${openers.join(', ')})`,
+        error: `no ${browser} browser opener available on ${plat.label} (tried: ${openers.map((entry) => entry.bin).join(', ')})`,
         hint: plat.isWSL
           ? 'install wslu for wslview, or open the URL manually'
           : 'install xdg-utils, or open the URL manually',
         url,
       }));
     }
-    const bin = openers[i];
-    const args = bin === 'gio' ? ['open', url] : [url];
+    const { bin, args } = openers[i];
     let child;
     try {
       child = spawn(bin, args, { windowsHide: true, detached: true, stdio: 'ignore' });
@@ -6123,7 +6555,7 @@ app.post('/api/open-url', (req, res) => {
     child.on('error', () => { tryOpener(i + 1); });
     child.on('spawn', () => {
       child.unref();
-      reply(() => res.json({ ok: true, url, opener: bin }));
+      reply(() => res.json({ ok: true, url, browser, opener: bin }));
     });
   };
   tryOpener(0);

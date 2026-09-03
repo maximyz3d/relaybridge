@@ -27,9 +27,7 @@
       "claude_fable": {
         "slots": [
           "safe",
-          "dangerous",
-          "oneshot_safe",
-          "oneshot_dangerous"
+          "oneshot_safe"
         ],
         "args": [
           {
@@ -84,13 +82,13 @@
   },
   "_models": {
     "_note": "Model selection inside a provider. Routing tiers map to weight classes: utility->light, standard->standard, complex/critical->heavy. Provider lineups change on weeks-long cycles, so prefer stable aliases (claude opus/sonnet/haiku) over versioned ids, and leave model_tiers unset where the account decides which models exist (cursor, copilot, grok) — a missing flag runs, a retired one fails every call. Discovery at boot reconciles these pins against each CLI's own model list.",
-    "modelsCheckedAt": "2026-08-20",
+    "modelsCheckedAt": "2026-09-03",
     "staleAfterDays": 45,
     "discoverOnBoot": true,
     "discoveryTimeoutMs": 20000,
     "discoveryMaxAgeMs": 86400000,
     "verifyCommands": {
-      "claude": "claude --help (aliases: opus, sonnet, haiku)",
+      "claude": "claude --help (aliases: fable, opus, sonnet, haiku)",
       "codex": "codex --help; see developers.openai.com/codex/models",
       "cursor": "agent models",
       "gemini": "agy models",
@@ -120,7 +118,7 @@
       ".credentials.json"
     ],
     "label": "Claude Code",
-    "oneshot_safe_filesystem_policy": "unverified_provider_policy",
+    "oneshot_safe_filesystem_policy": "read_only_enforced",
     "supervisor": {
       "providerBudgetByTaskTier": {
         "standard": {
@@ -184,19 +182,36 @@
     "color": "#cc785c",
     "safe": [
       "claude",
+      "--safe-mode",
+      "--restricted",
+      "--strict-mcp-config",
+      "--mcp-config",
+      "{\"mcpServers\":{}}",
+      "--tools",
+      "Read,Glob,Grep",
       "--permission-mode",
       "plan",
+      "--autocompact",
+      "150k",
       "--model",
-      "opus",
+      "sonnet",
       "--effort",
-      "high"
+      "medium"
     ],
     "dangerous": [
       "claude",
+      "--safe-mode",
+      "--strict-mcp-config",
+      "--mcp-config",
+      "{\"mcpServers\":{}}",
+      "--tools",
+      "Read,Glob,Grep,Edit,Write,Bash",
+      "--autocompact",
+      "150k",
       "--model",
-      "opus",
+      "sonnet",
       "--effort",
-      "high",
+      "medium",
       "--dangerously-skip-permissions"
     ],
     "oneshot_safe": [
@@ -206,12 +221,22 @@
       "stream-json",
       "--verbose",
       "--include-partial-messages",
+      "--safe-mode",
+      "--restricted",
+      "--strict-mcp-config",
+      "--mcp-config",
+      "{\"mcpServers\":{}}",
+      "--tools",
+      "Read,Glob,Grep",
       "--permission-mode",
       "plan",
+      "--no-session-persistence",
+      "--autocompact",
+      "150k",
       "--model",
-      "opus",
+      "sonnet",
       "--effort",
-      "high"
+      "medium"
     ],
     "oneshot_dangerous": [
       "claude",
@@ -220,10 +245,19 @@
       "stream-json",
       "--verbose",
       "--include-partial-messages",
+      "--safe-mode",
+      "--strict-mcp-config",
+      "--mcp-config",
+      "{\"mcpServers\":{}}",
+      "--tools",
+      "Read,Glob,Grep,Edit,Write,Bash",
+      "--no-session-persistence",
+      "--autocompact",
+      "150k",
       "--model",
-      "opus",
+      "sonnet",
       "--effort",
-      "high",
+      "medium",
       "--dangerously-skip-permissions"
     ],
     "oneshot_output_parser": "claude_json",
@@ -256,7 +290,7 @@
       ".credentials.json"
     ],
     "label": "Claude Fable 5",
-    "oneshot_safe_filesystem_policy": "unverified_provider_policy",
+    "oneshot_safe_filesystem_policy": "read_only_enforced",
     "supervisor": {
       "providerBudgetByTaskTier": {
         "standard": {
@@ -280,6 +314,16 @@
     "models_static": [
       "fable"
     ],
+    "model_tiers": {
+      "heavy": {
+        "args": [
+          "--model",
+          "fable"
+        ],
+        "model": "fable",
+        "note": "explicit hardest-planning tier; Fable is never used as a writer"
+      }
+    },
     "tags": [
       "coding",
       "audit",
@@ -289,25 +333,27 @@
     "company": "Anthropic",
     "transport": "subscription:anthropic",
     "quota_seat": "subscription:anthropic:default",
-    "model": "claude-fable-5",
+    "model": "fable",
     "color": "#d99574",
     "safe": [
       "claude",
+      "--safe-mode",
+      "--restricted",
+      "--strict-mcp-config",
+      "--mcp-config",
+      "{\"mcpServers\":{}}",
+      "--tools",
+      "Read,Glob,Grep",
       "--permission-mode",
       "plan",
+      "--autocompact",
+      "150k",
       "--model",
       "fable",
       "--effort",
       "high"
     ],
-    "dangerous": [
-      "claude",
-      "--model",
-      "fable",
-      "--effort",
-      "high",
-      "--dangerously-skip-permissions"
-    ],
+    "dangerous": [],
     "oneshot_safe": [
       "claude",
       "-p",
@@ -315,26 +361,24 @@
       "stream-json",
       "--verbose",
       "--include-partial-messages",
+      "--safe-mode",
+      "--restricted",
+      "--strict-mcp-config",
+      "--mcp-config",
+      "{\"mcpServers\":{}}",
+      "--tools",
+      "Read,Glob,Grep",
       "--permission-mode",
       "plan",
+      "--no-session-persistence",
+      "--autocompact",
+      "150k",
       "--model",
       "fable",
       "--effort",
       "high"
     ],
-    "oneshot_dangerous": [
-      "claude",
-      "-p",
-      "--output-format",
-      "stream-json",
-      "--verbose",
-      "--include-partial-messages",
-      "--model",
-      "fable",
-      "--effort",
-      "high",
-      "--dangerously-skip-permissions"
-    ],
+    "oneshot_dangerous": [],
     "oneshot_output_parser": "claude_json",
     "probe": [
       "claude",
@@ -358,7 +402,7 @@
       "CLAUDE_CODE_USE_FOUNDRY"
     ],
     "npm_package": "@anthropic-ai/claude-code",
-    "_note": "Fable 5 is an explicit lower-cost/review seat on the same Claude subscription. Readiness proves the installed CLI and login; an actual receipt is required before claiming end-to-end model availability."
+    "_note": "Fable 5 is an explicit heavy planning/review tier on the same Claude subscription. It has no writer slot; revisions use the Claude Sonnet writer so route metadata matches the invoked model. Readiness proves the installed CLI and login; an actual receipt is required before claiming end-to-end model availability."
   },
   "codex": {
     "credential_env": "CODEX_HOME",
@@ -366,7 +410,7 @@
       "auth.json"
     ],
     "label": "Codex",
-    "oneshot_safe_filesystem_policy": "unverified_provider_policy",
+    "oneshot_safe_filesystem_policy": "read_only_enforced",
     "effort_flags": {
       "minimal": [
         "--config",
@@ -384,11 +428,16 @@
         "--config",
         "model_reasoning_effort=high"
       ],
+      "xhigh": [
+        "--config",
+        "model_reasoning_effort=xhigh"
+      ],
       "max": [
         "--config",
-        "model_reasoning_effort=high"
+        "model_reasoning_effort=xhigh"
       ]
     },
+    "_effort_note": "Codex CLI configuration supports xhigh as its highest normal reasoning value. RelayBridge maps an explicit cross-provider max request to xhigh instead of silently reducing it to high.",
     "login_command": [
       "codex",
       "login"
@@ -441,6 +490,8 @@
       "--skip-git-repo-check",
       "--sandbox",
       "read-only",
+      "--ignore-user-config",
+      "--ignore-rules",
       "--ephemeral",
       "-"
     ],
@@ -448,6 +499,9 @@
       "codex",
       "exec",
       "--skip-git-repo-check",
+      "--ignore-user-config",
+      "--ignore-rules",
+      "--ephemeral",
       "--dangerously-bypass-approvals-and-sandbox",
       "-"
     ],

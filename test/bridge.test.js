@@ -61,24 +61,31 @@ test('provider config uses the installed subscription CLIs and safe headless mod
       args: [{ flag: '--effort', value_count: 1 }],
     },
     claude_fable: {
-      slots: ['safe', 'dangerous', 'oneshot_safe', 'oneshot_dangerous'],
+      slots: ['safe', 'oneshot_safe'],
       args: [{ flag: '--effort', value_count: 1 }],
     },
   });
   assert.equal(config.claude.safe[config.claude.safe.indexOf('--permission-mode') + 1], 'plan');
   assert.equal(config.claude.oneshot_safe[config.claude.oneshot_safe.indexOf('--permission-mode') + 1], 'plan');
-  assert.equal(config.claude.oneshot_safe_filesystem_policy, 'unverified_provider_policy');
+  assert.equal(config.claude.oneshot_safe_filesystem_policy, 'read_only_enforced');
+  for (const flag of ['--safe-mode', '--restricted', '--strict-mcp-config', '--no-session-persistence', '--autocompact']) {
+    assert.ok(config.claude.oneshot_safe.includes(flag), `claude safe one-shot includes ${flag}`);
+  }
+  assert.equal(config.claude.oneshot_safe[config.claude.oneshot_safe.indexOf('--tools') + 1], 'Read,Glob,Grep');
+  assert.equal(config.claude.oneshot_safe[config.claude.oneshot_safe.indexOf('--mcp-config') + 1], '{"mcpServers":{}}');
   assert.equal(config.claude.oneshot_safe[config.claude.oneshot_safe.indexOf('--output-format') + 1], 'stream-json');
   assert.ok(config.claude.oneshot_safe.includes('--include-partial-messages'));
   assert.equal(config.claude.oneshot_output_parser, 'claude_json');
   assert.deepEqual(config.claude.probe, ['claude', 'auth', 'status']);
   assert.ok(config.claude.strip_env.includes('ANTHROPIC_API_KEY'));
   assert.ok(config.claude.strip_env.includes('CLAUDE_CODE_OAUTH_TOKEN'));
-  assert.equal(config.claude.safe[config.claude.safe.indexOf('--model') + 1], 'opus');
+  assert.equal(config.claude.safe[config.claude.safe.indexOf('--model') + 1], 'sonnet');
   assert.equal(config.claude.quota_seat, 'subscription:anthropic:default');
   assert.equal(config.claude_fable.safe[config.claude_fable.safe.indexOf('--model') + 1], 'fable');
   assert.equal(config.claude_fable.safe[config.claude_fable.safe.indexOf('--effort') + 1], 'high');
   assert.equal(config.claude_fable.oneshot_safe[config.claude_fable.oneshot_safe.indexOf('--effort') + 1], 'high');
+  assert.equal(config.claude_fable.oneshot_safe_filesystem_policy, 'read_only_enforced');
+  assert.deepEqual(config.claude_fable.oneshot_dangerous, [], 'Fable is never a writer');
   for (const kind of ['claude', 'claude_fable']) {
     for (const slot of ['safe', 'dangerous', 'oneshot_safe', 'oneshot_dangerous']) {
       assert.notEqual(config[kind][slot][config[kind][slot].indexOf('--effort') + 1], 'max',
@@ -88,14 +95,16 @@ test('provider config uses the installed subscription CLIs and safe headless mod
   assert.equal(config.claude_fable.oneshot_safe[config.claude_fable.oneshot_safe.indexOf('--output-format') + 1], 'stream-json');
   assert.ok(config.claude_fable.oneshot_safe.includes('--include-partial-messages'));
   assert.equal(config.claude_fable.oneshot_output_parser, 'claude_json');
-  assert.equal(config.claude_fable.model, 'claude-fable-5');
+  assert.equal(config.claude_fable.model, 'fable');
   assert.equal(config.claude_fable.quota_seat, config.claude.quota_seat);
   assert.deepEqual(config.claude_fable.probe, ['claude', 'auth', 'status']);
   assert.ok(config.claude_fable.strip_env.includes('ANTHROPIC_API_KEY'));
   assert.ok(config.claude_fable.strip_env.includes('CLAUDE_CODE_OAUTH_TOKEN'));
   assert.equal(config.codex.safe[config.codex.safe.indexOf('--sandbox') + 1], 'read-only');
   assert.equal(config.codex.oneshot_safe[config.codex.oneshot_safe.indexOf('--sandbox') + 1], 'read-only');
-  assert.equal(config.codex.oneshot_safe_filesystem_policy, 'unverified_provider_policy');
+  assert.equal(config.codex.oneshot_safe_filesystem_policy, 'read_only_enforced');
+  assert.ok(config.codex.oneshot_safe.includes('--ignore-user-config'));
+  assert.ok(config.codex.oneshot_safe.includes('--ignore-rules'));
   assert.ok(config.codex.oneshot_safe.includes('--ephemeral'));
   assert.deepEqual(config.codex.probe, ['codex', 'login', 'status']);
   assert.ok(config.codex.strip_env.includes('CODEX_ACCESS_TOKEN'));
@@ -515,6 +524,20 @@ test('prompt-file transport preserves long special-character prompts and cleans 
       oneshot_dangerous: [...baseSlot, '--claude-json', '--effort', 'high'],
       oneshot_output_parser: 'claude_json',
     },
+    codex_effort: {
+      label: 'Codex Reasoning Effort Fixture',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: baseSlot,
+      oneshot_dangerous: baseSlot,
+      effort_flags: {
+        minimal: ['--config', 'model_reasoning_effort=minimal'],
+        low: ['--config', 'model_reasoning_effort=low'],
+        medium: ['--config', 'model_reasoning_effort=medium'],
+        high: ['--config', 'model_reasoning_effort=high'],
+        max: ['--config', 'model_reasoning_effort=xhigh'],
+      },
+    },
     queued_controls: {
       label: 'Queued Claude Control Forwarding',
       transport: 'subscription:anthropic',
@@ -812,6 +835,10 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(runningHealth.fullPermissions, false);
   assert.equal(runningHealth.buildId, TEST_BUILD_ID);
   assert.equal(runningHealth.stickyDangerousEnabled, false);
+  assert.equal(runningHealth.startFullPermissionsEnabled, false);
+  assert.equal(typeof runningHealth.runtime.platform, 'string');
+  assert.equal(runningHealth.runtime.wslNative.ok, true);
+  assert.equal(runningHealth.runtime.nativeProviderBinariesOnly, true);
   assert.deepEqual(runningHealth.oneShotTimeoutPolicy, { minimumMs: 1000, defaultMs: 1200000, maxMs: 2700000 });
   assert.ok(Object.prototype.hasOwnProperty.call(runningHealth, 'tokenAcl'));
   if (process.platform === 'win32') {
@@ -1649,6 +1676,17 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(clearedUsage.gauges.usage_json.basis, 'configured');
   assert.deepEqual(clearedUsage.operatorQuota, {});
 
+  const xhighPlanResponse = await fetch(baseUrl + '/api/plan', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ task: 'review a difficult architecture', kind: 'codex_effort', effort: 'xhigh' }),
+  });
+  assert.equal(xhighPlanResponse.status, 200);
+  const xhighPlan = await xhighPlanResponse.json();
+  assert.equal(xhighPlan.effort, 'xhigh');
+  assert.equal(xhighPlan.primary.effort, 'xhigh');
+  assert.equal(xhighPlan.primary.appliedEffort, 'xhigh');
+  assert.equal(xhighPlan.primary.effortSupported, true);
+
   const maxEffortRejected = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST', headers: jsonAuth,
     body: JSON.stringify({ kind: 'usage_json', prompt: 'do not infer max', effort: 'max', dangerous: false }),
@@ -1669,6 +1707,66 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(maxEffortExplicitResult.route.requested_effort, 'max');
   assert.equal(maxEffortExplicitResult.route.effort_explicit, true);
   assert.equal(maxEffortExplicitResult.route.max_effort_override, true);
+
+  const codexMinimalResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({
+      kind: 'codex_effort', prompt: 'CODEX_MINIMAL_OK', effort: 'minimal', dangerous: false,
+    }),
+  });
+  assert.equal(codexMinimalResponse.status, 200);
+  const codexMinimal = await codexMinimalResponse.json();
+  assert.equal(codexMinimal.stdout, 'CODEX_MINIMAL_OK');
+  assert.equal(codexMinimal.route.requested_effort, 'minimal');
+  assert.equal(codexMinimal.route.applied_effort, 'minimal');
+  assert.equal(codexMinimal.route.effort_method, 'effort_flags');
+  assert.equal(codexMinimal.route.effort_control, '--config model_reasoning_effort');
+
+  const codexXhighRejected = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ kind: 'codex_effort', prompt: 'do not infer xhigh', effort: 'xhigh', dangerous: false }),
+  });
+  assert.equal(codexXhighRejected.status, 400);
+  assert.match((await codexXhighRejected.json()).error, /maxEffortOverride=true/);
+
+  const codexXhighResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({
+      kind: 'codex_effort', prompt: 'CODEX_XHIGH_OK', effort: 'xhigh',
+      maxEffortOverride: true, dangerous: false,
+    }),
+  });
+  assert.equal(codexXhighResponse.status, 200);
+  const codexXhigh = await codexXhighResponse.json();
+  assert.equal(codexXhigh.stdout, 'CODEX_XHIGH_OK');
+  assert.equal(codexXhigh.route.requested_effort, 'xhigh');
+  assert.equal(codexXhigh.route.applied_effort, 'xhigh');
+  assert.equal(codexXhigh.route.effort_method, 'effort_flags');
+  assert.equal(codexXhigh.route.max_effort_override, true);
+
+  const codexMaxResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({
+      kind: 'codex_effort', prompt: 'CODEX_MAX_FALLBACK_OK', effort: 'max',
+      maxEffortOverride: true, dangerous: false,
+    }),
+  });
+  assert.equal(codexMaxResponse.status, 200);
+  const codexMax = await codexMaxResponse.json();
+  assert.equal(codexMax.stdout, 'CODEX_MAX_FALLBACK_OK');
+  assert.equal(codexMax.route.requested_effort, 'max');
+  assert.equal(codexMax.route.applied_effort, 'xhigh', 'Codex max resolves through its configured highest valid value');
+  assert.equal(codexMax.route.effort_method, 'effort_flags');
+
+  const unsupportedEffortResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ kind: 'echo', prompt: 'UNSUPPORTED_EFFORT', effort: 'minimal', dangerous: false }),
+  });
+  assert.equal(unsupportedEffortResponse.status, 400);
+  const unsupportedEffort = await unsupportedEffortResponse.json();
+  assert.match(unsupportedEffort.error, /cannot express requested effort=minimal/);
+  assert.equal(unsupportedEffort.model_invocation, false);
+  assert.equal(unsupportedEffort.route.effort_method, 'unsupported');
 
   const malformedModelsResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST',
@@ -2055,6 +2153,11 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   }
   assert.equal(completedTask.status, 'done', completedTask.error || 'CLI background task did not complete');
   assert.equal(completedTask.result, tempRoot);
+  assert.equal(completedTask.route.requested_effort, null);
+  assert.equal(completedTask.route.target_effort, 'low');
+  assert.equal(completedTask.route.applied_effort, null);
+  assert.equal(completedTask.route.effort_method, 'account_default');
+  assert.match(completedTask.route.effort_fallback_reason, /cannot express requested effort=low/);
 
   // Regression: the durable queue used to whitelist only prompt/cwd/user.
   // A caller explicitly requested Claude heavy/max plus a low test budget,
@@ -3587,6 +3690,12 @@ test('agents listing, tag updates, and broadcast fan-out respect auth, autoRoute
     oneshot_dangerous: [process.execPath, helper, '--prompt-file', '{prompt_file}', ...slotExtra],
     diagnostic_binary: process.execPath,
     probe: [process.execPath, helper, '--version'],
+    effort_flags: {
+      minimal: ['--reasoning-effort', 'minimal'],
+      low: ['--reasoning-effort', 'low'],
+      medium: ['--reasoning-effort', 'medium'],
+      high: ['--reasoning-effort', 'high'],
+    },
     ...extra,
   });
   fs.writeFileSync(configPath, JSON.stringify({

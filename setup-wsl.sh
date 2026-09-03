@@ -19,6 +19,13 @@ NODE_MAJOR=22
 
 step() { printf '\n\033[36m== %s ==\033[0m\n' "$*"; }
 
+case "$REPO_DIR" in
+  /mnt|/mnt/*)
+    echo "ERROR: RELAYBRIDGE must live on WSL's native Linux filesystem (for example ~/projects), not $REPO_DIR." >&2
+    exit 1
+    ;;
+esac
+
 # Privileged installs are best-effort, not preconditions. On a box provisioned
 # without passwordless sudo — node and gh installed as tarballs under ~/.local
 # and ~/.npm-global — the first `sudo apt-get update` failed and `set -e` killed
@@ -77,6 +84,12 @@ else
   exit 1
 fi
 node -v; npm -v
+case "$(command -v node)" in
+  /mnt|/mnt/*)
+    echo 'ERROR: Windows-side Node was found through /mnt. Install Linux-native Node inside WSL.' >&2
+    exit 1
+    ;;
+esac
 
 step "GitHub CLI"
 if command -v gh >/dev/null 2>&1; then

@@ -53,6 +53,31 @@ test('WSL bootstrap verifies that /dev/tty opens before allowing sudo to prompt'
   assert.match(setup, /\(: < \/dev\/tty\) 2>\/dev\/null/);
 });
 
+test('WSL native-runtime policy rejects /mnt state and Windows-side Node', () => {
+  assert.equal(P.isSlowWslInteropPath('/mnt/c/Users/example/project'), true);
+  assert.equal(P.isSlowWslInteropPath('/home/example/project'), false);
+  const status = P.wslNativeRuntimeStatus({
+    checkout: '/home/example/project',
+    data: '/mnt/c/relay-data',
+    token: '/home/example/project/.bridge-token',
+    node: '/mnt/c/Program Files/nodejs/node.exe',
+  }, { platform: { isWSL: true }, allowSlow: false });
+  assert.equal(status.applicable, true);
+  assert.equal(status.enforced, true);
+  assert.equal(status.ok, false);
+  assert.deepEqual(status.issues, ['data', 'node']);
+  assert.equal(status.nativeFilesystem, false);
+  assert.equal(status.nativeNode, false);
+});
+
+test('non-WSL hosts are unaffected by the WSL-native policy', () => {
+  const status = P.wslNativeRuntimeStatus({ checkout: '/mnt/c/project' }, {
+    platform: { isWSL: false }, allowSlow: false,
+  });
+  assert.equal(status.applicable, false);
+  assert.equal(status.ok, true);
+});
+
 // ---- shells ----------------------------------------------------------------
 
 posixOnly('a POSIX system resolves a real default shell', () => {
