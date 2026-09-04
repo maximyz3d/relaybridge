@@ -168,13 +168,21 @@ default; install their Linux CLI instead of relying on WSL interop.
 Windows Chrome is the intentional GUI exception. `start-chrome-debug.sh` uses
 `powershell.exe` only to launch Windows Chrome with a separate profile at
 `%LOCALAPPDATA%\RelayBridge\ChromeDevToolsProfile`, bound to
-`http://127.0.0.1:9222`; the MCP process and AI clients remain in WSL. If the
-endpoint is not reachable, enable WSL mirrored networking and rerun the script.
+`http://127.0.0.1:9222`; the MCP process and AI clients remain in WSL. Mirrored
+networking reaches that endpoint directly. Under WSL NAT, the launcher instead
+creates a narrow two-hop forward: Linux-native `socat` listens only on WSL
+`127.0.0.1:9222`, and Windows `node.exe` listens on a distinct high port only
+on the verified Hyper-V WSL adapter. The Windows helper accepts only the current
+distro IP and forwards only to Chrome's Windows loopback. It does not add or
+weaken firewall rules. The NAT fallback therefore requires Linux `socat` and
+Windows Node; installing either under `/mnt` is still not allowed for the main
+RelayBridge runtime.
 This profile is separate from normal Chrome, but it is persistent and may retain
 cookies or site data. Treat anyone able to reach its DevTools port as able to
-control that browser: keep the port on loopback, never tunnel or expose it, use
-only accounts appropriate for automation, and close the dedicated Chrome when
-finished.
+control that browser: do not publish either listener to wildcard, LAN, VPN, or
+internet addresses, use only accounts appropriate for automation, and close the
+dedicated Chrome when finished. Mirrored networking remains the preferred path;
+the source-restricted private adapter hop exists only for WSL NAT compatibility.
 
 Chrome MCP installs in slim mode by default. Slim mode covers the usual
 navigation, page evaluation, and screenshot workflow while keeping the tool

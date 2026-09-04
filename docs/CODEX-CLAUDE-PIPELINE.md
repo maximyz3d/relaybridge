@@ -92,9 +92,14 @@ provider binaries through interop.
 `powershell.exe` to launch Windows Chrome while the MCP server and both AI CLIs
 remain Linux-native. Chrome uses the dedicated persistent profile
 `%LOCALAPPDATA%\RelayBridge\ChromeDevToolsProfile` and exposes DevTools only at
-`http://127.0.0.1:9222`. WSL must be able to reach that loopback endpoint;
-enable mirrored networking if the launch check says it cannot. The registration
-pins `chrome-devtools-mcp` and defaults to its token-efficient slim mode.
+`http://127.0.0.1:9222`. Mirrored networking uses that loopback path directly.
+When WSL is in NAT mode, the launcher automatically uses Linux-native `socat`
+on WSL loopback plus a Windows-Node helper bound only to the verified Hyper-V
+WSL adapter on a separate high port. The helper allow-lists this distro's current
+private IP, targets only Chrome's Windows loopback, and never changes firewall
+policy. The fallback requires both Linux `socat` and Windows `node.exe`. The
+registration pins `chrome-devtools-mcp` and defaults to its token-efficient slim
+mode.
 
 Slim mode supplies the normal navigation, page-evaluation, and screenshot
 tools. If a bounded task needs the console, network, or performance families,
@@ -106,11 +111,12 @@ Claude:
 ```
 
 DevTools access is full browser control, not a sandbox or authentication
-mechanism. Keep the port loopback-only, never publish it through a tunnel or
-port proxy, avoid sensitive personal sessions in the automation profile, and
-close the dedicated Chrome when the task is done. Its separate profile prevents
-accidental reuse of the normal Chrome profile, but it may retain its own
-cookies, history, and site data between launches.
+mechanism. Never bind either hop to wildcard, LAN, VPN, or internet addresses;
+do not add broad firewall exceptions. Prefer mirrored networking when available.
+Avoid sensitive personal sessions in the automation profile, and close the
+dedicated Chrome when the task is done. Its separate profile prevents accidental
+reuse of the normal Chrome profile, but it may retain its own cookies, history,
+and site data between launches.
 
 ## Phase protocol
 

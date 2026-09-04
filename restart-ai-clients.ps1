@@ -35,12 +35,29 @@ $ErrorActionPreference = 'Stop'
 # Exact process names only. Killing by wildcard here would be dangerous: "Code"
 # and "Claude" are common substrings, and this script force-terminates.
 $clients = @(
-  @{ Key = 'claude';      Label = 'Claude Desktop / Cowork'; Names = @('Claude') }
+  # Claude Code's native Windows CLI is also named claude.exe. Never treat its
+  # per-user native install as the Desktop/Cowork Electron application.
+  @{ Key = 'claude';      Label = 'Claude Desktop / Cowork'; Names = @('Claude'); ExcludePathPattern = '(?i)[\\/]\.local[\\/]bin[\\/]claude\.exe$' }
   @{ Key = 'cursor';      Label = 'Cursor';                  Names = @('Cursor') }
   @{ Key = 'antigravity'; Label = 'Gemini / Antigravity';    Names = @('Antigravity') }
   @{ Key = 'vscode';      Label = 'VS Code';                 Names = @('Code') }
   @{ Key = 'windsurf';    Label = 'Windsurf';                Names = @('Windsurf') }
 )
+
+function Get-ClientProcesses($client) {
+  $found = @()
+  foreach ($name in $client.Names) {
+    $found += @(Get-Process -Name $name -ErrorAction SilentlyContinue)
+  }
+  if ($client.ExcludePathPattern) {
+    $found = @($found | Where-Object {
+      $processPath = $null
+      try { $processPath = $_.Path } catch { }
+      $processPath -and $processPath -notmatch $client.ExcludePathPattern
+    })
+  }
+  return @($found)
+}
 
 if ($Only.Count) {
   $wanted = $Only | ForEach-Object { $_.ToLower() }
@@ -52,10 +69,7 @@ $restarted = @()
 $missing = @()
 
 foreach ($client in $clients) {
-  $procs = @()
-  foreach ($name in $client.Names) {
-    $procs += @(Get-Process -Name $name -ErrorAction SilentlyContinue)
-  }
+  $procs = @(Get-ClientProcesses $client)
   if (-not $procs.Count) {
     $missing += $client.Label
     continue
@@ -64,7 +78,8 @@ foreach ($client in $clients) {
   # Capture the exe path BEFORE killing: afterwards there is nothing to ask.
   # The main window owner is the right one to relaunch; helpers share the path
   # but are started by the parent, so any non-empty path works.
-  $exe = ($procs | Where-Object { $_.Path } | Select-Object -First 1).Path
+  $exe = ($procs | Where-Object { $_.MainWindowHandle -ne 0 -and $_.Path } | Select-Object -First 1).Path
+  if (-not $exe) { $exe = ($procs | Where-Object { $_.Path } | Select-Object -First 1).Path }
   $count = $procs.Count
 
   if (-not $PSCmdlet.ShouldProcess("$($client.Label) ($count process(es))", 'restart')) { continue }
@@ -78,15 +93,13 @@ foreach ($client in $clients) {
 
   $deadline = (Get-Date).AddSeconds($GraceSeconds)
   while ((Get-Date) -lt $deadline) {
-    $alive = @()
-    foreach ($name in $client.Names) { $alive += @(Get-Process -Name $name -ErrorAction SilentlyContinue) }
+    $alive = @(Get-ClientProcesses $client)
     if (-not $alive.Count) { break }
     Start-Sleep -Milliseconds 400
   }
 
   # Whatever survived is a tray/GPU/renderer helper holding the old config.
-  $stubborn = @()
-  foreach ($name in $client.Names) { $stubborn += @(Get-Process -Name $name -ErrorAction SilentlyContinue) }
+  $stubborn = @(Get-ClientProcesses $client)
   if ($stubborn.Count) {
     Write-Host "[restart]   $($stubborn.Count) helper process(es) survived the close; forcing" -ForegroundColor DarkGray
     foreach ($p in $stubborn) {
@@ -95,8 +108,7 @@ foreach ($client in $clients) {
     Start-Sleep -Milliseconds 800
   }
 
-  $leftover = @()
-  foreach ($name in $client.Names) { $leftover += @(Get-Process -Name $name -ErrorAction SilentlyContinue) }
+  $leftover = @(Get-ClientProcesses $client)
   if ($leftover.Count) {
     Write-Host "[restart]   WARNING: $($leftover.Count) process(es) still running; config may not reload" -ForegroundColor Yellow
   } else {
