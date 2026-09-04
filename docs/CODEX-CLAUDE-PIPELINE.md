@@ -141,9 +141,13 @@ Use the MCP workflow in this order:
    REST clients.
 2. Run independent Codex research lanes only when they are read-only and
    non-overlapping. Consolidate them with `submit_pipeline_research`.
-3. Poll `get_pipeline` by pipeline ID until planning reaches `plan_ready`. It
-   reconciles a completed provider task exactly once. A slow active phase is
-   not permission to launch a duplicate.
+3. Read with `get_pipeline`, then use `reconcile_pipeline` when its
+   `nextActions` names that operation until planning reaches `plan_ready`.
+   Reconciliation settles a completed provider task exactly once. A slow active phase is
+   not permission to launch a duplicate. Typed transient failures in read-only
+   planning/review phases remain in the same phase and retry at most three
+   total attempts with durable backoff. Semantic failures and every writer
+   failure still fail closed.
 4. After accepting the Claude plan, call `claim_pipeline_implementation`.
    Codex is now the only writer. Use `renew_pipeline_writer_lease` before an
    active lease expires.
@@ -161,7 +165,8 @@ Use the MCP workflow in this order:
 8. Call `cancel_pipeline` for an intentional stop. Do not record a cancellation,
    timeout, or promise of later work as successful completion.
 
-Poll with `get_pipeline`; do not infer state from the newest receipt. Preserve
+Read status with `get_pipeline` and advance only with `reconcile_pipeline` when
+named by `nextActions`; do not infer state from the newest receipt. Preserve
 each direct `requestId`/`invocationId`/`receiptId` tuple because concurrent runs
 can complete out of order.
 
@@ -179,13 +184,15 @@ writer-lease gates.
 
 MCP is the preferred agent interface; REST exposes the same durable state
 machine to authenticated operator clients. `get_pipeline`/the workflow GET is
-also the reconciliation operation for queued provider work, so polling another
-receipt endpoint cannot advance a phase.
+strictly side-effect free. Provider settlement, persisted-handoff repair, and
+due retry dispatch use the identity-gated `reconcile_pipeline` POST, so a stale
+status client cannot spend provider quota.
 
 | MCP tool | REST operation | Required state and effect |
 |---|---|---|
 | `list_pipelines` | `GET /api/workflows` | Any time; list first to find resumable or conflicting work. |
-| `get_pipeline` | `GET /api/workflows/:runId` | Any phase; reconcile finished plan/review/revision work and return artifacts plus `nextActions`. |
+| `get_pipeline` | `GET /api/workflows/:runId` | Any phase; read current state, artifacts, and `nextActions` without dispatching or settling work. |
+| `reconcile_pipeline` | `POST /api/workflows/:runId/reconcile` | A handoff or active provider phase; identity-gated settlement, crash recovery, or due read-only retry dispatch. |
 | `start_codex_claude_pipeline` | `POST /api/workflows` | Create one `scoping` workflow after the duplicate check. |
 | `submit_pipeline_research` | `POST /api/workflows/:runId/research` | `scoping` → queued `planning` through the internal `research_ready` gate. |
 | `claim_pipeline_implementation` | `POST /api/workflows/:runId/implementation/claim` | `plan_ready` → `implementing`; return the exclusive lease token. |
@@ -193,6 +200,7 @@ receipt endpoint cannot advance a phase.
 | `complete_pipeline_implementation` | `POST /api/workflows/:runId/implementation/complete` | Valid lease: release it and queue `reviewing` through `implementation_ready`. |
 | `start_pipeline_revision` | `POST /api/workflows/:runId/revision/start` | `review_ready` with requested changes and a full+ack workflow → exclusive Claude `revising`. |
 | `start_pipeline_final_review` | `POST /api/workflows/:runId/final-review/start` | Approved `review_ready`, or `revision_ready`, → fresh `final_reviewing`; result is `complete` or returns to `review_ready`. |
+| `retry_failed_pipeline_provider` | `POST /api/workflows/:runId/provider/retry` | Recover an older terminal workflow only when its last read-only task has durable typed transient-failure evidence; the same three-attempt ceiling applies. |
 | `cancel_pipeline` | `POST /api/workflows/:runId/cancel` | Cancel nonterminal work; a running Claude writer must exit before its lease can be released. |
 
 REST calls require the RelayBridge capability token. Treat the returned
@@ -219,6 +227,18 @@ The canonical handoff packet should remain bounded:
 
 Transfer this packet and targeted evidence, not entire chats, logs, or source
 trees.
+
+Rate limits, provider timeouts, and overloads are retryable only after the prior
+read-only task is terminal. Retry timing uses the exact deadline committed by
+the shared cooldown store, and the next attempt number is persisted in
+`providerRetry`; status reads never dispatch, and reconciliation before
+`retryAt` does not spend quota. At
+attempt three the workflow becomes failed.
+`retry_failed_pipeline_provider` exists for runs terminalized by older bridge
+versions and refuses recovery without a matching durable task record and typed
+transient evidence. A bridge-restart interruption also requires this explicit
+action because the replacement cannot safely be automatic until the caller has
+confirmed the former provider process is gone. Writer tasks are never retried.
 
 ## Roles and models
 

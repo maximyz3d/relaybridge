@@ -1128,10 +1128,24 @@ function sendOneShotResult(res, payload, meta) {
           // model on the account. Generic 429/overload evidence has no narrower
           // scope, so it conservatively applies to the shared quota seat.
           const cooldownSeat = payload.vendor_quota?.scope === 'model' ? meta.kind : effectiveQuotaSeat;
-          cooldowns.noteFailure(cooldownSeat, failureKind, {
+          const cooldown = cooldowns.noteFailure(cooldownSeat, failureKind, {
             retryAfterSec: parseRetryAfter(`${payload.stdout || ''}\n${payload.stderr || ''}`, payload.retry_after),
             scope: payload.vendor_quota?.scope === 'model' ? 'model' : 'account',
           });
+          if (cooldown?.until) {
+            // Return the deadline actually committed by the shared cooldown
+            // store. Workflow/task retry logic must not guess a shorter delay
+            // and deliberately invoke a seat the router still considers cool.
+            payload.retry_at = cooldown.until;
+            payload.retry_after = Math.max(1, Math.ceil((cooldown.until - Date.now()) / 1000));
+            payload.cooldown = {
+              seat: cooldown.seat,
+              until: cooldown.until,
+              reason: cooldown.reason,
+              source: cooldown.source,
+              offences: cooldown.offences,
+            };
+          }
         }
       } catch { /* cooldown bookkeeping must never break a response */ }
       try {
@@ -5225,7 +5239,8 @@ const WORKFLOW_CONFLICT_CODES = new Set([
   'WRITER_CONFLICT', 'WRITER_TASK_RUNNING', 'LEASE_MISMATCH', 'LEASE_MISSING',
   'LEASE_EXPIRED', 'LEASE_NOT_REQUIRED', 'REVISION_NOT_REQUESTED',
   'REVISION_REQUIRED', 'PROVIDER_TASK_ACTIVE', 'PROVIDER_TASK_MISMATCH',
-  'PROVIDER_TASK_REUSED', 'FULL_PERMISSION_REQUIRED',
+  'PROVIDER_TASK_REUSED', 'PROVIDER_RETRY_MISMATCH', 'PROVIDER_RETRY_EXHAUSTED',
+  'PROVIDER_RETRY_NOT_ALLOWED', 'FULL_PERMISSION_REQUIRED',
 ]);
 
 function sendWorkflowError(res, error) {
@@ -5284,6 +5299,14 @@ app.get('/api/workflows/:runId', (req, res) => {
   } catch (error) { sendWorkflowError(res, error); }
 });
 
+app.post('/api/workflows/:runId/reconcile', (req, res) => {
+  try {
+    res.status(202).json(workflowController.reconcile(req.params.runId, {
+      includeArtifacts: req.body?.includeArtifacts !== false,
+    }));
+  } catch (error) { sendWorkflowError(res, error); }
+});
+
 app.post('/api/workflows/:runId/research', (req, res) => {
   try { res.status(202).json(workflowController.submitResearch(req.params.runId, req.body || {})); }
   catch (error) { sendWorkflowError(res, error); }
@@ -5307,6 +5330,14 @@ app.post('/api/workflows/:runId/revision/start', (req, res) => {
 app.post('/api/workflows/:runId/final-review/start', (req, res) => {
   try { res.status(202).json(workflowController.startFinalReview(req.params.runId)); }
   catch (error) { sendWorkflowError(res, error); }
+});
+
+app.post('/api/workflows/:runId/provider/retry', (req, res) => {
+  try {
+    res.status(202).json(workflowController.retryFailedProvider(req.params.runId, {
+      actor: req.body?.actor || 'operator',
+    }));
+  } catch (error) { sendWorkflowError(res, error); }
 });
 
 app.post('/api/workflows/:runId/lease/renew', (req, res) => {

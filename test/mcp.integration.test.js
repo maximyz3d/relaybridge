@@ -7,6 +7,7 @@ const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
+const { createWorkflowPipeline } = require('../lib/workflow-pipeline');
 
 const ROOT = path.resolve(__dirname, '..');
 
@@ -382,10 +383,11 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
     'bridge_status', 'list_providers', 'get_context_bundle', 'route_preview',
     'ask_provider', 'route_and_ask', 'run_committee', 'get_receipt',
     'restart_bridge', 'list_agents', 'set_agent_tags', 'broadcast',
-    'start_codex_claude_pipeline', 'list_pipelines', 'get_pipeline',
+    'start_codex_claude_pipeline', 'list_pipelines', 'get_pipeline', 'reconcile_pipeline',
     'submit_pipeline_research', 'claim_pipeline_implementation',
     'complete_pipeline_implementation', 'start_pipeline_revision',
-    'start_pipeline_final_review', 'renew_pipeline_writer_lease', 'cancel_pipeline',
+    'start_pipeline_final_review', 'retry_failed_pipeline_provider',
+    'renew_pipeline_writer_lease', 'cancel_pipeline',
     'open_in_chrome',
   ]) {
     assert.ok(toolNames.has(expected), `missing MCP tool ${expected}`);
@@ -437,6 +439,64 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   assert.equal(fetchedPipeline.structuredContent.artifactContents['base-revision'], 'test-base');
   assert.match(fetchedPipeline.structuredContent.artifactContents['file-scope'], /lib\/target\.js/);
   assert.deepEqual(fetchedPipeline.structuredContent.nextActions, ['submit_pipeline_research']);
+
+  // Build a due retry without invoking a provider. GET must remain a pure
+  // status read, and the action-identity middleware must reject reconciliation
+  // from a stale MCP before it can admit the replacement provider process.
+  const durablePipeline = createWorkflowPipeline({ dataDir });
+  const dueRetry = durablePipeline.createWorkflow({
+    cwd: allowedRootA,
+    objective: 'Prove stale status clients cannot dispatch a due provider retry.',
+    acceptance: 'No provider process starts before a matching action identity is accepted.',
+    providerPreferences: { planning: ['identity_guard'] },
+  });
+  durablePipeline.completeResearch(dueRetry.runId, { markdown: 'Bounded research.' });
+  durablePipeline.startPlanning(dueRetry.runId);
+  durablePipeline.bindProviderTask(dueRetry.runId, {
+    actor: 'claude-planner', taskId: 't_due_retry_original', provider: 'identity_guard',
+    purpose: 'planning', attempt: 1,
+  });
+  durablePipeline.scheduleProviderRetry(dueRetry.runId, {
+    actor: 'claude-planner', taskId: 't_due_retry_original', failureClass: 'rate_limit',
+    reason: 'Synthetic terminal 429.', delayMs: 0, maxAttempts: 3,
+  });
+  const dueCapability = await (await fetch(`${baseUrl}/api/capability`)).json();
+  const dueHeaders = {
+    'X-PS-Bridge-Token': dueCapability.token,
+    'Content-Type': 'application/json',
+  };
+
+  const inertRead = await fetch(`${baseUrl}/api/workflows/${dueRetry.runId}?includeArtifacts=false`, {
+    headers: { ...dueHeaders, 'X-RelayBridge-Client': 'mcp' },
+  });
+  assert.equal(inertRead.status, 200);
+  const inertStatus = await inertRead.json();
+  assert.equal(inertStatus.workflow.providerTask, null);
+  assert.equal(inertStatus.workflow.providerRetry.nextAttempt, 2);
+  assert.deepEqual(inertStatus.nextActions, ['reconcile_pipeline']);
+  assert.equal(fs.existsSync(invocationMarker), false, 'GET status must not dispatch a due retry');
+
+  const mismatchedReconcile = await fetch(`${baseUrl}/api/workflows/${dueRetry.runId}/reconcile`, {
+    method: 'POST',
+    headers: {
+      ...dueHeaders,
+      'X-RelayBridge-Client': 'mcp',
+      'X-RelayBridge-Expected-Build-Id': 'integration-current',
+      'X-RelayBridge-Expected-Receipt-Store-Id': '0'.repeat(64),
+    },
+    body: JSON.stringify({ includeArtifacts: false }),
+  });
+  assert.equal(mismatchedReconcile.status, 409);
+  const rejectedReconcile = await mismatchedReconcile.json();
+  assert.equal(rejectedReconcile.failureClass, 'bridge_identity_mismatch');
+  assert.equal(rejectedReconcile.actionPreflight.buildMatches, true);
+  assert.equal(rejectedReconcile.actionPreflight.receiptStoreMatches, false);
+  assert.equal(fs.existsSync(invocationMarker), false,
+    'mismatched reconciliation must fail before provider admission');
+  assert.equal(durablePipeline.get(dueRetry.runId).providerTask, null);
+  assert.equal(durablePipeline.get(dueRetry.runId).providerRetry.nextAttempt, 2);
+  durablePipeline.cancel(dueRetry.runId, { actor: 'fixture', reason: 'Identity guard fixture complete.' });
+
   const cancelledPipeline = await client.callTool({
     name: 'cancel_pipeline', arguments: { runId: pipelineId, reason: 'Fixture complete.' },
   });

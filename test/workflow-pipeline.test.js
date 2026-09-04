@@ -229,6 +229,107 @@ test('restart preserves workflow routing, state, artifacts, and a live writer le
   assert.equal(finished.phase, 'implementation_ready');
 });
 
+test('read-only provider retries are durable, bounded, and never replay a writer', (t) => {
+  const { pipeline, restart, cwd, clock } = fixture(t);
+  const runId = 'wf_retry_121212121212';
+  create(pipeline, cwd, runId, { permissionMode: 'full' });
+  pipeline.completeResearch(runId, { markdown: 'research' });
+  pipeline.startPlanning(runId);
+  pipeline.bindProviderTask(runId, {
+    actor: 'claude-planner', taskId: 't_retry_plan_1', provider: 'claude',
+    purpose: 'planning', attempt: 1,
+  });
+
+  const scheduled = pipeline.scheduleProviderRetry(runId, {
+    actor: 'claude-planner', taskId: 't_retry_plan_1', failureClass: 'rate_limit',
+    reason: 'typed HTTP 429', delayMs: 5000, maxAttempts: 3,
+  });
+  assert.equal(scheduled.phase, 'planning');
+  assert.equal(scheduled.terminal, null);
+  assert.equal(scheduled.providerTask, null);
+  assert.equal(scheduled.providerRetry.nextAttempt, 2);
+  assert.equal(scheduled.providerRetry.retryAt, clock.value + 5000);
+  assert.equal(scheduled.providerTaskHistory.at(-1).outcome, 'retry_scheduled');
+  assert.equal(pipeline.list()[0].providerRetry.nextAttempt, 2);
+  assert.equal(restart().get(runId).providerRetry.failureClass, 'rate_limit');
+  throwsCode(() => pipeline.bindProviderTask(runId, {
+    actor: 'claude-planner', taskId: 't_retry_wrong_attempt', provider: 'claude',
+    purpose: 'planning', attempt: 1,
+  }), 'PROVIDER_RETRY_MISMATCH');
+  pipeline.bindProviderTask(runId, {
+    actor: 'claude-planner', taskId: 't_retry_plan_2', provider: 'claude',
+    purpose: 'planning', attempt: 2,
+  });
+  assert.equal(pipeline.get(runId).providerRetry, null);
+  pipeline.completePlanning(runId, { actor: 'claude-planner', markdown: 'PLAN_STATUS: READY' });
+
+  const implementation = pipeline.startImplementation(runId);
+  pipeline.completeImplementation(runId, {
+    leaseToken: implementation.lease.leaseToken, markdown: 'implementation',
+  });
+  pipeline.startReview(runId);
+  pipeline.completeReview(runId, { markdown: 'review', revisionRequested: true });
+  pipeline.startRevision(runId, { actor: 'claude-reviser' });
+  pipeline.bindProviderTask(runId, {
+    actor: 'claude-reviser', taskId: 't_retry_writer', provider: 'claude',
+    purpose: 'revision', attempt: 1,
+  });
+  throwsCode(() => pipeline.scheduleProviderRetry(runId, {
+    actor: 'claude-reviser', taskId: 't_retry_writer', failureClass: 'timeout',
+    delayMs: 0, maxAttempts: 3,
+  }), 'INVALID_TRANSITION');
+});
+
+test('an explicitly retried legacy provider failure can leave terminal state only with read-only evidence', (t) => {
+  const { pipeline, cwd } = fixture(t);
+  const runId = 'wf_legacy_343434343434';
+  create(pipeline, cwd, runId);
+  pipeline.completeResearch(runId, { markdown: 'research' });
+  pipeline.startPlanning(runId);
+  pipeline.bindProviderTask(runId, {
+    actor: 'claude-planner', taskId: 't_legacy_plan_1', provider: 'claude',
+    purpose: 'planning', attempt: 1,
+  });
+  pipeline.fail(runId, { actor: 'relaybridge', reason: 'legacy bridge terminalized a typed 429' });
+
+  const recovered = pipeline.retryFailedReadOnlyProviderTask(runId, {
+    actor: 'operator', failureClass: 'rate_limit', reason: 'receipt proves HTTP 429',
+    delayMs: 0, maxAttempts: 3,
+  });
+  assert.equal(recovered.phase, 'planning');
+  assert.equal(recovered.terminal, null);
+  assert.equal(recovered.providerRetry.nextAttempt, 2);
+  assert.equal(recovered.history.at(-1).event, 'failed_provider_retry_requested');
+
+  pipeline.bindProviderTask(runId, {
+    actor: 'claude-planner', taskId: 't_legacy_plan_2', provider: 'claude',
+    purpose: 'planning', attempt: 2,
+  });
+  pipeline.completePlanning(runId, { markdown: 'plan' });
+  throwsCode(() => pipeline.retryFailedReadOnlyProviderTask(runId, {
+    actor: 'operator', failureClass: 'rate_limit', delayMs: 0, maxAttempts: 3,
+  }), 'INVALID_TRANSITION');
+});
+
+test('cancelling during provider retry backoff clears retry state cleanly', (t) => {
+  const { pipeline, cwd } = fixture(t);
+  const runId = 'wf_retrycancel_565656565656';
+  create(pipeline, cwd, runId);
+  pipeline.completeResearch(runId, { markdown: 'research' });
+  pipeline.startPlanning(runId);
+  pipeline.bindProviderTask(runId, {
+    actor: 'claude-planner', taskId: 't_retry_cancel_1', provider: 'claude',
+    purpose: 'planning', attempt: 1,
+  });
+  pipeline.scheduleProviderRetry(runId, {
+    actor: 'claude-planner', taskId: 't_retry_cancel_1', failureClass: 'timeout',
+    delayMs: 5000, maxAttempts: 3,
+  });
+  const cancelled = pipeline.cancel(runId, { actor: 'operator', reason: 'stop during backoff' });
+  assert.equal(cancelled.phase, 'cancelled');
+  assert.equal(cancelled.providerRetry, null);
+});
+
 test('one canonical cwd has one writer; only an expired lock may be reclaimed', (t) => {
   const { pipeline, cwd, root, clock } = fixture(t, { pipeline: { leaseMs: 100 } });
   const alias = path.join(root, 'project-alias');

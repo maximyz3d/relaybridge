@@ -522,7 +522,7 @@ async function buildContextBundle({
       terminalDetail: ['list_sessions', 'read_session_output'],
       collaborationDetail: ['list_collabs', 'read_collab', 'list_projects'],
       delegatedWork: ['list_runs', 'get_run', 'list_receipts', 'get_receipt'],
-      stagedWorkflows: ['list_pipelines', 'get_pipeline'],
+      stagedWorkflows: ['list_pipelines', 'get_pipeline', 'reconcile_pipeline'],
       browserActions: ['open_in_chrome', 'chrome-devtools (separate user-scoped MCP)'],
       safeActions: ['start_safe_session', 'ask_provider', 'route_and_ask', 'run_committee'],
       lifecycleActions: ['start_bridge', 'restart_bridge', 'stop_bridge', 'send_session_input', 'stop_session'],
@@ -1714,7 +1714,7 @@ function numericBoundsOf(field, depth = 0) {
 
 export function buildServer() {
   const server = new McpServer({ name: 'relaybridge', version: PACKAGE.version }, {
-    instructions: 'Read before acting: call get_context_bundle when taking over existing work, then use bridge_status, list_providers, list_pipelines, and route_preview as needed. For staged code work, Codex owns orchestration and primary implementation: create one workflow, submit a bounded research brief, poll get_pipeline, obey its nextActions, and never overlap writer leases. AI provider one-shots (ask_provider, route_and_ask, run_committee) always force dangerous:false, so they consume subscription quotas or local compute in the provider CLI\'s own safe/headless mode. Terminals are different: start_safe_session only forces the vendor bypass flags off, and start_safe_session(kind="powershell") opens a real host PowerShell shell running with your account\'s full privileges. Anything sent through send_session_input executes on the host with no sandbox and no filesystem confinement, so it needs host approval and human review. The /api/exec route, provider installs, and the global full-permissions toggle are not exposed as tools. Routing scores are operator preferences, not universal model-quality claims; use receipts and preserve the human gate for high-stakes work.',
+    instructions: 'Read before acting: call get_context_bundle when taking over existing work, then use bridge_status, list_providers, list_pipelines, and route_preview as needed. For staged code work, Codex owns orchestration and primary implementation: create one workflow, submit a bounded research brief, follow nextActions, use reconcile_pipeline while provider phases are active, and never overlap writer leases. get_pipeline is status-only and never spends provider quota. AI provider one-shots (ask_provider, route_and_ask, run_committee) always force dangerous:false, so they consume subscription quotas or local compute in the provider CLI\'s own safe/headless mode. Terminals are different: start_safe_session only forces the vendor bypass flags off, and start_safe_session(kind="powershell") opens a real host PowerShell shell running with your account\'s full privileges. Anything sent through send_session_input executes on the host with no sandbox and no filesystem confinement, so it needs host approval and human review. The /api/exec route, provider installs, and the global full-permissions toggle are not exposed as tools. Routing scores are operator preferences, not universal model-quality claims; use receipts and preserve the human gate for high-stakes work.',
     capabilities: { tools: {}, resources: {} },
     cacheHints: {
       'tools/list': { ttlMs: 60000, cacheScope: 'private' },
@@ -2768,16 +2768,30 @@ export function buildServer() {
   }));
 
   server.registerTool('get_pipeline', {
-    title: 'Get and advance pipeline status',
-    description: 'Poll one workflow by ID. This reconciles a finished provider task exactly once, returns bounded artifacts when requested, and names the permitted next action.',
+    title: 'Get pipeline status',
+    description: 'Read one workflow and its bounded artifacts without dispatching or settling provider work. Follow nextActions; active provider phases require the identity-gated reconcile_pipeline action.',
     inputSchema: z.object({
       runId: workflowIdSchema,
       includeArtifacts: z.boolean().default(true),
     }),
-    annotations: AUDITED_READ,
+    annotations: READ_ONLY,
   }, safeHandler(async ({ runId, includeArtifacts }, context) => result(await bridgeRequest(
     `/api/workflows/${encodeURIComponent(runId)}?includeArtifacts=${includeArtifacts ? 'true' : 'false'}`,
     { signal: context?.mcpReq?.signal },
+  ))));
+
+  server.registerTool('reconcile_pipeline', {
+    title: 'Reconcile and advance pipeline',
+    description: 'Identity-gated status advance for an active workflow. It may settle finished provider work, repair a persisted handoff, or dispatch a due read-only provider retry and therefore can consume provider quota.',
+    inputSchema: z.object({
+      runId: workflowIdSchema,
+      includeArtifacts: z.boolean().default(true),
+    }),
+    annotations: EXTERNAL_ACTION,
+  }, safeHandler(async ({ runId, includeArtifacts }, context) => result(await bridgeRequest(
+    `/api/workflows/${encodeURIComponent(runId)}/reconcile`, {
+      method: 'POST', body: { includeArtifacts }, signal: context?.mcpReq?.signal, actionIdentity: true,
+    },
   ))));
 
   server.registerTool('submit_pipeline_research', {
@@ -2848,6 +2862,17 @@ export function buildServer() {
   }, safeHandler(async ({ runId }, context) => result(await bridgeRequest(
     `/api/workflows/${encodeURIComponent(runId)}/final-review/start`, {
       method: 'POST', body: {}, signal: context?.mcpReq?.signal, actionIdentity: true,
+    },
+  ))));
+
+  server.registerTool('retry_failed_pipeline_provider', {
+    title: 'Retry a failed read-only pipeline provider',
+    description: 'Recover an older terminal workflow only when its last planning/review task has typed transient failure evidence such as a rate limit, timeout, overload, or bridge interruption. Confirm an interrupted provider process is gone before calling. Writer failures and semantic failures remain terminal; retries are bounded.',
+    inputSchema: z.object({ runId: workflowIdSchema }),
+    annotations: EXTERNAL_ACTION,
+  }, safeHandler(async ({ runId }, context) => result(await bridgeRequest(
+    `/api/workflows/${encodeURIComponent(runId)}/provider/retry`, {
+      method: 'POST', body: { actor: 'codex' }, signal: context?.mcpReq?.signal, actionIdentity: true,
     },
   ))));
 

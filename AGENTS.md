@@ -32,7 +32,8 @@ For an MCP-managed run, call `list_pipelines` before
 already active, resume it with `get_pipeline`, load its bounded artifacts, and
 obey `nextActions`; durable state, not chat history, is authoritative. Create
 one new run only when no matching active run exists, submit the brief with
-`submit_pipeline_research`, and poll `get_pipeline`. Acquire and renew the
+`submit_pipeline_research`, read status with `get_pipeline`, and invoke
+`reconcile_pipeline` only when `nextActions` names it. Acquire and renew the
 writer lease through `claim_pipeline_implementation` and
 `renew_pipeline_writer_lease`; finish that phase with
 `complete_pipeline_implementation`. Use `start_pipeline_revision` only for
@@ -51,15 +52,17 @@ omission remains `safe`/`false`. The resolved full+ack pair still does not
 bypass the accepted-review gate or the exclusive writer lease.
 
 The MCP workflow operations map directly to authenticated REST routes:
-`list_pipelines`/`GET /api/workflows`, `get_pipeline`/`GET
-/api/workflows/:runId`, create/`POST /api/workflows`, research/`POST
+`list_pipelines`/`GET /api/workflows`, status-only `get_pipeline`/`GET
+/api/workflows/:runId`, `reconcile_pipeline`/`POST
+/api/workflows/:runId/reconcile`, create/`POST /api/workflows`, research/`POST
 /api/workflows/:runId/research`, implementation claim and complete/`POST
 /api/workflows/:runId/implementation/{claim,complete}`, revision/`POST
 /api/workflows/:runId/revision/start`, final review/`POST
 /api/workflows/:runId/final-review/start`, lease renewal/`POST
 /api/workflows/:runId/lease/renew`, and cancellation/`POST
-/api/workflows/:runId/cancel`. Poll through `get_pipeline`; it reconciles a
-finished provider task exactly once and reports the permitted next action.
+/api/workflows/:runId/cancel`. `get_pipeline` never settles or dispatches work;
+the identity-gated reconciliation action advances a finished task exactly once
+and may dispatch a due read-only retry.
 
 Provider one-shots must not invoke RelayBridge again or spawn overlapping work.
 They receive their phase role in the prompt because hardened Claude safe mode

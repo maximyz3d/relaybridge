@@ -17,6 +17,14 @@ review cycle when changes are required.
   summaries and evidence, never whole transcripts or large file bodies.
 - Check active runs before dispatch. Do not repeat work already in progress or
   rerun a completed phase merely to recover context; read its receipt/artifact.
+- Let the bridge handle its bounded durable backoff for typed transient
+  planning/review failures. Read state with `get_pipeline`, then invoke
+  `reconcile_pipeline` only when named in `nextActions`; do not create a replacement.
+  Use `retry_failed_pipeline_provider` only for an older terminal run whose
+  durable task record proves a transient read-only failure. Never replay a
+  failed writer automatically. For a bridge-interrupted read-only task, first
+  confirm the former provider process is no longer alive; polling alone must
+  not launch its replacement.
 - Fan out only independent read-only discovery. Never fan out writers.
 - Use the `browser_researcher` or `open_in_chrome` only when live UI,
   console, network, screenshot, or browser-only evidence is required. Keep
@@ -46,7 +54,8 @@ review cycle when changes are required.
 3. **Plan:** Dispatch Claude `pipeline-planner` with the brief. Use Sonnet/medium
    for standard plans, Opus/high for complex plans, and the explicit Fable heavy
    tier only for the hardest planning work.
-   Poll `get_pipeline` by ID; do not submit a duplicate while a phase is active.
+   Use `reconcile_pipeline` by ID while a provider phase is active; use
+   status-only `get_pipeline` when no advance is intended. Do not submit a duplicate.
    Gate on a complete plan packet; a promise to continue is not completion.
 4. **Implement:** Codex calls `claim_pipeline_implementation`, acquires the
    writer lease, and implements the accepted plan. Renew a long-running lease
@@ -85,5 +94,7 @@ automatically.
 If RelayBridge MCP is available, begin with `get_context_bundle`, use
 `route_preview` before a hosted call, retain the returned request/invocation/
 receipt tuple, and inspect the exact receipt instead of selecting the newest one.
-Use `get_pipeline` as the sole polling/status read for an active pipeline; a
-slow phase is not permission to start another copy.
+Use `get_pipeline` as the sole side-effect-free status read for an active
+pipeline. Use identity-gated `reconcile_pipeline` only when `nextActions` names
+it; that operation may settle or dispatch provider work. A slow phase is not
+permission to start another copy.

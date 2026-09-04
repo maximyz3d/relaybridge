@@ -26,7 +26,9 @@ IDs. Start fresh plan and review sessions; compact continuing work around
 60–70% context use.
 
 At intake, Codex must call `list_pipelines` and resume matching durable work
-with `get_pipeline` before starting another workflow. When RelayBridge MCP was
+with status-only `get_pipeline` before starting another workflow. Active
+provider phases advance only when `nextActions` names the identity-gated
+`reconcile_pipeline` action. When RelayBridge MCP was
 registered with `install-mcp.sh --full-permissions`, omitting both pipeline
 permission fields atomically creates the matched `permissionMode:"full"` and
 `acknowledgeFilesystemWrites:true` pair. Explicit `full` without `true`, `true`

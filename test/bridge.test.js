@@ -2228,6 +2228,33 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(rateFailure.exitCode, 29);
   assert.equal(rateFailure.rate_limited, true);
   assert.equal(rateFailure.dropped_out, true);
+  assert.ok(Number.isSafeInteger(rateFailure.retry_at) && rateFailure.retry_at > Date.now());
+  assert.ok(rateFailure.retry_after > 0);
+  assert.equal(rateFailure.cooldown.until, rateFailure.retry_at);
+  assert.equal(rateFailure.cooldown.reason, 'rate_limited');
+
+  // Exercise the real server -> cooldown -> task persistence path. Workflow
+  // retries consume these task fields; a synthetic task payload would miss a
+  // regression where sendOneShotResult forgot to return the committed deadline.
+  const rateTaskSubmit = await fetch(baseUrl + '/api/tasks', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ kind: 'rate_fail', prompt: 'persist the actual cooldown deadline' }),
+  });
+  assert.equal(rateTaskSubmit.status, 200);
+  const rateTask = await rateTaskSubmit.json();
+  let completedRateTask = null;
+  for (let attempt = 0; attempt < 80; attempt++) {
+    completedRateTask = await (await fetch(`${baseUrl}/api/tasks/${rateTask.id}`, { headers: auth })).json();
+    if (['done', 'failed', 'cancelled', 'interrupted'].includes(completedRateTask.status)) break;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.equal(completedRateTask.status, 'failed');
+  assert.equal(completedRateTask.failureClass, 'rate_limit');
+  assert.ok(completedRateTask.retryAfterSec > 0);
+  assert.ok(Number.isSafeInteger(completedRateTask.retryAt));
+  const liveRateCooldown = await (await fetch(baseUrl + '/api/cooldowns', { headers: auth })).json();
+  assert.equal(completedRateTask.retryAt, liveRateCooldown.cooldowns.rate_fail.until,
+    'task backoff must use the deadline actually committed by the cooldown store');
 
   const blankResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST',

@@ -197,12 +197,17 @@ restart open AI clients:
 For the staged Codex-orchestrated planning, implementation, and review workflow,
 see [Codex-Claude pipeline](docs/CODEX-CLAUDE-PIPELINE.md).
 At the start of each new or resumed client session, use `list_pipelines` before
-creating a workflow. Resume a matching active run with `get_pipeline` and follow
-its `nextActions`; do not duplicate durable work after a disconnect or while a
-provider phase is merely slow. The pipeline guide maps every MCP phase tool to
+creating a workflow. Resume a matching active run with status-only
+`get_pipeline` and follow its `nextActions`; active provider phases advance only
+through the identity-gated `reconcile_pipeline` action. Do not duplicate durable
+work after a disconnect or while a provider phase is merely slow. The pipeline guide maps every MCP phase tool to
 its authenticated `/api/workflows...` REST operation. The closing review gate
 is a fresh read-only Claude Sonnet/high run; Codex verification may add focused
-evidence but does not replace that final Claude verdict.
+evidence but does not replace that final Claude verdict. Typed transient
+read-only failures use durable bounded backoff; older terminalized 429/timeout
+runs can use `retry_failed_pipeline_provider`, while writer and semantic
+failures remain terminal. Restart-interrupted tasks require that explicit
+recovery action so status reads cannot overlap a potentially surviving process.
 
 MCP actions that cross into REST or provider admission fail closed unless the MCP process and REST listener report the same exact build and receipt store. The store identity is a SHA-256 value bound to a persisted random seed and the canonical store location; health, errors, and receipts never expose the raw data path. Read-only status tools and local cache replays remain available during a mismatch so an operator can inspect the listener and use the lifecycle tools to replace a stale build. A rejected provider action records `modelInvocation:false`, `tokenUsageSource:not_invoked`, zero retries, and no transport receipt.
 
