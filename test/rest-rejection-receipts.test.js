@@ -131,8 +131,13 @@ test('direct REST pre-admission failures persist deduplicated zero-invocation re
     no_slot: provider('No one-shot slot', null, { oneshot_safe: [], oneshot_dangerous: [] }),
     mixed_transport: provider('Mixed transport', [process.execPath, helper, '--prompt-file', '{prompt_file}', '--output', '{prompt}']),
     signed_out: provider('Signed out', baseSlot, {
-      probe: [process.execPath, '-e', 'process.exit(1)'],
+      probe: [
+        process.execPath,
+        '-e',
+        "process.stderr.write('not logged in\\n'); process.exit(1)",
+      ],
       login_command: [process.execPath, '-e', 'process.exit(0)'],
+      probe_auth_authoritative: true,
     }),
   }), 'utf8');
 

@@ -18,6 +18,14 @@ test('every subscription CLI declares an interactive login command', () => {
   }
 });
 
+test('Copilot account relocation and login use the installed Copilot CLI contract', () => {
+  assert.equal(config.copilot.credential_env, 'COPILOT_HOME');
+  assert.deepEqual(config.copilot.credential_markers, ['config.json']);
+  assert.equal(config.copilot.linked_accounts_supported, false);
+  assert.match(config.copilot.linked_accounts_unavailable_reason, /auto-login.*outside COPILOT_HOME/i);
+  assert.deepEqual(config.copilot.login_command, ['copilot', 'login']);
+});
+
 test('login commands never carry dangerous or permission-bypass flags', () => {
   // Signing in must not also grant filesystem authority.
   const banned = /--dangerously|--yolo|--force|skip-permissions|dontAsk/i;
@@ -34,15 +42,16 @@ test('a signed-out provider is reported as auth_required rather than being calle
   // prompt (and no quota) is spent on a call that cannot succeed.
   assert.match(serverSource, /auth_required: true/, 'executeOneShot must signal auth_required');
   assert.match(serverSource, /res\.status\(409\)/, 'the gate must use 409, not a generic failure');
-  assert.match(serverSource, /readiness\.found && readiness\.ready === false/,
-    'only a positive signed-out observation may block a call');
+  assert.match(serverSource, /readiness\.ready === false && readiness\.authFailed === true/,
+    'only a typed positive auth failure may exclude the default account');
 });
 
 test('an unprobed provider is still attempted', () => {
   // "No readiness data" must not be treated as "signed out", or a provider that
   // was never probed would be permanently unreachable.
   const gate = serverSource.slice(serverSource.indexOf('const readiness = lastDiagnostics'));
-  assert.match(gate.slice(0, 400), /if \(readiness &&/, 'the gate must require a readiness record');
+  assert.match(gate.slice(0, 500), /defaultAccountSignedOut = !!\(readiness && readiness\.found/,
+    'the gate must require a readiness record');
 });
 
 test('sign-in sessions run the login command and are never dangerous', () => {
@@ -58,6 +67,15 @@ test('auth status endpoint exists and does not probe on every poll', () => {
   assert.match(serverSource, /app\.get\('\/api\/auth\/status'/);
   assert.match(serverSource, /req\.query\.refresh === '1' \|\| !diagnostics/,
     'a readiness sweep spawns a process per provider and must be opt-in');
+});
+
+test('only authentication-authoritative probes may clear a default-account quarantine', () => {
+  for (const kind of ['claude', 'claude_fable', 'codex']) {
+    assert.equal(config[kind].probe_auth_authoritative, true, `${kind} uses a real auth-status probe`);
+  }
+  assert.equal(config.copilot.probe_auth_authoritative, false,
+    'copilot --version proves installation only and must not clear live auth failure evidence');
+  assert.match(serverSource, /entry\.probe_auth_authoritative !== true/);
 });
 
 test('probe timeouts always resolve so readiness cannot wedge', () => {

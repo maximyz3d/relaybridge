@@ -70,6 +70,16 @@
   footer { padding:6px 12px; font-size:11px; color:var(--muted); background:#10161d; border-top:1px solid var(--border); display:flex; gap:10px; align-items:center; min-width:0; max-width:100%; }
   footer .ok { color:var(--safe); }
   footer .warn { color:var(--danger); }
+  /* Only footer .ok / footer .warn existed, so the same classes emitted by the
+     Team-status, Collab-picker and Add-AI dialogs (and every class="muted" hint
+     line and table header in the Fuel / Tasks / GitHub panels) rendered at full
+     --text brightness — a failure banner did not read as a failure. Scoped off
+     .btn because a provider launch button carries `kind warn` to colour its
+     readiness dot, not its label; the later .save-status / .toast / .collab-chip
+     rules keep their own colours by source order. */
+  .muted { color:var(--muted); }
+  .ok:not(.btn) { color:var(--safe); }
+  .warn:not(.btn) { color:var(--danger); }
   .status-pill { border:1px solid var(--border); border-radius:999px; padding:2px 8px; white-space:nowrap; background:rgba(255,255,255,.025); }
   .team-summary { display:grid; grid-template-columns:repeat(4,minmax(120px,1fr)); gap:8px; margin-bottom:14px; }
   .team-card { background:var(--panel-2); border:1px solid var(--border); border-radius:8px; padding:10px; box-shadow:0 1px 0 rgba(255,255,255,.03) inset; }
@@ -495,7 +505,9 @@
   </div>
 </dialog>
 
-<div class="tabs" id="tabs"></div>
+<!-- role=tablist: makeTab gives every child role="tab", which is only meaningful
+     inside a tablist — without it screen readers announce orphaned tab roles. -->
+<div class="tabs" id="tabs" role="tablist"></div>
 
 <main id="main">
   <div class="empty" id="empty-state">
@@ -505,7 +517,11 @@
   </div>
 </main>
 
-<footer aria-live="polite">
+<!-- No aria-live here: refreshHealthStatus() rewrites the work/liveness/activity/
+     version pills every 10s (and the liveness text changes on every tick while a
+     call runs), so a polite live region on the whole footer announced the status
+     bar to a screen reader forever. #toast-stack is the region that needs it. -->
+<footer>
   <span id="status-mode">mode: …</span>
   <span id="status-count">0 tabs</span>
   <span id="status-perm">permissions: …</span>
@@ -615,7 +631,19 @@ async function bridgeFetch(path, opts = {}) {
 }
 
 async function api(path, opts = {}) {
-  const res = await bridgeFetch(path, opts);
+  let res = await bridgeFetch(path, opts);
+  // The page caches the capability token for its lifetime, so if a different
+  // bridge process takes the port (a second checkout with its own token file)
+  // the cached token is silently wrong: /api/health is registered ahead of the
+  // token gate and still answers 200, so the footer keeps painting "bridge:
+  // v… " green while every other call fails with 401. A 401 can only come from
+  // that gate — it runs before any handler, so nothing was executed and the
+  // request is safe to replay. Drop the cached token, re-bootstrap once, retry.
+  if (res.status === 401) {
+    capabilityToken = '';
+    try { res = await bridgeFetch(path, opts); }
+    catch { /* bootstrap failed too; report the original 401 below */ }
+  }
   if (!res.ok) {
     const raw = await res.text().catch(() => '');
     let detail = raw;
@@ -1250,7 +1278,9 @@ $('#restart-btn').onclick = async () => {
     showBridgeOffline('RelayBridge is restarting…', { reloadButton: false });
     const live = await waitForNewInstance(before.instanceId);
     if (live) { location.reload(); return; }
-    showBridgeOffline('The bridge did not come back within 60 seconds. Start it manually (start.ps1), then reload this page.');
+    // Name both launchers: this branch also ships start.sh, so telling a
+    // Linux/WSL operator to run start.ps1 points at a file they cannot use.
+    showBridgeOffline('The bridge did not come back within 60 seconds. Start it manually (start.ps1 on Windows, ./start.sh on Linux/macOS), then reload this page.');
   } catch (error) {
     document.getElementById('bridge-offline-overlay')?.remove();
     toast('Restart failed: ' + error.message, 'error');
@@ -1261,7 +1291,7 @@ $('#stop-btn').onclick = async () => {
   if (!confirm('Stop RelayBridge? All terminal sessions close and this page goes offline until you start the bridge again.')) return;
   try {
     await api('/api/admin/shutdown', { method: 'POST' });
-    showBridgeOffline('RelayBridge is stopped. Start it again with start.ps1 (or the desktop shortcut), then reload this page.');
+    showBridgeOffline('RelayBridge is stopped. Start it again with start.ps1 or the desktop shortcut on Windows, ./start.sh on Linux/macOS, then reload this page.');
   } catch (error) {
     toast('Stop failed: ' + error.message, 'error');
   }
@@ -1503,6 +1533,10 @@ async function openSavedCollabs() {
           </div>
           <button class="btn" data-act="open" data-id="${escapeHtml(c.id)}" style="background:var(--accent); color:#fff; border:none;">Open</button>
           <button class="btn" data-act="del" data-id="${escapeHtml(c.id)}" title="Delete" style="color:#d9534f;">🗑</button>`;
+        // The row advertises itself as clickable (cursor:pointer + hover highlight)
+        // and both buttons below call stopPropagation() for a row handler that had
+        // gone missing, so clicking the card — the natural target — did nothing.
+        row.onclick = () => loadSavedCollab(c.id);
         savedBody.appendChild(row);
       }
     }
@@ -1806,7 +1840,18 @@ function renderChips(collab) {
       <strong>${escapeHtml(cfg.label || kind)}</strong>
       <span style="color:#8696a0; font-size:11px">${escapeHtml(cfg.company || '')}</span>
       <span class="x" title="Remove from chat">×</span>`;
-    chip.querySelector('.x').onclick = (e) => { e.stopPropagation(); removeParticipant(collab.id, kind); };
+    // The × is a hand-built <span>, so it needs the same role/tabindex/keydown the
+    // tab close control gets in makeTab. Without them keyboard focus stops at the
+    // chip (whose own Enter/Space toggles mute), leaving removeParticipant()
+    // reachable by mouse only. The keydown also stops propagation so Enter on the
+    // × does not additionally toggle mute on the chip behind it.
+    const removeX = chip.querySelector('.x');
+    removeX.setAttribute('role', 'button');
+    removeX.setAttribute('tabindex', '0');
+    removeX.onclick = (e) => { e.stopPropagation(); removeParticipant(collab.id, kind); };
+    removeX.onkeydown = (e) => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); removeX.click(); }
+    };
     const toggleReply = () => {
       if (collab.respond.has(kind)) collab.respond.delete(kind);
       else collab.respond.add(kind);
@@ -2482,7 +2527,6 @@ function maybePromptSignIn(results) {
 // real terminal running its own login command rather than failing the call.
 const signinDialog = document.getElementById('signin-dialog');
 const signinBody = document.getElementById('signin-body');
-let signinRetry = null;
 
 function renderSignin(list, note) {
   if (!list.length) {
@@ -2535,9 +2579,11 @@ async function openSignin({ refresh = false, note = '', only = null } = {}) {
   }
 }
 
-// Called when a provider call comes back 409 auth_required.
-function promptSignInFor(payload, retryFn) {
-  signinRetry = retryFn || null;
+// Called when a provider call comes back 409 auth_required. There is deliberately
+// no stored retry callback: the abandoned turn is re-sent by the operator, because
+// auto-re-issuing a provider call after a sign-in would spend quota without a fresh
+// confirmation. (A `signinRetry` variable used to be written here and never read.)
+function promptSignInFor(payload) {
   document.getElementById('signin-title').textContent = `${payload.label || payload.kind} is not signed in`;
   openSignin({ only: payload.kind, note: 'The call was not sent, so no quota was used. Sign in, then run it again.' });
 }
@@ -2591,7 +2637,16 @@ activityDialog.addEventListener('cancel', () => { if (activityTimer) { clearInte
 // ---- GitHub panel (Development + Versions) --------------------------------
 const githubDialog = $('#github-dialog');
 let githubTimer = null;
-function esc(t){ const d=document.createElement('div'); d.textContent=String(t??''); return d.innerHTML; }
+// esc() used to be textContent -> innerHTML, which escapes & < > but NOT " or '.
+// These panels interpolate it in attribute position (title=, data-task-open=,
+// data-task-cancel=, <option value=>), and a task title is attacker-supplied —
+// any capability-token holder can POST /api/tasks and task-queue.js only clamps
+// the title's length. A title of `x" data-task-cancel="<other-id>` therefore broke
+// out of the attribute and turned that row's Cancel button into a cancel for an
+// unrelated task (styling injection too — the CSP allows style-src-attr). Delegate
+// to escapeHtml, the escaper the older half of this file already uses, which
+// escapes both quote characters.
+function esc(t){ return escapeHtml(t); }
 async function refreshGithubActivity(){
   try {
     const { activity } = await api('/api/github/activity?limit=40');
@@ -2631,6 +2686,12 @@ async function openGithubPanel(){
     sel.innerHTML = repos.map(r => `<option value="${esc(r.name)}">${esc(r.name)}${r.dryRun?' (dry-run)':''}</option>`).join('');
   } catch {}
   refreshGithubActivity(); refreshGithubVersions();
+  // Reopening while the dialog is already modal-open (the ＋ Onboard repo handler
+  // calls this again, and the command palette stays usable on top of a dialog)
+  // used to overwrite the handle and orphan the previous poller for the life of
+  // the page — it kept hitting /api/github/activity every 5s and inflating the
+  // 📈 Activity log. Close the old one before taking a new handle.
+  if (githubTimer) { clearInterval(githubTimer); githubTimer = null; }
   githubTimer = setInterval(refreshGithubActivity, 5000);
 }
 $('#github-btn')?.addEventListener('click', openGithubPanel);
@@ -2691,7 +2752,9 @@ async function refreshFuel(){
 function openFuelPanel(){
   if (typeof fuelDialog.showModal === 'function') fuelDialog.showModal(); else fuelDialog.setAttribute('open','true');
   if (!$('#operator-quota-expires').value) $('#operator-quota-expires').value = quotaDateTimeValue(new Date(Date.now()+5*3600000));
-  refreshFuel(); fuelTimer = setInterval(refreshFuel, 10000);
+  refreshFuel();
+  if (fuelTimer) { clearInterval(fuelTimer); fuelTimer = null; } // see openGithubPanel: a reopen must not orphan the old poller
+  fuelTimer = setInterval(refreshFuel, 10000);
 }
 $('#fuel-btn')?.addEventListener('click', openFuelPanel);
 $('#fuel-close-btn')?.addEventListener('click', () => { fuelDialog.close(); if(fuelTimer){clearInterval(fuelTimer); fuelTimer=null;} });
@@ -2756,7 +2819,9 @@ async function openTasksPanel(){
   try { const { agents } = await api('/api/agents');
     $('#task-kind').innerHTML = (agents||[]).filter(a=>a.id!=='powershell').map(a=>`<option value="${esc(a.id)}">${esc(a.label||a.id)}</option>`).join('');
   } catch {}
-  refreshTasks(); tasksTimer = setInterval(refreshTasks, 4000);
+  refreshTasks();
+  if (tasksTimer) { clearInterval(tasksTimer); tasksTimer = null; } // see openGithubPanel: a reopen must not orphan the old poller
+  tasksTimer = setInterval(refreshTasks, 4000);
 }
 $('#tasks-btn')?.addEventListener('click', openTasksPanel);
 $('#tasks-close-btn')?.addEventListener('click', () => { tasksDialog.close(); if(tasksTimer){clearInterval(tasksTimer); tasksTimer=null;} });

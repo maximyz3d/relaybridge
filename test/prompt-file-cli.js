@@ -183,6 +183,32 @@ if (process.argv.includes('--claude-json-multiturn-bounded')) {
 }
 
 setTimeout(() => {
+  const authFailEnvAbsentIndex = process.argv.indexOf('--auth-fail-env-absent');
+  if (authFailEnvAbsentIndex >= 0) {
+    const envName = String(process.argv[authFailEnvAbsentIndex + 1] || '');
+    if (!String(process.env[envName] || '')) {
+      process.stderr.write('not logged in\n');
+      process.exit(1);
+    }
+  }
+  const authFailEnvSuffixIndex = process.argv.indexOf('--auth-fail-env-suffix');
+  if (authFailEnvSuffixIndex >= 0) {
+    const envName = String(process.argv[authFailEnvSuffixIndex + 1] || '');
+    const suffix = String(process.argv[authFailEnvSuffixIndex + 2] || '');
+    if (String(process.env[envName] || '').endsWith(suffix)) {
+      process.stderr.write('not logged in\n');
+      process.exit(1);
+    }
+  }
+  const copilotAuthFailEnvSuffixIndex = process.argv.indexOf('--copilot-auth-fail-env-suffix');
+  if (copilotAuthFailEnvSuffixIndex >= 0) {
+    const envName = String(process.argv[copilotAuthFailEnvSuffixIndex + 1] || '');
+    const suffix = String(process.argv[copilotAuthFailEnvSuffixIndex + 2] || '');
+    if (String(process.env[envName] || '').endsWith(suffix)) {
+      process.stderr.write('Error: No authentication information found.\nRun copilot login to authenticate.\n');
+      process.exit(1);
+    }
+  }
   if (process.argv.includes('--cursor-action-required')) {
     if (prompt.includes('CURSOR_NAMED_MODELS')) {
       process.stderr.write('ActionRequiredError: Named models unavailable Free plans can only use Auto. Switch to Auto or upgrade plans to continue.\n');
@@ -201,9 +227,23 @@ setTimeout(() => {
     process.exit(Number(process.argv[exitIndex + 1] || 1));
   }
   if (process.argv.includes('--empty')) return;
+  const assertLaterArgIndex = process.argv.indexOf('--assert-later-arg');
+  if (assertLaterArgIndex >= 0) {
+    const expected = String(process.argv[assertLaterArgIndex + 1] || '');
+    if (!process.argv.slice(assertLaterArgIndex + 2).includes(expected)) {
+      process.stderr.write(`required later argument missing: ${expected}\n`);
+      process.exit(2);
+    }
+  }
   const envIndex = process.argv.indexOf('--print-env');
   if (envIndex >= 0) {
     process.stdout.write(String(process.env[process.argv[envIndex + 1]] || ''));
+    return;
+  }
+  const envJsonIndex = process.argv.indexOf('--print-env-json');
+  if (envJsonIndex >= 0) {
+    const names = String(process.argv[envJsonIndex + 1] || '').split(',').filter(Boolean);
+    process.stdout.write(JSON.stringify(Object.fromEntries(names.map((name) => [name, process.env[name] || null]))));
     return;
   }
   const outputIndex = process.argv.indexOf('--output');
@@ -406,6 +446,16 @@ setTimeout(() => {
       type: 'result', is_error: true, subtype: 'error_during_execution',
       errors: ['Not logged in · Please run /login'],
       api_error_status: 401, terminal_reason: 'model_error', permission_denials: [],
+      num_turns: 0, duration_ms: 12, duration_api_ms: 0,
+      usage: { input_tokens: 0, output_tokens: 0 },
+    }));
+    return;
+  }
+  if (process.argv.includes('--claude-json-permission-403')) {
+    process.stdout.write(JSON.stringify({
+      type: 'result', is_error: true, subtype: 'error_during_execution',
+      errors: ['Forbidden: permission denied for this organization'],
+      api_error_status: 403, terminal_reason: 'model_error', permission_denials: [],
       num_turns: 0, duration_ms: 12, duration_api_ms: 0,
       usage: { input_tokens: 0, output_tokens: 0 },
     }));

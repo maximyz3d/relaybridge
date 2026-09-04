@@ -14,6 +14,7 @@ const { resolveModelArgs, applyModelArgs, modelConfigStaleness, modelTierForTask
 const { buildRegistry, parseModelList, pinIsRetired } = require('./lib/model-registry');
 const { buildTaskPlan, EFFORT_ORDER, costClassFor } = require('./lib/task-plan');
 const { buildQuotaSeatGroups } = require('./lib/quota-seat');
+const providerAccounts = require('./lib/provider-accounts');
 const { providerUsageCapability, providerUsageCapabilities } = require('./lib/provider-usage-capability');
 const platform = require('./lib/platform');
 const { receiptStoreIdentity } = require('./lib/receipt-store-identity.cjs');
@@ -103,8 +104,36 @@ function currentUserSid() {
   return match ? match[1] : null;
 }
 
+// POSIX used to assert "mode bits already restrict this file" without ever
+// looking at the file. That claim is false on any filesystem that ignores mode
+// bits: a checkout (or a RELAYBRIDGE_TOKEN_FILE / RELAYBRIDGE_DATA_DIR) under
+// /mnt on WSL is DrvFs/9p mounted with no metadata option, where both the 0600
+// in writeFileSync and the follow-up chmodSync succeed silently and leave the
+// file 0777 — so the swallowing catch never fires, /api/health reported the
+// token as protected, and every other local account could read full bridge
+// control. Stat the result instead of describing it, and let the existing
+// operator warning fire when the filesystem did not honour the request.
+function verifyPosixTokenMode(filePath) {
+  let mode;
+  try { mode = fs.statSync(filePath).mode & 0o777; }
+  catch (err) {
+    return { platform: process.platform, applicable: true, hardened: false, detail: `could not stat the token file to verify its mode: ${err.message}` };
+  }
+  const octal = mode.toString(8).padStart(3, '0');
+  const restricted = (mode & 0o077) === 0;
+  return {
+    platform: process.platform,
+    applicable: true,
+    hardened: restricted,
+    mode: octal,
+    detail: restricted
+      ? `mode ${octal}: no group or other access`
+      : `mode ${octal}: the filesystem did not honour the requested 0600 (a /mnt DrvFs or 9p mount does this) — every local account can read this token`,
+  };
+}
+
 function hardenTokenFileAcl(filePath) {
-  if (process.platform !== 'win32') return { platform: process.platform, applicable: false, hardened: null, detail: 'POSIX mode bits already restrict this file' };
+  if (process.platform !== 'win32') return verifyPosixTokenMode(filePath);
   if (TOKEN_ACL_SKIPPED) return { platform: 'win32', applicable: true, hardened: null, skipped: true, detail: 'RELAYBRIDGE_SKIP_TOKEN_ACL is set' };
   const before = readTokenAclState(filePath);
   if (!before.ok) return { platform: 'win32', applicable: true, hardened: false, detail: `could not read the token ACL: ${before.detail}` };
@@ -965,7 +994,18 @@ function sendOneShotResult(res, payload, meta) {
     stderr: payload.stderr,
     exitCode: payload.exitCode,
     elapsedMs: meta?.startedAt ? Date.now() - meta.startedAt : 0,
-    stopReason: payload.stop_reason,
+    // classifyRunFailure's stopReason means "the supervisor stopped this run",
+    // and it short-circuits on any value before its INTERNAL_TIMEOUT patterns
+    // run. stop_reason also carries provider-derived reasons — the CLI's own
+    // internal timeout — so passing it turned the exact case
+    // lib/provider-failure.js was written for (gemini, exit 1, "timeout waiting
+    // for response") into supervisor_provider_internal_timeout with
+    // failUp:false, writing a ledger failureKind that blames the bridge for a
+    // provider fault. Paths that know about the supervisor say so explicitly;
+    // older payloads that only carry stop_reason set it for bridge stops only.
+    stopReason: Object.prototype.hasOwnProperty.call(payload, 'supervisor_stop_reason')
+      ? payload.supervisor_stop_reason
+      : payload.stop_reason,
     modelFlagSent: !!meta?.route?.model_flag_sent,
   });
   if (classified.partialResult) {
@@ -1003,6 +1043,8 @@ function sendOneShotResult(res, payload, meta) {
         : payload.rate_limited ? 'rate_limited'
         : payload.auth_failed ? 'auth_failed'
         : payload.failureClass || (classified.kind !== 'ok' ? classified.kind : null);
+      const effectiveQuotaSeat = payload.route?.quota_seat || meta.route?.quota_seat
+        || quotaSeatForProvider(meta.kind);
       if (failureKind === 'rate_limited') {
         const vendorQuota = parseGrokQuota429({
           provider: meta.kind,
@@ -1011,10 +1053,18 @@ function sendOneShotResult(res, payload, meta) {
           text: `${payload.stdout || ''}\n${payload.stderr || ''}`,
           model: payload.route?.resolved_model_identity || payload.model || null,
         });
-        if (vendorQuota) payload.vendor_quota = usageLedger.observeVendorQuota(vendorQuota);
+        if (vendorQuota) {
+          payload.vendor_quota = usageLedger.observeVendorQuota({
+            ...vendorQuota,
+            quotaSeat: effectiveQuotaSeat,
+          });
+        }
       }
       recordRunUsage({
         kind: meta.kind, route: payload.route || meta.route, usage: payload.usage,
+        // Same precedence the vendor-quota parse above uses: the model the
+        // provider says answered, then the one the route asked for.
+        model: payload.route?.resolved_model_identity || payload.model || null,
         startedAt: meta.startedAt, ok, failureKind,
       });
       // Post-hoc grounding check: a seat WITH access can still hallucinate, and
@@ -1029,22 +1079,44 @@ function sendOneShotResult(res, payload, meta) {
         }
       } catch { /* verification is advisory; never fail a run over it */ }
       try {
-        const quotaSeat = quotaSeatForProvider(meta.kind);
         if (ok) {
-          cooldowns.noteSuccess(quotaSeat);
-          if (quotaSeat !== meta.kind) cooldowns.noteSuccess(meta.kind);
+          cooldowns.noteSuccess(effectiveQuotaSeat);
+          // A model-scoped cooldown is keyed by provider rather than account.
+          // A successful call through any linked account proves that model is
+          // available again, while the account-specific clear above remains
+          // isolated to the subscription that paid for this run.
+          const providerCooldown = cooldowns.status(meta.kind);
+          if (effectiveQuotaSeat !== meta.kind && providerCooldown.cooling
+            && providerCooldown.scope === 'model') cooldowns.noteSuccess(meta.kind);
         }
         else if (failureKind) {
           // An explicitly model-scoped vendor observation must not cool every
           // model on the account. Generic 429/overload evidence has no narrower
           // scope, so it conservatively applies to the shared quota seat.
-          const cooldownSeat = payload.vendor_quota?.scope === 'model' ? meta.kind : quotaSeat;
+          const cooldownSeat = payload.vendor_quota?.scope === 'model' ? meta.kind : effectiveQuotaSeat;
           cooldowns.noteFailure(cooldownSeat, failureKind, {
             retryAfterSec: parseRetryAfter(`${payload.stdout || ''}\n${payload.stderr || ''}`, payload.retry_after),
             scope: payload.vendor_quota?.scope === 'model' ? 'model' : 'account',
           });
         }
       } catch { /* cooldown bookkeeping must never break a response */ }
+      try {
+        const selectedAccountId = meta.accountId || payload.route?.account || meta.route?.account || null;
+        if (selectedAccountId) {
+          const changed = ok
+            ? providerAccounts.clearAccountAuthFailure(DATA_DIR, meta.kind, selectedAccountId)
+            : payload.auth_failed === true
+              ? providerAccounts.noteAccountAuthFailure(
+                  DATA_DIR, meta.kind, selectedAccountId, loadConfig()[meta.kind] || {},
+                )
+              : null;
+          if (changed) invalidateAccountRegistry();
+          if (selectedAccountId === providerAccounts.DEFAULT_ACCOUNT_ID) {
+            if (ok) updateDefaultAccountRuntimeAuth(meta.kind, true);
+            else if (payload.auth_failed === true) updateDefaultAccountRuntimeAuth(meta.kind, false);
+          }
+        }
+      } catch { /* account health bookkeeping must never break a response */ }
     }
   } catch { /* ignored on purpose */ }
   try {
@@ -1102,6 +1174,28 @@ function buildEnv(extras = {}, stripNames = []) {
     const preferred = new Set(candidates.map((p) => p.toLowerCase()));
     const remaining = cur.split(';').filter((p) => p && !preferred.has(p.toLowerCase()));
     env[pathKey] = [...candidates, ...remaining].join(';');
+  } else {
+    // The comment above promised ~/.local/bin coverage while the whole
+    // candidate block sat inside the win32 branch — including the POSIX-only
+    // ~/.local/bin entry, which is what gives away that the guard is the bug.
+    // On POSIX buildEnv returned the inherited PATH untouched, so a bridge
+    // started without a login shell (a systemd unit, an MCP stdio launcher, a
+    // desktop entry) hands every provider spawn, probe and PTY session a PATH
+    // with no user-level npm/pip prefix on it: the dashboard reports every
+    // seat "not installed" while the same commands work in the operator's own
+    // shell. lib/platform.js dodges this with `bash -lc`, but no provider
+    // spawn in this file goes through buildExecSpawn.
+    const cur = env.PATH || '';
+    const candidates = [
+      path.join(USER_HOME, '.local', 'bin'),
+      path.join(USER_HOME, '.npm-global', 'bin'),
+      path.join(USER_HOME, '.cargo', 'bin'),
+      path.join(USER_HOME, '.cursor', 'bin'),
+      path.join(USER_HOME, 'bin'),
+    ].filter((p) => p && fs.existsSync(p));
+    const preferred = new Set(candidates);
+    const remaining = cur.split(path.delimiter).filter((p) => p && !preferred.has(p));
+    env.PATH = [...candidates, ...remaining].join(path.delimiter);
   }
   return env;
 }
@@ -1131,7 +1225,35 @@ const WIN_EXEC_SUFFIX = /\.(exe|cmd|bat|ps1|com)$/i;
 
 // Like resolveExecutable, but also reports what it deliberately walked past, so
 // the dashboard can say WHY a seemingly-installed CLI is not on offer.
+// A full PATH miss costs one statSync per PATH entry, and on WSL most of the
+// inherited entries are 9p mounts under /mnt: ~90ms per miss here, against
+// 0.015ms for a hit. /api/diag does one lookup per seat before it starts
+// probing and the dashboard calls /api/diag from six places, so a sweep of
+// mostly-not-installed seats spends seconds walking the same directories.
+// Memoize on (command, PATH) for a short window — long enough to collapse a
+// dashboard refresh burst, short enough that a CLI installed by hand outside
+// the bridge appears on the next sweep. /api/install clears it outright.
+const EXECUTABLE_CACHE_TTL_MS = 15000;
+const executableCache = new Map();
 function resolveExecutableInfo(command, env = buildEnv()) {
+  // Key on the PATH the lookup will actually walk. Resolved the same
+  // case-insensitive way as the walk itself: on Windows a spread of
+  // process.env keeps the original casing ('Path'), and a plain-object read of
+  // the wrong case would key every env to the same empty string.
+  const pathKey = Object.keys(env || {}).find((k) => k.toUpperCase() === 'PATH') || 'Path';
+  const cacheKey = `${command}\u0000${(env && env[pathKey]) || ''}`;
+  const cached = executableCache.get(cacheKey);
+  const now = Date.now();
+  if (cached && cached.expires > now) return cached.value;
+  const value = resolveExecutableInfoUncached(command, env);
+  if (executableCache.size > 256) {
+    for (const [key, entry] of executableCache) if (entry.expires <= now) executableCache.delete(key);
+  }
+  executableCache.set(cacheKey, { value, expires: now + EXECUTABLE_CACHE_TTL_MS });
+  return value;
+}
+
+function resolveExecutableInfoUncached(command, env) {
   const none = { resolved: command, interopSkipped: [] };
   if (!command) return none;
   if (path.isAbsolute(command)) return { resolved: command, interopSkipped: [] };
@@ -1553,12 +1675,8 @@ function claudeTerminalReasonFailureClass(reason) {
   return reason;
 }
 
-function claudeApiStatusFailureClass(status) {
-  if (status === 401 || status === 403) return 'auth';
-  if (status === 408 || status === 504) return 'timeout';
-  if (status === 429) return 'rate_limit';
-  if (status === 402) return 'budget';
-  return status === null ? null : 'provider_error';
+function claudeApiStatusFailureClass(status, diagnostic = '') {
+  return status === null ? null : classifyProviderHttpFailure(status, diagnostic);
 }
 
 function normalizeClaudeResultString(value, maxChars = 128) {
@@ -1734,7 +1852,7 @@ function parseConfiguredOneShotOutput(entry, rawOutput) {
       isError,
       resultSubtype: subtype || null,
       failureClass: subtype === 'error_max_budget_usd' ? 'budget'
-        : claudeApiStatusFailureClass(apiErrorStatus)
+        : claudeApiStatusFailureClass(apiErrorStatus, errors.retained.join('\n'))
         || claudeStopReasonFailureClass(providerStopReason)
         || claudeTerminalReasonFailureClass(terminalReasonRaw)
         || claudeResultFailureClass(subtype)
@@ -1776,20 +1894,31 @@ function parseConfiguredOneShotOutput(entry, rawOutput) {
 }
 
 function ollamaManifestIdentity(entry) {
-  if (entry?.transport !== 'local:ollama' || !entry.model || !USER_HOME) return null;
+  if (entry?.transport !== 'local:ollama' || !entry.model) return null;
   const match = /^([A-Za-z0-9._-]+)(?::([A-Za-z0-9._-]+))?$/.exec(String(entry.model));
   if (!match) return null;
-  const manifestPath = path.join(
-    USER_HOME,
-    '.ollama', 'models', 'manifests', 'registry.ollama.ai', 'library',
-    match[1], match[2] || 'latest',
-  );
-  try {
-    const bytes = fs.readFileSync(manifestPath);
-    return `sha256:${crypto.createHash('sha256').update(bytes).digest('hex')}`;
-  } catch {
-    return null;
+  // The manifest store is not always under the bridge's own HOME. On WSL the
+  // ollama daemon reachable on loopback is typically the Windows one, whose
+  // weights live in the Windows profile — USER_HOME/.ollama does not exist, so
+  // every local-seat receipt silently degraded to a bare tag with no @sha256,
+  // losing the one fact that proves which weights answered. OLLAMA_MODELS is
+  // ollama's own documented override for the store location, which lets the
+  // operator state it instead of the bridge guessing at /mnt paths.
+  const roots = [
+    String(process.env.OLLAMA_MODELS || '').trim(),
+    USER_HOME ? path.join(USER_HOME, '.ollama', 'models') : '',
+  ].filter(Boolean);
+  for (const root of roots) {
+    const manifestPath = path.join(
+      root, 'manifests', 'registry.ollama.ai', 'library',
+      match[1], match[2] || 'latest',
+    );
+    try {
+      const bytes = fs.readFileSync(manifestPath);
+      return `sha256:${crypto.createHash('sha256').update(bytes).digest('hex')}`;
+    } catch { /* try the next configured store */ }
   }
+  return null;
 }
 
 function localOllamaUrl() {
@@ -1834,7 +1963,9 @@ function hostedApiKey(entry) {
     const value = process.env[name];
     if (value && String(value).trim()) return { name, value: String(value) };
   }
-  throw new Error(`hosted provider key is not set; define ${names[0] || 'the configured API key environment variable'}`);
+  const error = new Error(`hosted provider key is not set; define ${names[0] || 'the configured API key environment variable'}`);
+  error.code = HOSTED_API_KEY_MISSING_CODE;
+  throw error;
 }
 
 function rejectedHttpModelInvocation(status) {
@@ -1855,7 +1986,7 @@ function terminalProviderBudgetOutcome(usage, providerBudget, turns = null) {
     : { exceeded: false, detail: '', budget: supervisor.snapshot().providerBudget };
 }
 
-async function runOpenAIChatOneShot({ entry, prompt, timeoutMs, res, route, startedAt, providerBudget }) {
+async function runOpenAIChatOneShot({ entry, prompt, timeoutMs, res, route, startedAt, providerBudget, accountId }) {
   const bounded = capPrompt(prompt, Number(entry.prompt_max_chars || 12000));
   route.prompt_transport = 'hosted_openai_compatible';
   route.prompt_truncated = bounded.truncated;
@@ -1926,6 +2057,7 @@ async function runOpenAIChatOneShot({ entry, prompt, timeoutMs, res, route, star
     try { payload = responseText ? JSON.parse(responseText) : {}; } catch {}
     if (!response.ok) {
       const detail = cleanOutput(payload.error?.message || payload.error || responseText || `hosted provider HTTP ${response.status}`);
+      const httpFailure = classifyProviderHttpFailure(response.status, detail);
       if (!clientGone && !res.writableEnded) {
         sendOneShotResult(res, {
           kind: route.provider,
@@ -1933,13 +2065,15 @@ async function runOpenAIChatOneShot({ entry, prompt, timeoutMs, res, route, star
           exitCode: response.status,
           stdout: '',
           stderr: detail,
-          rate_limited: response.status === 429,
-          budget_exceeded: /budget|credit|quota/i.test(detail),
-          auth_failed: response.status === 401 || response.status === 403,
+          failureClass: httpFailure,
+          rate_limited: httpFailure === 'rate_limit',
+          budget_exceeded: httpFailure === 'budget',
+          auth_failed: httpFailure === 'auth',
+          permission_denied: httpFailure === 'permission',
           timed_out: isUpstreamTimeoutStatus(response.status),
           dropped_out: true,
           model_invocation: rejectedHttpModelInvocation(response.status),
-        }, { kind: route.provider, prompt, route, startedAt });
+        }, { kind: route.provider, prompt, route, startedAt, accountId });
       }
       return;
     }
@@ -1985,7 +2119,7 @@ async function runOpenAIChatOneShot({ entry, prompt, timeoutMs, res, route, star
         timed_out: false,
         dropped_out: budgetOutcome.exceeded || !stdout,
         model_invocation: true,
-      }, { kind: route.provider, prompt, route, startedAt });
+      }, { kind: route.provider, prompt, route, startedAt, accountId });
     }
   } catch (error) {
     if (!clientGone && !res.writableEnded) {
@@ -1995,18 +2129,18 @@ async function runOpenAIChatOneShot({ entry, prompt, timeoutMs, res, route, star
         exitCode: -1,
         stdout: '',
         stderr: cleanOutput(error?.message || String(error)),
-        auth_failed: /key is not set|401|403/i.test(error?.message || ''),
+        auth_failed: isHostedApiKeyMissingError(error),
         timed_out: timedOut,
         dropped_out: true,
         model_invocation: requestStarted ? null : false,
-      }, { kind: route.provider, prompt, route, startedAt });
+      }, { kind: route.provider, prompt, route, startedAt, accountId });
     }
   } finally {
     clearTimeout(timer);
   }
 }
 
-async function runOllamaApiOneShot({ entry, prompt, timeoutMs, res, route, startedAt, providerBudget }) {
+async function runOllamaApiOneShot({ entry, prompt, timeoutMs, res, route, startedAt, providerBudget, accountId }) {
   const bounded = capPrompt(prompt, Number(entry.prompt_max_chars || 24000));
   route.prompt_transport = 'local_http';
   route.prompt_truncated = bounded.truncated;
@@ -2074,7 +2208,7 @@ async function runOllamaApiOneShot({ entry, prompt, timeoutMs, res, route, start
           timed_out: isUpstreamTimeoutStatus(response.status),
           dropped_out: true,
           model_invocation: rejectedHttpModelInvocation(response.status),
-        }, { kind: route.provider, prompt, route, startedAt });
+        }, { kind: route.provider, prompt, route, startedAt, accountId });
       }
       return;
     }
@@ -2121,7 +2255,7 @@ async function runOllamaApiOneShot({ entry, prompt, timeoutMs, res, route, start
         timed_out: false,
         dropped_out: budgetOutcome.exceeded || !stdout,
         model_invocation: true,
-      }, { kind: route.provider, prompt, route, startedAt });
+      }, { kind: route.provider, prompt, route, startedAt, accountId });
     }
   } catch (error) {
     if (!clientGone && !res.writableEnded) {
@@ -2134,7 +2268,7 @@ async function runOllamaApiOneShot({ entry, prompt, timeoutMs, res, route, start
         timed_out: timedOut,
         dropped_out: true,
         model_invocation: requestStarted ? null : false,
-      }, { kind: route.provider, prompt, route, startedAt });
+      }, { kind: route.provider, prompt, route, startedAt, accountId });
     }
   } finally {
     clearTimeout(timer);
@@ -2187,6 +2321,14 @@ function killProcessTree(proc) {
 
 // ---- session management ----
 const sessions = new Map(); // id -> Session
+// How long an exited session stays listed and readable before it is reaped.
+// Long enough for a dashboard that reconnects after a reload to see how the
+// process ended; short enough that a long-lived bridge does not accumulate
+// dead sessions and their output buffers.
+const EXITED_SESSION_TTL_MS = 600000;
+// Per-client WebSocket send queue ceiling, in bytes, before session output is
+// dropped for that client instead of queued on the bridge's heap.
+const WS_CLIENT_BUFFER_MAX = 4194304;
 
 // Live provider runs, keyed by runId, so a human (or the dashboard) can vet
 // whether a quiet run is working or wedged instead of guessing.
@@ -2263,6 +2405,7 @@ class Session {
     this.buffer = []; // ring buffer of recent output
     this.bufferMax = 2000; // lines
     this.clients = new Set(); // WebSocket clients
+    this._starved = new Set(); // clients currently being skipped for backpressure
     this.proc = null;
     this.exited = false;
     this.exitCode = null;
@@ -2315,6 +2458,10 @@ class Session {
       cwd: this.cwd,
       env,
       windowsHide: true,
+      // Same reason as the one-shot spawn: killProcessTree can only take out
+      // the whole tree with a single signal when the child leads its own
+      // group. Pipe mode has no controlling terminal to lose.
+      detached: process.platform !== 'win32',
     });
     this._mode = 'pipe';
     this.proc.stdout.on('data', (d) => this._onData(d.toString('utf8')));
@@ -2333,27 +2480,64 @@ class Session {
     });
   }
 
+  // ws queues every unsent frame on the bridge's heap with no ceiling, so a
+  // child flooding stdout while one client is slow — a backgrounded Chrome tab
+  // throttles its socket reads, which is the common case — made the bridge's
+  // memory track the slowest browser tab. Past the threshold, drop frames for
+  // that client and say so once, rather than buffering on its behalf: the
+  // scrollback it missed is still available from GET /api/sessions/:id/buffer.
+  _sendTo(ws, frame) {
+    if (ws.readyState !== 1) return;
+    if (ws.bufferedAmount > WS_CLIENT_BUFFER_MAX) {
+      if (!this._starved.has(ws)) {
+        this._starved.add(ws);
+        try { ws.send(JSON.stringify({ type: 'data', data: '\r\n[RelayBridge] output skipped — this client is not reading fast enough; reload the tab to resync\r\n' })); } catch {}
+      }
+      return;
+    }
+    this._starved.delete(ws);
+    try { ws.send(frame); } catch {}
+  }
+
   _onData(text) {
     this.buffer.push(text);
     if (this.buffer.length > this.bufferMax) {
       this.buffer.splice(0, this.buffer.length - this.bufferMax);
     }
-    for (const ws of this.clients) {
-      if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'data', data: text }));
-    }
+    const frame = JSON.stringify({ type: 'data', data: text });
+    for (const ws of this.clients) this._sendTo(ws, frame);
   }
 
   _onExit(code) {
+    if (this.exited) return;   // pipe mode can deliver both 'error' and 'close'
     this.exited = true;
     this.exitCode = code;
     const msg = `\r\n[RelayBridge] process exited with code ${code}\r\n`;
     this.buffer.push(msg);
+    // The banner pushed past bufferMax without the trim _onData does.
+    if (this.buffer.length > this.bufferMax) {
+      this.buffer.splice(0, this.buffer.length - this.bufferMax);
+    }
     for (const ws of this.clients) {
+      this._sendTo(ws, JSON.stringify({ type: 'data', data: msg }));
+      // The exit frame is terminal state, not output: send it even to a client
+      // whose queue is over the cap, or a backed-up tab would never learn the
+      // process ended and would sit on a live-looking terminal forever.
       if (ws.readyState === 1) {
-        ws.send(JSON.stringify({ type: 'data', data: msg }));
-        ws.send(JSON.stringify({ type: 'exit', code }));
+        try { ws.send(JSON.stringify({ type: 'exit', code })); } catch {}
       }
     }
+    // Nothing removed an exited session from the `sessions` map: only DELETE
+    // /api/sessions/:id does, and only public/index.html issues it, so every
+    // CLI that finished on its own — plus every tab closed with the browser
+    // rather than the X — left a Session holding its buffer for the life of
+    // the bridge, and GET /api/sessions kept listing the corpses. Keep it
+    // addressable long enough for a reconnecting dashboard to read the exit,
+    // then drop it. unref'd so it never holds the process open.
+    const reaper = setTimeout(() => {
+      if (sessions.get(this.id) === this) sessions.delete(this.id);
+    }, EXITED_SESSION_TTL_MS);
+    if (typeof reaper.unref === 'function') reaper.unref();
   }
 
   write(input) {
@@ -2391,6 +2575,7 @@ class Session {
 
   detach(ws) {
     this.clients.delete(ws);
+    this._starved.delete(ws);
   }
 
   meta() {
@@ -2465,6 +2650,24 @@ const ALLOWED_ORIGINS = new Set([
   `http://localhost:${PORT}`,
 ]);
 
+// DNS rebinding turns "loopback-only" into "any web page can reach the bridge":
+// the attacker's page resolves its own hostname to 127.0.0.1, so the socket
+// really is loopback, and per Fetch a same-origin GET carries no Origin header
+// — isDirectLoopbackRequest and the Origin gate below both pass, and
+// /api/capability hands that page the master token. Host is the one header the
+// browser will not let it forge, so pin it to the names this process is
+// actually reachable under (it binds HOST only). lib/remote-mcp.js already
+// documents this check as part of its posture; /mcp itself is exempt because it
+// is bearer-gated and deliberately reached through a tunnel under a public
+// hostname, which is the only supported non-loopback surface.
+// Derived from ALLOWED_ORIGINS so the two gates can never disagree about which
+// names this bridge answers to. Both forms: a browser omits the port only when
+// it is the scheme default.
+const ALLOWED_HOSTS = new Set([...ALLOWED_ORIGINS].flatMap((origin) => {
+  const parsed = new URL(origin);
+  return [parsed.host, parsed.hostname];
+}));
+
 function isDirectLoopbackRequest(req) {
   const remote = String(req.socket?.remoteAddress || '').toLowerCase();
   const loopback = remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1';
@@ -2478,6 +2681,14 @@ app.use((req, res, next) => {
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('Referrer-Policy', 'no-referrer');
   res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=()');
+  // An absent Host cannot come from a browser (HTTP/1.1 requires it), so it is
+  // not a rebinding vector; a handwritten loopback client that omits it keeps
+  // working. Compared lowercase because only browsers normalize it.
+  const host = String(req.headers.host || '').toLowerCase();
+  const remoteMcpPath = req.path === '/mcp' || req.path.startsWith('/mcp/');
+  if (host && !ALLOWED_HOSTS.has(host) && !remoteMcpPath) {
+    return res.status(403).json({ error: 'host not allowed' });
+  }
   const origin = req.headers.origin;
   if (origin && !ALLOWED_ORIGINS.has(origin)) {
     return res.status(403).json({ error: 'origin not allowed' });
@@ -2519,6 +2730,19 @@ app.get(['/', '/index.html'], (req, res) => {
     "object-src 'none'",
   ].join('; '));
   res.type('html').send(html);
+});
+// The static mount below serves public/index.html for any path the route
+// matcher above misses — '//index.html' and '/%2findex.html' both reach it —
+// and that copy carries no CSP header, no per-response nonce and no
+// __ONE_SHOT_DEFAULT_TIMEOUT_MS__ substitution, so one extra slash yields an
+// unprotected page whose inline script dies on an unbound identifier. The
+// template is only ever served by the handler above; anything else asking for
+// it by path is not a real client.
+app.use((req, res, next) => {
+  let requested = req.path;
+  try { requested = decodeURIComponent(req.path); } catch { /* malformed escape: judge the raw path */ }
+  if (/(?:^|[\\/])index\.html$/i.test(requested)) return res.status(404).json({ error: 'not found' });
+  next();
 });
 app.use(express.static(path.join(ROOT, 'public'), { index: false, dotfiles: 'deny' }));
 
@@ -2724,7 +2948,10 @@ function runProbe(slotRaw, timeoutMs = 15000, stripEnv = [], signal) {
       : args;
     let proc;
     try {
-      proc = trackChild(spawn(spawnBinary, spawnArgs, { cwd: ROOT, env, windowsHide: true }));
+      // detached on POSIX so the timeout kill signals the probe's whole group
+      // instead of orphaning whatever it spawned — see the one-shot spawnOpts
+      // for why killTree's ps-walk fallback is not equivalent.
+      proc = trackChild(spawn(spawnBinary, spawnArgs, { cwd: ROOT, env, windowsHide: true, detached: process.platform !== 'win32' }));
     } catch (err) {
       return resolve({ exitCode: -1, stdout: '', stderr: err.message, timedOut: false });
     }
@@ -2738,7 +2965,13 @@ function runProbe(slotRaw, timeoutMs = 15000, stripEnv = [], signal) {
       settled = true;
       clearTimeout(timer);
       if (abortHandler) signal?.removeEventListener('abort', abortHandler);
-      resolve({ exitCode, stdout, stderr: error ? stderr + '\n' + error.message : stderr, timedOut, aborted: !!signal?.aborted });
+      // Join instead of prefixing: when the child never starts, stderr is '' and
+      // the old concatenation produced '\nspawn agy ENOENT', whose FIRST line is
+      // empty — and every consumer takes the first line (discoverModels,
+      // /api/auth/status). The most common failure on a fresh box, "that CLI is
+      // not installed under this name", was therefore recorded as no error at
+      // all: model-registry rows landed with error:null and no warning.
+      resolve({ exitCode, stdout, stderr: [stderr, error && error.message].filter(Boolean).join('\n'), timedOut, aborted: !!signal?.aborted });
     };
     const timer = setTimeout(() => {
       timedOut = true;
@@ -2767,6 +3000,77 @@ function runProbe(slotRaw, timeoutMs = 15000, stripEnv = [], signal) {
 // Latest completed /api/diag snapshot. /api/agents reuses it instead of
 // spawning fresh readiness probes on every listing.
 let lastDiagnostics = null;
+
+function updateDefaultAccountRuntimeAuth(kind, authenticated) {
+  if (!kind) return;
+  const priorResults = lastDiagnostics?.results && typeof lastDiagnostics.results === 'object'
+    ? lastDiagnostics.results : {};
+  const prior = priorResults[kind] && typeof priorResults[kind] === 'object'
+    ? priorResults[kind] : {};
+  lastDiagnostics = {
+    at: Date.now(),
+    results: {
+      ...priorResults,
+      [kind]: {
+        ...prior,
+        found: true,
+        ready: authenticated,
+        authFailed: !authenticated,
+        authAuthoritative: true,
+        detail: authenticated
+          ? 'authenticated by successful default-account dispatch'
+          : 'default account authentication failed during live dispatch',
+      },
+    },
+  };
+}
+
+function armDefaultAccountRuntimeAuthRetry(kind) {
+  const priorResults = lastDiagnostics?.results && typeof lastDiagnostics.results === 'object'
+    ? lastDiagnostics.results : {};
+  const prior = priorResults[kind] && typeof priorResults[kind] === 'object'
+    ? priorResults[kind] : {};
+  // Pending is intentionally neither ready nor signed out. The operator action
+  // authorizes one live validation; only that dispatch may prove success.
+  lastDiagnostics = {
+    at: Date.now(),
+    results: {
+      ...priorResults,
+      [kind]: {
+        ...prior,
+        ready: null,
+        authFailed: false,
+        authAuthoritative: false,
+        detail: 'operator requested an authentication retry; live validation is pending',
+      },
+    },
+  };
+}
+
+// A refreshed provider probe is the generic positive signal that the implicit
+// credential home was repaired. Keep the persisted managed-default quarantine
+// aligned with that live evidence; linked account markers remain independent.
+function reconcileManagedDefaultAuth(cfg, results) {
+  let changed = false;
+  for (const [kind, result] of Object.entries(results || {})) {
+    const entry = cfg?.[kind];
+    if (!entry || !providerAccounts.credentialEnvFor(entry) || !result?.found
+      || entry.probe_auth_authoritative !== true) continue;
+    try {
+      const mutation = result.ready === true
+        ? providerAccounts.clearAccountAuthFailure(
+            DATA_DIR, kind, providerAccounts.DEFAULT_ACCOUNT_ID,
+          )
+        : result.authFailed === true
+          ? providerAccounts.noteAccountAuthFailure(
+              DATA_DIR, kind, providerAccounts.DEFAULT_ACCOUNT_ID, entry,
+            )
+          : null;
+      changed = !!mutation || changed;
+    } catch { /* diagnostics must still return when account authority needs repair */ }
+  }
+  if (changed) invalidateAccountRegistry();
+}
 
 const PROVIDER_TAG_RE = /^[a-z][a-z0-9-]{0,23}$/;
 const MAX_PROVIDER_TAGS = 16;
@@ -2910,6 +3214,21 @@ async function coldPlanningDiagnostics(cfg, pathDetail) {
     return [kind, { found, ready: found, detail: pathDetail }];
   }));
   return Object.fromEntries(pairs);
+}
+
+// Live dispatch can update one provider's authentication state before a full
+// readiness sweep has ever run. Such a partial snapshot must not make every
+// absent provider look eligible. Fill only missing configured keys with cheap
+// path/transport evidence and preserve every live result already observed.
+async function completePlanningDiagnostics(cfg, existing, pathDetail) {
+  const preserved = existing && typeof existing === 'object' && !Array.isArray(existing)
+    ? existing : {};
+  const missingKinds = Object.keys(cfg).filter((kind) => !kind.startsWith('_')
+    && !Object.prototype.hasOwnProperty.call(preserved, kind));
+  if (!missingKinds.length) return preserved;
+  const missingConfig = Object.fromEntries(missingKinds.map((kind) => [kind, cfg[kind]]));
+  const missing = await coldPlanningDiagnostics(missingConfig, pathDetail);
+  return { ...missing, ...preserved };
 }
 
 function normalizeProviderTags(raw) {
@@ -3084,24 +3403,31 @@ app.post('/api/plan', async (req, res) => {
   try {
     const router = await import('./mcp/router.mjs');
     const cfg = loadConfig();
-    let diagnostics = lastDiagnostics?.results || null;
-    if (!diagnostics) {
-      diagnostics = await coldPlanningDiagnostics(cfg, 'path-only check');
-    }
+    let diagnostics = await completePlanningDiagnostics(
+      cfg,
+      lastDiagnostics?.results,
+      'path-only check',
+    );
     const gauges = usageLedger.gaugeAll(seatCostClasses());
-    const fleetInput = applyCooldownsToDiagnostics(diagnostics, coolingQuotaStates(), kind ? [kind] : []);
-    const vendorQuotaInput = applyVendorQuotaExhaustionToDiagnostics(fleetInput.diagnostics, gauges);
+    const routingInputs = accountAwareRoutingInputs(cfg, diagnostics, gauges, coolingQuotaStates());
+    const fleetInput = applyCooldownsToDiagnostics(
+      routingInputs.diagnostics, routingInputs.cooling, kind ? [kind] : [],
+    );
+    const vendorQuotaInput = applyVendorQuotaExhaustionToDiagnostics(
+      fleetInput.diagnostics, routingInputs.gauges,
+    );
     const filesystemInput = applyFilesystemEligibilityToDiagnostics(vendorQuotaInput.diagnostics, cfg, filesystemAuthority);
     diagnostics = filesystemInput.diagnostics;
     let route = router.routeTask({ task, diagnostics, dangerous: filesystemAuthority.dangerous });
-    route = levelRouteSelection(route, gauges, seatCostClassMap());
+    route = levelRouteSelection(route, routingInputs.gauges, seatCostClassMap());
     route.fleetState = {
       cooldownSkipped: fleetInput.skipped,
       vendorQuotaSkipped: vendorQuotaInput.skipped,
       balance: fleetBalance(gauges),
       vendorQuota: vendorQuotaFleet(gauges),
       operatorQuota: operatorQuotaFleet(gauges),
-      quotaSeats: quotaSeatRegistry.groups,
+      quotaSeats: currentQuotaSeatGroups(),
+      accountSelection: routingInputs.accountSelection,
       filesystemSkipped: filesystemInput.skipped,
       filesystemAuthority,
     };
@@ -3123,9 +3449,19 @@ app.post('/api/plan', async (req, res) => {
 // Delegation: classify a task, rank providers by tier, and pick the model
 // weight class inside each. Advisory — it returns a plan, it does not dispatch.
 app.post('/api/route', async (req, res) => {
-  const { task, diagnostics: supplied, preferKinds, excludeKinds, providerBudget: rawBudget } = req.body || {};
+  const {
+    task, diagnostics: supplied, preferKinds, excludeKinds, providerBudget: rawBudget,
+    localOnly = false, maxProviders, committeeMode = 'advisory',
+  } = req.body || {};
   if (!task || typeof task !== 'string' || !task.trim()) {
     return res.status(400).json({ error: 'task (non-empty string) required' });
+  }
+  if (maxProviders !== undefined
+    && (!Number.isInteger(maxProviders) || maxProviders < 1 || maxProviders > 4)) {
+    return res.status(400).json({ error: 'maxProviders must be an integer from 1 to 4' });
+  }
+  if (!['advisory', 'consensus'].includes(committeeMode)) {
+    return res.status(400).json({ error: 'committeeMode must be advisory or consensus' });
   }
   let requestedProviderBudget;
   try {
@@ -3139,14 +3475,20 @@ app.post('/api/route', async (req, res) => {
   try {
     const router = await import('./mcp/router.mjs');
     const cfg = loadConfig();
-    let diagnostics = supplied && typeof supplied === 'object' ? supplied : (lastDiagnostics?.results || null);
-    if (!diagnostics) {
-      diagnostics = await coldPlanningDiagnostics(cfg, 'path-only check; run /api/diag for auth status');
-    }
+    let diagnostics = await completePlanningDiagnostics(
+      cfg,
+      supplied && typeof supplied === 'object' ? supplied : lastDiagnostics?.results,
+      'path-only check; run /api/diag for auth status',
+    );
     const explicitKinds = Array.isArray(preferKinds) ? preferKinds : [];
     const gauges = usageLedger.gaugeAll(seatCostClasses());
-    const fleetInput = applyCooldownsToDiagnostics(diagnostics, coolingQuotaStates(), explicitKinds);
-    const vendorQuotaInput = applyVendorQuotaExhaustionToDiagnostics(fleetInput.diagnostics, gauges);
+    const routingInputs = accountAwareRoutingInputs(cfg, diagnostics, gauges, coolingQuotaStates());
+    const fleetInput = applyCooldownsToDiagnostics(
+      routingInputs.diagnostics, routingInputs.cooling, explicitKinds,
+    );
+    const vendorQuotaInput = applyVendorQuotaExhaustionToDiagnostics(
+      fleetInput.diagnostics, routingInputs.gauges,
+    );
     const filesystemInput = applyFilesystemEligibilityToDiagnostics(vendorQuotaInput.diagnostics, cfg, filesystemAuthority);
     diagnostics = filesystemInput.diagnostics;
     let route = router.routeTask({
@@ -3154,15 +3496,19 @@ app.post('/api/route', async (req, res) => {
       dangerous: filesystemAuthority.dangerous,
       preferredProviders: explicitKinds.length ? explicitKinds : undefined,
       excludedProviders: Array.isArray(excludeKinds) ? excludeKinds : undefined,
+      localOnly: localOnly === true,
+      maxProviders,
+      committeeMode,
     });
-    route = levelRouteSelection(route, gauges, seatCostClassMap());
+    route = levelRouteSelection(route, routingInputs.gauges, seatCostClassMap());
     route.fleetState = {
       cooldownSkipped: fleetInput.skipped,
       vendorQuotaSkipped: vendorQuotaInput.skipped,
       balance: fleetBalance(gauges),
       vendorQuota: vendorQuotaFleet(gauges),
       operatorQuota: operatorQuotaFleet(gauges),
-      quotaSeats: quotaSeatRegistry.groups,
+      quotaSeats: currentQuotaSeatGroups(),
+      accountSelection: routingInputs.accountSelection,
       filesystemSkipped: filesystemInput.skipped,
       filesystemAuthority,
     };
@@ -3201,7 +3547,7 @@ function signedOutProviders(diagnostics, cfg) {
   const results = diagnostics?.results || diagnostics || {};
   const out = [];
   for (const [kind, info] of Object.entries(results)) {
-    if (!info || !info.found || info.ready) continue;
+    if (!info || !info.found || info.ready || info.authFailed !== true) continue;
     const entry = cfg[kind];
     if (!entry) continue;
     out.push({
@@ -3213,6 +3559,11 @@ function signedOutProviders(diagnostics, cfg) {
     });
   }
   return out;
+}
+
+const AUTH_FAILURE_RE = /(?:not (?:logged|signed) in|not authenticated|unauthenticated|authentication required|please (?:log|sign) in|login required|no active (?:session|account)|invalid (?:api key|credentials)|"loggedIn"\s*:\s*false)/i;
+function probeIndicatesAuthFailure(text) {
+  return AUTH_FAILURE_RE.test(String(text || ''));
 }
 
 app.get('/api/auth/status', async (req, res) => {
@@ -3243,9 +3594,18 @@ app.get('/api/auth/status', async (req, res) => {
         } catch { found = false; }
         if (!found) return [kind, { found: false, ready: false, detail: 'not installed' }];
         const result = await runProbe(entry.probe, Number(entry.probe_timeout_ms || 30000), entry.strip_env || []);
-        return [kind, { found: true, ready: result.exitCode === 0, detail: result.exitCode === 0 ? 'authenticated' : (result.stderr || '').split('\n')[0].slice(0, 160) }];
+        const probeText = cleanOutput([result.stdout, result.stderr].filter(Boolean).join('\n'));
+        return [kind, {
+          found: true,
+          ready: result.exitCode === 0,
+          authFailed: result.exitCode !== 0 && probeIndicatesAuthFailure(probeText),
+          authAuthoritative: entry.probe_auth_authoritative === true,
+          detail: result.exitCode === 0 ? 'authenticated' : probeText.split('\n')[0].slice(0, 160),
+        }];
       }));
-      diagnostics = { at: Date.now(), results: Object.fromEntries(pairs.filter(([, v]) => v)) };
+      const refreshedResults = Object.fromEntries(pairs.filter(([, v]) => v));
+      reconcileManagedDefaultAuth(cfg, refreshedResults);
+      diagnostics = { at: Date.now(), results: refreshedResults };
       lastDiagnostics = diagnostics;
     } catch (err) {
       return res.status(500).json({ ok: false, error: err.message });
@@ -3342,20 +3702,33 @@ app.get('/api/diag', async (req, res) => {
     let ready = found;
     let detail = '';
     let probeExitCode = null;
+    let authFailed = false;
     // Say WHY a CLI that is plainly on PATH is not being offered, instead of
     // reporting a bare "not installed" the operator cannot act on.
     if (!found && resolvedInfo.interopSkipped.length) {
       detail = `found only as a Windows binary (${resolvedInfo.interopSkipped[0]}) — `
         + 'install the native Linux CLI, or set RELAYBRIDGE_ALLOW_WIN_INTEROP=1 to use it over WSL interop';
     }
-    if (found && Array.isArray(entry.probe) && entry.probe.length) {
-      const probe = await runProbe(entry.probe, Number(entry.probe_timeout_ms || 30000), entry.strip_env || [], controller.signal);
+    // Authentication and version probes are independent read-only calls. Run
+    // them under one wall-clock envelope instead of spending up to 30s and
+    // then another 15s sequentially; the MCP diagnostic deadline can now cover
+    // every server-legal probe plus process-close grace.
+    const [probe, versionProbe] = await Promise.all([
+      found && Array.isArray(entry.probe) && entry.probe.length
+        ? runProbe(entry.probe, Number(entry.probe_timeout_ms || 30000), entry.strip_env || [], controller.signal)
+        : Promise.resolve(null),
+      found && Array.isArray(entry.version_probe) && entry.version_probe.length
+        ? runProbe(entry.version_probe, 15000, entry.strip_env || [], controller.signal)
+        : Promise.resolve(null),
+    ]);
+    if (probe) {
       probeExitCode = probe.exitCode;
       ready = !probe.timedOut && probe.exitCode === 0;
       const probeText = cleanOutput([probe.stdout, probe.stderr].filter(Boolean).join('\n'));
       if (entry.probe_expect && !probeText.toLowerCase().includes(String(entry.probe_expect).toLowerCase())) ready = false;
       const probeReject = Array.isArray(entry.probe_reject) ? entry.probe_reject : [];
       if (probeReject.some((value) => probeText.toLowerCase().includes(String(value).toLowerCase()))) ready = false;
+      authFailed = !ready && probeIndicatesAuthFailure(probeText);
       detail = ready && entry.probe_success_detail
         ? String(entry.probe_success_detail).slice(0, 300)
         : (entry.probe_redact ? (ready ? 'readiness check passed' : 'readiness check failed') : probeText.split('\n')[0].slice(0, 300));
@@ -3363,8 +3736,7 @@ app.get('/api/diag', async (req, res) => {
       if (probe.aborted) detail = 'readiness check cancelled';
     }
     let runtimeVersion = '';
-    if (!controller.signal.aborted && found && Array.isArray(entry.version_probe) && entry.version_probe.length) {
-      const versionProbe = await runProbe(entry.version_probe, 15000, entry.strip_env || [], controller.signal);
+    if (versionProbe) {
       if (!versionProbe.timedOut && versionProbe.exitCode === 0) {
         runtimeVersion = cleanOutput(versionProbe.stdout || versionProbe.stderr).split('\n')[0].slice(0, 200);
       }
@@ -3377,14 +3749,45 @@ app.get('/api/diag', async (req, res) => {
       label: entry.label,
       detail,
       probeExitCode,
+      authFailed,
+      authAuthoritative: entry.probe_auth_authoritative === true,
       runtimeVersion,
       usageCapability: providerUsageCapability(entry, { runtimeVersion }),
     }];
   }));
   const rawResults = Object.fromEntries(pairs);
   const results = applyFilesystemEligibilityToDiagnostics(rawResults, cfg).diagnostics;
-  if (!controller.signal.aborted) lastDiagnostics = { at: Date.now(), results };
-  if (!clientGone && !res.writableEnded) res.json({ results });
+  if (!controller.signal.aborted) {
+    reconcileManagedDefaultAuth(cfg, results);
+    lastDiagnostics = { at: Date.now(), results };
+  }
+  if (!clientGone && !res.writableEnded) {
+    let routing = null;
+    try {
+      const gauges = usageLedger.gaugeAll(seatCostClasses());
+      const accountInputs = accountAwareRoutingInputs(cfg, results, gauges, coolingQuotaStates());
+      const cooldownInput = applyCooldownsToDiagnostics(accountInputs.diagnostics, accountInputs.cooling, []);
+      const vendorInput = applyVendorQuotaExhaustionToDiagnostics(
+        cooldownInput.diagnostics, accountInputs.gauges,
+      );
+      const filesystemInput = applyFilesystemEligibilityToDiagnostics(vendorInput.diagnostics, cfg);
+      const projectedResults = Object.fromEntries(Object.entries(filesystemInput.diagnostics)
+        .map(([kind, info]) => [kind, info && typeof info === 'object' ? {
+          ...info,
+          accountSelection: accountInputs.accountSelection[kind] || null,
+        } : info]));
+      routing = {
+        results: projectedResults,
+        accountSelection: accountInputs.accountSelection,
+        cooldownSkipped: cooldownInput.skipped,
+        vendorQuotaSkipped: vendorInput.skipped,
+        filesystemSkipped: filesystemInput.skipped,
+      };
+    } catch (err) {
+      routing = { results, unavailable: true, detail: err.message };
+    }
+    res.json({ results, routing });
+  }
 });
 
 app.get('/api/permissions', (req, res) => {
@@ -3439,6 +3842,7 @@ app.get('/api/sessions/:id/buffer', (req, res) => {
 });
 
 // One-shot exec â€” for Cowork to run a PowerShell command and get output back.
+const EXEC_OUTPUT_MAX = 1048576;
 app.post('/api/exec', (req, res) => {
   if (!isDirectLoopbackRequest(req)) {
     return res.status(403).json({ error: 'command execution is loopback-only' });
@@ -3473,13 +3877,19 @@ app.post('/api/exec', (req, res) => {
   res.on('close', () => { if (!res.writableEnded) killProcessTree(proc); });
   proc.stdout.setEncoding('utf8');
   proc.stderr.setEncoding('utf8');
-  proc.stdout.on('data', (d) => { stdout += d; });
-  proc.stderr.on('data', (d) => { stderr += d; });
+  // Cap the accumulation. A command that streams faster than the timeout grew
+  // two JS strings without limit, which is the OOM the one-shot path is
+  // hardened against by supervisor.recordOutput and runProbe by its 32 KB
+  // ceiling; this route had neither. `truncated` tells the caller the output
+  // is short rather than the command being quiet.
+  let truncated = false;
+  proc.stdout.on('data', (d) => { if (stdout.length < EXEC_OUTPUT_MAX) stdout += d; else truncated = true; });
+  proc.stderr.on('data', (d) => { if (stderr.length < EXEC_OUTPUT_MAX) stderr += d; else truncated = true; });
   proc.on('close', (code) => {
     clearTimeout(t);
     if (settled) return;
     settled = true;
-    res.json({ stdout, stderr, exitCode: code, shell: built.shellKind, shellNote: built.fallbackNote || undefined });
+    res.json({ stdout, stderr, exitCode: code, truncated: truncated || undefined, shell: built.shellKind, shellNote: built.fallbackNote || undefined });
   });
   proc.on('error', (err) => {
     clearTimeout(t);
@@ -3500,6 +3910,9 @@ app.post('/api/exec', (req, res) => {
 // resolution, admission control, receipts, and cleanup. `res` only needs the
 // Express response surface this function touches (status/json/on/once/
 // writableEnded/destroyed), so broadcast passes a captured stand-in.
+// How long to wait after the child's own 'exit' for the stdio pipes to reach
+// EOF before settling anyway. Matches runProbe's 2s post-kill grace.
+const ONESHOT_CLOSE_GRACE_MS = 2000;
 async function executeOneShot(body, res) {
   const startedAt = Date.now();
   const { kind, prompt, timeoutMs, cwd, dangerous } = body || {};
@@ -3594,24 +4007,15 @@ async function executeOneShot(body, res) {
   if (body?.maxEffortOverride === true && requestedEffort !== 'max') {
     return rejectBeforeAdmission(400, 'validation', { error: 'maxEffortOverride is valid only with effort=max' });
   }
-  // Pre-flight auth gate. If the last readiness sweep saw this CLI installed but
-  // signed out, the call would fail with an opaque provider error and the prompt
-  // would be wasted. Report it as an actionable auth_required instead, so the
-  // caller can open a sign-in terminal and retry. Only a *positive* signed-out
-  // observation blocks: an unprobed provider is attempted as before.
+  // A provider-wide readiness probe describes the operator's implicit/default
+  // login. Linked credential directories are separate authority domains, so a
+  // positive signed-out result excludes only that implicit account; account
+  // selection below may still choose a provisioned linked login.
   const readiness = lastDiagnostics?.results?.[kind];
-  if (readiness && readiness.found && readiness.ready === false && Array.isArray(entry.login_command)) {
-    return rejectBeforeAdmission(409, 'auth', {
-      ok: false,
-      auth_required: true,
-      kind,
-      label: entry.label || kind,
-      login_command: entry.login_command,
-      detail: readiness.detail || 'the provider CLI reports no active session',
-      error: `${entry.label || kind} is installed but not signed in`,
-      dropped_out: true,
-    });
-  }
+  const defaultAccountSignedOut = !!(readiness && readiness.found
+    && readiness.ready === false && readiness.authFailed === true
+    && readiness.authAuthoritative === true
+    && Array.isArray(entry.login_command));
   let oneShotEnv;
   try {
     oneShotEnv = normalizeEnvOverrides(entry.oneshot_env);
@@ -3721,6 +4125,78 @@ async function executeOneShot(body, res) {
       validation: err.validation || null,
     });
   }
+  // Account selection is part of admission, not spawn setup. If every linked
+  // account is disabled, unsigned, or cooling, an empty env would silently run
+  // against the operator's default credentials and misattribute the receipt.
+  const dispatchAccount = resolveDispatchAccount(kind, entry, {
+    unavailableAccountIds: defaultAccountSignedOut
+      ? new Set([providerAccounts.DEFAULT_ACCOUNT_ID]) : new Set(),
+  });
+  if (dispatchAccount.exhausted) {
+    if (defaultAccountSignedOut && !dispatchAccount.resolutionError
+      && !dispatchAccount.providerManaged) {
+      return rejectBeforeAdmission(409, 'auth', {
+        ok: false,
+        auth_required: true,
+        kind,
+        label: entry.label || kind,
+        login_command: entry.login_command,
+        detail: readiness.detail || 'the provider CLI reports no active session',
+        error: `${entry.label || kind} is installed but not signed in`,
+        dropped_out: true,
+      });
+    }
+    const registryInvalid = dispatchAccount.reason === 'registry_invalid';
+    const vendorExhausted = dispatchAccount.reason === 'vendor_exhausted';
+    const relocationMissing = dispatchAccount.reason === 'credential_relocation_unavailable';
+    const isolationUnsupported = dispatchAccount.reason === 'linked_account_isolation_unsupported';
+    const failureClass = registryInvalid ? 'account_registry_invalid'
+      : relocationMissing || isolationUnsupported ? 'account_configuration_invalid'
+        : vendorExhausted ? 'vendor_quota_exhausted' : 'account_unavailable';
+    return rejectBeforeAdmission(registryInvalid || relocationMissing ? 500 : 409, failureClass, {
+      ok: false,
+      account_unavailable: !vendorExhausted,
+      vendor_quota_exhausted: vendorExhausted,
+      kind,
+      error: registryInvalid
+        ? 'The linked-account registry is invalid; dispatch is disabled to protect credential attribution'
+        : relocationMissing
+          ? `Managed linked accounts for ${entry.label || kind} cannot be isolated because credential_env is missing or invalid`
+        : isolationUnsupported
+          ? `Linked accounts are disabled for ${entry.label || kind} because its authentication cannot be isolated safely`
+        : vendorExhausted
+          ? `Every available account for ${entry.label || kind} has authoritative exhausted-quota evidence`
+          : `No enabled and provisioned account is available for ${entry.label || kind}`,
+      remedy: registryInvalid
+        ? 'Repair the account registry shown by /api/accounts before retrying.'
+        : relocationMissing
+          ? 'Restore this provider\'s credential_env configuration before dispatching any managed linked account.'
+        : isolationUnsupported
+          ? (entry.linked_accounts_unavailable_reason || 'Use this provider\'s implicit default account only.')
+        : vendorExhausted
+          ? 'Use another provider or wait until the reported vendor reset.'
+          : 'Check /api/accounts, then sign in or enable an account.',
+      retryAt: dispatchAccount.retryAt || null,
+      dropped_out: true,
+      usage: { input_tokens: 0, output_tokens: 0 },
+    }, {
+      provider: kind,
+      account: null,
+      quota_seat: null,
+      request_id: requestId,
+    });
+  }
+  if (dispatchAccount.account && !dispatchAccount.account.implicit) {
+    try {
+      slot = [...slot, ...providerAccounts.linkedAccountArgsFor(entry)];
+    } catch (err) {
+      return rejectBeforeAdmission(500, 'account_configuration_invalid', {
+        error: `invalid linked-account arguments for ${kind}: ${err.message}`,
+        model_invocation: false,
+        dropped_out: true,
+      });
+    }
+  }
   if (!acquireOneShot(kind, res)) {
     return rejectBeforeAdmission(429, 'admission_limit', {
       error: 'provider concurrency limit reached; retry with backoff',
@@ -3795,7 +4271,19 @@ async function executeOneShot(body, res) {
     promptFileDir = null;
   };
   const [bin, ...args] = slotResolved;
-  const childEnv = buildEnv({ ...oneShotEnv, ...(isolatedProviderHome?.env || {}) }, entry.strip_env || []);
+  // Multi-account: point the CLI's credential directory at the selected
+  // account before anything resolves the binary or builds the route metadata.
+  const childEnv = buildEnv(
+    { ...oneShotEnv, ...(isolatedProviderHome?.env || {}) },
+    entry.strip_env || [],
+  );
+  // Applied AFTER buildEnv, never through it. strip_env is applied last inside
+  // buildEnv, so a seat that ever listed its own credential variable there
+  // would have it silently removed — and the run would then execute against
+  // whichever account the operator's own config directory holds. Running work
+  // on the wrong plan is worse than failing, so this assignment is not
+  // strippable.
+  Object.assign(childEnv, dispatchAccount.env);
   const resolvedBin = resolveExecutable(bin, childEnv);
   const flagValue = (name) => {
     const index = args.indexOf(name);
@@ -3808,6 +4296,12 @@ async function executeOneShot(body, res) {
   // guessing from a generic "Claude" label.
   const route = {
     provider: kind,
+    // Which of the provider's accounts paid for this run. Null for a seat with
+    // a single sign-in, so existing receipts are unchanged. It rides on the
+    // route because that is what reaches both the receipt and the ledger.
+    account: dispatchAccount.account && !dispatchAccount.account.implicit
+      ? dispatchAccount.account.id : null,
+    quota_seat: dispatchAccount.quotaSeat || null,
     transport: entry.transport || 'cli',
     configured_binary: bin,
     resolved_binary: resolvedBin,
@@ -3917,11 +4411,19 @@ async function executeOneShot(body, res) {
   }).providerBudget;
   if (entry.oneshot_adapter === 'ollama_api') {
     cleanupPromptFile();
-    return runOllamaApiOneShot({ entry, prompt, timeoutMs: adapterTimeoutMs, res, route, startedAt, providerBudget: resolvedProviderBudget });
+    return runOllamaApiOneShot({
+      entry, prompt, timeoutMs: adapterTimeoutMs, res, route, startedAt,
+      providerBudget: resolvedProviderBudget,
+      accountId: dispatchAccount.account?.id || null,
+    });
   }
   if (entry.oneshot_adapter === 'openai_chat_api') {
     cleanupPromptFile();
-    return runOpenAIChatOneShot({ entry, prompt, timeoutMs: adapterTimeoutMs, res, route, startedAt, providerBudget: resolvedProviderBudget });
+    return runOpenAIChatOneShot({
+      entry, prompt, timeoutMs: adapterTimeoutMs, res, route, startedAt,
+      providerBudget: resolvedProviderBudget,
+      accountId: dispatchAccount.account?.id || null,
+    });
   }
   const isWindows = process.platform === 'win32';
   let proc;
@@ -3948,6 +4450,14 @@ async function executeOneShot(body, res) {
       cwd: resolvedCwd,
       env: childEnv,
       windowsHide: true,
+      // NOTE: this spawn deliberately does NOT set `detached`, even though
+      // killProcessTree's fast path (process.kill(-pid)) needs a process group
+      // to exist and therefore always ESRCHes here, falling back to a racy `ps`
+      // walk. Adding it is a real fix for that, but it also converts every
+      // killProcessTree call on this child from a harmless no-op into a real
+      // group kill, and doing so fails the prompt-file transport test with
+      // exitCode null (signal death) — the kill paths around a normal run have
+      // to be audited before the group can be created. Tracked separately.
     };
     if (isWindows && !/\.exe$/i.test(resolvedBin)) {
       spawnBin = process.env.ComSpec || 'cmd.exe';
@@ -3969,7 +4479,10 @@ async function executeOneShot(body, res) {
         validation: err.validation,
       });
     }
-    return sendOneShotResult(res, { kind, route, exitCode: -1, stdout: '', stderr: err.message, error: 'spawn failed', dropped_out: true, model_invocation: false }, { kind, prompt, route, startedAt, cwd: resolvedCwd });
+    return sendOneShotResult(res, { kind, route, exitCode: -1, stdout: '', stderr: err.message, error: 'spawn failed', dropped_out: true, model_invocation: false }, {
+      kind, prompt, route, startedAt, cwd: resolvedCwd,
+      accountId: dispatchAccount.account?.id || null,
+    });
   }
   let stdout = '';
   let stderr = '';
@@ -4116,9 +4629,12 @@ async function executeOneShot(body, res) {
       if (res._relayIsolationReceiptDeferred) persistCancellationReceipt();
       return;
     }
-    sendOneShotResult(res, { kind, route, exitCode: -1, stdout, stderr: stderr + '\n' + err.message, error: err.message, failureClass: isolationCleanup.ok ? null : 'isolation_cleanup', dropped_out: true }, { kind, prompt, route, startedAt, cwd: resolvedCwd });
+    sendOneShotResult(res, { kind, route, exitCode: -1, stdout, stderr: stderr + '\n' + err.message, error: err.message, failureClass: isolationCleanup.ok ? null : 'isolation_cleanup', dropped_out: true }, {
+      kind, prompt, route, startedAt, cwd: resolvedCwd,
+      accountId: dispatchAccount.account?.id || null,
+    });
   });
-  proc.on('close', (code) => {
+  const settleFromClose = (code) => {
     if (settled) return;
     settled = true;
     finishSupervision();
@@ -4177,22 +4693,10 @@ async function executeOneShot(body, res) {
       'upgrade to pro', '429', 'credit balance is too low', 'usage limit', 'out of credits',
     ];
     const budget_signals = ['exceeded usd budget','exceeded the usd budget','max-budget-usd','budget exceeded','budget cap reached'];
-    // Word boundaries avoid false positives such as "deSIGN INtent" in a
-    // perfectly valid model response.
-    const auth_signals = [
-      /\benoent\b/,
-      /\bnot authenticated\b/,
-      /\bnot logged in\b/,
-      /\bplease log in\b/,
-      /\bplease run \/login\b/,
-      /\bsign in\b/,
-      /\blogin required\b/,
-      /\bauthentication required\b/,
-      /\binvalid api key\b/,
-      /\bauthentication[_ ]error\b/,
-      /\boauth\b.{0,40}\b(?:revoked|expired)\b/,
-    ];
-    const authoritativeApiFailure = claudeApiStatusFailureClass(parsedOutput.apiErrorStatus);
+    const authoritativeApiFailure = claudeApiStatusFailureClass(
+      parsedOutput.apiErrorStatus,
+      cleanOutput([stderr, parsedOutput.diagnostic].filter(Boolean).join('\n')),
+    );
     const copilotQuotaEvidence = detectCopilotMonthlyQuota({
       provider: kind,
       stdout: cleanedStdout,
@@ -4222,9 +4726,10 @@ async function executeOneShot(body, res) {
     // provider route as unauthenticated when the command failed or produced no
     // usable answer.
     const auth_failed = authoritativeApiFailure === 'auth'
-      || (auth_signals.some((pattern) => pattern.test(failureBlob))
-        && (code !== 0 || !cleanedStdout || parsedOutput.isError));
-    const permission_denied = runClassification.kind === 'headless_command_permission_auto_denied';
+      || ((code !== 0 || !cleanedStdout || parsedOutput.isError)
+        && runClassification.kind === 'auth_failed');
+    const permission_denied = authoritativeApiFailure === 'permission'
+      || runClassification.kind === 'headless_command_permission_auto_denied';
     // Provider CLIs can enforce their own request deadline before RelayBridge's
     // progress supervisor fires. Promote only authoritative failed/no-answer
     // diagnostics; healthy model prose that discusses timeouts must remain a
@@ -4303,12 +4808,28 @@ async function executeOneShot(body, res) {
       timed_out: providerTimedOut,
       dropped_out,
       model_invocation: true,
-    }, { kind, prompt, route, startedAt, cwd: resolvedCwd, transportStdout: stdout });
+    }, {
+      kind, prompt, route, startedAt, cwd: resolvedCwd, transportStdout: stdout,
+      accountId: dispatchAccount.account?.id || null,
+    });
     // GitHub middleware: only successful runs checkpoint — a dropped-out run
     // may have left half-applied edits, which the human should triage first.
     if (sentPayload && !sentPayload.dropped_out) {
       trackRunAfterResponse({ runId, kind, user: runUser, prompt, cwd: resolvedCwd, intent: runIntent });
     }
+  };
+  proc.on('close', settleFromClose);
+  // 'close' waits for every inherited stdio pipe to reach EOF, so a CLI that
+  // leaves an MCP server or node shim holding stdout exits without ever firing
+  // it: nothing settles, the admission slot stays taken, and the request hangs
+  // until the client gives up. 'exit' is the child's own death, so settle from
+  // a grace window after it — the same guarantee runProbe arms after a kill
+  // ("killing the tree is not a guarantee of an exit event"). A normal run's
+  // 'close' lands within microseconds of 'exit' and wins the `settled` race, so
+  // this only fires when a survivor is holding the pipe open.
+  proc.on('exit', (code) => {
+    const graceful = setTimeout(() => settleFromClose(code === null ? -1 : code), ONESHOT_CLOSE_GRACE_MS);
+    if (typeof graceful.unref === 'function') graceful.unref();
   });
   // Providers without a placeholder (Claude/Codex/Perplexity wrapper) read
   // stdin. Antigravity consumes {prompt}; Grok consumes {prompt_file}.
@@ -4372,7 +4893,13 @@ app.post('/api/tasks/:id/cancel', (req, res) => {
 // subscription plans.
 const { createCooldownStore, parseRetryAfter } = require('./lib/provider-cooldown');
 const { checkGrounding, verifyReferencedPaths } = require('./lib/workspace-grounding');
-const { classifyRunFailure, detectCopilotMonthlyQuota } = require('./lib/provider-failure');
+const {
+  classifyRunFailure,
+  classifyProviderHttpFailure,
+  detectCopilotMonthlyQuota,
+  isHostedApiKeyMissingError,
+  HOSTED_API_KEY_MISSING_CODE,
+} = require('./lib/provider-failure');
 // Issue #17: readiness proves auth, not quota. A seat that returned 429 stays
 // "ready" forever unless the 429 is remembered, so remember it durably and
 // share it with every client.
@@ -4391,7 +4918,8 @@ const {
 } = require('./lib/cancellation-state');
 const {
   levelCandidates, suggestTierAdjustment, fleetBalance,
-  applyCooldownsToDiagnostics, applyVendorQuotaExhaustionToDiagnostics,
+  applyCooldownsToDiagnostics, activeVendorQuotaExhaustion,
+  applyVendorQuotaExhaustionToDiagnostics,
   levelRouteSelection,
 } = require('./lib/load-leveller');
 
@@ -4419,9 +4947,9 @@ function coolingQuotaStates() {
     };
   });
 }
-function filterCandidatesByQuotaCooldown(candidates = [], explicit = null) {
+function filterCandidatesByQuotaCooldown(candidates = [], explicit = null, coolingStates = coolingQuotaStates()) {
   const byAlias = new Map();
-  for (const state of coolingQuotaStates()) {
+  for (const state of coolingStates || []) {
     for (const alias of state.aliases || []) byAlias.set(alias, state);
   }
   const usable = [];
@@ -4443,19 +4971,399 @@ const usageLedger = createUsageLedger({
   log: (m) => console.log(m),
 });
 
+// Which account should this dispatch run on, and what env makes the CLI use it?
+//
+// Returns the implicit single-account shape for every seat the operator has not
+// added a second plan to, so this is a no-op for an ordinary install: no env is
+// injected and the quotaSeat is exactly the one configured in cli-config.json.
+function resolveDispatchAccount(kind, entry, { unavailableAccountIds = new Set() } = {}) {
+  try {
+    // Dispatch is an authority boundary: a malformed or unreadable registry
+    // must not be treated as "no accounts configured", which would silently
+    // fall back to the operator's default credentials.
+    const registry = providerAccounts.loadRegistry(DATA_DIR, { strict: true });
+    const accounts = providerAccounts.accountsFor(kind, entry, registry);
+    const hasExplicitAccounts = accounts.some((account) => !account.implicit);
+    const providerManaged = Object.prototype.hasOwnProperty.call(registry.providers, kind);
+    const enabledLinkedAccounts = accounts.some((candidate) => !candidate.implicit && candidate.enabled);
+    const relocationMissing = providerManaged
+      && !providerAccounts.credentialEnvFor(entry)
+      && enabledLinkedAccounts;
+    if (relocationMissing) {
+      return {
+        account: null, env: {}, quotaSeat: null, exhausted: true,
+        hasExplicitAccounts, providerManaged, resolutionError: false,
+        reason: 'credential_relocation_unavailable', retryAt: null,
+      };
+    }
+    const isolationUnsupported = providerManaged && enabledLinkedAccounts
+      && !providerAccounts.supportsLinkedAccounts(entry);
+    if (isolationUnsupported) {
+      return {
+        account: null, env: {}, quotaSeat: null, exhausted: true,
+        hasExplicitAccounts, providerManaged, resolutionError: false,
+        reason: 'linked_account_isolation_unsupported', retryAt: null,
+      };
+    }
+    const cooling = new Set(coolingQuotaStates()
+      .filter((state) => state.scope !== 'model')
+      .map((state) => state.quotaSeat).filter(Boolean));
+    let gauges = {};
+    try {
+      // Keyed by seat; re-key by quotaSeat so a per-account gauge can be found.
+      for (const [gaugeSeat, gauge] of Object.entries(usageLedger.gaugeAll(seatCostClasses()) || {})) {
+        if (gaugeSeat !== kind && !gaugeSeat.startsWith(`${kind}#`)) continue;
+        if (gauge && gauge.quotaSeat) gauges[gauge.quotaSeat] = gauge;
+      }
+    } catch { gauges = {}; }
+    const account = providerAccounts.selectAccount({
+      kind, entry, registry, dataDir: DATA_DIR, gauges, coolingQuotaSeats: cooling,
+      unavailableAccountIds,
+      allowCoolingFallback: true,
+    });
+    if (!account) {
+      const usable = accounts.filter((candidate) => candidate.enabled
+        && !unavailableAccountIds.has(candidate.id)
+        && providerAccounts.accountIsProvisioned({ entry, account: candidate, dataDir: DATA_DIR, kind })
+        && providerAccounts.accountAuthAvailable({ entry, account: candidate, dataDir: DATA_DIR, kind }));
+      const vendorBlocks = usable.map((candidate) => ({
+        account: candidate,
+        block: activeVendorQuotaExhaustion(gauges[candidate.quotaSeat]),
+      })).filter((item) => item.block);
+      const vendorExhausted = usable.length > 0 && vendorBlocks.length === usable.length;
+      return {
+        account: null, env: {}, quotaSeat: null, exhausted: true,
+        hasExplicitAccounts, providerManaged, resolutionError: false,
+        reason: vendorExhausted ? 'vendor_exhausted' : 'auth_unavailable',
+        retryAt: vendorExhausted
+          ? vendorBlocks.map((item) => item.block.reset?.expiresAt).filter(Boolean).sort()[0] || null
+          : null,
+      };
+    }
+    return {
+      account,
+      env: providerAccounts.envForAccount({ entry, account, dataDir: DATA_DIR, kind }),
+      quotaSeat: account.quotaSeat,
+      exhausted: false,
+      hasExplicitAccounts,
+      providerManaged,
+      resolutionError: false,
+      reason: null,
+      retryAt: null,
+    };
+  } catch (err) {
+    // Never run on a different login than the receipt will attribute.
+    console.log('[RelayBridge] account resolution failed: ' + err.message);
+    return {
+      account: null, env: {}, quotaSeat: null, exhausted: true,
+      hasExplicitAccounts: false, providerManaged: false, resolutionError: true,
+      reason: 'registry_invalid', retryAt: null,
+    };
+  }
+}
+
 function seatCostClasses() {
   const cfg = loadConfig();
+  const groups = currentQuotaSeatGroups();
   const out = {};
   for (const [seat, entry] of Object.entries(cfg)) {
     if (seat.startsWith('_')) continue;
-    out[seat] = {
+    const base = {
       costClass: costClassFor(entry, seat),
       model: entry.model || null,
       quotaSeat: quotaSeatForProvider(seat),
-      aliases: quotaSeatRegistry.groups[quotaSeatForProvider(seat)]?.providers || [seat],
+      aliases: groups[quotaSeatForProvider(seat)]?.providers || [seat],
     };
+    out[seat] = base;
+    // One gauge per linked account. gauge() already filters ledger rows by
+    // quotaSeat and looks its budget up by quotaSeat first, so emitting an
+    // extra seat config per account is all that separate allowances need —
+    // without this, three plans drain one bar and the operator cannot see
+    // which of them is nearly empty. Keyed 'seat#account' so it never collides
+    // with the seat's own entry, which stays exactly as it was.
+    try {
+      for (const account of providerAccounts.accountsFor(seat, entry, accountRegistry())) {
+        if (account.implicit) continue;
+        out[`${seat}#${account.id}`] = {
+          ...base,
+          quotaSeat: account.quotaSeat,
+          aliases: groups[account.quotaSeat]?.providers || [seat],
+        };
+      }
+    } catch { /* a malformed registry must not break fleet accounting */ }
   }
   return out;
+}
+
+// Cached per call-site rather than per seat: seatCostClasses() runs on the
+// routing path and re-reading the registry once per provider would put 14 file
+// reads on it.
+let _accountRegistryCache = { at: 0, value: { providers: {} } };
+function accountRegistry() {
+  const now = Date.now();
+  if (now - _accountRegistryCache.at < 2000) return _accountRegistryCache.value;
+  _accountRegistryCache = { at: now, value: providerAccounts.loadRegistry(DATA_DIR) };
+  return _accountRegistryCache.value;
+}
+
+function invalidateAccountRegistry() {
+  _accountRegistryCache = { at: 0, value: { providers: {} } };
+}
+
+function currentQuotaSeatGroups() {
+  const groups = Object.fromEntries(Object.entries(quotaSeatRegistry.groups).map(([quotaSeat, group]) => [
+    quotaSeat,
+    { ...group, providers: [...group.providers] },
+  ]));
+  const cfg = loadConfig();
+  const registry = accountRegistry();
+  for (const [kind, entry] of Object.entries(cfg)) {
+    if (kind.startsWith('_') || !entry || typeof entry !== 'object') continue;
+    for (const account of providerAccounts.accountsFor(kind, entry, registry)) {
+      if (account.implicit) continue;
+      const group = groups[account.quotaSeat] || (groups[account.quotaSeat] = {
+        quotaSeat: account.quotaSeat,
+        providers: [],
+        transport: entry.transport || null,
+        explicitlyGrouped: true,
+        account: { id: account.id, providers: [] },
+      });
+      if (!group.providers.includes(kind)) group.providers.push(kind);
+      group.providers.sort();
+      if (group.transport !== (entry.transport || null)) group.transport = null;
+      if (!group.account || group.account.id !== account.id) {
+        throw new Error(`linked account quota-seat collision at ${account.quotaSeat}`);
+      }
+      group.account.providers = [...group.providers];
+    }
+  }
+  return groups;
+}
+
+function providerGaugeMap(kind, gauges) {
+  const byQuotaSeat = {};
+  for (const [gaugeSeat, gauge] of Object.entries(gauges || {})) {
+    if (gaugeSeat !== kind && !gaugeSeat.startsWith(`${kind}#`)) continue;
+    if (gauge?.quotaSeat) byQuotaSeat[gauge.quotaSeat] = gauge;
+  }
+  return byQuotaSeat;
+}
+
+// Project account-level capacity onto provider-level routing without pretending
+// that one drained/default account exhausts every linked subscription. The
+// router still consumes provider keys; this picks the gauge and cooldown state
+// of an actually selectable account for each key.
+function accountAwareRoutingInputs(config, diagnostics, gauges, coolingStates) {
+  const adjustedDiagnostics = Object.fromEntries(Object.entries(diagnostics || {}).map(([kind, info]) => [
+    kind,
+    info && typeof info === 'object' ? { ...info } : info,
+  ]));
+  const routeGauges = {};
+  const routeCooling = [];
+  const accountSelection = {};
+  const coolingKeys = new Set();
+  const addCooling = (kind, state) => {
+    if (!state) return;
+    const key = `${kind}\u0000${state.seat}\u0000${state.scope}`;
+    if (coolingKeys.has(key)) return;
+    coolingKeys.add(key);
+    routeCooling.push({ ...state, aliases: [kind] });
+  };
+  const projectGauge = (kind, gauge) => gauge ? { ...gauge, aliases: [kind] } : gauge;
+  let registry = { providers: {} };
+  let registryError = null;
+  try {
+    registry = providerAccounts.loadRegistry(DATA_DIR, { strict: true });
+  } catch (err) {
+    registryError = err;
+  }
+
+  for (const [kind, entry] of Object.entries(config || {})) {
+    if (kind.startsWith('_') || !entry || typeof entry !== 'object') continue;
+    const byQuotaSeat = providerGaugeMap(kind, gauges);
+    routeGauges[kind] = projectGauge(
+      kind, byQuotaSeat[quotaSeatForProvider(kind)] || gauges?.[kind],
+    );
+    const aliasedStates = (coolingStates || []).filter((state) =>
+      (state.aliases || [state.seat]).map(String).includes(kind));
+    const providerManaged = !registryError
+      && Object.prototype.hasOwnProperty.call(registry.providers, kind);
+    if (registryError) {
+      const prior = adjustedDiagnostics[kind] && typeof adjustedDiagnostics[kind] === 'object'
+        ? adjustedDiagnostics[kind] : {};
+      adjustedDiagnostics[kind] = {
+        ...prior,
+        ready: false,
+        accountUnavailable: true,
+        accountUnavailableReason: 'registry_invalid',
+        detail: 'linked-account registry is invalid; dispatch is disabled until it is repaired',
+      };
+      accountSelection[kind] = { available: false, reason: 'registry_invalid' };
+      continue;
+    }
+    if (!providerAccounts.credentialEnvFor(entry) && !providerManaged) {
+      for (const state of aliasedStates) addCooling(kind, state);
+      continue;
+    }
+
+    let accounts;
+    let linkedAccountsSupported;
+    try {
+      accounts = providerAccounts.accountsFor(kind, entry, registry);
+      linkedAccountsSupported = providerAccounts.supportsLinkedAccounts(entry);
+    } catch (err) {
+      const prior = adjustedDiagnostics[kind] && typeof adjustedDiagnostics[kind] === 'object'
+        ? adjustedDiagnostics[kind] : {};
+      adjustedDiagnostics[kind] = {
+        ...prior,
+        ready: false,
+        accountUnavailable: true,
+        accountUnavailableReason: 'registry_invalid',
+        detail: `linked-account configuration is invalid for ${kind}`,
+      };
+      accountSelection[kind] = { available: false, reason: 'registry_invalid' };
+      continue;
+    }
+    const enabledLinkedAccounts = accounts.some((account) => !account.implicit && account.enabled);
+    if (providerManaged && enabledLinkedAccounts
+      && entry.linked_accounts_supported === false && !linkedAccountsSupported) {
+      const prior = adjustedDiagnostics[kind] && typeof adjustedDiagnostics[kind] === 'object'
+        ? adjustedDiagnostics[kind] : {};
+      adjustedDiagnostics[kind] = {
+        ...prior,
+        ready: false,
+        accountUnavailable: true,
+        accountUnavailableReason: 'linked_account_isolation_unsupported',
+        detail: entry.linked_accounts_unavailable_reason
+          || 'linked accounts are disabled because this provider cannot isolate authentication safely',
+      };
+      accountSelection[kind] = {
+        available: false,
+        reason: 'linked_account_isolation_unsupported',
+      };
+      continue;
+    }
+    const relocationMissing = providerManaged
+      && !providerAccounts.credentialEnvFor(entry)
+      && enabledLinkedAccounts;
+    if (relocationMissing) {
+      const prior = adjustedDiagnostics[kind] && typeof adjustedDiagnostics[kind] === 'object'
+        ? adjustedDiagnostics[kind] : {};
+      adjustedDiagnostics[kind] = {
+        ...prior,
+        ready: false,
+        accountUnavailable: true,
+        accountUnavailableReason: 'credential_relocation_unavailable',
+        detail: 'managed linked accounts exist but credential_env is missing or invalid',
+      };
+      accountSelection[kind] = {
+        available: false,
+        reason: 'credential_relocation_unavailable',
+      };
+      continue;
+    }
+    const readiness = adjustedDiagnostics[kind];
+    const defaultSignedOut = !!(readiness && readiness.found && readiness.ready === false
+      && readiness.authFailed === true && readiness.authAuthoritative === true
+      && Array.isArray(entry.login_command));
+    const unavailableAccountIds = defaultSignedOut
+      ? new Set([providerAccounts.DEFAULT_ACCOUNT_ID]) : new Set();
+    const eligible = accounts.filter((account) => account.enabled
+      && !unavailableAccountIds.has(account.id)
+      && providerAccounts.accountIsProvisioned({ entry, account, dataDir: DATA_DIR, kind })
+      && providerAccounts.accountAuthAvailable({ entry, account, dataDir: DATA_DIR, kind }));
+    const accountCooldowns = new Map((coolingStates || [])
+      .filter((state) => state.scope !== 'model')
+      .map((state) => [state.quotaSeat, state]));
+    const ownCoolingSeats = new Set(accountCooldowns.keys());
+    const vendorBlockFor = (account) => activeVendorQuotaExhaustion(byQuotaSeat[account.quotaSeat]);
+    const nonExhausted = eligible.filter((account) => !vendorBlockFor(account));
+    const selected = providerAccounts.selectAccount({
+      kind,
+      entry,
+      registry,
+      dataDir: DATA_DIR,
+      gauges: byQuotaSeat,
+      coolingQuotaSeats: ownCoolingSeats,
+      unavailableAccountIds,
+      // Retain one concrete cooled account in the projection. The cooldown
+      // layer below still hides it from normal routing, while an explicitly
+      // requested provider can exercise the established one-shot retry path.
+      allowCoolingFallback: true,
+    });
+
+    if (selected) {
+      const selectedCooldown = accountCooldowns.get(selected.quotaSeat) || null;
+      routeGauges[kind] = projectGauge(
+        kind, byQuotaSeat[selected.quotaSeat] || routeGauges[kind],
+      );
+      accountSelection[kind] = selectedCooldown ? {
+        available: false,
+        reason: 'cooling',
+        account: selected.implicit ? null : selected.id,
+        quotaSeat: selected.quotaSeat,
+        retryAt: selectedCooldown.until || null,
+      } : {
+        available: true,
+        account: selected.implicit ? null : selected.id,
+        quotaSeat: selected.quotaSeat,
+      };
+      if (defaultSignedOut && !selected.implicit) {
+        adjustedDiagnostics[kind] = {
+          ...readiness,
+          ready: true,
+          linkedAccountReady: true,
+          selectedAccount: selected.id,
+          detail: `default sign-in unavailable; linked account '${selected.id}' is provisioned`,
+        };
+      }
+      if (selectedCooldown) addCooling(kind, selectedCooldown);
+      // Model-scoped cooldowns apply to the provider/model regardless of which
+      // account holds the credential directory. Account-scoped cooldowns do not.
+      for (const state of aliasedStates.filter((item) => item.scope === 'model')) addCooling(kind, state);
+      continue;
+    }
+
+    if (!eligible.length) {
+      const prior = adjustedDiagnostics[kind] && typeof adjustedDiagnostics[kind] === 'object'
+        ? adjustedDiagnostics[kind] : {};
+      adjustedDiagnostics[kind] = {
+        ...prior,
+        ready: false,
+        accountUnavailable: true,
+        accountUnavailableReason: 'auth_unavailable',
+        detail: 'no enabled and provisioned linked account is available',
+      };
+      accountSelection[kind] = { available: false, reason: 'auth_unavailable' };
+      continue;
+    }
+    if (!nonExhausted.length) {
+      // Hard vendor evidence cannot be bypassed, even for an explicitly named
+      // provider. Project one exhausted account gauge onto the provider key so
+      // the existing typed reset guidance remains intact.
+      routeGauges[kind] = projectGauge(
+        kind, byQuotaSeat[eligible[0].quotaSeat] || routeGauges[kind],
+      );
+      accountSelection[kind] = { available: false, reason: 'vendor_exhausted' };
+      continue;
+    }
+
+    // Every non-exhausted account is cooling. Normal routing blocks the
+    // provider, while the established explicit-provider override can still
+    // probe one account and clear a recovered cooldown.
+    const cooled = nonExhausted[0];
+    routeGauges[kind] = projectGauge(
+      kind, byQuotaSeat[cooled.quotaSeat] || routeGauges[kind],
+    );
+    addCooling(kind, accountCooldowns.get(cooled.quotaSeat));
+    accountSelection[kind] = {
+      available: false,
+      reason: 'cooling',
+      retryAt: accountCooldowns.get(cooled.quotaSeat)?.until || null,
+    };
+  }
+
+  return { diagnostics: adjustedDiagnostics, gauges: routeGauges, cooling: routeCooling, accountSelection };
 }
 
 function seatCostClassMap() {
@@ -4487,20 +5395,255 @@ function operatorQuotaFleet(gauges) {
   return out;
 }
 
-function recordRunUsage({ kind, route, usage, startedAt, ok, failureKind, taskId }) {
+function recordRunUsage({ kind, route, usage, model, startedAt, ok, failureKind, taskId }) {
   try {
     const classes = seatCostClasses();
     usageLedger.record({
       seat: kind,
-      model: route?.resolved_model || route?.model || null,
+      // Per-account attribution: three plans on one provider are three
+      // allowances, and pooling them back into one gauge would hide the fact
+      // that one of them is nearly drained.
+      quotaSeat: route?.quota_seat || null,
+      // route.resolved_model is only ever assigned by the two API adapters, so
+      // every CLI seat (claude, codex, gemini, copilot, cursor, grok,
+      // perplexity) recorded model:null — which prices an Opus run at the
+      // $1/$5 _default rate instead of $15/$75 and, because usage-ledger gates
+      // its per-model tally on `if (r.model)`, left gauge().models permanently
+      // empty. The caller passes what the provider actually reported.
+      model: model || route?.resolved_model || route?.resolved_model_identity
+        || route?.requested_model || route?.model || null,
       costClass: classes[kind]?.costClass || 'metered',
       inputTokens: usage?.input_tokens ?? usage?.prompt_tokens ?? 0,
       outputTokens: usage?.output_tokens ?? usage?.completion_tokens ?? 0,
+      // Claude reports single-digit input_tokens against tens of thousands of
+      // cache-read tokens on a resumed session, so input+output alone books a
+      // tiny fraction of the real draw for the seat with the largest budget.
+      // normalizeClaudeJsonUsage already computes all four counts, an
+      // authoritative total and the provider's own cost, and they were dropped
+      // here. Forwarded so the ledger can book the real draw and prefer the
+      // provider's cost over the list-rate estimate; lib/usage-ledger.js's
+      // record() still recomputes totalTokens = input + output and ignores
+      // these until it is taught to read them.
+      cacheReadTokens: usage?.cache_read_input_tokens ?? 0,
+      cacheCreationTokens: usage?.cache_creation_input_tokens ?? 0,
+      totalTokens: nonnegativeUsageNumber(usage?.total_tokens),
+      providerCostUsd: nonnegativeCostNumber(usage?.cost_usd),
       elapsedMs: startedAt ? Date.now() - startedAt : 0,
       ok, failureKind: failureKind || null, taskId: taskId || null,
     });
   } catch (err) { console.log('[RelayBridge] usage record failed: ' + err.message); }
 }
+
+// ---- Multiple accounts per provider ----
+//
+// Link several subscriptions to one seat: each account gets its own credential
+// directory and its own quotaSeat, so the ledger, the cooldown store and the
+// load leveller treat them as separate allowances that the router drains in
+// turn. Three Claude plans behave as three seats to spend, not one.
+app.get('/api/accounts', (req, res) => {
+  const cfg = loadConfig();
+  let registry;
+  try {
+    registry = providerAccounts.loadRegistry(DATA_DIR, { strict: true });
+  } catch (err) {
+    return res.status(500).json({
+      error: 'account registry is invalid; dispatch is disabled until it is repaired',
+      detail: err.message,
+    });
+  }
+  const cooling = new Set(coolingQuotaStates().map((s) => s.quotaSeat).filter(Boolean));
+  let gauges = {};
+  try {
+    for (const g of Object.values(usageLedger.gaugeAll(seatCostClasses()) || {})) {
+      if (g && g.quotaSeat) gauges[g.quotaSeat] = g;
+    }
+  } catch { gauges = {}; }
+  const out = {};
+  for (const [kind, entry] of Object.entries(cfg)) {
+    if (kind.startsWith('_') || !entry || typeof entry !== 'object') continue;
+    const credentialEnv = providerAccounts.credentialEnvFor(entry);
+    let supportsMultipleAccounts = false;
+    try { supportsMultipleAccounts = providerAccounts.supportsLinkedAccounts(entry); }
+    catch { supportsMultipleAccounts = false; }
+    const accounts = providerAccounts.accountsFor(kind, entry, registry).map((a) => {
+      const runtimeAuthUnavailable = a.implicit
+        && lastDiagnostics?.results?.[kind]?.ready === false
+        && lastDiagnostics?.results?.[kind]?.authFailed === true
+        && lastDiagnostics?.results?.[kind]?.authAuthoritative === true;
+      const authUnavailable = runtimeAuthUnavailable || !providerAccounts.accountAuthAvailable({
+        entry, account: a, dataDir: DATA_DIR, kind,
+      });
+      return {
+        id: a.id,
+        label: a.label,
+        quotaSeat: a.quotaSeat,
+        enabled: a.enabled,
+        implicit: a.implicit,
+        provisioned: providerAccounts.accountIsProvisioned({ entry, account: a, dataDir: DATA_DIR, kind }),
+        authUnavailable,
+        authFailedAt: a.authFailedAt ? new Date(a.authFailedAt).toISOString() : null,
+        authRetry: authUnavailable ? {
+          method: 'POST',
+          path: `/api/accounts/${encodeURIComponent(kind)}/${encodeURIComponent(a.id)}/auth/retry`,
+          body: { retry: true },
+          note: 'Use only after signing in again. The next live dispatch revalidates the credentials and quarantines them again if authentication still fails.',
+        } : null,
+        cooling: cooling.has(a.quotaSeat),
+        percentRemaining: typeof gauges[a.quotaSeat]?.percentRemaining === 'number'
+          && Number.isFinite(gauges[a.quotaSeat].percentRemaining)
+          ? gauges[a.quotaSeat].percentRemaining : null,
+      };
+    });
+    // Only report seats that can actually hold more than one account, so the
+    // dashboard does not offer to link a second plan to a seat whose CLI has
+    // no way to relocate its credentials.
+    out[kind] = {
+      label: entry.label || kind,
+      credentialEnv,
+      supportsMultipleAccounts,
+      linkedAccountsUnavailableReason: supportsMultipleAccounts
+        ? null : (entry.linked_accounts_unavailable_reason || null),
+      accounts,
+    };
+  }
+  res.json({ providers: out, dataDir: path.join(DATA_DIR, 'accounts') });
+});
+
+app.post('/api/accounts/:kind', (req, res) => {
+  const kind = String(req.params.kind);
+  const entry = loadConfig()[kind];
+  if (!entry || kind.startsWith('_')) return res.status(404).json({ error: `unknown provider '${kind}'` });
+  let supportsMultipleAccounts = false;
+  try { supportsMultipleAccounts = providerAccounts.supportsLinkedAccounts(entry); }
+  catch (err) { return res.status(400).json({ error: err.message }); }
+  if (!supportsMultipleAccounts) {
+    return res.status(400).json({
+      error: entry.linked_accounts_supported === false
+        ? `${kind} does not support attribution-safe linked accounts`
+        : `${kind} does not declare credential_env, so its credentials cannot be separated per account`,
+      hint: entry.linked_accounts_unavailable_reason
+        || 'add "credential_env": "<ENV_VAR>" to this provider in cli-config.json',
+    });
+  }
+  try {
+    providerAccounts.addAccount(DATA_DIR, kind, { id: req.body?.id, label: req.body?.label });
+    invalidateAccountRegistry();
+  } catch (err) { return res.status(400).json({ error: err.message }); }
+  const dir = providerAccounts.accountDir(DATA_DIR, kind, String(req.body.id));
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const login = Array.isArray(entry.login_command) ? entry.login_command : null;
+  const credentialEnv = providerAccounts.credentialEnvFor(entry);
+  const signInEnvironment = providerAccounts.credentialEnvironmentFor(entry, dir);
+  res.json({
+    ok: true, kind, id: String(req.body.id), credentialDir: dir,
+    // The bridge cannot complete an interactive OAuth flow on the operator's
+    // behalf, so hand back the exact command that signs THIS account in.
+    signIn: { environment: signInEnvironment, argv: login },
+    signInCommand: providerAccounts.formatSignInCommand({
+      envName: credentialEnv,
+      credentialDir: dir,
+      environment: signInEnvironment,
+      argv: login,
+    }),
+    note: 'Run that command in a terminal, complete the sign-in, then this account becomes selectable.',
+  });
+});
+
+app.post('/api/accounts/:kind/:id/enabled', (req, res) => {
+  const kind = String(req.params.kind);
+  const entry = loadConfig()[kind];
+  if (!entry || kind.startsWith('_')) return res.status(404).json({ error: `unknown provider '${kind}'` });
+  const body = req.body;
+  if (!body || typeof body !== 'object' || Array.isArray(body)
+    || Object.keys(body).length !== 1 || typeof body.enabled !== 'boolean') {
+    return res.status(400).json({ error: 'body must contain only enabled as a boolean' });
+  }
+  try {
+    providerAccounts.setAccountEnabled(DATA_DIR, kind, String(req.params.id), body.enabled);
+    invalidateAccountRegistry();
+    res.json({ ok: true });
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// Some CLIs (notably Copilot) expose a version probe but no non-interactive
+// authentication-status command. A live auth failure must still quarantine the
+// default account, yet a successful re-login cannot be inferred from that
+// version-only probe. Give the operator one explicit, typed way to arm a single
+// retry. If the credentials are still bad, normal dispatch accounting writes
+// the quarantine marker straight back.
+app.post('/api/accounts/:kind/:id/auth/retry', (req, res) => {
+  const kind = String(req.params.kind);
+  const id = String(req.params.id);
+  const entry = loadConfig()[kind];
+  if (!entry || kind.startsWith('_')) return res.status(404).json({ error: `unknown provider '${kind}'` });
+  const body = req.body;
+  if (!body || typeof body !== 'object' || Array.isArray(body)
+    || Object.keys(body).length !== 1 || body.retry !== true) {
+    return res.status(400).json({ error: 'body must contain only retry: true' });
+  }
+  try {
+    const registry = providerAccounts.loadRegistry(DATA_DIR, { strict: true });
+    const account = providerAccounts.accountsFor(kind, entry, registry)
+      .find((candidate) => candidate.id === id);
+    if (!account) return res.status(404).json({ error: `unknown account '${id}' for ${kind}` });
+    const cleared = providerAccounts.clearAccountAuthFailure(DATA_DIR, kind, id);
+    if (id === providerAccounts.DEFAULT_ACCOUNT_ID) {
+      armDefaultAccountRuntimeAuthRetry(kind);
+    }
+    invalidateAccountRegistry();
+    return res.json({
+      ok: true,
+      kind,
+      id,
+      authRetryArmed: true,
+      priorAuthFailureCleared: !!cleared,
+      note: 'The next live dispatch will validate this account and quarantine it again if authentication still fails.',
+    });
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+});
+
+app.delete('/api/accounts/:kind/:id', (req, res) => {
+  const kind = String(req.params.kind);
+  const id = String(req.params.id);
+  const entry = loadConfig()[kind];
+  if (!entry || kind.startsWith('_')) return res.status(404).json({ error: `unknown provider '${kind}'` });
+  // Validate and persist the registry change before deleting credentials. A
+  // malformed registry or unknown account must leave its recoverable token
+  // directory untouched rather than deleting first and failing afterward.
+  try {
+    providerAccounts.removeAccount(DATA_DIR, kind, id);
+    invalidateAccountRegistry();
+  } catch (err) {
+    return res.status(400).json({ error: err.message, accountRemoved: false, credentialsRemoved: false });
+  }
+  const implicitDefault = id === providerAccounts.DEFAULT_ACCOUNT_ID;
+  const removeManagedCredentials = req.query.keepCredentials !== '1' && !implicitDefault;
+  if (removeManagedCredentials) {
+    try {
+      providerAccounts.forgetAccountCredentials(DATA_DIR, kind, id);
+    } catch (err) {
+      return res.json({
+        ok: false,
+        accountRemoved: true,
+        credentialsRemoved: false,
+        credentialCleanupRequired: true,
+        credentialDir: providerAccounts.accountDir(DATA_DIR, kind, id),
+        error: `account was removed, but its credential directory could not be deleted: ${err.message}`,
+      });
+    }
+  }
+  return res.json({
+    ok: true,
+    accountRemoved: true,
+    credentialsRemoved: removeManagedCredentials,
+    ...(implicitDefault ? {
+      requiresProviderLogout: true,
+      note: 'The default account uses the provider CLI home; run the provider logout command to revoke that session.',
+    } : {}),
+  });
+});
 
 app.get('/api/usage/gauges', (req, res) => {
   try {
@@ -4511,7 +5654,7 @@ app.get('/api/usage/gauges', (req, res) => {
     res.json({
       gauges,
       balance: fleetBalance(gauges),
-      quotaSeats: quotaSeatRegistry.groups,
+      quotaSeats: currentQuotaSeatGroups(),
       operatorQuota: operatorQuotaFleet(gauges),
       providerUsageCapabilities: providerUsageCapabilities(loadConfig(), runtimeVersions),
       totals: usageLedger.totals(windowMs),
@@ -4521,7 +5664,7 @@ app.get('/api/usage/gauges', (req, res) => {
 app.get('/api/usage/operator-quota', (req, res) => {
   res.json({
     observations: usageLedger.operatorQuotaObservations(),
-    quotaSeats: quotaSeatRegistry.groups,
+    quotaSeats: currentQuotaSeatGroups(),
     provenanceOptions: OPERATOR_QUOTA_PROVENANCE,
     maxTtlMs: MAX_OPERATOR_QUOTA_TTL_MS,
   });
@@ -4537,7 +5680,7 @@ app.put('/api/usage/operator-quota', (req, res) => {
     return res.status(400).json({ error: `unsupported fields: ${unknown.join(', ')}; credentials and free-form notes are never stored` });
   }
   const quotaSeat = typeof body.quotaSeat === 'string' ? body.quotaSeat.trim() : '';
-  if (!quotaSeatRegistry.groups[quotaSeat]) return res.status(400).json({ error: 'quotaSeat must name a configured quota seat' });
+  if (!currentQuotaSeatGroups()[quotaSeat]) return res.status(400).json({ error: 'quotaSeat must name a configured quota seat' });
   if (!Number.isInteger(body.percentRemaining) || body.percentRemaining < 0 || body.percentRemaining > 100) {
     return res.status(400).json({ error: 'percentRemaining must be an integer from 0 to 100' });
   }
@@ -4564,12 +5707,12 @@ app.delete('/api/usage/operator-quota', (req, res) => {
     return res.status(400).json({ error: 'body must contain only quotaSeat' });
   }
   const quotaSeat = typeof body.quotaSeat === 'string' ? body.quotaSeat.trim() : '';
-  if (!quotaSeatRegistry.groups[quotaSeat]) return res.status(400).json({ error: 'quotaSeat must name a configured quota seat' });
+  if (!currentQuotaSeatGroups()[quotaSeat]) return res.status(400).json({ error: 'quotaSeat must name a configured quota seat' });
   if (!usageLedger.clearOperatorQuota(quotaSeat)) return res.status(500).json({ error: 'operator quota clear could not be persisted' });
   return res.json({ ok: true, quotaSeat, cleared: true });
 });
 app.get('/api/cooldowns', (req, res) => {
-  res.json({ cooldowns: cooldowns.all(), cooling: coolingQuotaStates(), quotaSeats: quotaSeatRegistry.groups });
+  res.json({ cooldowns: cooldowns.all(), cooling: coolingQuotaStates(), quotaSeats: currentQuotaSeatGroups() });
 });
 
 app.get('/api/usage/totals', (req, res) => {
@@ -4594,17 +5737,44 @@ app.post('/api/usage/advise', (req, res) => {
     const candidateDiagnostics = Object.fromEntries(filesystemUsable.map((item) => [item.seat, {
       found: true, ready: true,
     }]));
-    const vendorQuotaInput = applyVendorQuotaExhaustionToDiagnostics(candidateDiagnostics, gauges);
+    // Advice is a routing surface too. Project the healthiest selectable linked
+    // account onto each provider key before applying quota gates; otherwise a
+    // cooling/exhausted default account hides a healthy second subscription.
+    const routingInputs = accountAwareRoutingInputs(
+      cfg, candidateDiagnostics, gauges, coolingQuotaStates(),
+    );
+    const accountUnavailableKinds = new Set(Object.entries(routingInputs.accountSelection)
+      .filter(([, state]) => state?.available === false
+        && (state.reason === 'auth_unavailable' || state.reason === 'registry_invalid'
+          || state.reason === 'credential_relocation_unavailable'))
+      .map(([kind]) => kind));
+    const accountUnavailableSkipped = filesystemUsable
+      .filter((item) => accountUnavailableKinds.has(item.seat))
+      .map((item) => ({
+        ...item,
+        blocked: true,
+        reason: routingInputs.accountSelection[item.seat].reason,
+      }));
+    const accountUsable = filesystemUsable.filter((item) => !accountUnavailableKinds.has(item.seat));
+    const vendorQuotaInput = applyVendorQuotaExhaustionToDiagnostics(
+      routingInputs.diagnostics, routingInputs.gauges,
+    );
     const vendorQuotaKinds = new Set(vendorQuotaInput.skipped.map((item) => item.kind));
-    const quotaUsable = filesystemUsable.filter((item) => !vendorQuotaKinds.has(item.seat));
+    const quotaUsable = accountUsable.filter((item) => !vendorQuotaKinds.has(item.seat));
     const vendorQuotaSkipped = vendorQuotaInput.skipped.filter((item) => candidateDiagnostics[item.kind]);
     // Quota state first: a cooling seat cannot do the work at any rank.
     const { usable, skipped, allCooling } = filterCandidatesByQuotaCooldown(
-      quotaUsable, explicitProvider ? (req.body?.explicitSeat || null) : null);
-    const ranked = levelCandidates(usable, gauges);
-    const top = ranked[0] ? gauges[ranked[0].seat] : null;
+      quotaUsable,
+      explicitProvider ? (req.body?.explicitSeat || null) : null,
+      routingInputs.cooling,
+    );
+    const ranked = levelCandidates(usable, routingInputs.gauges);
+    const top = ranked[0] ? routingInputs.gauges[ranked[0].seat] : null;
     res.json({
       ranked, skipped, allCooling,
+      allAccountsUnavailable: accountUsable.length === 0 && accountUnavailableSkipped.length > 0,
+      accountUnavailableSkipped,
+      accountSelection: routingInputs.accountSelection,
       allVendorQuotaExhausted: quotaUsable.length === 0 && vendorQuotaSkipped.length > 0,
       vendorQuotaSkipped, filesystemSkipped, filesystemAuthority,
       tierAdjustment: suggestTierAdjustment({ tier, gauge: top, highStakes, explicitProvider }),
@@ -4874,6 +6044,9 @@ app.post('/api/install', (req, res) => {
     cwd: installCwd,
     env,
     windowsHide: true,
+    // npm/pip fan out into their own children; group-kill them when the
+    // 5-minute cap fires instead of leaving a half-finished install running.
+    detached: process.platform !== 'win32',
   }));
   let stdout = '';
   let stderr = '';
@@ -4894,6 +6067,10 @@ app.post('/api/install', (req, res) => {
     if (settled) return;
     settled = true;
     clearTimeout(t);
+    // An install is the one event that makes a PATH lookup stale on purpose:
+    // the seat the caller just installed must not stay "not installed" for the
+    // rest of the memo's TTL.
+    executableCache.clear();
     res.json({ kind, package: pkg, installer: entry.install_display, success: code === 0, exitCode: code, stdout, stderr });
   });
 });
@@ -5048,7 +6225,16 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
 
 wss.on('connection', (ws, req) => {
-  const url = new URL(req.url, `http://${req.headers.host}`);
+  // Same DNS-rebinding guard as the HTTP middleware, applied before the URL
+  // parse: a rebound page's socket really is loopback and only its Host names
+  // the attacker. Parsing an arbitrary Host into the base URL also throws for a
+  // malformed value, and a throw in this event handler costs the whole bridge.
+  const host = String(req.headers.host || '').toLowerCase();
+  if (host && !ALLOWED_HOSTS.has(host)) {
+    ws.close(1008, 'unauthorized');
+    return;
+  }
+  const url = new URL(req.url, `http://${host || `${HOST}:${PORT}`}`);
   const origin = req.headers.origin;
   const token = url.searchParams.get('token');
   if ((origin && !ALLOWED_ORIGINS.has(origin)) || !tokenMatches(token)) {
@@ -5097,6 +6283,25 @@ let remoteMcpStatus = { enabled: false, reason: 'initializing' };
   }
 })();
 app.get('/api/remote-mcp/status', (req, res) => res.json(remoteMcpStatus));
+
+// Terminal error handler. Without one, Express's finalhandler answers with
+// err.stack whenever NODE_ENV is unset — and express.json() runs ahead of the
+// /api token gate, so an UNAUTHENTICATED malformed body returned the absolute
+// checkout path, the Node version and the whole dependency layout in an HTML
+// 400. Log the stack locally, and answer with the message only when the error
+// marks itself safe to expose (body-parser's 400s do; a thrown handler bug
+// does not). Registered last because Express only reaches an error handler
+// that sits after the layer that failed; the remote-MCP route is mounted
+// asynchronously after this point and carries its own try/catch. The unused
+// 4th parameter is load-bearing: arity is how Express recognizes this as an
+// error handler rather than ordinary middleware.
+app.use((err, req, res, next) => {
+  console.error('[RelayBridge] request failed: ' + (err && err.stack ? err.stack : err));
+  if (res.headersSent) return next(err);
+  const status = Number(err && (err.status || err.statusCode)) || 500;
+  res.status(status >= 400 && status <= 599 ? status : 500)
+    .json({ error: err && err.expose && err.message ? err.message : 'request failed' });
+});
 
 
 server.listen(PORT, HOST, () => {
