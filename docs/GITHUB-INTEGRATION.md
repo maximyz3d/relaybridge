@@ -8,11 +8,15 @@ effect of running, never as a task anyone has to remember.
 
 | Layer | Lives in | Does |
 |---|---|---|
-| **Server-side Actions** (source of truth) | each project repo | `claim-on-start.yml`: assigns the PR author to the linked issue + duplicate-work warning. `version-on-merge.yml`: reads the PR's bump label on merge, writes `VERSION` + `CHANGELOG.md`, creates the annotated `vX.Y.Z` tag (and optionally a Release). Works for **every** contributor, RelayBridge or not. |
+| **Server-side Actions** (source of truth) | each project repo | `claim-on-start.yml`: assigns trusted same-repository PR authors to linked issues + warns on duplicate work; forks and Dependabot stay read-only for a maintainer to claim. `version-on-merge.yml`: handles every maintainer-approved default-branch merge (including forks), writes `VERSION` + `CHANGELOG.md`, creates the annotated `vX.Y.Z` tag, and can optionally create a Release. |
 | **RelayBridge** (real-time control plane) | this repo | checkpoint commits per run, DEVLOG entries, sticky issue comments, draft-PR lifecycle, **dictates** the bump label, **mirrors** the version history, one-action repo onboarding. |
 
 RelayBridge **never** creates, moves, or deletes tags and never writes the
 version number. Versions are append-only; rollback = a new branch from a tag.
+The version workflow serializes merge events and chooses the highest strict
+`vX.Y.Z` tag, then a valid `VERSION`, then a valid `package.json` version, and
+finally `0.1.0`. An explicit `set-version:X.Y.Z` is rejected unless it is
+strictly greater than that baseline.
 
 ## Enrolling a repo
 
