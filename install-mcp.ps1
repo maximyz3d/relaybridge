@@ -17,9 +17,11 @@ $bridgeRoot = (Resolve-Path -LiteralPath $PSScriptRoot).Path
 $mcpServer = Join-Path $bridgeRoot 'mcp\server.mjs'
 $tokenFile = Join-Path $bridgeRoot '.bridge-token'
 $timeoutPolicyPath = Join-Path $bridgeRoot 'config\timeout-policy.json'
+$buildInfoTool = Join-Path $bridgeRoot 'tools\prepare-build-info.cjs'
 $nodePath = (Get-Command node.exe -ErrorAction Stop).Source
 $codexConfigPath = Join-Path $env:USERPROFILE '.codex\config.toml'
 $claudeConfigPath = Join-Path $env:USERPROFILE '.claude.json'
+$registrationLockTimeoutMilliseconds = 30000
 
 foreach ($legacyName in $LegacyNames) {
   if ($legacyName -notmatch '^[A-Za-z0-9_-]+$') { throw "Invalid legacy MCP registration name: $legacyName" }
@@ -42,12 +44,120 @@ function Restore-ConfigSnapshot($Snapshot) {
   }
 }
 
-function Protect-CapabilityToken([string]$Path) {
-  if (-not $IsWindows -and $PSVersionTable.PSVersion.Major -ge 6) { return }
+function Get-CurrentWindowsUserSid {
   $identity = (& whoami.exe /user /fo csv /nh 2>$null | Out-String)
   $match = [regex]::Match($identity, 'S-[0-9]+(?:-[0-9]+)+')
-  if (-not $match.Success) { throw 'Could not resolve the current Windows user SID for capability-token ACL hardening.' }
-  $sid = $match.Value
+  if (-not $match.Success) { throw 'Could not resolve the current Windows user SID for local-state ACL hardening.' }
+  return $match.Value
+}
+
+function New-McpRegistrationMutexSecurity([string]$Sid) {
+  $security = New-Object System.Security.AccessControl.MutexSecurity
+  $security.SetAccessRuleProtection($true, $false)
+  $currentUser = New-Object System.Security.Principal.SecurityIdentifier($Sid)
+  foreach ($principal in @(
+    $currentUser,
+    (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')),
+    (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544'))
+  )) {
+    $rule = New-Object System.Security.AccessControl.MutexAccessRule(
+      $principal,
+      [System.Security.AccessControl.MutexRights]::FullControl,
+      [System.Security.AccessControl.AccessControlType]::Allow
+    )
+    $security.AddAccessRule($rule)
+  }
+  $security.SetOwner($currentUser)
+  return $security
+}
+
+function Assert-McpRegistrationMutexSecurity($Mutex, [string]$ExpectedSid) {
+  try {
+    $security = $Mutex.GetAccessControl()
+    $owner = $security.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+    $rules = @($security.GetAccessRules(
+      $true,
+      $true,
+      [System.Security.Principal.SecurityIdentifier]
+    ))
+  } catch {
+    throw 'MCP registration mutex security descriptor could not be verified.'
+  }
+
+  $allowedSids = @($ExpectedSid, 'S-1-5-18', 'S-1-5-32-544')
+  if ($owner -ne $ExpectedSid -or -not $security.AreAccessRulesProtected -or
+      -not $security.AreAccessRulesCanonical) {
+    throw 'MCP registration mutex security descriptor is not trusted.'
+  }
+  $seenSids = @{}
+  foreach ($rule in $rules) {
+    $ruleSid = $rule.IdentityReference.Value
+    if ($allowedSids -notcontains $ruleSid -or $rule.IsInherited -or
+        $rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or
+        [int64]$rule.MutexRights -ne [int64][System.Security.AccessControl.MutexRights]::FullControl) {
+      throw 'MCP registration mutex security descriptor is not trusted.'
+    }
+    $seenSids[$ruleSid] = $true
+  }
+  foreach ($requiredSid in $allowedSids) {
+    if (-not $seenSids.ContainsKey($requiredSid)) {
+      throw 'MCP registration mutex security descriptor is not trusted.'
+    }
+  }
+}
+
+function Enter-McpRegistrationLock([int]$TimeoutMilliseconds) {
+  if ($TimeoutMilliseconds -lt 1) { throw 'The MCP registration-lock timeout must be positive.' }
+  $sid = Get-CurrentWindowsUserSid
+  # A SID-named Global kernel object gives every checkout and Windows session
+  # for this OS user exactly one namespace. No environment or CLI override can
+  # accidentally split transactions that mutate the same user-global clients.
+  $mutexName = "Global\RelayBridge-McpInstall-$sid"
+  $mutexSecurity = New-McpRegistrationMutexSecurity $sid
+  $createdNew = $false
+  $mutex = $null
+  $owned = $false
+  $abandoned = $false
+  try {
+    $mutex = [System.Threading.Mutex]::new($false, $mutexName, [ref]$createdNew, $mutexSecurity)
+    # Constructor security is applied only when the object is new. An existing
+    # object is accepted only after its live descriptor proves the same owner,
+    # protected DACL, principals, and rights we require for a new mutex.
+    Assert-McpRegistrationMutexSecurity $mutex $sid
+    try { $owned = $mutex.WaitOne(0) }
+    catch [System.Threading.AbandonedMutexException] { $owned = $true; $abandoned = $true }
+    if (-not $owned) {
+      Write-Host '[RelayBridge] Another MCP registration is active; waiting for its transaction lock...' -ForegroundColor Yellow
+      try { $owned = $mutex.WaitOne($TimeoutMilliseconds) }
+      catch [System.Threading.AbandonedMutexException] { $owned = $true; $abandoned = $true }
+    }
+    if (-not $owned) {
+      throw "Timed out after $TimeoutMilliseconds ms waiting for the active MCP registration transaction lock."
+    }
+    return [pscustomobject]@{ Mutex = $mutex; Name = $mutexName; Abandoned = $abandoned }
+  } catch {
+    if ($null -ne $mutex) {
+      if ($owned) {
+        try { $mutex.ReleaseMutex() } catch { }
+      }
+      $mutex.Dispose()
+    }
+    throw
+  }
+}
+
+function Exit-McpRegistrationLock($Lock) {
+  if ($null -ne $Lock -and $null -ne $Lock.Mutex) {
+    # Release only the exact kernel object successfully acquired above. An
+    # abandoned owner is recovered by WaitOne; there is no path to delete.
+    try { $Lock.Mutex.ReleaseMutex() }
+    finally { $Lock.Mutex.Dispose() }
+  }
+}
+
+function Protect-CapabilityToken([string]$Path) {
+  if (-not $IsWindows -and $PSVersionTable.PSVersion.Major -ge 6) { return }
+  $sid = Get-CurrentWindowsUserSid
   & icacls.exe $Path /inheritance:r /grant:r "*${sid}:(F)" /grant:r '*S-1-5-18:(F)' /grant:r '*S-1-5-32-544:(F)' *> $null
   if ($LASTEXITCODE -ne 0) { throw "Could not harden the capability-token ACL: $Path" }
   $aclText = (& icacls.exe $Path 2>$null | Out-String)
@@ -72,6 +182,9 @@ if (-not (Test-Path -LiteralPath $mcpServer -PathType Leaf)) {
 if (-not (Test-Path -LiteralPath $timeoutPolicyPath -PathType Leaf)) {
   throw "Timeout policy not found: $timeoutPolicyPath"
 }
+if (-not (Test-Path -LiteralPath $buildInfoTool -PathType Leaf)) {
+  throw "Build identity tool not found: $buildInfoTool"
+}
 $timeoutPolicy = [IO.File]::ReadAllText($timeoutPolicyPath, [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
 $mcpToolTimeoutSec = [int][Math]::Ceiling((
   [double]$timeoutPolicy.oneShotMaxMs +
@@ -79,30 +192,42 @@ $mcpToolTimeoutSec = [int][Math]::Ceiling((
   [double]$timeoutPolicy.mcpHostGraceMs
 ) / 1000)
 if ($mcpToolTimeoutSec -lt 1) { throw "Invalid timeout policy: $timeoutPolicyPath" }
+$registrationLock = $null
+try {
+$registrationLock = Enter-McpRegistrationLock $registrationLockTimeoutMilliseconds
 $tokenCreated = $false
-if (-not (Test-Path -LiteralPath $tokenFile -PathType Leaf)) {
-  Write-Host '[RelayBridge] Creating the local capability token...' -ForegroundColor Cyan
-  $tokenBytes = New-Object byte[] 32
-  $tokenRng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-  try { $tokenRng.GetBytes($tokenBytes) } finally { $tokenRng.Dispose() }
-  $token = ([BitConverter]::ToString($tokenBytes)).Replace('-', '').ToLowerInvariant()
-  [IO.File]::WriteAllText($tokenFile, "$token`n", [Text.UTF8Encoding]::new($false))
-  $tokenCreated = $true
-} else {
-  $existingToken = (Get-Content -LiteralPath $tokenFile -Raw).Trim()
-  if ($existingToken -notmatch '^[A-Fa-f0-9]{64}$') { throw "Existing RelayBridge capability token is invalid: $tokenFile" }
-}
-try { Protect-CapabilityToken $tokenFile }
-catch {
-  if ($tokenCreated) { Remove-Item -LiteralPath $tokenFile -Force -ErrorAction SilentlyContinue }
-  throw
-}
-
 $configurationSnapshots = @()
 if (-not $SkipCodex) { $configurationSnapshots += Get-ConfigSnapshot $codexConfigPath }
 if (-not $SkipClaude) { $configurationSnapshots += Get-ConfigSnapshot $claudeConfigPath }
 
 try {
+$tokenExists = Test-Path -LiteralPath $tokenFile -PathType Leaf
+if (-not $tokenExists) {
+  Write-Host '[RelayBridge] Creating the local capability token...' -ForegroundColor Cyan
+  # Mark ownership before the first write so even a partial WriteAllText
+  # failure is removed by the catch below.
+  $tokenCreated = $true
+  $tokenBytes = New-Object byte[] 32
+  $tokenRng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+  try { $tokenRng.GetBytes($tokenBytes) } finally { $tokenRng.Dispose() }
+  $token = ([BitConverter]::ToString($tokenBytes)).Replace('-', '').ToLowerInvariant()
+  [IO.File]::WriteAllText($tokenFile, "$token`n", [Text.UTF8Encoding]::new($false))
+} else {
+  $existingToken = (Get-Content -LiteralPath $tokenFile -Raw).Trim()
+  if ($existingToken -notmatch '^[A-Fa-f0-9]{64}$') { throw "Existing RelayBridge capability token is invalid: $tokenFile" }
+}
+Protect-CapabilityToken $tokenFile
+
+# build-info.json is deterministic generated state and is published atomically.
+# Do not include it in configuration rollback: restoring an old snapshot could
+# clobber a newer manifest concurrently prepared by another launcher.
+$preparedBuildText = (& $nodePath $buildInfoTool $bridgeRoot | Out-String).Trim()
+$preparedBuildExitCode = $LASTEXITCODE
+if ($preparedBuildExitCode -ne 0 -or $preparedBuildText -notmatch '^[A-Za-z0-9._+-]{1,128}$') {
+  throw 'Could not prepare or validate an exact RelayBridge build identity; MCP registration was not changed.'
+}
+Write-Host "[RelayBridge] Exact build identity ready: $preparedBuildText" -ForegroundColor Green
+
 if (-not $SkipCodex) {
   if (-not (Get-Command codex -ErrorAction SilentlyContinue)) {
     throw 'Codex CLI is not installed or is not on PATH.'
@@ -249,3 +374,6 @@ foreach ($legacy in @($LegacyNames | Where-Object { $_ -and $_ -ne $Name } | Sel
 }
 
 Write-Host '[RelayBridge] Registration complete. Restart open Codex/Claude clients so they reload MCP configuration.' -ForegroundColor Cyan
+} finally {
+  Exit-McpRegistrationLock $registrationLock
+}

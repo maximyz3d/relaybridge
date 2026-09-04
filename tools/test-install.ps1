@@ -1,5 +1,7 @@
 [CmdletBinding()]
-param()
+param(
+  [switch]$SafetyOnly
+)
 
 $ErrorActionPreference = 'Stop'
 if ($env:RELAYBRIDGE_SKIP_INSTALL_TEST -eq '1') {
@@ -7,7 +9,7 @@ if ($env:RELAYBRIDGE_SKIP_INSTALL_TEST -eq '1') {
   exit 0
 }
 
-$repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
+$repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).ProviderPath
 $installer = Join-Path $repoRoot 'install.ps1'
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ('relaybridge-install-test-' + [Guid]::NewGuid().ToString('N'))
 $installRoot = Join-Path $testRoot 'RelayBridge'
@@ -44,6 +46,14 @@ function Get-FreePort {
   $listener.Start()
   try { return ([Net.IPEndPoint]$listener.LocalEndpoint).Port }
   finally { $listener.Stop() }
+}
+
+function Test-ProcessRunning([int]$ProcessId) {
+  if ($ProcessId -le 0) { return $false }
+  try {
+    $process = Get-Process -Id $ProcessId -ErrorAction Stop
+    return (-not $process.HasExited)
+  } catch { return $false }
 }
 
 function Invoke-TestInstall([string]$FailAt = '', [switch]$Start, [int]$Port = 0) {
@@ -84,14 +94,22 @@ function Get-InstallerFunctionText([string[]]$Names) {
   # Dot-sourcing has to happen in the script scope, so hand the caller the text
   # rather than defining the functions inside this one and losing them on return.
   $ast = [System.Management.Automation.Language.Parser]::ParseFile($installer, [ref]$null, [ref]$null)
+  $functions = $ast.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
+  }, $true)
+  $functionText = @{}
+  $functionCounts = @{}
+  foreach ($functionAst in $functions) {
+    $functionName = [string]$functionAst.Name
+    $functionCounts[$functionName] = 1 + [int]$functionCounts[$functionName]
+    $functionText[$functionName] = $functionAst.Extent.Text
+  }
   $blocks = @()
-  foreach ($name in $Names) {
-    $found = $ast.FindAll({
-      param($node)
-      $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
-    }, $true)
-    if ($found.Count -ne 1) { throw "install.ps1 must define exactly one $name function (found $($found.Count))." }
-    $blocks += $found[0].Extent.Text
+  foreach ($requestedName in $Names) {
+    $foundCount = [int]$functionCounts[$requestedName]
+    if ($foundCount -ne 1) { throw "install.ps1 must define exactly one $requestedName function (found $foundCount)." }
+    $blocks += $functionText[$requestedName]
   }
   return ($blocks -join "`n")
 }
@@ -154,7 +172,10 @@ function Test-RequiredStripEnvMigration([string]$InstalledStripEnvJson) {
 . ([scriptblock]::Create((Get-InstallerFunctionText @(
   'Test-ExactJsonStringArray', 'Restore-ShippedCredentialRelocation', 'Restore-ShippedManagedLoginCommands',
   'Restore-ShippedRequiredStripEnv',
-  'Test-RetiredJsonNumber', 'Format-JsonScalar', 'Restore-ShippedManagedSupervisorBudget'
+  'Test-RetiredJsonNumber', 'Format-JsonScalar', 'Restore-ShippedManagedSupervisorBudget',
+  'Test-ReleasePathExcluded', 'Test-SecretLikeReleasePath', 'Assert-ReleaseItemSafe',
+  'Copy-ReleaseSource', 'Get-ReleaseIdentityFiles', 'Get-BridgeHealth',
+  'Test-LocalPortInUse', 'Start-StagedBridge'
 ))))
 
 $retiredCopilot = Test-CopilotMetadataMigration '{ "credential_env": "GH_CONFIG_DIR", "credential_markers": ["hosts.yml"], "login_command": ["copilot", "/login"] }'
@@ -212,6 +233,178 @@ Assert-True (-not (Test-RetiredJsonNumber ([datetime]'2024-01-01') ([int]24))) '
 Assert-True (Test-RetiredJsonNumber ([decimal]24) ([int]24)) 'a decimal literal must still match its retired integer'
 Assert-True ((Format-JsonScalar $null) -eq 'null') 'the migration report must name the shipped null explicitly'
 Write-Host '[RelayBridge] Managed supervisor budget migration cases passed.' -ForegroundColor DarkGray
+
+$copyFixture = Join-Path $testRoot 'copy-safety'
+$copySource = Join-Path $copyFixture 'source'
+$copyStage = Join-Path $copyFixture 'stage'
+$copyExternal = Join-Path $copyFixture 'external'
+New-Item -ItemType Directory -Path $copySource, $copyExternal -Force | Out-Null
+[IO.File]::WriteAllText((Join-Path $copySource 'keep.txt'), "release bytes`n", [Text.UTF8Encoding]::new($false))
+[IO.File]::WriteAllText((Join-Path $copyExternal 'outside-secret.txt'), "must never be staged`n", [Text.UTF8Encoding]::new($false))
+$junction = Join-Path $copySource 'junction-escape'
+New-Item -ItemType Junction -Path $junction -Target $copyExternal | Out-Null
+$junctionRejected = $false
+try { Copy-ReleaseSource $copySource $copyStage }
+catch { $junctionRejected = $_.Exception.Message -match 'reparse point' }
+Assert-True $junctionRejected 'release staging must reject a directory junction instead of following it outside SourceDir'
+Assert-True (-not (Test-Path -LiteralPath (Join-Path $copyStage 'junction-escape\outside-secret.txt'))) 'junction target bytes must never reach staging'
+[IO.Directory]::Delete($junction)
+if (Test-Path -LiteralPath $copyStage) { Remove-Item -LiteralPath $copyStage -Recurse -Force }
+
+foreach ($runtimeName in @('.bridge.pid', '.bridge.8787.pid', 'mcp-config.json', '.build-info.1.test.tmp', 'bridge.start.out.log')) {
+  [IO.File]::WriteAllText((Join-Path $copySource $runtimeName), "runtime-only`n", [Text.UTF8Encoding]::new($false))
+}
+New-Item -ItemType Directory -Path (Join-Path $copySource '.mcp-install.lock') -Force | Out-Null
+[IO.File]::WriteAllText((Join-Path $copySource '.mcp-install.lock\owner'), "runtime-lock-owner`n", [Text.UTF8Encoding]::new($false))
+Copy-ReleaseSource $copySource $copyStage
+Assert-True (Test-Path -LiteralPath (Join-Path $copyStage 'keep.txt') -PathType Leaf) 'ordinary release source must still be staged'
+foreach ($runtimeName in @('.bridge.pid', '.bridge.8787.pid', 'mcp-config.json', '.build-info.1.test.tmp', 'bridge.start.out.log')) {
+  Assert-True (-not (Test-Path -LiteralPath (Join-Path $copyStage $runtimeName))) "runtime artifact must be excluded from staging: $runtimeName"
+}
+Assert-True (-not (Test-Path -LiteralPath (Join-Path $copyStage '.mcp-install.lock'))) 'MCP registration lock directory must be excluded from release staging'
+$identityNames = @(Get-ReleaseIdentityFiles $copyStage | ForEach-Object { $_.Name })
+Assert-True ($identityNames.Count -eq 1 -and $identityNames[0] -eq 'keep.txt') 'release identity enumeration must share staging runtime exclusions'
+
+[IO.File]::WriteAllText((Join-Path $copySource '.npmrc'), "//registry.example.invalid/:_authToken=must-not-be-read`n", [Text.UTF8Encoding]::new($false))
+$secretRejected = $false
+try { Copy-ReleaseSource $copySource (Join-Path $copyFixture 'secret-stage') }
+catch { $secretRejected = $_.Exception.Message -match 'secret-looking path' }
+Assert-True $secretRejected 'release staging must reject a nonignored secret-looking path before copying it'
+Assert-True (-not (Test-Path -LiteralPath (Join-Path $copyFixture 'secret-stage\.npmrc'))) 'secret-looking bytes must never reach staging'
+foreach ($secretName in @('accesstoken.json', 'refreshcredential.toml', 'auth-secret.txt')) {
+  Assert-True (Test-SecretLikeReleasePath $secretName) "Windows release staging must match the shared secret policy: $secretName"
+}
+foreach ($sourceName in @('tokens.ts', 'credential.py', 'design-secrets.md')) {
+  Assert-True (-not (Test-SecretLikeReleasePath $sourceName)) "ordinary source must not be rejected as a secret: $sourceName"
+}
+Write-Host '[RelayBridge] Confined release staging and runtime-exclusion cases passed.' -ForegroundColor DarkGray
+
+$candidateRoot = Join-Path $copyFixture 'unready-candidate'
+New-Item -ItemType Directory -Path $candidateRoot -Force | Out-Null
+$unreadyServer = @'
+'use strict';
+const http = require('http');
+const server = http.createServer((req, res) => {
+  res.setHeader('content-type', 'application/json');
+  res.end(JSON.stringify({
+    capabilityAuth: true,
+    buildId: '2.0.1+aaaaaaaaaaaaaaaa',
+    buildIdentityReady: false,
+    receiptStoreIdentityReady: true,
+    receiptStoreId: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+  }));
+});
+server.listen(Number(process.env.PORT), '127.0.0.1');
+'@
+[IO.File]::WriteAllText((Join-Path $candidateRoot 'server.js'), ($unreadyServer + "`n"), [Text.UTF8Encoding]::new($false))
+$candidatePort = Get-FreePort
+$candidateRejected = $false
+try { Start-StagedBridge $candidateRoot $candidatePort '2.0.1+aaaaaaaaaaaaaaaa' | Out-Null }
+catch { $candidateRejected = $true }
+Assert-True $candidateRejected 'Windows installer candidate validation must reject buildIdentityReady:false even when buildId matches'
+for ($attempt = 0; $attempt -lt 30 -and (Test-LocalPortInUse $candidatePort); $attempt++) { Start-Sleep -Milliseconds 100 }
+Assert-True (-not (Test-LocalPortInUse $candidatePort)) 'rejected unready Windows candidate must be terminated'
+Write-Host '[RelayBridge] Windows candidate readiness rejection passed.' -ForegroundColor DarkGray
+
+# A candidate can lose the bind race to a detached process that reports the
+# same build. Build identity alone cannot prove that the process returned by
+# Start-Process owns the listener, so candidate promotion must also require the
+# exact spawned PID and terminate only that rejected candidate.
+$portWinnerRoot = Join-Path $copyFixture 'same-build-port-winner'
+New-Item -ItemType Directory -Path $portWinnerRoot -Force | Out-Null
+$raceCandidatePidPath = Join-Path $portWinnerRoot '.bridge.race-candidate.pid'
+$raceWinnerPidPath = Join-Path $portWinnerRoot '.bridge.race-winner.pid'
+$raceBuildId = '2.0.1+bbbbbbbbbbbbbbbb'
+$raceCandidateServer = @'
+'use strict';
+const fs = require('fs');
+const path = require('path');
+const { spawn } = require('child_process');
+fs.writeFileSync(path.join(__dirname, '.bridge.race-candidate.pid'), String(process.pid));
+const winner = spawn(process.execPath, [path.join(__dirname, 'winner.js')], {
+  cwd: __dirname,
+  env: process.env,
+  detached: true,
+  stdio: 'ignore',
+  windowsHide: true
+});
+fs.writeFileSync(path.join(__dirname, '.bridge.race-winner.pid'), String(winner.pid));
+winner.unref();
+setInterval(() => {}, 1000);
+'@
+$raceWinnerServer = @'
+'use strict';
+const http = require('http');
+const buildId = process.env.RELAYBRIDGE_EXPECTED_BUILD_ID;
+const server = http.createServer((req, res) => {
+  res.setHeader('content-type', 'application/json');
+  res.end(JSON.stringify({
+    pid: process.pid,
+    capabilityAuth: true,
+    buildId,
+    buildIdentityReady: true,
+    receiptStoreIdentityReady: true,
+    receiptStoreId: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+  }));
+});
+server.listen(Number(process.env.PORT), '127.0.0.1');
+'@
+[IO.File]::WriteAllText((Join-Path $portWinnerRoot 'server.js'), ($raceCandidateServer + "`n"), [Text.UTF8Encoding]::new($false))
+[IO.File]::WriteAllText((Join-Path $portWinnerRoot 'winner.js'), ($raceWinnerServer + "`n"), [Text.UTF8Encoding]::new($false))
+$racePort = Get-FreePort
+$raceRejected = $false
+$raceDiagnostic = ''
+$raceCandidatePid = 0
+$raceWinnerPid = 0
+$raceCandidateStopped = $false
+$raceWinnerHealthMatched = $false
+$raceListenerCleaned = $false
+$racePidArtifactsCleaned = $false
+try {
+  try { Start-StagedBridge $portWinnerRoot $racePort $raceBuildId | Out-Null }
+  catch {
+    $raceRejected = $true
+    $raceDiagnostic = $_.Exception.Message
+  }
+  if (Test-Path -LiteralPath $raceCandidatePidPath -PathType Leaf) {
+    $raceCandidatePid = [int]([IO.File]::ReadAllText($raceCandidatePidPath).Trim())
+  }
+  if (Test-Path -LiteralPath $raceWinnerPidPath -PathType Leaf) {
+    $raceWinnerPid = [int]([IO.File]::ReadAllText($raceWinnerPidPath).Trim())
+  }
+  for ($attempt = 0; $attempt -lt 30 -and (Test-ProcessRunning $raceCandidatePid); $attempt++) { Start-Sleep -Milliseconds 100 }
+  $raceCandidateStopped = $raceCandidatePid -gt 0 -and -not (Test-ProcessRunning $raceCandidatePid)
+  $raceWinnerHealth = Get-BridgeHealth $racePort
+  $raceWinnerHealthMatched = $raceWinnerPid -gt 0 -and $null -ne $raceWinnerHealth -and
+    [int64]$raceWinnerHealth.pid -eq [int64]$raceWinnerPid -and
+    [string]$raceWinnerHealth.buildId -eq $raceBuildId -and
+    $raceWinnerPid -ne $raceCandidatePid
+} finally {
+  if ($raceCandidatePid -gt 0 -and (Test-ProcessRunning $raceCandidatePid)) {
+    Stop-Process -Id $raceCandidatePid -Force -ErrorAction SilentlyContinue
+  }
+  if ($raceWinnerPid -gt 0 -and (Test-ProcessRunning $raceWinnerPid)) {
+    Stop-Process -Id $raceWinnerPid -Force -ErrorAction SilentlyContinue
+  }
+  for ($attempt = 0; $attempt -lt 50 -and (Test-LocalPortInUse $racePort); $attempt++) { Start-Sleep -Milliseconds 100 }
+  $raceListenerCleaned = -not (Test-LocalPortInUse $racePort)
+  Remove-Item -LiteralPath $raceCandidatePidPath, $raceWinnerPidPath -Force -ErrorAction SilentlyContinue
+  $racePidArtifactsCleaned = -not (Test-Path -LiteralPath $raceCandidatePidPath) -and
+    -not (Test-Path -LiteralPath $raceWinnerPidPath)
+}
+Assert-True $raceRejected 'Windows installer candidate validation must reject a same-build listener owned by another PID'
+Assert-True ($raceDiagnostic -match 'candidate PID') 'same-build port-winner rejection must identify the PID ownership mismatch'
+Assert-True $raceCandidateStopped 'same-build port-winner rejection must terminate the spawned candidate process'
+Assert-True $raceWinnerHealthMatched 'the race fixture must prove that a different PID won the port while reporting the expected build'
+Assert-True $raceListenerCleaned 'same-build port-winner regression must clean the detached winner listener'
+Assert-True $racePidArtifactsCleaned 'same-build port-winner regression must clean its PID artifacts'
+Write-Host '[RelayBridge] Windows exact candidate-PID rejection passed.' -ForegroundColor DarkGray
+
+if ($SafetyOnly) {
+  if (Test-Path -LiteralPath $testRoot) { Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue }
+  Write-Host '[RelayBridge] Windows install safety-only tests passed.' -ForegroundColor Green
+  return
+}
 
 New-Item -ItemType Directory -Path (Join-Path $installRoot 'data\receipts'), (Join-Path $installRoot 'config') -Force | Out-Null
 try {
@@ -396,6 +589,7 @@ server.listen(port, '127.0.0.1');
   Assert-True ([string]$build.buildId -match '^2\.0\.1\+[a-f0-9]{16}$') 'installed release must have an exact code-hash build identity'
   $health = Invoke-RestMethod -Uri "http://127.0.0.1:$($success.Port)/api/health" -TimeoutSec 3 -UseBasicParsing
   Assert-True ([string]$health.buildId -eq [string]$build.buildId) 'promoted server health must report the exact staged build identity'
+  Assert-True ($health.buildIdentityReady -eq $true) 'promoted server must report a ready exact build identity before install succeeds'
   $token = (Get-Content -LiteralPath (Join-Path $installRoot '.bridge-token') -Raw).Trim()
   Invoke-RestMethod -Uri "http://127.0.0.1:$($success.Port)/api/admin/shutdown" -Method Post -Headers @{ 'X-RelayBridge-Token' = $token } -ContentType 'application/json' -Body '{}' -TimeoutSec 3 -UseBasicParsing | Out-Null
   for ($attempt = 0; $attempt -lt 50; $attempt++) {

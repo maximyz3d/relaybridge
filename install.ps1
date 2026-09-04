@@ -799,26 +799,95 @@ function Merge-OperatorConfiguration([string]$StageRoot, [string]$ExistingRoot) 
   }
 }
 
-function Copy-ReleaseSource([string]$SourceRoot, [string]$StageRoot) {
-  $excluded = @('.git', 'node_modules', '.bridge-token', '.state.json', '.mcp-start.lock', 'data', 'migration-backups', 'build-info.json')
-  New-Item -ItemType Directory -Path $StageRoot -Force | Out-Null
-  Get-ChildItem -LiteralPath $SourceRoot -Force | ForEach-Object {
-    if ($excluded -contains $_.Name) { return }
-    Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $StageRoot $_.Name) -Recurse -Force
+function Test-ReleasePathExcluded([string]$RelativePath, [string]$LeafName, [bool]$IsContainer) {
+  $portable = $RelativePath.Replace('\', '/')
+  $topLevel = ($portable -split '/', 2)[0]
+  if ($topLevel -in @('.git', 'node_modules', 'data', 'migration-backups')) { return $true }
+  if ($IsContainer -and $LeafName -in @('.git', 'node_modules')) { return $true }
+  if ($LeafName -in @(
+    '.bridge-token', '.state.json', '.mcp-start.lock', '.mcp-install.lock', 'build-info.json',
+    'mcp-config.json', '.bridge.pid'
+  )) { return $true }
+  if ($LeafName -like '.bridge.*.pid' -or $LeafName -like '.build-info.*.tmp' -or $LeafName -like '*.log') {
+    return $true
   }
+  return $false
+}
+
+function Test-SecretLikeReleasePath([string]$RelativePath) {
+  $portable = $RelativePath.Replace('\', '/')
+  $leaf = [IO.Path]::GetFileName($portable)
+  return $leaf -match '^\.env(?:\..*)?$' -or
+    $leaf -match '^\.(?:npmrc|netrc|pgpass|pypirc|envrc|dockercfg)$' -or
+    $leaf -match '\.(?:env|pem|key|pfx|p12|kdbx|keystore|jks)$' -or
+    $leaf -match '^id_(?:rsa|ed25519|ecdsa|dsa)(?:\.pub)?$' -or
+    $leaf -match '^credentials?(?:\.(?:json|xml|ya?ml))?$' -or
+    $leaf -match '^secrets?\.(?:json|ya?ml|toml|env)$' -or
+    $leaf -match '(^|[._-])token([._-]|$)' -or
+    $leaf -match '(?:access|api|auth|refresh)?(?:token|credential|secret)s?(?:\.(?!(?:ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|rb|php|c|h|cc|cpp|hpp|cs|swift|kt|kts|scala|ex|exs|lua|pl|r|m|mm|sql|md|mdx|rst|html?|css|scss|less|vue|svelte|astro|snap|lock|map)$)[^.]+)?$' -or
+    $leaf -match '(^|[._-])(?:deploy|private|ssh)[._-]?key(?:[._-]|$)' -or
+    $portable -match '(^|/)\.docker/config\.json$' -or
+    $leaf -match '(^|[._-])(?:service[._-]?account(?:[._-]?key)?|gcp[._-]?key|sa[._-]?key)(?:[._-][^/]*)?\.json$'
+}
+
+function Assert-ReleaseItemSafe($Item, [string]$RelativePath) {
+  if (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+    throw "Release source contains a reparse point and cannot be staged safely: $RelativePath"
+  }
+  if (-not $Item.PSIsContainer -and (Test-SecretLikeReleasePath $RelativePath)) {
+    throw "Release source contains a secret-looking path; ignore or remove it before installing: $RelativePath"
+  }
+}
+
+function Copy-ReleaseSource([string]$SourceRoot, [string]$StageRoot) {
+  $sourceItem = Get-Item -LiteralPath $SourceRoot -Force
+  Assert-ReleaseItemSafe $sourceItem '.'
+  New-Item -ItemType Directory -Path $StageRoot -Force | Out-Null
+  $pending = New-Object System.Collections.Stack
+  $pending.Push([pscustomobject]@{ Source = $sourceItem.FullName; Target = $StageRoot; Relative = '' })
+  while ($pending.Count -gt 0) {
+    $current = $pending.Pop()
+    foreach ($item in @(Get-ChildItem -LiteralPath $current.Source -Force)) {
+      $relative = if ($current.Relative) { $current.Relative + '/' + $item.Name } else { $item.Name }
+      if (Test-ReleasePathExcluded $relative $item.Name $item.PSIsContainer) { continue }
+      Assert-ReleaseItemSafe $item $relative
+      $target = Join-Path $current.Target $item.Name
+      if ($item.PSIsContainer) {
+        New-Item -ItemType Directory -Path $target -Force | Out-Null
+        $pending.Push([pscustomobject]@{ Source = $item.FullName; Target = $target; Relative = $relative })
+      } else {
+        Copy-Item -LiteralPath $item.FullName -Destination $target -Force
+      }
+    }
+  }
+}
+
+function Get-ReleaseIdentityFiles([string]$StageRoot) {
+  $files = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+  $rootItem = Get-Item -LiteralPath $StageRoot -Force
+  Assert-ReleaseItemSafe $rootItem '.'
+  $pending = New-Object System.Collections.Stack
+  $pending.Push([pscustomobject]@{ Path = $rootItem.FullName; Relative = '' })
+  while ($pending.Count -gt 0) {
+    $current = $pending.Pop()
+    foreach ($item in @(Get-ChildItem -LiteralPath $current.Path -Force)) {
+      $relative = if ($current.Relative) { $current.Relative + '/' + $item.Name } else { $item.Name }
+      if (Test-ReleasePathExcluded $relative $item.Name $item.PSIsContainer) { continue }
+      Assert-ReleaseItemSafe $item $relative
+      if ($item.PSIsContainer) {
+        $pending.Push([pscustomobject]@{ Path = $item.FullName; Relative = $relative })
+      } else {
+        $files.Add($item)
+      }
+    }
+  }
+  return @($files)
 }
 
 function Get-ReleaseBuildInfo([string]$StageRoot, [string]$SourceLabel) {
   $package = [IO.File]::ReadAllText((Join-Path $StageRoot 'package.json'), [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
-  $excludedTopLevel = @('node_modules', 'data', 'migration-backups')
   $parts = @()
-  $files = @(Get-ChildItem -LiteralPath $StageRoot -File -Recurse -Force | Where-Object {
-    $relative = $_.FullName.Substring($StageRoot.Length).TrimStart('\', '/')
-    $topLevel = ($relative -split '[\\/]', 2)[0]
-    $excludedTopLevel -notcontains $topLevel -and
-      $_.Name -notin @('.bridge-token', '.state.json', '.mcp-start.lock', 'build-info.json') -and
-      $_.Extension -ine '.log'
-  } | Sort-Object FullName)
+  $files = @(Get-ReleaseIdentityFiles $StageRoot | Sort-Object FullName)
   if ($files.Count -eq 0) { throw 'Release contains no files to identify.' }
   foreach ($file in $files) {
     $relative = $file.FullName.Substring($StageRoot.Length).TrimStart('\', '/').Replace('\', '/')
@@ -882,21 +951,27 @@ function Start-StagedBridge([string]$BridgeRoot, [int]$BridgePort, [string]$Expe
   $stdout = Join-Path $BridgeRoot 'bridge.install.out.log'
   $stderr = Join-Path $BridgeRoot 'bridge.install.err.log'
   $previousPort = $env:PORT
+  $previousExpectedBuildId = $env:RELAYBRIDGE_EXPECTED_BUILD_ID
   try {
     $env:PORT = [string]$BridgePort
+    if ($AllowLegacyVersion) { $env:RELAYBRIDGE_EXPECTED_BUILD_ID = $null }
+    else { $env:RELAYBRIDGE_EXPECTED_BUILD_ID = $ExpectedBuildId }
     $proc = Start-Process -FilePath $nodePath -ArgumentList 'server.js' -WorkingDirectory $BridgeRoot -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
   } finally {
     $env:PORT = $previousPort
+    $env:RELAYBRIDGE_EXPECTED_BUILD_ID = $previousExpectedBuildId
   }
   try {
     for ($attempt = 0; $attempt -lt 100; $attempt++) {
       if ($proc.HasExited) { throw "RelayBridge candidate exited with code $($proc.ExitCode). See $stderr" }
       $health = Get-BridgeHealth $BridgePort
       if ($health) {
+        $reportedPid = try { [int64]$health.pid } catch { 0 }
         $actualBuildId = [string]$health.buildId
         if (-not $actualBuildId -and $AllowLegacyVersion) { $actualBuildId = [string]$health.version }
-        if (-not $health.capabilityAuth -or $actualBuildId -ne $ExpectedBuildId) {
-          throw "Port $BridgePort reported build '$actualBuildId' instead of candidate '$ExpectedBuildId'."
+        if ($reportedPid -ne [int64]$proc.Id -or -not $health.capabilityAuth -or $actualBuildId -ne $ExpectedBuildId -or
+            (-not $AllowLegacyVersion -and $health.buildIdentityReady -ne $true)) {
+          throw "Port $BridgePort reported PID '$reportedPid' and build '$actualBuildId' instead of candidate PID '$($proc.Id)' and build '$ExpectedBuildId'."
         }
         if (-not $AllowLegacyVersion -and
             (-not $health.receiptStoreIdentityReady -or [string]$health.receiptStoreId -notmatch '^[0-9a-f]{64}$')) {
