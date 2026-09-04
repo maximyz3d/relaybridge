@@ -25,6 +25,9 @@
   "optionalDependencies": {
     "node-pty": "^1.1.0"
   },
+  "overrides": {
+    "qs": "6.16.0"
+  },
   "engines": {
     "node": ">=20.3"
   },
