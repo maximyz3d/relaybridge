@@ -7,12 +7,27 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const { spawn } = require('child_process');
 
 const P = require('../lib/platform');
 
 const posixOnly = process.platform === 'win32' ? test.skip : test;
+
+function resolvePosixCommand(name) {
+  const result = spawn('/bin/sh', ['-c', 'command -v "$1"', 'sh', name], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stdout = '';
+  result.stdout.on('data', (chunk) => { stdout += chunk; });
+  return new Promise((resolve, reject) => {
+    result.once('error', reject);
+    result.once('close', (code) => code === 0
+      ? resolve(stdout.trim())
+      : reject(new Error(`could not resolve ${name}`)));
+  });
+}
 
 // ---- detection -------------------------------------------------------------
 
@@ -159,4 +174,56 @@ posixOnly('killTree on an already-dead pid is a no-op, not a crash', () => {
   P.killTree(999999);
   P.killTree(null);
   P.killTree({});
+});
+
+posixOnly('start.sh never trusts the shared legacy pidfile without a port inspector', async (t) => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'relaybridge-start-pid-'));
+  const binDir = path.join(tempRoot, 'bin');
+  const scriptPath = path.join(tempRoot, 'start.sh');
+  const port = 62179;
+  fs.mkdirSync(binDir);
+  fs.copyFileSync(path.join(__dirname, '..', 'start.sh'), scriptPath);
+  for (const command of ['cat', 'dirname', 'rm']) {
+    fs.symlinkSync(await resolvePosixCommand(command), path.join(binDir, command));
+  }
+
+  const sentinel = () => spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+    stdio: 'ignore',
+  });
+  const legacy = sentinel();
+  const scoped = sentinel();
+  t.after(() => {
+    for (const child of [legacy, scoped]) {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    }
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  });
+
+  fs.writeFileSync(path.join(tempRoot, '.bridge.pid'), `${legacy.pid}\n`);
+  let stopped = spawn('/bin/bash', [scriptPath, '--stop'], {
+    env: { ...process.env, PATH: binDir, PORT: String(port), RELAYBRIDGE_PORT: String(port) },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let output = '';
+  stopped.stdout.on('data', (chunk) => { output += chunk; });
+  assert.equal(await new Promise((resolve) => stopped.once('close', resolve)), 0);
+  assert.match(output, /nothing listening/);
+  assert.doesNotThrow(() => process.kill(legacy.pid, 0),
+    'an unverifiable legacy pid must never be signalled');
+
+  fs.writeFileSync(path.join(tempRoot, `.bridge.${port}.pid`), `${scoped.pid}\n`);
+  stopped = spawn('/bin/bash', [scriptPath, '--stop'], {
+    env: { ...process.env, PATH: binDir, PORT: String(port), RELAYBRIDGE_PORT: String(port) },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  output = '';
+  stopped.stdout.on('data', (chunk) => { output += chunk; });
+  assert.equal(await new Promise((resolve) => stopped.once('close', resolve)), 0);
+  assert.match(output, new RegExp(`stopped pid ${scoped.pid}`));
+  if (scoped.exitCode === null && scoped.signalCode === null) {
+    await new Promise((resolve) => scoped.once('close', resolve));
+  }
+  assert.equal(fs.existsSync(path.join(tempRoot, `.bridge.${port}.pid`)), false);
+  assert.equal(fs.readFileSync(path.join(tempRoot, '.bridge.pid'), 'utf8').trim(), String(legacy.pid),
+    'stopping a scoped pid must preserve a different legacy hint');
 });

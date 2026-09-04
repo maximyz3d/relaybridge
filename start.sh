@@ -24,6 +24,7 @@ LEGACY_PIDFILE="$ROOT/.bridge.pid"
 # left over from the pre-port-scoped layout, or name a recycled pid.
 pid_owns_port() {
   local p="${1:-}"
+  local source_file="${2:-}"
   [[ -n "$p" ]] || return 1
   kill -0 "$p" 2>/dev/null || return 1
   if command -v ss >/dev/null 2>&1; then
@@ -34,7 +35,9 @@ pid_owns_port() {
     lsof -ti "tcp:$PORT" -sTCP:LISTEN 2>/dev/null | grep -qx "$p"
     return
   fi
-  return 0  # nothing to verify with; trust the port-scoped file
+  # With no kernel inspector, only the port-scoped pidfile is a sufficiently
+  # narrow hint. The shared legacy file may name a healthy bridge on any port.
+  [[ "$source_file" == "$PIDFILE" ]]
 }
 
 listening_pid() {
@@ -56,7 +59,7 @@ listening_pid() {
   for f in "$PIDFILE" "$LEGACY_PIDFILE"; do
     [[ -f "$f" ]] || continue
     p="$(cat "$f" 2>/dev/null || true)"
-    if pid_owns_port "$p"; then echo "$p"; return; fi
+    if pid_owns_port "$p" "$f"; then echo "$p"; return; fi
   done
 }
 

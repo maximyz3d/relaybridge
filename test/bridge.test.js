@@ -2312,7 +2312,7 @@ test('local Ollama adapter uses loopback HTTP, returns final-only text, and reco
     // CLI. It carries no request body, so parsing one here threw.
     if (req.method === 'GET' && req.url.startsWith('/api/tags')) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ models: [{ name: 'qwen2.5:1.5b' }] }));
+      res.end(JSON.stringify({ models: [{ name: 'fake-local:1b' }] }));
       return;
     }
     requestPayload = JSON.parse(body);
@@ -2344,18 +2344,18 @@ test('local Ollama adapter uses loopback HTTP, returns final-only text, and reco
   });
 
   fs.writeFileSync(configPath, JSON.stringify({
-    local: {
+    ollama_fast: {
       label: 'Fake local model',
       transport: 'local:ollama',
       oneshot_adapter: 'ollama_api',
       model: 'fake-local:1b',
       strip_thinking: true,
       max_output_tokens: 64,
-      safe: [process.execPath, '--version'],
-      dangerous: [process.execPath, '--version'],
-      oneshot_safe: [process.execPath, '--version'],
-      oneshot_dangerous: [process.execPath, '--version'],
-      diagnostic_binary: process.execPath,
+      safe: ['ollama-cli-deliberately-absent', '--version'],
+      dangerous: ['ollama-cli-deliberately-absent', '--version'],
+      oneshot_safe: ['ollama-cli-deliberately-absent', '--version'],
+      oneshot_dangerous: ['ollama-cli-deliberately-absent', '--version'],
+      diagnostic_binary: 'ollama-cli-deliberately-absent',
     },
   }), 'utf8');
 
@@ -2386,10 +2386,30 @@ test('local Ollama adapter uses loopback HTTP, returns final-only text, and reco
 
   await waitForHealth(baseUrl, bridge);
   const headers = await capabilityHeaders(baseUrl, true);
+  const coldPlanResponse = await fetch(`${baseUrl}/api/plan`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ kind: 'ollama_fast', task: 'Summarize one short paragraph.' }),
+  });
+  assert.equal(coldPlanResponse.status, 200);
+  const coldPlan = await coldPlanResponse.json();
+  assert.equal(coldPlan.primary.kind, 'ollama_fast');
+  assert.equal(coldPlan.primary.ready, true,
+    'cold planning must probe the HTTP transport instead of requiring an Ollama CLI on PATH');
+  const authStatus = await (await fetch(`${baseUrl}/api/auth/status?refresh=1`, { headers })).json();
+  assert.equal(authStatus.signedOut.some((item) => item.kind === 'ollama_fast'), false,
+    'auth refresh must not poison cached Ollama readiness with a missing CLI result');
+  const cachedPlan = await (await fetch(`${baseUrl}/api/plan`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ kind: 'ollama_fast', task: 'Summarize one short paragraph.' }),
+  })).json();
+  assert.equal(cachedPlan.primary.ready, true);
+
   const response = await fetch(`${baseUrl}/api/oneshot`, {
     method: 'POST',
     headers,
-    body: JSON.stringify({ kind: 'local', prompt: 'test prompt', dangerous: false }),
+    body: JSON.stringify({ kind: 'ollama_fast', prompt: 'test prompt', dangerous: false }),
   });
   const result = await response.json();
   assert.equal(result.stdout, 'FINAL_ONLY');
@@ -2406,7 +2426,7 @@ test('local Ollama adapter uses loopback HTTP, returns final-only text, and reco
   const terminalBudgetResponse = await fetch(`${baseUrl}/api/oneshot`, {
     method: 'POST', headers,
     body: JSON.stringify({
-      kind: 'local', prompt: 'terminal budget', dangerous: false,
+      kind: 'ollama_fast', prompt: 'terminal budget', dangerous: false,
       providerBudget: { maxTotalTokens: 10 },
     }),
   });
@@ -2420,7 +2440,7 @@ test('local Ollama adapter uses loopback HTTP, returns final-only text, and reco
   const ambiguousFailureResponse = await fetch(`${baseUrl}/api/oneshot`, {
     method: 'POST',
     headers,
-    body: JSON.stringify({ kind: 'local', prompt: 'upstream-500', dangerous: false }),
+    body: JSON.stringify({ kind: 'ollama_fast', prompt: 'upstream-500', dangerous: false }),
   });
   const ambiguousFailure = await ambiguousFailureResponse.json();
   assert.equal(ambiguousFailure.exitCode, 500);
@@ -2428,7 +2448,7 @@ test('local Ollama adapter uses loopback HTTP, returns final-only text, and reco
   const timeoutFailureResponse = await fetch(`${baseUrl}/api/oneshot`, {
     method: 'POST',
     headers,
-    body: JSON.stringify({ kind: 'local', prompt: 'upstream-504', dangerous: false }),
+    body: JSON.stringify({ kind: 'ollama_fast', prompt: 'upstream-504', dangerous: false }),
   });
   const timeoutFailure = await timeoutFailureResponse.json();
   assert.equal(timeoutFailure.timed_out, true);

@@ -2850,6 +2850,68 @@ function agentSummary(kind, entry) {
   };
 }
 
+async function probeOllamaReadiness(entry) {
+  let found = false;
+  let ready = false;
+  let detail = '';
+  let runtimeVersion = '';
+  const model = entry.model || entry.oneshot_model
+    || (Array.isArray(entry.safe) ? entry.safe[2] : '') || '';
+  try {
+    const base = localOllamaUrl();
+    const tagsUrl = new URL('/api/tags', base.origin);
+    const resp = await fetch(tagsUrl, { signal: AbortSignal.timeout(4000) });
+    found = true;
+    if (!resp.ok) {
+      detail = `ollama daemon at ${base.origin} returned HTTP ${resp.status}`;
+    } else {
+      const body = await resp.json();
+      const names = Array.isArray(body?.models) ? body.models.map((item) => String(item?.name || '')) : [];
+      runtimeVersion = `${names.length} model(s) loaded`;
+      ready = !model || names.some((name) => name === model
+        || name.split(':')[0] === String(model).split(':')[0]);
+      detail = ready
+        ? `daemon up at ${base.origin} with ${model || 'any model'}`
+        : `daemon up at ${base.origin} but ${model} is not pulled (have: ${names.slice(0, 4).join(', ') || 'none'})`;
+    }
+  } catch (err) {
+    detail = err.name === 'TimeoutError'
+      ? `no ollama daemon answering at ${String(envFirst('RELAYBRIDGE_OLLAMA_URL', 'PS_BRIDGE_OLLAMA_URL') || 'http://127.0.0.1:11434')} (timed out)`
+      : `no ollama daemon reachable: ${err.message}`;
+  }
+  return {
+    binary: null,
+    found,
+    ready,
+    paths: [],
+    label: entry.label,
+    detail,
+    probeExitCode: null,
+    runtimeVersion,
+    usageCapability: providerUsageCapability(entry, { runtimeVersion }),
+  };
+}
+
+async function coldPlanningDiagnostics(cfg, pathDetail) {
+  const env = buildEnv();
+  const pairs = await Promise.all(Object.keys(cfg).filter((kind) => !kind.startsWith('_')).map(async (kind) => {
+    const entry = cfg[kind];
+    if (entry.oneshot_adapter === 'ollama_api') {
+      return [kind, await probeOllamaReadiness(entry)];
+    }
+    let found = false;
+    try {
+      const probeBin = (entry.version_probe || entry.probe || entry.safe || [])[0];
+      // resolveExecutable returns an unresolved command unchanged. Only a
+      // changed or already-absolute path proves that a CLI transport exists.
+      const resolvedProbe = probeBin ? resolveExecutable(probeBin, env) : '';
+      found = !!probeBin && (resolvedProbe !== probeBin || path.isAbsolute(resolvedProbe));
+    } catch { found = false; }
+    return [kind, { found, ready: found, detail: pathDetail }];
+  }));
+  return Object.fromEntries(pairs);
+}
+
 function normalizeProviderTags(raw) {
   if (!Array.isArray(raw)) throw new Error('tags must be an array of strings');
   if (raw.length > MAX_PROVIDER_TAGS) throw new Error(`tags cannot exceed ${MAX_PROVIDER_TAGS} entries`);
@@ -3024,20 +3086,7 @@ app.post('/api/plan', async (req, res) => {
     const cfg = loadConfig();
     let diagnostics = lastDiagnostics?.results || null;
     if (!diagnostics) {
-      const env = buildEnv();
-      diagnostics = {};
-      for (const k of Object.keys(cfg).filter((x) => !x.startsWith('_'))) {
-        let found = false;
-        try {
-          const probeBin = (cfg[k].version_probe || cfg[k].probe || cfg[k].safe || [])[0];
-          // See the note in /api/auth/status: resolveExecutable echoes the
-          // command back when it cannot resolve it, so a truthiness test marked
-          // every provider found — and this path feeds `ready` straight from it.
-          const resolvedProbe = probeBin ? resolveExecutable(probeBin, env) : '';
-          found = !!probeBin && (resolvedProbe !== probeBin || path.isAbsolute(resolvedProbe));
-        } catch { found = false; }
-        diagnostics[k] = { found, ready: found, detail: 'path-only check' };
-      }
+      diagnostics = await coldPlanningDiagnostics(cfg, 'path-only check');
     }
     const gauges = usageLedger.gaugeAll(seatCostClasses());
     const fleetInput = applyCooldownsToDiagnostics(diagnostics, coolingQuotaStates(), kind ? [kind] : []);
@@ -3092,23 +3141,7 @@ app.post('/api/route', async (req, res) => {
     const cfg = loadConfig();
     let diagnostics = supplied && typeof supplied === 'object' ? supplied : (lastDiagnostics?.results || null);
     if (!diagnostics) {
-      const env = buildEnv();
-      diagnostics = {};
-      for (const kind of Object.keys(cfg).filter((k) => !k.startsWith('_'))) {
-        const entry = cfg[kind];
-        let found = false;
-        try {
-          const probeBin = (entry.version_probe || entry.probe || entry.safe || [])[0];
-          // resolveExecutable returns the command UNCHANGED when it cannot
-          // resolve it, and a non-empty string is truthy — so the old
-          // `!!resolveExecutable(...)` was true for every provider, including
-          // ones that are not installed. Compare against the input the way the
-          // main /api/diag sweep does.
-          const resolvedProbe = probeBin ? resolveExecutable(probeBin, env) : '';
-          found = !!probeBin && (resolvedProbe !== probeBin || path.isAbsolute(resolvedProbe));
-        } catch { found = false; }
-        diagnostics[kind] = { found, ready: found, detail: 'path-only check; run /api/diag for auth status' };
-      }
+      diagnostics = await coldPlanningDiagnostics(cfg, 'path-only check; run /api/diag for auth status');
     }
     const explicitKinds = Array.isArray(preferKinds) ? preferKinds : [];
     const gauges = usageLedger.gaugeAll(seatCostClasses());
@@ -3193,6 +3226,9 @@ app.get('/api/auth/status', async (req, res) => {
       const kinds = Object.keys(cfg).filter((k) => !k.startsWith('_') && k !== 'powershell');
       const pairs = await Promise.all(kinds.map(async (kind) => {
         const entry = cfg[kind];
+        if (entry?.oneshot_adapter === 'ollama_api') {
+          return [kind, await probeOllamaReadiness(entry)];
+        }
         if (!entry || !Array.isArray(entry.probe) || !entry.probe.length) return [kind, null];
         let found = false;
         try {
@@ -3295,44 +3331,7 @@ app.get('/api/diag', async (req, res) => {
     // routing-policy scores local seats +30 and a "live diagnostic ready" seat
     // +20, so those dead seats won the default utility route.
     if (entry.oneshot_adapter === 'ollama_api') {
-      let found = false;
-      let ready = false;
-      let detail = '';
-      let runtimeVersion = '';
-      const model = entry.oneshot_model || (Array.isArray(entry.safe) ? entry.safe[2] : '') || '';
-      try {
-        const base = localOllamaUrl();
-        const tagsUrl = new URL('/api/tags', base.origin);
-        const resp = await fetch(tagsUrl, { signal: AbortSignal.timeout(4000) });
-        found = true; // the daemon answered, so the seat's transport exists
-        if (!resp.ok) {
-          detail = `ollama daemon at ${base.origin} returned HTTP ${resp.status}`;
-        } else {
-          const body = await resp.json();
-          const names = Array.isArray(body?.models) ? body.models.map((m) => String(m?.name || '')) : [];
-          runtimeVersion = `${names.length} model(s) loaded`;
-          // Ollama reports "qwen2.5:1.5b"; a seat may be configured without the tag.
-          ready = !model || names.some((n) => n === model || n.split(':')[0] === String(model).split(':')[0]);
-          detail = ready
-            ? `daemon up at ${base.origin} with ${model || 'any model'}`
-            : `daemon up at ${base.origin} but ${model} is not pulled (have: ${names.slice(0, 4).join(', ') || 'none'})`;
-        }
-      } catch (err) {
-        detail = err.name === 'TimeoutError'
-          ? `no ollama daemon answering at ${String(envFirst('RELAYBRIDGE_OLLAMA_URL', 'PS_BRIDGE_OLLAMA_URL') || 'http://127.0.0.1:11434')} (timed out)`
-          : `no ollama daemon reachable: ${err.message}`;
-      }
-      return [kind, {
-        binary: null,
-        found,
-        ready,
-        paths: [],
-        label: entry.label,
-        detail,
-        probeExitCode: null,
-        runtimeVersion,
-        usageCapability: providerUsageCapability(entry, { runtimeVersion }),
-      }];
+      return [kind, await probeOllamaReadiness(entry)];
     }
     const binary = entry.diagnostic_binary ||
       (entry.safe && entry.safe[0]) || (entry.dangerous && entry.dangerous[0]);
