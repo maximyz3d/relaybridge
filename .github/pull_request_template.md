@@ -1,9 +1,12 @@
-# rb-template v2
+# rb-template v3
 ## Summary
 
 <!-- What changed and why. RelayBridge fills its sticky comment separately. -->
 
-Fixes #
+<!-- Use `Fixes #123` when this PR completes the issue. Use an exact
+     `Tracks #123` line for partial work that must leave the issue open. -->
+
+Tracks #
 
 ## Version bump
 

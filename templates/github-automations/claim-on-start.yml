@@ -1,92 +1,78 @@
-# rb-template v3
+# rb-template v4
 # .github/workflows/claim-on-start.yml
 #
 # Solves the "two people on the same issue" problem.
-# The moment a trusted same-repository author opens a PR (open a DRAFT PR the
-# instant you start work), the issue it's linked to gets:
+# The moment a trusted same-repository author opens or edits a PR (open a DRAFT
+# PR the instant you start work), every issue it closes or explicitly Tracks
+# gets:
 #   1. the PR author assigned to it
 #   2. a comment saying who's now working on it + the branch name
 #   3. a ⚠️ warning if the issue was ALREADY assigned to someone else
 #
 # Requires no secrets — uses the built-in GITHUB_TOKEN. Fork and Dependabot
-# PRs stay read-only and require a maintainer to claim the linked issue.
-# Linking: either use the "Create a branch" link in the issue's Development
-# sidebar, or put "Fixes #123" in the PR description.
+# PRs are excluded before a runner starts and require a maintainer to claim.
+# Linking: use the issue's Development sidebar, put "Fixes #123" in the PR
+# description when the PR completes the issue, or put an exact `Tracks #123`
+# line in the description for partial work that must not close the issue.
+# Marker comments are updated in place. Dropped links and unmerged PR closures
+# release only assignments this workflow owns, never manual assignments or an
+# assignment retained by another active or completed claim generation.
 
 name: Claim issue on PR open
 
 on:
-  pull_request:
-    types: [opened, ready_for_review, reopened]
+  pull_request_target:
+    types: [opened, edited, ready_for_review, reopened, closed]
 
 permissions:
+  contents: read
   issues: write
   pull-requests: read
 
+# Claims share issue assignments across PRs, so serialize repository-wide.
+# Keeping the full FIFO queue avoids a close/edit event overtaking an open.
+concurrency:
+  group: issue-claims-${{ github.repository }}
+  cancel-in-progress: false
+  queue: max
+
 jobs:
   claim:
-    # Fork and Dependabot pull_request tokens are intentionally read-only.
-    # Same-repository human/agent branches are the trusted collaboration lane;
-    # external contributions remain visible but require a maintainer to claim.
+    # Same-repository human/agent branches are the trusted collaboration lane.
+    # Fork and Dependabot PRs never start this privileged job; external
+    # contributions remain visible but require a maintainer to claim.
     if: >-
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.user.login != 'dependabot[bot]'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - name: Assign linked issues and announce ownership
+      # pull_request_target and github.sha select the reviewed default-branch
+      # workflow commit. A PR that first introduces the helper cleanly skips
+      # reconciliation; it becomes active after merge. Never execute PR/base/
+      # head code in this issues:write job.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Detect trusted claim helper
+        id: claim-helper
+        shell: bash
+        run: |
+          if [[ -f .github/scripts/claim-issues.cjs ]]; then
+            echo 'available=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'available=false' >> "$GITHUB_OUTPUT"
+            echo 'Claim helper is new in this PR; reconciliation begins after merge.'
+          fi
+
+      - name: Reconcile linked issue claims
+        if: steps.claim-helper.outputs.available == 'true'
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
-            const pr = context.payload.pull_request;
-            const author = pr.user.login;
-
-            // Find every issue this PR is linked to close (keyword- or sidebar-linked)
-            const query = `
-              query($owner:String!, $repo:String!, $number:Int!) {
-                repository(owner:$owner, name:$repo) {
-                  pullRequest(number:$number) {
-                    closingIssuesReferences(first:10) { nodes { number } }
-                  }
-                }
-              }`;
-            const result = await github.graphql(query, {
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              number: pr.number
-            });
-
-            const issues = result.repository.pullRequest.closingIssuesReferences.nodes;
-            if (issues.length === 0) {
-              core.info('No linked issue. Tip: create the branch from the issue, or add "Fixes #123" to the PR body.');
-              return;
-            }
-
-            for (const issue of issues) {
-              // Who's already on this issue BEFORE we add ourselves?
-              const { data: before } = await github.rest.issues.get({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: issue.number
-              });
-              const others = before.assignees.map(a => a.login).filter(l => l !== author);
-
-              // Claim it
-              await github.rest.issues.addAssignees({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: issue.number,
-                assignees: [author]
-              });
-
-              let body = `🔒 **@${author} is now working on this** — PR #${pr.number} (\`${pr.head.ref}\`).`;
-              if (others.length > 0) {
-                body += `\n\n⚠️ **Possible duplicate work** — this issue is *also* assigned to ${others.map(o => '@' + o).join(', ')}. Sync up before you both build the same thing.`;
-              }
-
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: issue.number,
-                body
-              });
-            }
+            const path = require('node:path');
+            const helper = require(path.join(
+              process.env.GITHUB_WORKSPACE, '.github', 'scripts', 'claim-issues.cjs'));
+            await helper.reconcileClaims({ github, context, core });

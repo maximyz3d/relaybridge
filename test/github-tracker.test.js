@@ -189,12 +189,25 @@ test('version-on-merge is serialized, strict, immutable, and history append-only
 
 test('claim workflow warns on duplicates and uses least required immutable action permissions', () => {
   const claim = fs.readFileSync(path.join(onboard.TEMPLATE_DIR, 'claim-on-start.yml'), 'utf8');
-  assert.match(claim, /Possible duplicate work/);
+  assert.match(claim, /opened, edited, ready_for_review, reopened, closed/);
+  assert.match(claim, /contents: read/);
   assert.match(claim, /pull-requests: read/);
   assert.doesNotMatch(claim, /pull-requests: write/);
-  assert.doesNotMatch(claim, /contents: read/);
   assert.match(claim, /head\.repo\.full_name == github\.repository/);
   assert.match(claim, /pull_request\.user\.login != 'dependabot\[bot\]'/);
+  assert.match(claim, /pull_request_target:/);
+  assert.doesNotMatch(claim, /^\s+pull_request:\s*$/m);
+  assert.match(claim, /group: issue-claims-\$\{\{ github\.repository \}\}/);
+  assert.match(claim, /cancel-in-progress: false/);
+  assert.match(claim, /queue: max/);
+  assert.match(claim, /timeout-minutes: 10/);
+  assert.match(claim, /ref: \$\{\{ github\.sha \}\}/);
+  assert.match(claim, /persist-credentials: false/);
+  assert.doesNotMatch(claim, /ref: \$\{\{ github\.event\.pull_request\.(?:head|base)\.sha \}\}/,
+    'a write-token workflow must never execute PR-controlled head/base helper code');
+  assert.match(claim, /\.github', 'scripts', 'claim-issues\.cjs/);
+  assert.match(claim, /steps\.claim-helper\.outputs\.available == 'true'/);
+  assert.match(claim, /actions\/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6\.0\.2/);
   assert.match(claim, /actions\/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9\.0\.0/);
 });
 
@@ -205,9 +218,27 @@ test('RelayBridge CI uses Node 24, immutable actions, least permissions, and sta
   assert.match(ci, /actions\/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7\.0\.0/);
   assert.match(ci, /node-version: 24/);
   assert.match(ci, /cancel-in-progress: \$\{\{ github\.event_name == 'pull_request' \}\}/);
-  for (const command of ['npm ci', 'npm test', 'npm audit --omit=dev']) {
+  assert.match(ci, /name: Linux \/ Node 24\n    runs-on: ubuntu-latest/);
+  assert.match(ci, /name: Windows \/ Node 24\n    runs-on: windows-latest/);
+  for (const command of [
+    'npm ci', 'npm test', 'npm run test:install', 'npm run test:install-mcp', 'npm audit --omit=dev',
+  ]) {
     assert.match(ci, new RegExp(`run: ${command.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
   }
+});
+
+test('security reporting and grouped weekly dependency updates are configured', () => {
+  const root = path.resolve(__dirname, '..');
+  const security = fs.readFileSync(path.join(root, 'SECURITY.md'), 'utf8');
+  const dependabot = fs.readFileSync(path.join(root, '.github', 'dependabot.yml'), 'utf8');
+  assert.match(security, /private vulnerability reporting/i);
+  assert.match(security, /security\/advisories\/new/);
+  assert.match(security, /Redact capability tokens/i);
+  assert.match(dependabot, /package-ecosystem: npm/);
+  assert.match(dependabot, /package-ecosystem: github-actions/);
+  assert.equal((dependabot.match(/interval: weekly/g) || []).length, 2);
+  assert.match(dependabot, /npm-minor-and-patch:/);
+  assert.match(dependabot, /actions-minor-and-patch:/);
 });
 
 test('labels.json provides every label the workflows key off', () => {
