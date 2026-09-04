@@ -73,6 +73,7 @@ test('provider config uses the installed subscription CLIs and safe headless mod
   assert.equal(config.claude.oneshot_output_parser, 'claude_json');
   assert.deepEqual(config.claude.probe, ['claude', 'auth', 'status']);
   assert.ok(config.claude.strip_env.includes('ANTHROPIC_API_KEY'));
+  assert.ok(config.claude.strip_env.includes('CLAUDE_CODE_OAUTH_TOKEN'));
   assert.equal(config.claude.safe[config.claude.safe.indexOf('--model') + 1], 'opus');
   assert.equal(config.claude.quota_seat, 'subscription:anthropic:default');
   assert.equal(config.claude_fable.safe[config.claude_fable.safe.indexOf('--model') + 1], 'fable');
@@ -91,11 +92,13 @@ test('provider config uses the installed subscription CLIs and safe headless mod
   assert.equal(config.claude_fable.quota_seat, config.claude.quota_seat);
   assert.deepEqual(config.claude_fable.probe, ['claude', 'auth', 'status']);
   assert.ok(config.claude_fable.strip_env.includes('ANTHROPIC_API_KEY'));
+  assert.ok(config.claude_fable.strip_env.includes('CLAUDE_CODE_OAUTH_TOKEN'));
   assert.equal(config.codex.safe[config.codex.safe.indexOf('--sandbox') + 1], 'read-only');
   assert.equal(config.codex.oneshot_safe[config.codex.oneshot_safe.indexOf('--sandbox') + 1], 'read-only');
   assert.equal(config.codex.oneshot_safe_filesystem_policy, 'unverified_provider_policy');
   assert.ok(config.codex.oneshot_safe.includes('--ephemeral'));
   assert.deepEqual(config.codex.probe, ['codex', 'login', 'status']);
+  assert.ok(config.codex.strip_env.includes('CODEX_ACCESS_TOKEN'));
   assert.equal(config.copilot.npm_package, '@github/copilot');
   const supportedCopilotInstallers = [
     ['npm', 'install', '-g', '@github/copilot'],
@@ -108,6 +111,16 @@ test('provider config uses the installed subscription CLIs and safe headless mod
   assert.ok(config.copilot.oneshot_safe.includes('--prompt'));
   assert.ok(config.copilot.oneshot_safe.includes('{prompt}'));
   assert.ok(config.copilot.strip_env.includes('COPILOT_GITHUB_TOKEN'));
+  assert.ok(config.copilot.strip_env.includes('GITHUB_COPILOT_API_TOKEN'));
+  for (const name of [
+    'GITHUB_COPILOT_GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN', 'GH_HOST',
+    'COPILOT_PROVIDER_BASE_URL', 'COPILOT_PROVIDER_TYPE',
+    'COPILOT_PROVIDER_API_KEY', 'COPILOT_PROVIDER_BEARER_TOKEN', 'COPILOT_PROVIDER_WIRE_API',
+    'COPILOT_PROVIDER_TRANSPORT', 'COPILOT_PROVIDER_AZURE_API_VERSION', 'COPILOT_PROVIDER_MODEL_ID',
+    'COPILOT_PROVIDER_WIRE_MODEL', 'COPILOT_PROVIDER_MODEL_LIMITS_ID',
+    'COPILOT_PROVIDER_MAX_PROMPT_TOKENS', 'COPILOT_PROVIDER_MAX_OUTPUT_TOKENS',
+    'COPILOT_PROVIDER_HEADERS', 'COPILOT_MODEL', 'COPILOT_OFFLINE', 'COPILOT_ENABLE_ALT_PROVIDERS',
+  ]) assert.ok(config.copilot.strip_env.includes(name), `${name} must not override the selected Copilot account`);
   assert.equal(config.gemini.safe[0], 'agy.exe');
   assert.match(config.gemini.label, /Antigravity/);
   assert.deepEqual(config.gemini.probe, ['agy.exe', 'models']);
@@ -1699,6 +1712,13 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(partialCostResult.usage.cost_usd, null);
   assert.equal(partialCostResult.usage.thinking_tokens, null);
   assert.equal(partialCostResult.route.resolved_model_identity, 'b');
+  const usageRows = fs.readFileSync(path.join(
+    tempRoot, 'data', 'usage', `usage-${new Date().toISOString().slice(0, 10)}.jsonl`,
+  ), 'utf8').trim().split(/\r?\n/).map((line) => JSON.parse(line));
+  const partialCostLedgerRow = usageRows.find((row) => row.seat === 'usage_json_partial_cost');
+  assert.equal(partialCostLedgerRow.costSource, 'estimated',
+    'a null provider cost must not be coerced into an authoritative free call');
+  assert.ok(partialCostLedgerRow.costUsd > 0);
 
   const errorResultResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST',
@@ -2302,6 +2322,1029 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   const activity = await (await fetch(baseUrl + '/api/activity?limit=5', { headers: auth })).json();
   assert.ok(Array.isArray(activity.runs));
   assert.ok(Array.isArray(activity.receipts));
+});
+
+test('linked provider accounts fail closed, isolate cooldowns, and refresh mutations', { timeout: 30000 }, async (t) => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ps-bridge-account-pool-test-'));
+  const dataDir = path.join(tempRoot, 'data');
+  const configPath = path.join(tempRoot, 'config.json');
+  const tokenPath = path.join(tempRoot, 'capability.token');
+  const helper = path.join(ROOT, 'test', 'prompt-file-cli.js');
+  const pooledMarker = path.join(tempRoot, 'pooled-invocations.txt');
+  const toggleMarker = path.join(tempRoot, 'toggle-invocations.txt');
+  const authMarker = path.join(tempRoot, 'auth-invocations.txt');
+  const staleAuthMarker = path.join(tempRoot, 'stale-auth-invocations.txt');
+  const defaultAuthMarker = path.join(tempRoot, 'default-auth-invocations.txt');
+  const nonAuthMarker = path.join(tempRoot, 'non-auth-invocations.txt');
+  const auxiliarySignInMarker = path.join(tempRoot, 'auxiliary-sign-in-invocations.txt');
+  const configDriftMarker = path.join(tempRoot, 'config-drift-invocations.txt');
+  const pristineDefaultMarker = path.join(tempRoot, 'pristine-default-invocations.txt');
+  const pooledBaseSeat = 'subscription:test:pooled';
+  const pooledWorkSeat = `${pooledBaseSeat}#work`;
+  const toggleBaseSeat = 'subscription:test:toggle';
+  const toggleWorkSeat = `${toggleBaseSeat}#work`;
+  const sharedBaseSeat = 'subscription:test:shared';
+  const sharedWorkSeat = `${sharedBaseSeat}#work`;
+  const copilotOverrideNames = [
+    'COPILOT_GITHUB_TOKEN', 'GITHUB_COPILOT_API_TOKEN', 'GITHUB_COPILOT_GITHUB_TOKEN',
+    'GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN', 'GH_HOST',
+    'COPILOT_PROVIDER_BASE_URL', 'COPILOT_PROVIDER_TYPE',
+    'COPILOT_PROVIDER_API_KEY', 'COPILOT_PROVIDER_BEARER_TOKEN', 'COPILOT_PROVIDER_WIRE_API',
+    'COPILOT_PROVIDER_TRANSPORT', 'COPILOT_PROVIDER_AZURE_API_VERSION', 'COPILOT_PROVIDER_MODEL_ID',
+    'COPILOT_PROVIDER_WIRE_MODEL', 'COPILOT_PROVIDER_MODEL_LIMITS_ID',
+    'COPILOT_PROVIDER_MAX_PROMPT_TOKENS', 'COPILOT_PROVIDER_MAX_OUTPUT_TOKENS',
+    'COPILOT_PROVIDER_HEADERS', 'COPILOT_MODEL', 'COPILOT_OFFLINE', 'COPILOT_ENABLE_ALT_PROVIDERS',
+  ];
+  const provider = (label, quotaSeat, slotExtra) => ({
+    label,
+    quota_seat: quotaSeat,
+    credential_env: 'TEST_ACCOUNT_HOME',
+    credential_markers: ['.credentials.json'],
+    safe: [process.execPath, helper, '--version'],
+    dangerous: [process.execPath, helper, '--version'],
+    oneshot_safe: [process.execPath, helper, '--prompt-file', '{prompt_file}', ...slotExtra],
+    oneshot_dangerous: [process.execPath, helper, '--prompt-file', '{prompt_file}', ...slotExtra],
+    diagnostic_binary: process.execPath,
+    probe: [process.execPath, helper, '--version'],
+  });
+  fs.mkdirSync(dataDir, { recursive: true });
+  fs.writeFileSync(configPath, JSON.stringify({
+    pooled_rate: provider('Pooled rate-limit fixture', pooledBaseSeat, [
+      '--invocation-marker', pooledMarker,
+      '--stderr', 'HTTP 429 rate limit exceeded', '--exit', '29',
+    ]),
+    toggle_pool: provider('Mutation cache fixture', toggleBaseSeat, [
+      '--invocation-marker', toggleMarker, '--print-env', 'TEST_ACCOUNT_HOME',
+    ]),
+    same_base: provider('Provider-key quota-seat fixture', 'same_base', [
+      '--print-env', 'TEST_ACCOUNT_HOME',
+    ]),
+    auth_pool: {
+      ...provider('Account-scoped auth fixture', 'subscription:test:auth', [
+        '--invocation-marker', authMarker, '--print-env', 'TEST_ACCOUNT_HOME',
+      ]),
+      login_command: ['fake-provider', 'login'],
+      probe: [process.execPath, '-e', "process.stderr.write('not logged in'); process.exit(1)"],
+      probe_auth_authoritative: true,
+      probe_redact: true,
+    },
+    shared_a: provider('Shared alias A', sharedBaseSeat, ['--print-env', 'TEST_ACCOUNT_HOME']),
+    shared_b: provider('Shared alias B', sharedBaseSeat, ['--print-env', 'TEST_ACCOUNT_HOME']),
+    stale_pool: provider('Stale linked-auth fixture', 'subscription:test:stale', [
+      '--invocation-marker', staleAuthMarker,
+      '--auth-fail-env-suffix', 'TEST_ACCOUNT_HOME', `${path.sep}aaa-stale`,
+      '--print-env', 'TEST_ACCOUNT_HOME',
+    ]),
+    default_stale_pool: {
+      ...provider('Expired default-auth fixture', 'subscription:test:default-stale', [
+        '--invocation-marker', defaultAuthMarker,
+        '--auth-fail-env-absent', 'TEST_ACCOUNT_HOME',
+        '--print-env', 'TEST_ACCOUNT_HOME',
+      ]),
+      probe_auth_authoritative: false,
+    },
+    non_auth_pool: provider('Non-auth ENOENT fixture', 'subscription:test:non-auth', [
+      '--invocation-marker', nonAuthMarker,
+      '--stderr', 'ENOENT: provider internal helper path is missing', '--exit', '2',
+    ]),
+    auxiliary_signin_pool: provider('Auxiliary sign-in warning fixture', 'subscription:test:aux-signin', [
+      '--invocation-marker', auxiliarySignInMarker,
+      '--stderr', 'MCP server docs: authentication required; MCP OAuth token expired; Sign in to enable search', '--exit', '2',
+    ]),
+    config_drift_pool: provider('Credential relocation drift fixture', 'subscription:test:config-drift', [
+      '--invocation-marker', configDriftMarker, '--print-env', 'TEST_ACCOUNT_HOME',
+    ]),
+    codex: provider('Available default Codex fixture', 'subscription:test:planning-codex', []),
+    copilot: {
+      label: 'Uninstalled preferred Copilot fixture',
+      tags: ['coding'],
+      safe: ['relaybridge-uninstalled-copilot'],
+      dangerous: ['relaybridge-uninstalled-copilot'],
+      oneshot_safe: ['relaybridge-uninstalled-copilot'],
+      oneshot_dangerous: ['relaybridge-uninstalled-copilot'],
+      probe: ['relaybridge-uninstalled-copilot', '--version'],
+      version_probe: ['relaybridge-uninstalled-copilot', '--version'],
+    },
+    copilot_home_pool: {
+      ...provider('Copilot credential-home fixture', 'subscription:test:copilot-home', [
+        '--assert-later-arg', '--no-auto-login',
+        '--print-env-json', ['COPILOT_HOME', 'GH_CONFIG_DIR', ...copilotOverrideNames].join(','),
+      ]),
+      credential_env: 'COPILOT_HOME',
+      credential_aux_env: ['GH_CONFIG_DIR'],
+      credential_markers: ['config.json'],
+      linked_account_args: ['--no-auto-login'],
+      strip_env: copilotOverrideNames,
+    },
+    linked_403_pool: {
+      ...provider('Linked non-auth 403 fixture', 'subscription:test:linked-403', [
+        '--claude-json-permission-403',
+      ]),
+      oneshot_output_parser: 'claude_json',
+    },
+    default_403_pool: {
+      ...provider('Default non-auth 403 fixture', 'subscription:test:default-403', [
+        '--claude-json-permission-403',
+      ]),
+      oneshot_output_parser: 'claude_json',
+    },
+    unsupported_pool: {
+      ...provider('Unsupported linked-auth fixture', 'subscription:test:unsupported', []),
+      linked_accounts_supported: false,
+      linked_accounts_unavailable_reason: 'fixture cannot isolate its OS credential store',
+    },
+    pristine_default_pool: {
+      ...provider('Pristine default auth fixture', 'subscription:test:pristine-default', [
+        '--invocation-marker', pristineDefaultMarker,
+        '--auth-fail-env-absent', 'TEST_ACCOUNT_HOME',
+        '--print-env', 'TEST_ACCOUNT_HOME',
+      ]),
+      login_command: ['fake-provider', 'login'],
+      probe_auth_authoritative: false,
+    },
+  }), 'utf8');
+  fs.writeFileSync(path.join(dataDir, 'accounts.json'), JSON.stringify({
+    providers: {
+      pooled_rate: {
+        accounts: [
+          { id: 'default', label: 'existing sign-in', enabled: true },
+          { id: 'work', label: 'work plan', enabled: true },
+        ],
+      },
+      toggle_pool: {
+        accounts: [
+          { id: 'default', label: 'existing sign-in', enabled: false },
+          { id: 'work', label: 'work plan', enabled: false },
+        ],
+      },
+      same_base: {
+        accounts: [
+          { id: 'default', label: 'existing sign-in', enabled: true },
+          { id: 'work', label: 'work plan', enabled: true },
+        ],
+      },
+      auth_pool: {
+        accounts: [
+          { id: 'default', label: 'existing sign-in', enabled: true },
+          { id: 'work', label: 'work plan', enabled: true },
+        ],
+      },
+      shared_a: {
+        accounts: [
+          { id: 'default', label: 'existing sign-in', enabled: true },
+          { id: 'work', label: 'work plan', enabled: true },
+        ],
+      },
+      shared_b: {
+        accounts: [{ id: 'default', label: 'existing sign-in', enabled: true }],
+      },
+      stale_pool: {
+        accounts: [
+          { id: 'default', label: 'existing sign-in', enabled: false },
+          { id: 'aaa-stale', label: 'stale token', enabled: true },
+          { id: 'zzz-healthy', label: 'healthy token', enabled: true },
+        ],
+      },
+      default_stale_pool: {
+        accounts: [
+          { id: 'default', label: 'expired existing sign-in', enabled: true },
+          { id: 'work', label: 'healthy linked plan', enabled: true },
+        ],
+      },
+      non_auth_pool: {
+        accounts: [
+          { id: 'default', label: 'existing sign-in', enabled: false },
+          { id: 'work', label: 'linked plan', enabled: true },
+        ],
+      },
+      auxiliary_signin_pool: {
+        accounts: [
+          { id: 'default', label: 'existing sign-in', enabled: false },
+          { id: 'work', label: 'linked plan', enabled: true },
+        ],
+      },
+      config_drift_pool: {
+        accounts: [
+          { id: 'default', label: 'enabled default', enabled: true },
+          { id: 'work', label: 'managed linked plan', enabled: true },
+        ],
+      },
+      copilot_home_pool: {
+        accounts: [
+          { id: 'default', label: 'existing sign-in', enabled: false },
+          { id: 'work', label: 'Copilot work plan', enabled: true },
+        ],
+      },
+      linked_403_pool: {
+        accounts: [
+          { id: 'default', label: 'existing sign-in', enabled: false },
+          { id: 'work', label: 'linked plan', enabled: true },
+        ],
+      },
+      default_403_pool: {
+        accounts: [
+          { id: 'default', label: 'existing sign-in', enabled: true },
+        ],
+      },
+      unsupported_pool: {
+        accounts: [
+          { id: 'default', label: 'existing sign-in', enabled: true },
+          { id: 'work', label: 'unsafe linked plan', enabled: true },
+        ],
+      },
+    },
+  }, null, 2), 'utf8');
+  for (const kind of [
+    'pooled_rate', 'toggle_pool', 'same_base', 'auth_pool', 'shared_a',
+    'default_stale_pool', 'non_auth_pool', 'auxiliary_signin_pool', 'config_drift_pool',
+    'linked_403_pool', 'unsupported_pool',
+  ]) {
+    const accountDir = path.join(dataDir, 'accounts', kind, 'work');
+    fs.mkdirSync(accountDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(accountDir, '.credentials.json'), '{}', { mode: 0o600 });
+  }
+  for (const id of ['aaa-stale', 'zzz-healthy']) {
+    const accountDir = path.join(dataDir, 'accounts', 'stale_pool', id);
+    fs.mkdirSync(accountDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(accountDir, '.credentials.json'), '{}', { mode: 0o600 });
+  }
+  const copilotWorkDir = path.join(dataDir, 'accounts', 'copilot_home_pool', 'work');
+  fs.mkdirSync(copilotWorkDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(copilotWorkDir, 'config.json'), '{}', { mode: 0o600 });
+  const initialCooldownAt = Date.now();
+  fs.writeFileSync(path.join(dataDir, 'cooldowns.json'), JSON.stringify({
+    [pooledBaseSeat]: {
+      offences: 1,
+      lastOffenceAt: initialCooldownAt,
+      until: initialCooldownAt + 3600000,
+      reason: 'rate_limited',
+      source: 'backoff',
+      scope: 'account',
+    },
+    toggle_pool: {
+      offences: 1,
+      lastOffenceAt: initialCooldownAt,
+      until: initialCooldownAt + 3600000,
+      reason: 'rate_limited',
+      source: 'backoff',
+      scope: 'model',
+    },
+    same_base: {
+      offences: 1,
+      lastOffenceAt: initialCooldownAt,
+      until: initialCooldownAt + 3600000,
+      reason: 'rate_limited',
+      source: 'backoff',
+      scope: 'account',
+    },
+  }, null, 2), 'utf8');
+
+  const port = await reservePort();
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const proc = spawn(process.execPath, [path.join(ROOT, 'server.js')], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      NODE_ENV: 'test',
+      RELAYBRIDGE_TEST_BUILD_ID: TEST_BUILD_ID,
+      PORT: String(port),
+      PTY_MODE: 'none',
+      RELAYBRIDGE_CONFIG_FILE: configPath,
+      RELAYBRIDGE_TOKEN_FILE: tokenPath,
+      RELAYBRIDGE_DATA_DIR: dataDir,
+      RELAYBRIDGE_ALLOWED_ROOTS: tempRoot,
+      ...Object.fromEntries(copilotOverrideNames.map((name) => [name, 'must-not-override-the-selected-account'])),
+    },
+    windowsHide: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let serverOutput = '';
+  proc.stdout.on('data', (chunk) => { serverOutput += chunk; });
+  proc.stderr.on('data', (chunk) => { serverOutput += chunk; });
+  t.after(async () => {
+    if (proc.exitCode === null) proc.kill('SIGTERM');
+    await new Promise((resolve) => proc.exitCode !== null ? resolve() : proc.once('exit', resolve));
+    fs.rmSync(tempRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+  try {
+    await waitForHealth(baseUrl, proc);
+  } catch (err) {
+    throw new Error(err.message + '\n' + serverOutput);
+  }
+  const headers = await capabilityHeaders(baseUrl, true);
+
+  const unsupportedStatus = await (await fetch(`${baseUrl}/api/accounts`, { headers })).json();
+  assert.equal(unsupportedStatus.providers.unsupported_pool.supportsMultipleAccounts, false);
+  assert.match(unsupportedStatus.providers.unsupported_pool.linkedAccountsUnavailableReason,
+    /cannot isolate its OS credential store/);
+  const unsupportedAdd = await fetch(`${baseUrl}/api/accounts/unsupported_pool`, {
+    method: 'POST', headers, body: JSON.stringify({ id: 'spare' }),
+  });
+  assert.equal(unsupportedAdd.status, 400,
+    'the REST surface must not create accounts the dispatch path cannot isolate');
+  const unsupportedDispatch = await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST', headers,
+    body: JSON.stringify({ kind: 'unsupported_pool', prompt: 'must fail before execution', dangerous: false }),
+  });
+  assert.equal(unsupportedDispatch.status, 409);
+  assert.equal((await unsupportedDispatch.json()).failureClass, 'account_configuration_invalid');
+
+  const firstDefaultResponse = await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST', headers,
+    body: JSON.stringify({ kind: 'codex', prompt: 'establish one live default result', dangerous: false }),
+  });
+  assert.equal(firstDefaultResponse.status, 200);
+  assert.equal((await firstDefaultResponse.json()).exitCode, 0);
+  const completeRoute = await (await fetch(`${baseUrl}/api/route`, {
+    method: 'POST', headers,
+    body: JSON.stringify({
+      task: 'implement a complex repository change',
+      preferKinds: ['copilot', 'codex'],
+    }),
+  })).json();
+  assert.equal(completeRoute.selected.some((item) => item.kind === 'copilot'), false,
+    'a partial live-auth snapshot must still path-check missing provider keys');
+  assert.equal(completeRoute.selected.some((item) => item.kind === 'codex'), true);
+  const completePlan = await (await fetch(`${baseUrl}/api/plan`, {
+    method: 'POST', headers,
+    body: JSON.stringify({ task: 'implement a complex repository change' }),
+  })).json();
+  assert.notEqual(completePlan.primary.kind, 'copilot',
+    'planning must not select an uninstalled provider omitted from a partial runtime snapshot');
+
+  const copilotRelocationResponse = await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST', headers,
+    body: JSON.stringify({ kind: 'copilot_home_pool', prompt: 'use the relocated Copilot profile', dangerous: false }),
+  });
+  assert.equal(copilotRelocationResponse.status, 200);
+  const copilotRelocation = await copilotRelocationResponse.json();
+  assert.equal(copilotRelocation.route.account, 'work');
+  assert.deepEqual(JSON.parse(copilotRelocation.stdout), {
+    COPILOT_HOME: copilotWorkDir,
+    GH_CONFIG_DIR: copilotWorkDir,
+    ...Object.fromEntries(copilotOverrideNames.map((name) => [name, null])),
+  }, 'the child must receive the selected profile and no inherited token override');
+
+  for (const kind of ['linked_403_pool', 'default_403_pool']) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const nonAuth403Response = await fetch(`${baseUrl}/api/oneshot`, {
+        method: 'POST', headers,
+        body: JSON.stringify({ kind, prompt: `non-auth 403 attempt ${attempt}`, dangerous: false }),
+      });
+      assert.equal(nonAuth403Response.status, 200);
+      const nonAuth403 = await nonAuth403Response.json();
+      assert.equal(nonAuth403.failureClass, 'permission');
+      assert.equal(nonAuth403.auth_failed, false);
+      assert.equal(nonAuth403.route.account, kind === 'linked_403_pool' ? 'work' : null);
+    }
+  }
+  let nonAuth403Status = await (await fetch(`${baseUrl}/api/accounts`, { headers })).json();
+  assert.equal(nonAuth403Status.providers.linked_403_pool.accounts
+    .find((account) => account.id === 'work').authUnavailable, false);
+  assert.equal(nonAuth403Status.providers.default_403_pool.accounts
+    .find((account) => account.id === 'default').authUnavailable, false,
+  'a non-auth 403 must not durably quarantine linked or default credentials');
+
+  let sharedUsage = await (await fetch(`${baseUrl}/api/usage/gauges`, { headers })).json();
+  assert.deepEqual(sharedUsage.quotaSeats[sharedWorkSeat].providers, ['shared_a']);
+  assert.deepEqual(sharedUsage.gauges['shared_a#work'].aliases, ['shared_a'],
+    'an account linked under one alias must not affect another shared-base provider');
+  const linkSharedAlias = await fetch(`${baseUrl}/api/accounts/shared_b`, {
+    method: 'POST', headers, body: JSON.stringify({ id: 'work', label: 'work plan' }),
+  });
+  assert.equal(linkSharedAlias.status, 200);
+  const linkInstructions = await linkSharedAlias.json();
+  assert.deepEqual(linkInstructions.signIn.environment, {
+    TEST_ACCOUNT_HOME: path.join(dataDir, 'accounts', 'shared_b', 'work'),
+  });
+  assert.ok(Array.isArray(linkInstructions.signIn.argv) || linkInstructions.signIn.argv === null);
+  sharedUsage = await (await fetch(`${baseUrl}/api/usage/gauges`, { headers })).json();
+  assert.deepEqual(sharedUsage.quotaSeats[sharedWorkSeat].providers, ['shared_a', 'shared_b']);
+  assert.deepEqual(sharedUsage.gauges['shared_a#work'].aliases, ['shared_a', 'shared_b']);
+  assert.deepEqual(sharedUsage.gauges['shared_b#work'].aliases, ['shared_a', 'shared_b']);
+
+  const staleAuthResponse = await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST', headers,
+    body: JSON.stringify({ kind: 'stale_pool', prompt: 'quarantine stale account', dangerous: false }),
+  });
+  const staleAuth = await staleAuthResponse.json();
+  assert.equal(staleAuth.auth_failed, true);
+  assert.equal(staleAuth.route.account, 'aaa-stale');
+  const healthyAuthResponse = await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST', headers,
+    body: JSON.stringify({ kind: 'stale_pool', prompt: 'fail over to healthy account', dangerous: false }),
+  });
+  const healthyAuth = await healthyAuthResponse.json();
+  assert.equal(healthyAuth.exitCode, 0);
+  assert.equal(healthyAuth.route.account, 'zzz-healthy');
+  let accountStatus = await (await fetch(`${baseUrl}/api/accounts`, { headers })).json();
+  assert.equal(accountStatus.providers.stale_pool.accounts
+    .find((account) => account.id === 'aaa-stale').authUnavailable, true);
+
+  const staleCredential = path.join(dataDir, 'accounts', 'stale_pool', 'aaa-stale', '.credentials.json');
+  fs.writeFileSync(staleCredential, '{"refreshed":true}', 'utf8');
+  const refreshedConfig = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  const refreshedSlot = [
+    process.execPath, helper, '--prompt-file', '{prompt_file}',
+    '--invocation-marker', staleAuthMarker, '--print-env', 'TEST_ACCOUNT_HOME',
+  ];
+  refreshedConfig.stale_pool.oneshot_safe = refreshedSlot;
+  refreshedConfig.stale_pool.oneshot_dangerous = refreshedSlot;
+  fs.writeFileSync(configPath, JSON.stringify(refreshedConfig), 'utf8');
+  const disableHealthy = await fetch(`${baseUrl}/api/accounts/stale_pool/zzz-healthy/enabled`, {
+    method: 'POST', headers, body: JSON.stringify({ enabled: false }),
+  });
+  assert.equal(disableHealthy.status, 200);
+  const recoveredAuthResponse = await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST', headers,
+    body: JSON.stringify({ kind: 'stale_pool', prompt: 'use refreshed credentials', dangerous: false }),
+  });
+  const recoveredAuth = await recoveredAuthResponse.json();
+  assert.equal(recoveredAuth.exitCode, 0);
+  assert.equal(recoveredAuth.route.account, 'aaa-stale');
+  accountStatus = await (await fetch(`${baseUrl}/api/accounts`, { headers })).json();
+  assert.equal(accountStatus.providers.stale_pool.accounts
+    .find((account) => account.id === 'aaa-stale').authUnavailable, false);
+
+  const expiredDefaultResponse = await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST', headers,
+    body: JSON.stringify({ kind: 'default_stale_pool', prompt: 'discover expired default without a probe', dangerous: false }),
+  });
+  const expiredDefault = await expiredDefaultResponse.json();
+  assert.equal(expiredDefault.auth_failed, true);
+  assert.equal(expiredDefault.route.account, null);
+  const noProbeFailoverResponse = await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST', headers,
+    body: JSON.stringify({ kind: 'default_stale_pool', prompt: 'fail over after live default auth failure', dangerous: false }),
+  });
+  const noProbeFailover = await noProbeFailoverResponse.json();
+  assert.equal(noProbeFailover.exitCode, 0);
+  assert.equal(noProbeFailover.route.account, 'work');
+  accountStatus = await (await fetch(`${baseUrl}/api/accounts`, { headers })).json();
+  assert.equal(accountStatus.providers.default_stale_pool.accounts
+    .find((account) => account.id === 'default').authUnavailable, true);
+
+  const malformedAuthRetry = await fetch(`${baseUrl}/api/accounts/default_stale_pool/default/auth/retry`, {
+    method: 'POST', headers, body: JSON.stringify({ retry: 'true' }),
+  });
+  assert.equal(malformedAuthRetry.status, 400,
+    'operator auth recovery must require the exact typed acknowledgement');
+  accountStatus = await (await fetch(`${baseUrl}/api/accounts`, { headers })).json();
+  const quarantinedDefault = accountStatus.providers.default_stale_pool.accounts
+    .find((account) => account.id === 'default');
+  assert.equal(quarantinedDefault.authUnavailable, true);
+  assert.deepEqual(quarantinedDefault.authRetry.body, { retry: true });
+
+  const reloggedConfig = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  const reloggedDefaultSlot = [
+    process.execPath, helper, '--prompt-file', '{prompt_file}',
+    '--invocation-marker', defaultAuthMarker, '--print-env', 'TEST_ACCOUNT_HOME',
+  ];
+  reloggedConfig.default_stale_pool.oneshot_safe = reloggedDefaultSlot;
+  reloggedConfig.default_stale_pool.oneshot_dangerous = reloggedDefaultSlot;
+  fs.writeFileSync(configPath, JSON.stringify(reloggedConfig), 'utf8');
+  const authRetry = await fetch(`${baseUrl}/api/accounts/default_stale_pool/default/auth/retry`, {
+    method: 'POST', headers, body: JSON.stringify({ retry: true }),
+  });
+  assert.equal(authRetry.status, 200);
+  assert.equal((await authRetry.json()).priorAuthFailureCleared, true);
+  const recoveredDefaultResponse = await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST', headers,
+    body: JSON.stringify({ kind: 'default_stale_pool', prompt: 'validate explicit default auth retry', dangerous: false }),
+  });
+  const recoveredDefault = await recoveredDefaultResponse.json();
+  assert.equal(recoveredDefault.exitCode, 0);
+  assert.equal(recoveredDefault.route.account, null,
+    'the explicit retry makes the implicit default eligible for one live validation');
+
+  const expiredAgainConfig = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  const expiredDefaultSlot = [
+    process.execPath, helper, '--prompt-file', '{prompt_file}',
+    '--invocation-marker', defaultAuthMarker,
+    '--auth-fail-env-absent', 'TEST_ACCOUNT_HOME',
+    '--print-env', 'TEST_ACCOUNT_HOME',
+  ];
+  expiredAgainConfig.default_stale_pool.oneshot_safe = expiredDefaultSlot;
+  expiredAgainConfig.default_stale_pool.oneshot_dangerous = expiredDefaultSlot;
+  fs.writeFileSync(configPath, JSON.stringify(expiredAgainConfig), 'utf8');
+  const expiredAfterRetryResponse = await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST', headers,
+    body: JSON.stringify({ kind: 'default_stale_pool', prompt: 'credentials expire again after retry', dangerous: false }),
+  });
+  assert.equal((await expiredAfterRetryResponse.json()).auth_failed, true);
+  const failoverAfterRetryResponse = await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST', headers,
+    body: JSON.stringify({ kind: 'default_stale_pool', prompt: 'use work after retried default expires', dangerous: false }),
+  });
+  assert.equal((await failoverAfterRetryResponse.json()).route.account, 'work');
+
+  const authRefresh = await fetch(`${baseUrl}/api/auth/status?refresh=1`, { headers });
+  assert.equal(authRefresh.status, 200);
+  accountStatus = await (await fetch(`${baseUrl}/api/accounts`, { headers })).json();
+  assert.equal(accountStatus.providers.default_stale_pool.accounts
+    .find((account) => account.id === 'default').authUnavailable, true,
+  'a version-only probe must not clear authoritative live auth failure evidence');
+  const versionOnlyFailoverResponse = await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST', headers,
+    body: JSON.stringify({ kind: 'default_stale_pool', prompt: 'version-only probe cannot re-enable default', dangerous: false }),
+  });
+  assert.equal((await versionOnlyFailoverResponse.json()).route.account, 'work');
+
+  const authoritativeProbeConfig = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  authoritativeProbeConfig.default_stale_pool.probe_auth_authoritative = true;
+  fs.writeFileSync(configPath, JSON.stringify(authoritativeProbeConfig), 'utf8');
+  const authoritativeAuthRefresh = await fetch(`${baseUrl}/api/auth/status?refresh=1`, { headers });
+  assert.equal(authoritativeAuthRefresh.status, 200);
+  accountStatus = await (await fetch(`${baseUrl}/api/accounts`, { headers })).json();
+  assert.equal(accountStatus.providers.default_stale_pool.accounts
+    .find((account) => account.id === 'default').authUnavailable, false,
+  'an explicitly authentication-authoritative successful probe clears the quarantine');
+  const expiredAfterProbeResponse = await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST', headers,
+    body: JSON.stringify({ kind: 'default_stale_pool', prompt: 'token expired after successful probe', dangerous: false }),
+  });
+  assert.equal((await expiredAfterProbeResponse.json()).auth_failed, true);
+  const postProbeFailoverResponse = await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST', headers,
+    body: JSON.stringify({ kind: 'default_stale_pool', prompt: 'fail over after post-probe expiry', dangerous: false }),
+  });
+  assert.equal((await postProbeFailoverResponse.json()).route.account, 'work');
+
+  const pristineFailureResponse = await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST', headers,
+    body: JSON.stringify({ kind: 'pristine_default_pool', prompt: 'discover pristine default auth failure', dangerous: false }),
+  });
+  const pristineFailure = await pristineFailureResponse.json();
+  assert.equal(pristineFailure.auth_failed, true);
+  accountStatus = await (await fetch(`${baseUrl}/api/accounts`, { headers })).json();
+  assert.equal(accountStatus.providers.pristine_default_pool.accounts.length, 1);
+  assert.equal(accountStatus.providers.pristine_default_pool.accounts[0].id, 'default');
+  assert.equal(accountStatus.providers.pristine_default_pool.accounts[0].authUnavailable, true,
+    'the first live failure materializes durable default-account authority');
+  const pristineReloggedConfig = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  const pristineHealthySlot = [
+    process.execPath, helper, '--prompt-file', '{prompt_file}',
+    '--invocation-marker', pristineDefaultMarker, '--print-env', 'TEST_ACCOUNT_HOME',
+  ];
+  pristineReloggedConfig.pristine_default_pool.oneshot_safe = pristineHealthySlot;
+  pristineReloggedConfig.pristine_default_pool.oneshot_dangerous = pristineHealthySlot;
+  fs.writeFileSync(configPath, JSON.stringify(pristineReloggedConfig), 'utf8');
+  const pristineRetryResponse = await fetch(`${baseUrl}/api/accounts/pristine_default_pool/default/auth/retry`, {
+    method: 'POST', headers, body: JSON.stringify({ retry: true }),
+  });
+  assert.equal(pristineRetryResponse.status, 200);
+  const pristineRecoveredResponse = await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST', headers,
+    body: JSON.stringify({ kind: 'pristine_default_pool', prompt: 'immediate retry after sign-in', dangerous: false }),
+  });
+  const pristineRecovered = await pristineRecoveredResponse.json();
+  assert.equal(pristineRecovered.exitCode, 0);
+  assert.equal(pristineRecovered.route.account, null,
+    'operator retry clears live runtime quarantine without requiring a diagnostic refresh');
+
+  for (const prompt of ['non-auth failure one', 'non-auth failure two']) {
+    const nonAuthResponse = await fetch(`${baseUrl}/api/oneshot`, {
+      method: 'POST', headers,
+      body: JSON.stringify({ kind: 'non_auth_pool', prompt, dangerous: false }),
+    });
+    const nonAuth = await nonAuthResponse.json();
+    assert.equal(nonAuth.route.account, 'work');
+    assert.equal(nonAuth.auth_failed, false,
+      'a provider/internal ENOENT is not evidence that linked credentials expired');
+  }
+  accountStatus = await (await fetch(`${baseUrl}/api/accounts`, { headers })).json();
+  assert.equal(accountStatus.providers.non_auth_pool.accounts
+    .find((account) => account.id === 'work').authUnavailable, false);
+
+  for (const prompt of ['auxiliary warning one', 'auxiliary warning two']) {
+    const auxiliaryWarningResponse = await fetch(`${baseUrl}/api/oneshot`, {
+      method: 'POST', headers,
+      body: JSON.stringify({ kind: 'auxiliary_signin_pool', prompt, dangerous: false }),
+    });
+    const auxiliaryWarning = await auxiliaryWarningResponse.json();
+    assert.equal(auxiliaryWarning.route.account, 'work');
+    assert.equal(auxiliaryWarning.auth_failed, false,
+      'an auxiliary service sign-in warning is not provider credential evidence');
+  }
+  assert.equal(fs.readFileSync(auxiliarySignInMarker, 'utf8').trim().split(/\r?\n/).length, 2,
+    'the unchanged linked credentials remain selectable after the warning');
+  accountStatus = await (await fetch(`${baseUrl}/api/accounts`, { headers })).json();
+  assert.equal(accountStatus.providers.auxiliary_signin_pool.accounts
+    .find((account) => account.id === 'work').authUnavailable, false);
+
+  const driftedConfig = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  delete driftedConfig.config_drift_pool.credential_env;
+  fs.writeFileSync(configPath, JSON.stringify(driftedConfig), 'utf8');
+  const driftRoute = await (await fetch(`${baseUrl}/api/route`, {
+    method: 'POST', headers,
+    body: JSON.stringify({
+      task: 'inspect managed account configuration drift',
+      diagnostics: { config_drift_pool: { found: true, ready: true } },
+      preferKinds: ['config_drift_pool'],
+    }),
+  })).json();
+  assert.equal(driftRoute.fleetState.accountSelection.config_drift_pool.available, false);
+  assert.equal(driftRoute.fleetState.accountSelection.config_drift_pool.reason,
+    'credential_relocation_unavailable');
+  const driftAdvice = await (await fetch(`${baseUrl}/api/usage/advise`, {
+    method: 'POST', headers,
+    body: JSON.stringify({
+      candidates: [{ seat: 'config_drift_pool', rank: 0, costClass: 'subscription' }],
+    }),
+  })).json();
+  assert.equal(driftAdvice.ranked.length, 0);
+  assert.equal(driftAdvice.allAccountsUnavailable, true);
+  assert.equal(driftAdvice.accountUnavailableSkipped[0].reason,
+    'credential_relocation_unavailable');
+  const driftDispatchResponse = await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST', headers,
+    body: JSON.stringify({ kind: 'config_drift_pool', prompt: 'must not use implicit default', dangerous: false }),
+  });
+  assert.equal(driftDispatchResponse.status, 500);
+  const driftDispatch = await driftDispatchResponse.json();
+  assert.equal(driftDispatch.failureClass, 'account_configuration_invalid');
+  assert.equal(driftDispatch.model_invocation, false);
+  assert.equal(fs.existsSync(configDriftMarker), false,
+    'losing credential_env must not bypass a disabled managed default');
+
+  const diagnostics = await (await fetch(`${baseUrl}/api/diag`, { headers })).json();
+  assert.equal(diagnostics.results.auth_pool.authFailed, true);
+  const authResponse = await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST', headers,
+    body: JSON.stringify({ kind: 'auth_pool', prompt: 'use linked auth, never signed-out default', dangerous: false }),
+  });
+  assert.equal(authResponse.status, 200);
+  const authResult = await authResponse.json();
+  assert.equal(authResult.route.account, 'work');
+  assert.equal(authResult.stdout, path.join(dataDir, 'accounts', 'auth_pool', 'work'));
+  assert.equal(fs.readFileSync(authMarker, 'utf8').trim(), 'use linked auth, never signed-out default');
+
+  const alternateRoute = await (await fetch(`${baseUrl}/api/route`, {
+    method: 'POST', headers,
+    body: JSON.stringify({
+      task: 'inspect account-aware routing',
+      diagnostics: { pooled_rate: { found: true, ready: true } },
+    }),
+  })).json();
+  assert.equal(alternateRoute.fleetState.accountSelection.pooled_rate.available, true);
+  assert.equal(alternateRoute.fleetState.accountSelection.pooled_rate.account, 'work');
+  assert.equal(alternateRoute.fleetState.cooldownSkipped.includes('pooled_rate'), false,
+    'a default-account cooldown must not hide a healthy linked account');
+
+  const alternateAdvice = await (await fetch(`${baseUrl}/api/usage/advise`, {
+    method: 'POST', headers,
+    body: JSON.stringify({
+      candidates: [{ seat: 'pooled_rate', rank: 0, costClass: 'subscription' }],
+    }),
+  })).json();
+  assert.equal(alternateAdvice.ranked.some((item) => item.seat === 'pooled_rate'), true,
+    'usage advice must not let a cooled default account hide a healthy linked account');
+  assert.equal(alternateAdvice.accountSelection.pooled_rate.account, 'work');
+  assert.equal(alternateAdvice.allCooling, false);
+
+  const unavailableResponse = await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST', headers,
+    body: JSON.stringify({
+      kind: 'toggle_pool', prompt: 'must not reach default credentials', dangerous: false,
+      requestId: 'test:account-unavailable:one',
+    }),
+  });
+  assert.equal(unavailableResponse.status, 409);
+  const unavailable = await unavailableResponse.json();
+  assert.equal(unavailable.failureClass, 'account_unavailable');
+  assert.equal(unavailable.model_invocation, false);
+  assert.equal(fs.existsSync(toggleMarker), false, 'an unavailable pool must not spawn the provider');
+  const rejectedReceipt = fs.readFileSync(
+    path.join(dataDir, 'receipts', `${new Date().toISOString().slice(0, 10)}.jsonl`), 'utf8',
+  ).trim().split(/\r?\n/).map(JSON.parse)
+    .find((row) => row.receiptId === unavailable.receiptId);
+  assert.equal(rejectedReceipt.physicalAttemptCount, 0);
+  assert.equal(rejectedReceipt.modelInvocation, false);
+
+  const stringFalseEnable = await fetch(`${baseUrl}/api/accounts/toggle_pool/work/enabled`, {
+    method: 'POST', headers, body: JSON.stringify({ enabled: 'false' }),
+  });
+  assert.equal(stringFalseEnable.status, 400,
+    'the string "false" must never be coerced into enabling an account');
+  const extraEnableField = await fetch(`${baseUrl}/api/accounts/toggle_pool/work/enabled`, {
+    method: 'POST', headers, body: JSON.stringify({ enabled: true, account: 'default' }),
+  });
+  assert.equal(extraEnableField.status, 400,
+    'account authority mutations reject undeclared fields');
+  accountStatus = await (await fetch(`${baseUrl}/api/accounts`, { headers })).json();
+  assert.equal(accountStatus.providers.toggle_pool.accounts
+    .find((account) => account.id === 'work').enabled, false);
+
+  const enableResponse = await fetch(`${baseUrl}/api/accounts/toggle_pool/work/enabled`, {
+    method: 'POST', headers, body: JSON.stringify({ enabled: true }),
+  });
+  assert.equal(enableResponse.status, 200);
+  const enabledResponse = await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST', headers,
+    body: JSON.stringify({ kind: 'toggle_pool', prompt: 'use the newly enabled account', dangerous: false }),
+  });
+  assert.equal(enabledResponse.status, 200,
+    'account mutations must invalidate the dispatch cache immediately');
+  const enabled = await enabledResponse.json();
+  assert.equal(enabled.exitCode, 0);
+  assert.equal(enabled.route.account, 'work');
+  assert.equal(enabled.route.quota_seat, toggleWorkSeat);
+  assert.equal(enabled.stdout, path.join(dataDir, 'accounts', 'toggle_pool', 'work'));
+  assert.equal(fs.readFileSync(toggleMarker, 'utf8').trim(), 'use the newly enabled account');
+
+  const sameBaseResponse = await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST', headers,
+    body: JSON.stringify({ kind: 'same_base', prompt: 'do not clear the default account cooldown', dangerous: false }),
+  });
+  const sameBaseResult = await sameBaseResponse.json();
+  assert.equal(sameBaseResult.route.account, 'work');
+  assert.equal(sameBaseResult.route.quota_seat, 'same_base#work');
+
+  const rateResponse = await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST', headers,
+    body: JSON.stringify({ kind: 'pooled_rate', prompt: 'use the account whose quota remains', dangerous: false }),
+  });
+  assert.equal(rateResponse.status, 200);
+  const rateResult = await rateResponse.json();
+  assert.equal(rateResult.rate_limited, true);
+  assert.equal(rateResult.route.account, 'work');
+  assert.equal(rateResult.route.quota_seat, pooledWorkSeat);
+  assert.equal(fs.readFileSync(pooledMarker, 'utf8').trim(), 'use the account whose quota remains');
+
+  const cooldowns = await (await fetch(`${baseUrl}/api/cooldowns`, { headers })).json();
+  assert.equal(cooldowns.cooldowns.toggle_pool.cooling, false,
+    'a successful linked-account run must clear an earlier model-scoped provider cooldown');
+  assert.equal(cooldowns.cooldowns.same_base.cooling, true,
+    'success on work must not clear an account-scoped cooldown keyed like the provider');
+  assert.equal(cooldowns.cooldowns[pooledBaseSeat].offences, 1,
+    'a linked-account failure must not increment the base account cooldown');
+  assert.equal(cooldowns.cooldowns[pooledWorkSeat].cooling, true);
+  assert.equal(cooldowns.cooldowns[pooledWorkSeat].reason, 'rate_limited');
+  assert.equal(cooldowns.quotaSeats[pooledWorkSeat].account.id, 'work');
+
+  const allCoolingRoute = await (await fetch(`${baseUrl}/api/route`, {
+    method: 'POST', headers,
+    body: JSON.stringify({
+      task: 'normal routing must avoid an entirely cooling pool',
+      diagnostics: { pooled_rate: { found: true, ready: true } },
+    }),
+  })).json();
+  assert.equal(allCoolingRoute.fleetState.accountSelection.pooled_rate.reason, 'cooling');
+  assert.equal(allCoolingRoute.fleetState.cooldownSkipped.includes('pooled_rate'), true);
+  const explicitCoolingRoute = await (await fetch(`${baseUrl}/api/route`, {
+    method: 'POST', headers,
+    body: JSON.stringify({
+      task: 'explicitly probe a cooling pool', preferKinds: ['pooled_rate'],
+      diagnostics: { pooled_rate: { found: true, ready: true } },
+    }),
+  })).json();
+  assert.equal(explicitCoolingRoute.fleetState.cooldownSkipped.includes('pooled_rate'), false);
+
+  const route = await (await fetch(`${baseUrl}/api/route`, {
+    method: 'POST', headers,
+    body: JSON.stringify({
+      task: 'route with linked accounts', preferKinds: ['toggle_pool'],
+      diagnostics: { toggle_pool: { found: true, ready: true } },
+    }),
+  })).json();
+  assert.equal(route.fleetState.quotaSeats[toggleWorkSeat].account.id, 'work');
+
+  const expiresAt = new Date(Date.now() + 3600000).toISOString();
+  const quotaResponse = await fetch(`${baseUrl}/api/usage/operator-quota`, {
+    method: 'PUT', headers,
+    body: JSON.stringify({
+      quotaSeat: pooledWorkSeat,
+      percentRemaining: 37,
+      provenance: 'human_account_owner',
+      expiresAt,
+    }),
+  });
+  assert.equal(quotaResponse.status, 200,
+    'operator quota evidence must accept a generated linked-account quota seat');
+  const quotaStatus = await (await fetch(`${baseUrl}/api/usage/operator-quota`, { headers })).json();
+  assert.equal(quotaStatus.observations[pooledWorkSeat].percentRemaining, 37);
+  const clearResponse = await fetch(`${baseUrl}/api/usage/operator-quota`, {
+    method: 'DELETE', headers, body: JSON.stringify({ quotaSeat: pooledWorkSeat }),
+  });
+  assert.equal(clearResponse.status, 200);
+
+  const traversalTarget = path.join(dataDir, 'usage', 'victim');
+  fs.mkdirSync(traversalTarget, { recursive: true });
+  fs.writeFileSync(path.join(traversalTarget, 'keep.txt'), 'keep', 'utf8');
+  const traversalResponse = await fetch(`${baseUrl}/api/accounts/%2E%2E%2Fusage/victim`, {
+    method: 'DELETE', headers,
+  });
+  assert.equal(traversalResponse.status, 404);
+  assert.equal(fs.readFileSync(path.join(traversalTarget, 'keep.txt'), 'utf8'), 'keep');
+
+  const deleteWork = await fetch(`${baseUrl}/api/accounts/toggle_pool/work`, {
+    method: 'DELETE', headers,
+  });
+  assert.equal(deleteWork.status, 200);
+  assert.equal((await deleteWork.json()).credentialsRemoved, true);
+  const deleteDefault = await fetch(`${baseUrl}/api/accounts/toggle_pool/default`, {
+    method: 'DELETE', headers,
+  });
+  const defaultDeletion = await deleteDefault.json();
+  assert.equal(defaultDeletion.credentialsRemoved, false);
+  assert.equal(defaultDeletion.requiresProviderLogout, true);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dataDir, 'accounts.json'), 'utf8'))
+    .providers.toggle_pool.accounts, []);
+  const markerBeforeTombstone = fs.readFileSync(toggleMarker, 'utf8');
+  const tombstoneResponse = await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST', headers,
+    body: JSON.stringify({ kind: 'toggle_pool', prompt: 'must not resurrect default', dangerous: false }),
+  });
+  assert.equal(tombstoneResponse.status, 409);
+  assert.equal((await tombstoneResponse.json()).failureClass, 'account_unavailable');
+  assert.equal(fs.readFileSync(toggleMarker, 'utf8'), markerBeforeTombstone);
+
+  const registryPath = path.join(dataDir, 'accounts.json');
+  const registryBeforeLoss = fs.readFileSync(registryPath, 'utf8');
+  assert.equal(fs.readFileSync(path.join(dataDir, 'accounts.initialized'), 'utf8'), '1\n');
+  fs.rmSync(registryPath);
+  const missingRegistryResponse = await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST', headers,
+    body: JSON.stringify({ kind: 'toggle_pool', prompt: 'must fail closed after registry loss', dangerous: false }),
+  });
+  assert.equal(missingRegistryResponse.status, 500);
+  const missingRegistry = await missingRegistryResponse.json();
+  assert.equal(missingRegistry.failureClass, 'account_registry_invalid');
+  assert.equal(missingRegistry.model_invocation, false);
+  assert.equal(fs.readFileSync(toggleMarker, 'utf8'), markerBeforeTombstone,
+    'deleting a managed registry must never dispatch through default credentials');
+  fs.writeFileSync(registryPath, registryBeforeLoss, 'utf8');
+
+  const markerBeforeCorruption = fs.readFileSync(toggleMarker, 'utf8');
+  const corruptRegistryBytes = '{ not valid json';
+  fs.writeFileSync(registryPath, corruptRegistryBytes, 'utf8');
+  const pooledCredentials = path.join(dataDir, 'accounts', 'pooled_rate', 'work', '.credentials.json');
+  const corruptDeleteResponse = await fetch(`${baseUrl}/api/accounts/pooled_rate/work`, {
+    method: 'DELETE', headers,
+  });
+  assert.equal(corruptDeleteResponse.status, 400);
+  assert.equal(fs.readFileSync(pooledCredentials, 'utf8'), '{}');
+  assert.equal(fs.readFileSync(registryPath, 'utf8'), corruptRegistryBytes);
+  const corruptAddResponse = await fetch(`${baseUrl}/api/accounts/pooled_rate`, {
+    method: 'POST', headers, body: JSON.stringify({ id: 'spare' }),
+  });
+  assert.equal(corruptAddResponse.status, 400);
+  assert.equal(fs.readFileSync(registryPath, 'utf8'), corruptRegistryBytes);
+  assert.equal((await fetch(`${baseUrl}/api/accounts`, { headers })).status, 500);
+  const corruptRegistryResponse = await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST', headers,
+    body: JSON.stringify({ kind: 'toggle_pool', prompt: 'must fail closed on corrupt account authority', dangerous: false }),
+  });
+  assert.equal(corruptRegistryResponse.status, 500);
+  const corruptRegistry = await corruptRegistryResponse.json();
+  assert.equal(corruptRegistry.failureClass, 'account_registry_invalid');
+  assert.equal(corruptRegistry.model_invocation, false);
+  assert.equal(fs.readFileSync(toggleMarker, 'utf8'), markerBeforeCorruption,
+    'a corrupt account registry must never fall back to default credentials');
+});
+
+test('Copilot live signed-out evidence quarantines only the failing linked profile', { timeout: 15000 }, async (t) => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ps-bridge-copilot-auth-test-'));
+  const dataDir = path.join(tempRoot, 'data');
+  const configPath = path.join(tempRoot, 'config.json');
+  const tokenPath = path.join(tempRoot, 'capability.token');
+  const helper = path.join(ROOT, 'test', 'prompt-file-cli.js');
+  const slot = [
+    process.execPath, helper, '--prompt-file', '{prompt_file}',
+    '--copilot-auth-fail-env-suffix', 'COPILOT_HOME', `${path.sep}aaa-stale`,
+    '--print-env', 'COPILOT_HOME',
+  ];
+  fs.mkdirSync(dataDir, { recursive: true });
+  fs.writeFileSync(configPath, JSON.stringify({
+    copilot: {
+      label: 'Copilot live-auth fixture',
+      credential_env: 'COPILOT_HOME',
+      credential_aux_env: ['GH_CONFIG_DIR'],
+      credential_markers: ['config.json'],
+      linked_account_args: ['--no-auto-login'],
+      login_command: ['copilot', 'login'],
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: slot,
+      oneshot_dangerous: slot,
+      diagnostic_binary: process.execPath,
+      probe: [process.execPath, helper, '--version'],
+      probe_auth_authoritative: false,
+    },
+  }), 'utf8');
+  fs.writeFileSync(path.join(dataDir, 'accounts.json'), JSON.stringify({
+    providers: {
+      copilot: {
+        accounts: [
+          { id: 'default', label: 'existing sign-in', enabled: false },
+          { id: 'aaa-stale', label: 'stale Copilot login', enabled: true },
+          { id: 'zzz-healthy', label: 'healthy Copilot login', enabled: true },
+        ],
+      },
+    },
+  }), 'utf8');
+  for (const id of ['aaa-stale', 'zzz-healthy']) {
+    const accountDir = path.join(dataDir, 'accounts', 'copilot', id);
+    fs.mkdirSync(accountDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(accountDir, 'config.json'), '{}', { mode: 0o600 });
+  }
+
+  const port = await reservePort();
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const bridge = spawn(process.execPath, [path.join(ROOT, 'server.js')], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      NODE_ENV: 'test',
+      RELAYBRIDGE_TEST_BUILD_ID: TEST_BUILD_ID,
+      PORT: String(port),
+      PTY_MODE: 'none',
+      RELAYBRIDGE_CONFIG_FILE: configPath,
+      RELAYBRIDGE_TOKEN_FILE: tokenPath,
+      RELAYBRIDGE_DATA_DIR: dataDir,
+    },
+    windowsHide: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  t.after(async () => {
+    if (bridge.exitCode === null) bridge.kill('SIGTERM');
+    await new Promise((resolve) => bridge.exitCode !== null ? resolve() : bridge.once('exit', resolve));
+    fs.rmSync(tempRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+
+  await waitForHealth(baseUrl, bridge);
+  const headers = await capabilityHeaders(baseUrl, true);
+  const failed = await (await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST', headers,
+    body: JSON.stringify({ kind: 'copilot', prompt: 'detect the stale login', dangerous: false }),
+  })).json();
+  assert.equal(failed.route.account, 'aaa-stale');
+  assert.equal(failed.auth_failed, true);
+  const healthy = await (await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST', headers,
+    body: JSON.stringify({ kind: 'copilot', prompt: 'use the healthy login', dangerous: false }),
+  })).json();
+  assert.equal(healthy.exitCode, 0);
+  assert.equal(healthy.route.account, 'zzz-healthy');
+  const accountStatus = await (await fetch(`${baseUrl}/api/accounts`, { headers })).json();
+  assert.equal(accountStatus.providers.copilot.accounts
+    .find((account) => account.id === 'aaa-stale').authUnavailable, true);
+  assert.equal(accountStatus.providers.copilot.accounts
+    .find((account) => account.id === 'zzz-healthy').authUnavailable, false);
+});
+
+test('readiness and version probes share one diagnostic wall-clock envelope', { timeout: 10000 }, async (t) => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ps-bridge-parallel-diag-test-'));
+  const configPath = path.join(tempRoot, 'config.json');
+  const tokenPath = path.join(tempRoot, 'capability.token');
+  fs.writeFileSync(configPath, JSON.stringify({
+    staged_probe: {
+      label: 'Parallel diagnostic fixture',
+      safe: [process.execPath, '-e', ''],
+      dangerous: [process.execPath, '-e', ''],
+      oneshot_safe: [process.execPath, '-e', ''],
+      oneshot_dangerous: [process.execPath, '-e', ''],
+      diagnostic_binary: process.execPath,
+      probe: [process.execPath, '-e', "setTimeout(() => process.stdout.write('authenticated'), 1500)"],
+      probe_timeout_ms: 3000,
+      version_probe: [process.execPath, '-e', "setTimeout(() => process.stdout.write('fixture-v1'), 1000)"],
+    },
+  }), 'utf8');
+
+  const port = await reservePort();
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const bridge = spawn(process.execPath, [path.join(ROOT, 'server.js')], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      NODE_ENV: 'test',
+      RELAYBRIDGE_TEST_BUILD_ID: TEST_BUILD_ID,
+      PORT: String(port),
+      PTY_MODE: 'none',
+      RELAYBRIDGE_CONFIG_FILE: configPath,
+      RELAYBRIDGE_TOKEN_FILE: tokenPath,
+      RELAYBRIDGE_DATA_DIR: path.join(tempRoot, 'data'),
+    },
+    windowsHide: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  t.after(async () => {
+    if (bridge.exitCode === null) bridge.kill('SIGTERM');
+    await new Promise((resolve) => bridge.exitCode !== null ? resolve() : bridge.once('exit', resolve));
+    fs.rmSync(tempRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+
+  await waitForHealth(baseUrl, bridge);
+  const headers = await capabilityHeaders(baseUrl);
+  const startedAt = Date.now();
+  const response = await fetch(`${baseUrl}/api/diag`, { headers });
+  const elapsedMs = Date.now() - startedAt;
+  assert.equal(response.status, 200);
+  const diagnostics = await response.json();
+  assert.equal(diagnostics.results.staged_probe.ready, true);
+  assert.equal(diagnostics.results.staged_probe.runtimeVersion, 'fixture-v1');
+  assert.ok(elapsedMs < 2300,
+    `independent 1.5s and 1s probes ran sequentially (${elapsedMs}ms)`);
 });
 
 test('local Ollama adapter uses loopback HTTP, returns final-only text, and records usage', async (t) => {

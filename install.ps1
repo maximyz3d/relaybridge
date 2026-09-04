@@ -443,6 +443,201 @@ function Restore-ShippedManagedProviderArgs($Merged, $Defaults) {
   return $Merged
 }
 
+# Compare JSON arrays without PowerShell's scalar/array coercions. Credential
+# marker lists and login argv are security boundaries: an extra marker or
+# different casing identifies an operator-authored value, not a retired shipped
+# default that an upgrade may replace.
+function Test-ExactJsonStringArray($Candidate, $Expected) {
+  $candidateValues = @($Candidate)
+  $expectedValues = @($Expected)
+  if ($candidateValues.Count -ne $expectedValues.Count) { return $false }
+  for ($i = 0; $i -lt $candidateValues.Count; $i++) {
+    if (-not ($candidateValues[$i] -is [string]) -or
+        -not ($expectedValues[$i] -is [string]) -or
+        [string]$candidateValues[$i] -cne [string]$expectedValues[$i]) { return $false }
+  }
+  return $true
+}
+
+# A provider CLI's real credential-home contract is release metadata, but the
+# ordinary defaults merge intentionally preserves installed values. Correct a
+# previously shipped bad contract only when the installed fields equal a
+# declared retired shape. The first released Copilot declaration had the bad
+# environment variable and no marker field; a later candidate paired it with a
+# GitHub CLI marker. A custom environment variable, marker list, or partially
+# edited pair remains operator-owned.
+function Restore-ShippedCredentialRelocation($Merged, $Defaults, $Existing) {
+  if (-not ($Merged -is [pscustomobject]) -or
+      -not ($Defaults -is [pscustomobject]) -or
+      -not ($Existing -is [pscustomobject])) { return $Merged }
+  $mergeSchema = $Defaults.PSObject.Properties['_config_merge']
+  if (-not $mergeSchema -or -not ($mergeSchema.Value -is [pscustomobject])) { return $Merged }
+  $managed = $mergeSchema.Value.PSObject.Properties['managed_credential_relocations']
+  if (-not $managed -or -not ($managed.Value -is [pscustomobject])) { return $Merged }
+
+  foreach ($providerSpec in $managed.Value.PSObject.Properties) {
+    $providerName = $providerSpec.Name
+    $spec = $providerSpec.Value
+    if (-not ($spec -is [pscustomobject])) { throw "Invalid managed credential relocation schema for '$providerName'." }
+    $retired = $spec.PSObject.Properties['retired_pair']
+    $retiredWithoutMarkers = $spec.PSObject.Properties['retired_env_without_markers']
+    if (-not $retired -or -not ($retired.Value -is [pscustomobject]) -or
+        -not $retiredWithoutMarkers -or -not ($retiredWithoutMarkers.Value -is [string])) {
+      throw "Managed credential relocation '$providerName' requires retired_pair and retired_env_without_markers."
+    }
+    $providers = @{}
+    foreach ($source in @(@{ Key = 'default'; Root = $Defaults }, @{ Key = 'merged'; Root = $Merged }, @{ Key = 'existing'; Root = $Existing })) {
+      $entry = $source.Root.PSObject.Properties[$providerName]
+      if ($entry -and $entry.Value -is [pscustomobject]) { $providers[$source.Key] = $entry.Value }
+    }
+    if (-not $providers.ContainsKey('default')) {
+      throw "Managed credential relocation '$providerName' has no shipped provider object."
+    }
+    if (-not $providers.ContainsKey('merged') -or -not $providers.ContainsKey('existing')) { continue }
+
+    $defaultEnv = $providers['default'].PSObject.Properties['credential_env']
+    $defaultMarkers = $providers['default'].PSObject.Properties['credential_markers']
+    $retiredEnv = $retired.Value.PSObject.Properties['credential_env']
+    $retiredMarkers = $retired.Value.PSObject.Properties['credential_markers']
+    if (-not $defaultEnv -or -not ($defaultEnv.Value -is [string]) -or
+        -not $defaultMarkers -or -not $retiredEnv -or -not ($retiredEnv.Value -is [string]) -or
+        -not $retiredMarkers) {
+      throw "Managed credential relocation '$providerName' requires shipped and retired credential_env/credential_markers values."
+    }
+    if ([string]$defaultEnv.Value -ceq [string]$retiredEnv.Value -and
+        (Test-ExactJsonStringArray $defaultMarkers.Value $retiredMarkers.Value)) {
+      throw "Managed credential relocation '$providerName' retires the pair it still ships."
+    }
+
+    $existingEnv = $providers['existing'].PSObject.Properties['credential_env']
+    $existingMarkers = $providers['existing'].PSObject.Properties['credential_markers']
+    if (-not $existingEnv -or -not ($existingEnv.Value -is [string])) { continue }
+    $matchesRetiredPair = $existingMarkers -and
+      [string]$existingEnv.Value -ceq [string]$retiredEnv.Value -and
+      (Test-ExactJsonStringArray $existingMarkers.Value $retiredMarkers.Value)
+    $matchesReleasedShape = -not $existingMarkers -and
+      [string]$existingEnv.Value -ceq [string]$retiredWithoutMarkers.Value
+    if (-not $matchesRetiredPair -and -not $matchesReleasedShape) { continue }
+
+    if ($providers['merged'].PSObject.Properties['credential_env']) {
+      $providers['merged'].credential_env = $defaultEnv.Value
+    } else {
+      $providers['merged'] | Add-Member -NotePropertyName 'credential_env' -NotePropertyValue $defaultEnv.Value -Force
+    }
+    if ($providers['merged'].PSObject.Properties['credential_markers']) {
+      $providers['merged'].credential_markers = @($defaultMarkers.Value)
+    } else {
+      $providers['merged'] | Add-Member -NotePropertyName 'credential_markers' -NotePropertyValue @($defaultMarkers.Value) -Force
+    }
+    Write-Host ("[RelayBridge] {0}: replaced the retired shipped credential relocation {1}/{2} with {3}/{4}." -f `
+      $providerName, $retiredEnv.Value, (@($retiredMarkers.Value) -join ','),
+      $defaultEnv.Value, (@($defaultMarkers.Value) -join ','))
+  }
+  return $Merged
+}
+
+# Login commands are also preserved by the ordinary merge. Refresh one only
+# when the installed argv is byte-for-byte the retired shipped command; a
+# wrapper or any operator edit stays untouched.
+function Restore-ShippedManagedLoginCommands($Merged, $Defaults, $Existing) {
+  if (-not ($Merged -is [pscustomobject]) -or
+      -not ($Defaults -is [pscustomobject]) -or
+      -not ($Existing -is [pscustomobject])) { return $Merged }
+  $mergeSchema = $Defaults.PSObject.Properties['_config_merge']
+  if (-not $mergeSchema -or -not ($mergeSchema.Value -is [pscustomobject])) { return $Merged }
+  $managed = $mergeSchema.Value.PSObject.Properties['managed_login_commands']
+  if (-not $managed -or -not ($managed.Value -is [pscustomobject])) { return $Merged }
+
+  foreach ($providerSpec in $managed.Value.PSObject.Properties) {
+    $providerName = $providerSpec.Name
+    $spec = $providerSpec.Value
+    if (-not ($spec -is [pscustomobject])) { throw "Invalid managed login-command schema for '$providerName'." }
+    $retired = $spec.PSObject.Properties['retired_command']
+    $defaultProvider = $Defaults.PSObject.Properties[$providerName]
+    $mergedProvider = $Merged.PSObject.Properties[$providerName]
+    $existingProvider = $Existing.PSObject.Properties[$providerName]
+    if (-not $retired -or -not $defaultProvider -or -not ($defaultProvider.Value -is [pscustomobject])) {
+      throw "Managed login command '$providerName' requires retired_command and a shipped provider object."
+    }
+    if (-not $mergedProvider -or -not ($mergedProvider.Value -is [pscustomobject]) -or
+        -not $existingProvider -or -not ($existingProvider.Value -is [pscustomobject])) { continue }
+    $shipped = $defaultProvider.Value.PSObject.Properties['login_command']
+    $installed = $existingProvider.Value.PSObject.Properties['login_command']
+    if (-not $shipped) { throw "Managed login command '$providerName' has no shipped login_command." }
+    if (Test-ExactJsonStringArray $shipped.Value $retired.Value) {
+      throw "Managed login command '$providerName' retires the command it still ships."
+    }
+    if (-not $installed -or -not (Test-ExactJsonStringArray $installed.Value $retired.Value)) { continue }
+    $mergedProvider.Value.login_command = @($shipped.Value)
+    Write-Host ("[RelayBridge] {0}: replaced the retired shipped login command '{1}' with '{2}'." -f `
+      $providerName, (@($retired.Value) -join ' '), (@($shipped.Value) -join ' '))
+  }
+  return $Merged
+}
+
+# Token and alternate-provider environment variables can override a relocated
+# credential directory and make one account pay while another is recorded.
+# For the explicitly managed providers, shipped strip_env entries are therefore
+# minimum safety policy rather than replaceable defaults. Preserve the
+# operator's order and extra exclusions, appending only missing required names.
+function Restore-ShippedRequiredStripEnv($Merged, $Defaults) {
+  if (-not ($Merged -is [pscustomobject]) -or -not ($Defaults -is [pscustomobject])) { return $Merged }
+  $mergeSchema = $Defaults.PSObject.Properties['_config_merge']
+  if (-not $mergeSchema -or -not ($mergeSchema.Value -is [pscustomobject])) { return $Merged }
+  $managed = $mergeSchema.Value.PSObject.Properties['managed_required_strip_env']
+  if (-not $managed) { return $Merged }
+  $managedProviders = @($managed.Value)
+  if (-not $managedProviders.Count) { throw 'managed_required_strip_env must name at least one provider.' }
+
+  foreach ($providerNameValue in $managedProviders) {
+    if (-not ($providerNameValue -is [string]) -or -not [string]$providerNameValue) {
+      throw 'managed_required_strip_env contains an invalid provider name.'
+    }
+    $providerName = [string]$providerNameValue
+    $defaultProvider = $Defaults.PSObject.Properties[$providerName]
+    $mergedProvider = $Merged.PSObject.Properties[$providerName]
+    if (-not $defaultProvider -or -not ($defaultProvider.Value -is [pscustomobject])) {
+      throw "Managed strip_env provider '$providerName' has no shipped provider object."
+    }
+    if (-not $mergedProvider -or -not ($mergedProvider.Value -is [pscustomobject])) { continue }
+    $requiredProp = $defaultProvider.Value.PSObject.Properties['strip_env']
+    if (-not $requiredProp) { throw "Managed strip_env provider '$providerName' has no shipped strip_env." }
+    $required = @($requiredProp.Value)
+    $invalidRequired = @($required | Where-Object {
+      -not ($_ -is [string]) -or $_ -notmatch '^[A-Z][A-Z0-9_]*$'
+    })
+    if (-not $required.Count -or $invalidRequired.Count) {
+      throw "Managed strip_env provider '$providerName' has an invalid shipped strip_env."
+    }
+
+    $installedProp = $mergedProvider.Value.PSObject.Properties['strip_env']
+    $installed = if ($installedProp) { @($installedProp.Value) } else { @() }
+    $invalidInstalled = @($installed | Where-Object {
+      -not ($_ -is [string]) -or $_ -notmatch '^[A-Za-z_][A-Za-z0-9_]*$'
+    })
+    if ($invalidInstalled.Count) {
+      throw "Installed strip_env for '$providerName' is not an array of environment names."
+    }
+    $seen = @{}
+    foreach ($name in $installed) { $seen[[string]$name.ToUpperInvariant()] = $true }
+    $changed = $false
+    foreach ($name in $required) {
+      $key = [string]$name.ToUpperInvariant()
+      if ($seen.ContainsKey($key)) { continue }
+      $installed += [string]$name
+      $seen[$key] = $true
+      $changed = $true
+    }
+    if (-not $changed -and $installedProp) { continue }
+    if ($installedProp) { $mergedProvider.Value.strip_env = $installed }
+    else { $mergedProvider.Value | Add-Member -NotePropertyName 'strip_env' -NotePropertyValue $installed -Force }
+    if ($changed) {
+      Write-Host ("[RelayBridge] {0}: added required credential-identity environment exclusions." -f $providerName)
+    }
+  }
+  return $Merged
+}
+
 # JSON numbers survive ConvertFrom-Json as Int32/Int64/Decimal/Double depending
 # on the literal, so a retired default written as 24 must still match an
 # installed 24 read back as any of those. PowerShell's -contains would go
@@ -574,6 +769,9 @@ function Merge-JsonFile([string]$DefaultPath, [string]$ExistingPath) {
   if ([IO.Path]::GetFileName($DefaultPath) -ieq 'cli-config.json') {
     $merged = Restore-ShippedModelPins $merged $defaults $existing
     $merged = Restore-ShippedManagedProviderArgs $merged $defaults
+    $merged = Restore-ShippedCredentialRelocation $merged $defaults $existing
+    $merged = Restore-ShippedManagedLoginCommands $merged $defaults $existing
+    $merged = Restore-ShippedRequiredStripEnv $merged $defaults
     $merged = Restore-ShippedManagedSupervisorBudget $merged $defaults $existing
   }
   $tempPath = "$DefaultPath.merge.$([Guid]::NewGuid().ToString('N')).tmp"
@@ -897,6 +1095,17 @@ try {
 } catch {
   $installError = $_
   $rollbackErrors = @()
+  if ($env:RELAYBRIDGE_INSTALL_TEST_ERROR_FILE) {
+    try {
+      $diagnostic = @(
+        $_.Exception.ToString()
+        $_.ScriptStackTrace
+      ) -join "`r`n"
+      [IO.File]::WriteAllText($env:RELAYBRIDGE_INSTALL_TEST_ERROR_FILE, ($diagnostic + "`r`n"), [Text.UTF8Encoding]::new($false))
+    } catch {
+      # Test-only diagnostics must never interfere with the production rollback.
+    }
+  }
   Write-Warning ("RelayBridge installation failed; restoring the previous release: {0}" -f $_.Exception.Message)
   if ($candidate -and $candidate.Process -and -not $candidate.Process.HasExited) {
     Stop-Process -Id $candidate.Process.Id -Force -ErrorAction SilentlyContinue

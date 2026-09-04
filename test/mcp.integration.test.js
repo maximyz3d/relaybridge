@@ -145,7 +145,16 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
     ollama: { ...echoProvider, label: 'Fake local utility' },
     ollama_coder: { ...echoProvider, label: 'Fake local coder' },
     codex: { ...echoProvider, label: 'Fake Codex' },
-    claude: { ...echoProvider, label: 'Fake Claude' },
+    claude: {
+      ...echoProvider,
+      label: 'Fake Claude',
+      quota_seat: 'subscription:test:mcp-claude',
+      credential_env: 'TEST_ACCOUNT_HOME',
+      credential_markers: ['.credentials.json'],
+      login_command: ['fake-claude', 'login'],
+      probe: [process.execPath, '-e', "process.stderr.write('not logged in\\n'); process.exit(1)"],
+      probe_auth_authoritative: true,
+    },
     gemini: { ...echoProvider, label: 'Fake Gemini' },
     usage_json: {
       ...echoProvider,
@@ -224,12 +233,56 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
       label: 'Identity preflight fixture',
       oneshot_safe: [process.execPath, helper, '--prompt-file', '{prompt_file}', '--invocation-marker', invocationMarker],
     },
+    account_pool: {
+      ...echoProvider,
+      label: 'Linked-account authority fixture',
+      credential_env: 'TEST_ACCOUNT_HOME',
+      credential_markers: ['.credentials.json'],
+    },
     slow: {
       ...echoProvider,
       label: 'Slow cancellable provider',
       oneshot_safe: [process.execPath, helper, '--prompt-file', '{prompt_file}', '--delay', '10000'],
     },
   }), 'utf8');
+
+  fs.mkdirSync(dataDir, { recursive: true });
+  const initialAccountsRegistry = {
+    providers: {
+      claude: {
+        accounts: [
+          { id: 'default', label: 'signed-out default', enabled: true },
+          { id: 'work', label: 'healthy linked account', enabled: true },
+        ],
+      },
+      account_pool: {
+        accounts: [
+          { id: 'default', label: 'enabled default', enabled: true },
+          { id: 'work', label: 'managed linked plan', enabled: true },
+        ],
+      },
+    },
+  };
+  const initialAccountsRegistryText = JSON.stringify(initialAccountsRegistry, null, 2);
+  fs.writeFileSync(path.join(dataDir, 'accounts.json'), initialAccountsRegistryText, 'utf8');
+  const linkedClaudeHome = path.join(dataDir, 'accounts', 'claude', 'work');
+  fs.mkdirSync(linkedClaudeHome, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(linkedClaudeHome, '.credentials.json'), '{}', { mode: 0o600 });
+  const managedPoolHome = path.join(dataDir, 'accounts', 'account_pool', 'work');
+  fs.mkdirSync(managedPoolHome, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(managedPoolHome, '.credentials.json'), '{}', { mode: 0o600 });
+  const defaultClaudeCooldownAt = Date.now();
+  const cooldownsPath = path.join(dataDir, 'cooldowns.json');
+  fs.writeFileSync(cooldownsPath, JSON.stringify({
+    'subscription:test:mcp-claude': {
+      offences: 1,
+      lastOffenceAt: defaultClaudeCooldownAt,
+      until: defaultClaudeCooldownAt + 3600000,
+      reason: 'rate_limited',
+      source: 'backoff',
+      scope: 'account',
+    },
+  }, null, 2), 'utf8');
 
   const port = await reservePort();
   const baseUrl = `http://127.0.0.1:${port}`;
@@ -244,6 +297,7 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
       PS_BRIDGE_DATA_DIR: dataDir,
       NODE_ENV: 'test',
       RELAYBRIDGE_TEST_BUILD_ID: 'integration-current',
+      RELAYBRIDGE_DIAGNOSTIC_CACHE_TTL_MS: '1',
       RELAYBRIDGE_ALLOWED_ROOTS: `${allowedRootA};${allowedRootB}`,
     },
     windowsHide: true,
@@ -432,6 +486,13 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   assert.ok(providers.structuredContent.providers.some((provider) => provider.kind === 'codex'
     && provider.safeOneShot?.ready === true
     && provider.safeOneShot?.policy === 'read_only_enforced'));
+  const linkedClaudeProvider = providers.structuredContent.providers
+    .find((provider) => provider.kind === 'claude');
+  assert.equal(linkedClaudeProvider.readiness.ready, true,
+    'MCP provider summaries must project a healthy linked account over a signed-out default');
+  assert.equal(linkedClaudeProvider.readiness.accountSelection.account, 'work');
+  assert.equal(linkedClaudeProvider.readiness.accountSelection.quotaSeat,
+    'subscription:test:mcp-claude#work');
   assert.ok(Array.isArray(providers.structuredContent.candidateIntegrations));
 
   const preview = await client.callTool({
@@ -443,6 +504,61 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   assert.match(preview.structuredContent.note, /not a universal model-quality score/);
   assert.ok(preview.structuredContent.candidates.every((candidate) =>
     candidate.readiness.safeFilesystem == null || typeof candidate.readiness.safeFilesystem.eligible === 'boolean'));
+
+  const linkedClaudePreview = await client.callTool({
+    name: 'route_preview',
+    arguments: {
+      task: 'Review this JavaScript module for correctness.',
+      preferredProviders: ['claude'],
+      maxProviders: 1,
+    },
+  });
+  assert.equal(linkedClaudePreview.isError, undefined, JSON.stringify(linkedClaudePreview.structuredContent));
+  assert.equal(linkedClaudePreview.structuredContent.selected[0].kind, 'claude');
+  assert.equal(linkedClaudePreview.structuredContent.fleetState.accountSelection.claude.account, 'work');
+  assert.equal(linkedClaudePreview.structuredContent.fleetState.accountSelection.claude.quotaSeat,
+    'subscription:test:mcp-claude#work');
+  assert.equal(linkedClaudePreview.structuredContent.fleetState.cooldownSkipped.includes('claude'), false,
+    'a default-account cooldown must not hide a healthy linked account from MCP routing');
+
+  const allClaudeCooldowns = JSON.parse(fs.readFileSync(cooldownsPath, 'utf8'));
+  const linkedClaudeCooldownAt = Date.now();
+  allClaudeCooldowns['subscription:test:mcp-claude#work'] = {
+    offences: 1,
+    lastOffenceAt: linkedClaudeCooldownAt,
+    until: linkedClaudeCooldownAt + 3600000,
+    reason: 'rate_limited',
+    source: 'backoff',
+    scope: 'account',
+  };
+  fs.writeFileSync(cooldownsPath, JSON.stringify(allClaudeCooldowns, null, 2), 'utf8');
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  const explicitCoolingPreview = await client.callTool({
+    name: 'route_preview',
+    arguments: {
+      task: 'Review this JavaScript module despite the explicitly accepted cooldown probe.',
+      preferredProviders: ['claude'],
+      maxProviders: 1,
+    },
+  });
+  assert.equal(explicitCoolingPreview.isError, undefined,
+    JSON.stringify(explicitCoolingPreview.structuredContent));
+  assert.equal(explicitCoolingPreview.structuredContent.selected[0].kind, 'claude');
+  assert.equal(explicitCoolingPreview.structuredContent.fleetState.accountSelection.claude.reason, 'cooling');
+  assert.equal(explicitCoolingPreview.structuredContent.fleetState.accountSelection.claude.account, 'work');
+  const explicitCoolingDispatch = await client.callTool({
+    name: 'route_and_ask',
+    arguments: {
+      task: 'Review this JavaScript function despite the explicitly accepted cooldown probe.',
+      preferredProviders: ['claude'],
+      maxEscalations: 0,
+      useCache: false,
+    },
+  });
+  assert.equal(explicitCoolingDispatch.isError, undefined,
+    JSON.stringify(explicitCoolingDispatch.structuredContent));
+  assert.equal(explicitCoolingDispatch.structuredContent.winner.kind, 'claude');
+  assert.equal(explicitCoolingDispatch.structuredContent.winner.route.account, 'work');
 
   const datasheetPreview = await client.callTool({
     name: 'route_preview',
@@ -752,6 +868,39 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   assert.equal(preflightRejected.structuredContent.modelInvocation, false);
   assert.equal(preflightRejected.structuredContent.admissionLimited, false);
 
+  const accountRegistryPath = path.join(dataDir, 'accounts.json');
+  fs.writeFileSync(accountRegistryPath, '{ corrupt linked-account authority', 'utf8');
+  const corruptAccountRegistry = await client.callTool({
+    name: 'ask_provider',
+    arguments: { kind: 'account_pool', prompt: 'MUST_NOT_INVOKE_CORRUPT_ACCOUNT_POOL', useCache: false },
+  });
+  assert.equal(corruptAccountRegistry.isError, undefined, JSON.stringify(corruptAccountRegistry.structuredContent));
+  assert.equal(corruptAccountRegistry.structuredContent.failureClass, 'account_registry_invalid');
+  assert.equal(corruptAccountRegistry.structuredContent.modelInvocation, false);
+  assert.equal(corruptAccountRegistry.structuredContent.tokenUsageSource, 'not_invoked');
+  assert.equal(corruptAccountRegistry.structuredContent.transportRetryCount, 0);
+  assert.equal(corruptAccountRegistry.structuredContent.providerRetries.count, 0);
+  assert.match(corruptAccountRegistry.structuredContent.transportReceiptId, /^rcpt_/);
+  assert.equal(corruptAccountRegistry.structuredContent.transportReceiptPersisted, true);
+  fs.writeFileSync(accountRegistryPath, initialAccountsRegistryText, 'utf8');
+
+  const configBeforeRelocationDrift = fs.readFileSync(configPath, 'utf8');
+  const relocationDriftConfig = JSON.parse(configBeforeRelocationDrift);
+  delete relocationDriftConfig.account_pool.credential_env;
+  fs.writeFileSync(configPath, JSON.stringify(relocationDriftConfig), 'utf8');
+  const relocationDrift = await client.callTool({
+    name: 'ask_provider',
+    arguments: { kind: 'account_pool', prompt: 'MUST_NOT_INVOKE_RELOCATION_DRIFT', useCache: false },
+  });
+  assert.equal(relocationDrift.isError, undefined, JSON.stringify(relocationDrift.structuredContent));
+  assert.equal(relocationDrift.structuredContent.failureClass, 'account_configuration_invalid');
+  assert.equal(relocationDrift.structuredContent.modelInvocation, false);
+  assert.equal(relocationDrift.structuredContent.tokenUsageSource, 'not_invoked');
+  assert.equal(relocationDrift.structuredContent.transportRetryCount, 0);
+  assert.equal(relocationDrift.structuredContent.providerRetries.count, 0);
+  assert.match(relocationDrift.structuredContent.transportReceiptId, /^rcpt_/);
+  fs.writeFileSync(configPath, configBeforeRelocationDrift, 'utf8');
+
   const expectedCwdDiagnostic = {
     code: 'cwd_outside_allowed_roots',
     field: 'cwd',
@@ -866,6 +1015,20 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   assert.equal(routedProvider.isError, undefined, JSON.stringify(routedProvider.structuredContent));
   assert.equal(routedProvider.structuredContent.winner.kind, 'codex');
   assert.ok(routedProvider.structuredContent.winner.route.effective_timeout_ms > 300000);
+
+  const linkedClaudeRoute = await client.callTool({
+    name: 'route_and_ask',
+    arguments: {
+      task: 'Review this JavaScript function for a simple bug.',
+      preferredProviders: ['claude'],
+      maxEscalations: 0,
+      useCache: false,
+    },
+  });
+  assert.equal(linkedClaudeRoute.isError, undefined, JSON.stringify(linkedClaudeRoute.structuredContent));
+  assert.equal(linkedClaudeRoute.structuredContent.winner.kind, 'claude');
+  assert.equal(linkedClaudeRoute.structuredContent.winner.route.account, 'work');
+  assert.equal(linkedClaudeRoute.structuredContent.route.fleetState.accountSelection.claude.account, 'work');
 
   const gated = await client.callTool({
     name: 'ask_provider',

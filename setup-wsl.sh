@@ -36,7 +36,7 @@ elif ! command -v sudo >/dev/null 2>&1; then
   CAN_ROOT=0
 elif sudo -n true 2>/dev/null; then
   CAN_ROOT=1                      # passwordless
-elif [[ -t 0 ]] || [[ -r /dev/tty ]]; then
+elif [[ -t 0 ]] || (: < /dev/tty) 2>/dev/null; then
   CAN_ROOT=1; SUDO_PROMPTS=1      # sudo exists and there is a tty to prompt on
 else
   CAN_ROOT=0                      # piped install, password required: cannot ask

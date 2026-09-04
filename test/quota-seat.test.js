@@ -6,7 +6,8 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { buildQuotaSeatGroups } = require('../lib/quota-seat');
+const { buildQuotaSeatGroups, BASE_QUOTA_SEAT_RE, QUOTA_SEAT_RE } = require('../lib/quota-seat');
+const { quotaSeatForAccount } = require('../lib/provider-accounts');
 const { createUsageLedger } = require('../lib/usage-ledger');
 const {
   fleetBalance, applyCooldownsToDiagnostics, applyVendorQuotaExhaustionToDiagnostics,
@@ -24,6 +25,24 @@ test('quota grouping is explicit and does not infer shared accounts from transpo
   });
   assert.deepEqual(result.groups[GROUP].providers, ['claude', 'claude_fable']);
   assert.equal(result.providerToQuotaSeat.second_account, 'second_account');
+});
+
+test('configured and generated quota-seat namespaces cannot collide', () => {
+  const invalidDeclared = 'subscription:anthropic:default#work';
+  const result = buildQuotaSeatGroups({
+    claude: { quota_seat: invalidDeclared },
+    other: { quota_seat: 'subscription:anthropic:default' },
+  });
+  assert.equal(result.providerToQuotaSeat.claude, 'claude', 'configured bases may not claim generated account ids');
+  assert.equal(BASE_QUOTA_SEAT_RE.test(invalidDeclared), false);
+  const longestBase = `s${'a'.repeat(127)}`;
+  const longestId = `i${'b'.repeat(63)}`;
+  const generated = quotaSeatForAccount(longestBase, longestId);
+  assert.equal(generated.length, 193);
+  assert.equal(QUOTA_SEAT_RE.test(generated), true);
+  assert.throws(() => quotaSeatForAccount(`${longestBase}x`, 'work'), /base quota seat/);
+  assert.equal(QUOTA_SEAT_RE.test(`${longestBase}#${longestId}x`), false);
+  assert.equal(QUOTA_SEAT_RE.test('base#work#collision'), false);
 });
 
 test('Claude aliases share configured fuel and burn while retaining per-model detail', () => {

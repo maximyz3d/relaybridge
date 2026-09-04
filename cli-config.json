@@ -1,7 +1,7 @@
 {
   "_comment": "Per-CLI config. 'safe'/'dangerous' launch interactive sessions. 'oneshot_safe'/'oneshot_dangerous' power Collab Mode. Every safe one-shot requires oneshot_safe_filesystem_policy: read_only_enforced, isolated_home, or unverified_provider_policy (fail closed). Use {prompt} for a bounded inline prompt, {prompt_file} when the CLI supports a file, or no placeholder to pipe stdin. 'oneshot_env' applies validated string environment overrides only to one-shot children. 'probe' is a non-mutating readiness check. Edit freely.",
   "_config_merge": {
-    "_note": "Installer-owned values that must follow shipped safety policy across upgrades. managed_provider_args refreshes only the named flag/value slices of a launch array. managed_supervisor_budget_fields replaces a _supervisor.providerBudget field only when the installed value is exactly one of that field's retired shipped defaults; any other installed value is an operator choice and is preserved. Operator models, extra arguments, provider fields, and unknown providers remain preserved.",
+    "_note": "Installer-owned values that must follow shipped safety policy across upgrades. managed_provider_args refreshes only the named flag/value slices of a launch array. managed_supervisor_budget_fields replaces a _supervisor.providerBudget field only when the installed value is exactly one of that field's retired shipped defaults. managed_credential_relocations replaces only a declared retired shipped credential shape, managed_login_commands replaces only an exact retired shipped command, and managed_required_strip_env unions the shipped identity-isolation variables into known providers while preserving operator extras. Any other installed value is an operator choice and is preserved. Operator models, extra arguments, provider fields, and unknown providers remain preserved.",
     "managed_supervisor_budget_fields": {
       "maxTurns": {
         "retired_values": [
@@ -38,7 +38,32 @@
           }
         ]
       }
-    }
+    },
+    "managed_credential_relocations": {
+      "copilot": {
+        "retired_env_without_markers": "GH_CONFIG_DIR",
+        "retired_pair": {
+          "credential_env": "GH_CONFIG_DIR",
+          "credential_markers": [
+            "hosts.yml"
+          ]
+        }
+      }
+    },
+    "managed_login_commands": {
+      "copilot": {
+        "retired_command": [
+          "copilot",
+          "/login"
+        ]
+      }
+    },
+    "managed_required_strip_env": [
+      "claude",
+      "claude_fable",
+      "codex",
+      "copilot"
+    ]
   },
   "_supervisor": {
     "_note": "Liveness policy for provider runs. Runs are judged by progress, not by the clock: while new content keeps arriving a run is left alone to finish, and it is stopped early with a reason when it goes silent or starts repeating. idleMs is generous because print-mode CLIs buffer their whole answer and emit nothing until the end. providerBudget gates on authoritative provider-reported usage only; null disables one dimension. maxTurns ships as null because an agentic CLI spends a turn per tool call, so a turn count measures neither cost nor liveness. Set a positive number here, on a provider entry, or per request when you do want a turn ceiling. Any provider entry may override these with its own \"supervisor\" object.",
@@ -91,6 +116,9 @@
   },
   "claude": {
     "credential_env": "CLAUDE_CONFIG_DIR",
+    "credential_markers": [
+      ".credentials.json"
+    ],
     "label": "Claude Code",
     "oneshot_safe_filesystem_policy": "unverified_provider_policy",
     "supervisor": {
@@ -204,6 +232,7 @@
       "auth",
       "status"
     ],
+    "probe_auth_authoritative": true,
     "probe_redact": true,
     "probe_success_detail": "authenticated Claude subscription session",
     "version_probe": [
@@ -214,6 +243,7 @@
       "ANTHROPIC_API_KEY",
       "ANTHROPIC_AUTH_TOKEN",
       "ANTHROPIC_BASE_URL",
+      "CLAUDE_CODE_OAUTH_TOKEN",
       "CLAUDE_CODE_USE_BEDROCK",
       "CLAUDE_CODE_USE_VERTEX",
       "CLAUDE_CODE_USE_FOUNDRY"
@@ -222,6 +252,9 @@
   },
   "claude_fable": {
     "credential_env": "CLAUDE_CONFIG_DIR",
+    "credential_markers": [
+      ".credentials.json"
+    ],
     "label": "Claude Fable 5",
     "oneshot_safe_filesystem_policy": "unverified_provider_policy",
     "supervisor": {
@@ -308,6 +341,7 @@
       "auth",
       "status"
     ],
+    "probe_auth_authoritative": true,
     "probe_redact": true,
     "probe_success_detail": "authenticated Claude subscription session; Fable alias is accepted by the installed CLI",
     "version_probe": [
@@ -318,6 +352,7 @@
       "ANTHROPIC_API_KEY",
       "ANTHROPIC_AUTH_TOKEN",
       "ANTHROPIC_BASE_URL",
+      "CLAUDE_CODE_OAUTH_TOKEN",
       "CLAUDE_CODE_USE_BEDROCK",
       "CLAUDE_CODE_USE_VERTEX",
       "CLAUDE_CODE_USE_FOUNDRY"
@@ -327,6 +362,9 @@
   },
   "codex": {
     "credential_env": "CODEX_HOME",
+    "credential_markers": [
+      "auth.json"
+    ],
     "label": "Codex",
     "oneshot_safe_filesystem_policy": "unverified_provider_policy",
     "effort_flags": {
@@ -418,6 +456,7 @@
       "login",
       "status"
     ],
+    "probe_auth_authoritative": true,
     "probe_success_detail": "authenticated ChatGPT Codex session",
     "version_probe": [
       "codex",
@@ -426,17 +465,23 @@
     "strip_env": [
       "OPENAI_API_KEY",
       "CODEX_API_KEY",
+      "CODEX_ACCESS_TOKEN",
       "OPENAI_BASE_URL"
     ],
     "npm_package": "@openai/codex"
   },
   "copilot": {
-    "credential_env": "GH_CONFIG_DIR",
+    "credential_env": "COPILOT_HOME",
+    "credential_markers": [
+      "config.json"
+    ],
+    "linked_accounts_supported": false,
+    "linked_accounts_unavailable_reason": "Copilot auto-login can borrow OS or GitHub CLI OAuth outside COPILOT_HOME, while --no-auto-login also disables the selected stored OAuth. Profile-directory pooling is not attribution-safe; use the implicit default account until per-account token transport is implemented.",
     "label": "GitHub Copilot CLI",
     "oneshot_safe_filesystem_policy": "unverified_provider_policy",
     "login_command": [
       "copilot",
-      "/login"
+      "login"
     ],
     "tags": [
       "coding"
@@ -465,6 +510,7 @@
       "copilot",
       "--version"
     ],
+    "probe_auth_authoritative": false,
     "probe_success_detail": "GitHub Copilot CLI is installed; authentication and workspace trust are verified by the first live receipt",
     "version_probe": [
       "copilot",
@@ -472,8 +518,29 @@
     ],
     "strip_env": [
       "COPILOT_GITHUB_TOKEN",
+      "GITHUB_COPILOT_API_TOKEN",
+      "GITHUB_COPILOT_GITHUB_TOKEN",
       "GH_TOKEN",
-      "GITHUB_TOKEN"
+      "GITHUB_TOKEN",
+      "GH_ENTERPRISE_TOKEN",
+      "GITHUB_ENTERPRISE_TOKEN",
+      "GH_HOST",
+      "COPILOT_PROVIDER_BASE_URL",
+      "COPILOT_PROVIDER_TYPE",
+      "COPILOT_PROVIDER_API_KEY",
+      "COPILOT_PROVIDER_BEARER_TOKEN",
+      "COPILOT_PROVIDER_WIRE_API",
+      "COPILOT_PROVIDER_TRANSPORT",
+      "COPILOT_PROVIDER_AZURE_API_VERSION",
+      "COPILOT_PROVIDER_MODEL_ID",
+      "COPILOT_PROVIDER_WIRE_MODEL",
+      "COPILOT_PROVIDER_MODEL_LIMITS_ID",
+      "COPILOT_PROVIDER_MAX_PROMPT_TOKENS",
+      "COPILOT_PROVIDER_MAX_OUTPUT_TOKENS",
+      "COPILOT_PROVIDER_HEADERS",
+      "COPILOT_MODEL",
+      "COPILOT_OFFLINE",
+      "COPILOT_ENABLE_ALT_PROVIDERS"
     ],
     "npm_package": "@github/copilot",
     "install_command": [
@@ -483,7 +550,7 @@
       "@github/copilot"
     ],
     "install_display": "npm install -g @github/copilot  # or: winget install GitHub.Copilot",
-    "post_install": "Run copilot once, use /login if prompted, and trust only workspaces you want Copilot CLI to inspect.",
+    "post_install": "Run copilot login, then trust only workspaces you want Copilot CLI to inspect.",
     "docs_url": "https://docs.github.com/en/copilot/how-tos/copilot-cli/use-copilot-cli/overview",
     "_note": "The official CLI supports copilot --prompt for direct prompts and Copilot CLI custom agents. RelayBridge runs it in bounded one-shot mode; mutating tool approval remains governed by Copilot CLI."
   },

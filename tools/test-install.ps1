@@ -49,8 +49,11 @@ function Get-FreePort {
 function Invoke-TestInstall([string]$FailAt = '', [switch]$Start, [int]$Port = 0) {
   if (-not $Port) { $Port = Get-FreePort }
   $previousFailAt = $env:RELAYBRIDGE_INSTALL_TEST_FAIL_AT
+  $previousErrorFile = $env:RELAYBRIDGE_INSTALL_TEST_ERROR_FILE
+  $errorFile = Join-Path $testRoot ('install-error-' + [Guid]::NewGuid().ToString('N') + '.txt')
   try {
     $env:RELAYBRIDGE_INSTALL_TEST_FAIL_AT = $FailAt
+    $env:RELAYBRIDGE_INSTALL_TEST_ERROR_FILE = $errorFile
     $arguments = @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $installer,
       '-SourceDir', $repoRoot, '-InstallDir', $installRoot, '-SkipProviderSetup', '-SkipCliPathRegistration', '-NoBrowser', '-Port', [string]$Port)
     if (-not $Start) { $arguments += '-NoStart' }
@@ -62,18 +65,21 @@ function Invoke-TestInstall([string]$FailAt = '', [switch]$Start, [int]$Port = 0
     $proc.WaitForExit()
     $exitCode = [int]$proc.ExitCode
     $proc.Dispose()
-    return [pscustomobject]@{ ExitCode = $exitCode; Port = $Port }
+    $diagnostic = if (Test-Path -LiteralPath $errorFile -PathType Leaf) {
+      [IO.File]::ReadAllText($errorFile, [Text.UTF8Encoding]::new($false)).Trim()
+    } else { '' }
+    return [pscustomobject]@{ ExitCode = $exitCode; Port = $Port; Diagnostic = $diagnostic }
   } finally {
     $env:RELAYBRIDGE_INSTALL_TEST_FAIL_AT = $previousFailAt
+    $env:RELAYBRIDGE_INSTALL_TEST_ERROR_FILE = $previousErrorFile
   }
 }
 
-# Issue #82: the shipped provider turn ceiling has to be correctable by an
-# upgrade, because config preservation otherwise keeps the installed copy
-# forever. The migration must be exactly as narrow as it claims: it may replace
-# the retired shipped value and nothing else. The full install below proves the
-# end-to-end path; these cases exercise the branches one install cannot reach
-# at once, by loading the real functions straight out of install.ps1.
+# Shipped release metadata has to be correctable by an upgrade, because config
+# preservation otherwise keeps an installed mistake forever. Each migration
+# must be exactly as narrow as it claims. The full install below proves the
+# end-to-end path; these cases exercise branches one install cannot reach at
+# once, by loading the real functions straight out of install.ps1.
 function Get-InstallerFunctionText([string[]]$Names) {
   # Dot-sourcing has to happen in the script scope, so hand the caller the text
   # rather than defining the functions inside this one and losing them on return.
@@ -105,7 +111,79 @@ function Test-BudgetMigration([string]$InstalledBudgetJson) {
   return (Restore-ShippedManagedSupervisorBudget $merged $defaults $existing)._supervisor.providerBudget
 }
 
-. ([scriptblock]::Create((Get-InstallerFunctionText @('Test-RetiredJsonNumber', 'Format-JsonScalar', 'Restore-ShippedManagedSupervisorBudget'))))
+function Test-CopilotMetadataMigration([string]$InstalledProviderJson) {
+  $defaults = @'
+{
+  "_config_merge": {
+    "managed_credential_relocations": {
+      "copilot": {
+        "retired_env_without_markers": "GH_CONFIG_DIR",
+        "retired_pair": { "credential_env": "GH_CONFIG_DIR", "credential_markers": ["hosts.yml"] }
+      }
+    },
+    "managed_login_commands": {
+      "copilot": { "retired_command": ["copilot", "/login"] }
+    }
+  },
+  "copilot": {
+    "credential_env": "COPILOT_HOME",
+    "credential_markers": ["config.json"],
+    "login_command": ["copilot", "login"]
+  }
+}
+'@ | ConvertFrom-Json
+  $installedJson = '{ "copilot": ' + $InstalledProviderJson + ' }'
+  $existing = $installedJson | ConvertFrom-Json
+  $merged = $installedJson | ConvertFrom-Json
+  $merged = Restore-ShippedCredentialRelocation $merged $defaults $existing
+  return (Restore-ShippedManagedLoginCommands $merged $defaults $existing).copilot
+}
+
+function Test-RequiredStripEnvMigration([string]$InstalledStripEnvJson) {
+  $defaults = @'
+{
+  "_config_merge": { "managed_required_strip_env": ["copilot"] },
+  "copilot": { "strip_env": ["GITHUB_TOKEN", "GITHUB_COPILOT_API_TOKEN", "COPILOT_PROVIDER_BASE_URL"] }
+}
+'@ | ConvertFrom-Json
+  $installedJson = '{ "copilot": { "strip_env": ' + $InstalledStripEnvJson + ' } }'
+  $merged = $installedJson | ConvertFrom-Json
+  return (Restore-ShippedRequiredStripEnv $merged $defaults).copilot.strip_env
+}
+
+. ([scriptblock]::Create((Get-InstallerFunctionText @(
+  'Test-ExactJsonStringArray', 'Restore-ShippedCredentialRelocation', 'Restore-ShippedManagedLoginCommands',
+  'Restore-ShippedRequiredStripEnv',
+  'Test-RetiredJsonNumber', 'Format-JsonScalar', 'Restore-ShippedManagedSupervisorBudget'
+))))
+
+$retiredCopilot = Test-CopilotMetadataMigration '{ "credential_env": "GH_CONFIG_DIR", "credential_markers": ["hosts.yml"], "login_command": ["copilot", "/login"] }'
+Assert-True ($retiredCopilot.credential_env -ceq 'COPILOT_HOME') 'the exact retired Copilot environment variable must migrate'
+Assert-True ((Test-ExactJsonStringArray $retiredCopilot.credential_markers @('config.json'))) 'the exact retired Copilot marker must migrate'
+Assert-True ((Test-ExactJsonStringArray $retiredCopilot.login_command @('copilot', 'login'))) 'the exact retired Copilot login command must migrate'
+
+$releasedCopilot = Test-CopilotMetadataMigration '{ "credential_env": "GH_CONFIG_DIR", "login_command": ["copilot", "/login"] }'
+Assert-True ($releasedCopilot.credential_env -ceq 'COPILOT_HOME') 'the released Copilot declaration without markers must migrate'
+Assert-True ((Test-ExactJsonStringArray $releasedCopilot.credential_markers @('config.json'))) 'the released Copilot declaration must gain the real marker'
+
+$customCopilotEnv = Test-CopilotMetadataMigration '{ "credential_env": "OPERATOR_COPILOT_HOME", "credential_markers": ["hosts.yml"], "login_command": ["copilot", "/login"] }'
+Assert-True ($customCopilotEnv.credential_env -ceq 'OPERATOR_COPILOT_HOME') 'a custom Copilot environment variable must be preserved'
+Assert-True ((Test-ExactJsonStringArray $customCopilotEnv.credential_markers @('hosts.yml'))) 'a partially edited relocation pair must remain operator-owned'
+
+$customCopilotMarkers = Test-CopilotMetadataMigration '{ "credential_env": "GH_CONFIG_DIR", "credential_markers": ["hosts.yml", "operator.json"], "login_command": ["copilot", "/login"] }'
+Assert-True ($customCopilotMarkers.credential_env -ceq 'GH_CONFIG_DIR') 'the retired environment variable must not migrate beside custom markers'
+Assert-True ((Test-ExactJsonStringArray $customCopilotMarkers.credential_markers @('hosts.yml', 'operator.json'))) 'custom Copilot markers must be preserved'
+
+$customCopilotLogin = Test-CopilotMetadataMigration '{ "credential_env": "GH_CONFIG_DIR", "credential_markers": ["hosts.yml"], "login_command": ["operator-wrapper", "copilot-login"] }'
+Assert-True ((Test-ExactJsonStringArray $customCopilotLogin.login_command @('operator-wrapper', 'copilot-login'))) 'a custom Copilot login command must be preserved'
+Write-Host '[RelayBridge] Managed Copilot metadata migration cases passed.' -ForegroundColor DarkGray
+
+$requiredStrip = @(Test-RequiredStripEnvMigration '["GITHUB_TOKEN", "OPERATOR_EXTRA"]')
+Assert-True (($requiredStrip -join ',') -ceq 'GITHUB_TOKEN,OPERATOR_EXTRA,GITHUB_COPILOT_API_TOKEN,COPILOT_PROVIDER_BASE_URL') 'required environment exclusions must append without replacing operator extras'
+$caseInsensitiveStrip = @(Test-RequiredStripEnvMigration '["github_token", "GITHUB_COPILOT_API_TOKEN", "COPILOT_PROVIDER_BASE_URL"]')
+Assert-True ($caseInsensitiveStrip.Count -eq 3) 'a differently-cased exclusion must not be duplicated on Windows'
+Assert-True ($caseInsensitiveStrip[0] -ceq 'github_token') 'the operator spelling and order of an existing exclusion must be preserved'
+Write-Host '[RelayBridge] Required provider environment-exclusion migration cases passed.' -ForegroundColor DarkGray
 
 $retired = Test-BudgetMigration '{ "maxOutputTokens": 100000, "maxTurns": 24 }'
 Assert-True ($null -eq $retired.maxTurns) 'the exact retired shipped turn ceiling must migrate to the release default'
@@ -194,12 +272,22 @@ server.listen(port, '127.0.0.1');
       model_tiers = [ordered]@{
         standard = [ordered]@{ args = @('--model', 'operator-custom-model'); model = 'operator-custom-model' }
       }
+      strip_env = @('ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'OPERATOR_CLAUDE_SECRET')
     }
     claude_fable = [ordered]@{
       safe = @('claude', '--permission-mode', 'plan', '--model', 'operator-fable-model', '--effort', 'max')
       dangerous = @('claude', '--model', 'operator-fable-model', '--effort', 'max', '--dangerously-skip-permissions')
       oneshot_safe = @('claude', '-p', '--output-format', 'stream-json', '--verbose', '--include-partial-messages', '--permission-mode', 'plan', '--model', 'operator-fable-model', '--effort', 'max')
       oneshot_dangerous = @('claude', '-p', '--output-format', 'stream-json', '--verbose', '--include-partial-messages', '--model', 'operator-fable-model', '--effort', 'max', '--dangerously-skip-permissions')
+      strip_env = @('ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY')
+    }
+    codex = [ordered]@{
+      strip_env = @('OPENAI_API_KEY', 'CODEX_API_KEY', 'OPENAI_BASE_URL')
+    }
+    copilot = [ordered]@{
+      credential_env = 'GH_CONFIG_DIR'
+      login_command = @('copilot', '/login')
+      strip_env = @('COPILOT_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN', 'OPERATOR_COPILOT_SECRET')
     }
     custom_provider = [ordered]@{
       label = 'Private Operator Provider'
@@ -244,7 +332,9 @@ server.listen(port, '127.0.0.1');
   $legacyPort = 0
 
   $success = Invoke-TestInstall -Start
-  if ($success.ExitCode -ne 0) { throw "Installer success case failed with exit code $($success.ExitCode)." }
+  if ($success.ExitCode -ne 0) {
+    throw "Installer success case failed with exit code $($success.ExitCode). $($success.Diagnostic)"
+  }
   $startedPort = $success.Port
   Assert-True (Test-Path -LiteralPath (Join-Path $installRoot 'server.js') -PathType Leaf) 'new server.js must be promoted'
   Assert-True (Test-Path -LiteralPath (Join-Path $installRoot 'relaybridge.cmd') -PathType Leaf) 'Windows CLI shim must be promoted'
@@ -285,7 +375,18 @@ server.listen(port, '127.0.0.1');
   Assert-True ($merged.claude_fable.safe[[Array]::IndexOf(@($merged.claude_fable.safe), '--model') + 1] -eq 'operator-fable-model') 'managed-argument migration must preserve the Fable model choice'
   Assert-True ($merged.cursor.tags[0] -eq 'custom-routing') 'operator routing tags must be preserved'
   Assert-True ($merged.cursor.probe_expect -eq 'Logged in as') 'missing release fields must be added to existing providers'
-  Assert-True ($null -ne $merged.copilot) 'new release providers must be added'
+  Assert-True ($merged.copilot.credential_env -ceq 'COPILOT_HOME') 'the installed retired Copilot environment variable must migrate end-to-end'
+  Assert-True ((Test-ExactJsonStringArray $merged.copilot.credential_markers @('config.json'))) 'the installed retired Copilot marker must migrate end-to-end'
+  Assert-True ((Test-ExactJsonStringArray $merged.copilot.login_command @('copilot', 'login'))) 'the installed retired Copilot login command must migrate end-to-end'
+  Assert-True ($merged.copilot.linked_accounts_supported -eq $false) 'upgrades must disable unsafe profile-only Copilot account pooling'
+  $shippedConfig = [IO.File]::ReadAllText((Join-Path $repoRoot 'cli-config.json'), [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
+  foreach ($providerName in @('claude', 'claude_fable', 'codex', 'copilot')) {
+    foreach ($requiredName in @($shippedConfig.$providerName.strip_env)) {
+      Assert-True (@($merged.$providerName.strip_env) -contains $requiredName) "$providerName must gain required identity exclusion $requiredName on upgrade"
+    }
+  }
+  Assert-True (@($merged.claude.strip_env) -contains 'OPERATOR_CLAUDE_SECRET') 'required exclusions must preserve a Claude operator extra'
+  Assert-True (@($merged.copilot.strip_env) -contains 'OPERATOR_COPILOT_SECRET') 'required exclusions must preserve a Copilot operator extra'
   Assert-True ($merged.custom_provider.label -eq 'Private Operator Provider') 'unknown operator providers must be preserved'
   $routing = [IO.File]::ReadAllText((Join-Path $installRoot 'config\routing-policy.json'), [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
   Assert-True ($routing.operatorNote -eq 'preserve me') 'operator routing-policy fields must be preserved'

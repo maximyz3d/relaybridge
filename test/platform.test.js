@@ -43,7 +43,14 @@ test('platform detection is coherent', () => {
 test('WSL bootstrap installs the active Linux port, not the retired fuel-gauge branch', () => {
   const setup = fs.readFileSync(path.join(__dirname, '..', 'setup-wsl.sh'), 'utf8');
   assert.doesNotMatch(setup, /BRANCH=.*feat\/usage-fuel-gauge/);
-  assert.match(setup, /BRANCH="\$\{RELAYBRIDGE_BRANCH:-feat\/wsl-port-on-main\}"/);
+  assert.match(setup, /BRANCH="\$\{RELAYBRIDGE_BRANCH:-main\}"/);
+});
+
+test('WSL bootstrap verifies that /dev/tty opens before allowing sudo to prompt', () => {
+  const setup = fs.readFileSync(path.join(__dirname, '..', 'setup-wsl.sh'), 'utf8');
+  assert.doesNotMatch(setup, /\[\[ -r \/dev\/tty \]\]/,
+    'device permissions do not prove this process owns a controlling terminal');
+  assert.match(setup, /\(: < \/dev\/tty\) 2>\/dev\/null/);
 });
 
 // ---- shells ----------------------------------------------------------------

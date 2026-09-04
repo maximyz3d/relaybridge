@@ -72,6 +72,24 @@ test('shadow and metered cost are reported separately so a plan\'s value is visi
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+test('a null provider cost stays unknown and falls back to the pricing estimate', () => {
+  const dir = tmp();
+  const ledger = createUsageLedger({ dataDir: dir });
+  const estimated = ledger.record({
+    seat: 'claude', model: 'claude-sonnet-4-6', costClass: 'subscription',
+    inputTokens: 1e6, outputTokens: 0, providerCostUsd: null,
+  });
+  assert.equal(estimated.costSource, 'estimated');
+  assert.equal(estimated.costUsd, 3);
+  const zero = ledger.record({
+    seat: 'claude', model: 'claude-sonnet-4-6', costClass: 'subscription',
+    inputTokens: 1e6, outputTokens: 0, providerCostUsd: 0,
+  });
+  assert.equal(zero.costSource, 'provider', 'a real numeric zero remains authoritative');
+  assert.equal(zero.costUsd, 0);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 test('a malformed ledger line is skipped rather than crashing the gauge', () => {
   const dir = tmp();
   const l = createUsageLedger({ dataDir: dir });
@@ -115,6 +133,52 @@ test('burn rate projects time-to-empty from actual usage', () => {
   assert.equal(g.percentRemaining, 80);
   assert.ok(g.burn.tokensPerHour > 0, 'burn rate must be measured');
   assert.ok(g.hoursToEmpty > 0, 'a projection must exist when burning against a budget');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('linked-account quota seats retain usage, burn rate, and explicit quota evidence', () => {
+  const dir = tmp();
+  const baseSeat = 'subscription:anthropic:default';
+  const accountSeat = `${baseSeat}#work`;
+  const ledger = createUsageLedger({
+    dataDir: dir,
+    budgets: { [baseSeat]: { tokensPerDay: 1000 } },
+    quotaSeats: { claude: baseSeat },
+  });
+  ledger.record({
+    seat: 'claude', quotaSeat: accountSeat, model: 'claude-sonnet-4-6',
+    costClass: 'subscription', inputTokens: 50, outputTokens: 50,
+  });
+  let gauge = ledger.gauge('claude#work', {
+    quotaSeat: accountSeat, aliases: ['claude'], costClass: 'subscription',
+  });
+  assert.equal(gauge.used.totalTokens, 100);
+  assert.ok(gauge.burn.tokensPerHour > 0, 'burn rate must use the selected account quota seat');
+  assert.ok(gauge.hoursToEmpty > 0);
+
+  const observedAt = new Date();
+  const operator = ledger.observeOperatorQuota({
+    quotaSeat: accountSeat, percentRemaining: 45, source: 'operator_reported',
+    provenance: 'human_account_owner', observedAt: observedAt.toISOString(),
+    expiresAt: new Date(observedAt.getTime() + 3600000).toISOString(),
+  });
+  assert.equal(operator.quotaSeat, accountSeat,
+    'the generated account delimiter must be valid under the ledger contract');
+
+  const vendor = ledger.observeVendorQuota({
+    provider: 'claude', quotaSeat: accountSeat, model: 'claude-sonnet-4-6',
+    scope: 'account', unit: 'tokens', actual: 90, limit: 100,
+    observedAt: observedAt.toISOString(),
+    reset: { expiresAt: new Date(observedAt.getTime() + 3600000).toISOString() },
+  });
+  assert.equal(vendor.quotaSeat, accountSeat);
+  gauge = ledger.gauge('claude#work', {
+    quotaSeat: accountSeat, aliases: ['claude'], costClass: 'subscription',
+  });
+  assert.equal(gauge.vendorQuota.quotaSeat, accountSeat);
+  assert.equal(gauge.percentRemaining, 10);
+  assert.equal(ledger.gauge('claude', { quotaSeat: baseSeat, costClass: 'subscription' }).vendorQuota, null,
+    'one linked account must not contaminate the base account gauge');
   fs.rmSync(dir, { recursive: true, force: true });
 });
 

@@ -7,9 +7,10 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
-  classifyRunFailure, detectCopilotMonthlyQuota,
+  classifyRunFailure, classifyProviderHttpFailure, detectCopilotMonthlyQuota,
   detectCursorActionRequired, detectPerplexityNoAnswerSentinel,
-  isHeadlessCommandPermissionDenial, isNarrationOnlyResponse, seatToleratesLongRuns,
+  isHeadlessCommandPermissionDenial, isHostedApiKeyMissingError,
+  isNarrationOnlyResponse, seatToleratesLongRuns, HOSTED_API_KEY_MISSING_CODE,
 } = require('../lib/provider-failure');
 
 const CURSOR_NAMED_MODELS = 'ActionRequiredError: Named models unavailable Free plans can only use Auto. Switch to Auto or upgrade plans to continue.';
@@ -249,6 +250,25 @@ test('quota text wins over a generic 403 auth signature', () => {
   assert.equal(v.failUp, true);
 });
 
+test('HTTP 403 requires typed response detail before changing account authority', () => {
+  assert.equal(classifyProviderHttpFailure(401, ''), 'auth');
+  assert.equal(classifyProviderHttpFailure(403, 'HTTP 403: quota exceeded for this subscription'), 'rate_limit');
+  assert.equal(classifyProviderHttpFailure(403, 'Credit budget exhausted'), 'budget');
+  assert.equal(classifyProviderHttpFailure(403, 'Not logged in. Please run /login'), 'auth');
+  assert.equal(classifyProviderHttpFailure(403, 'Forbidden: permission denied for this organization'), 'permission');
+  assert.equal(classifyProviderHttpFailure(403, ''), 'provider_error');
+  assert.notEqual(classifyRunFailure({ stderr: '403', exitCode: 1 }).kind, 'auth_failed',
+    'a bare forbidden status is not proof that credentials are invalid');
+});
+
+test('hosted transport errors never infer authentication from numeric lookalikes', () => {
+  assert.equal(isHostedApiKeyMissingError(new Error('connect ECONNREFUSED 127.0.0.1:4010')), false);
+  assert.equal(isHostedApiKeyMissingError(new Error('proxy route /403/status was unreachable')), false);
+  const missingKey = new Error('hosted provider key is not set');
+  missingKey.code = HOSTED_API_KEY_MISSING_CODE;
+  assert.equal(isHostedApiKeyMissingError(missingKey), true);
+});
+
 test('overload is the one class worth retrying', () => {
   const v = classifyRunFailure({ stderr: 'Error 529: overloaded', exitCode: 1 });
   assert.equal(v.kind, 'overloaded');
@@ -258,7 +278,27 @@ test('overload is the one class worth retrying', () => {
 test('auth and missing-binary failures are distinguished from task failures', () => {
   assert.equal(classifyRunFailure({ stderr: '401 Unauthorized', exitCode: 1 }).kind, 'auth_failed');
   assert.equal(classifyRunFailure({ stderr: 'Please run `gemini auth login`', exitCode: 1 }).kind, 'auth_failed');
+  assert.notEqual(classifyRunFailure({
+    stderr: 'MCP server docs: authentication required; MCP OAuth token expired; Sign in to enable search',
+    exitCode: 1,
+  }).kind, 'auth_failed', 'auxiliary-service auth warnings are not provider-account evidence');
   assert.equal(classifyRunFailure({ stderr: "spawn gemini ENOENT", exitCode: 1 }).kind, 'not_installed');
+});
+
+test('Copilot signed-out terminal lines are provider-specific auth evidence', () => {
+  for (const stderr of [
+    'Error: No authentication information found.\nRun copilot login to authenticate.',
+    'Not authenticated. Please authenticate first.',
+    'Error: chat requires authentication. Please sign in first with: copilot login',
+  ]) {
+    assert.equal(classifyRunFailure({ provider: 'copilot', stderr, exitCode: 1 }).kind, 'auth_failed');
+    assert.notEqual(classifyRunFailure({ provider: 'claude', stderr, exitCode: 1 }).kind, 'auth_failed');
+  }
+  assert.notEqual(classifyRunFailure({
+    provider: 'copilot',
+    stderr: 'MCP server docs: authentication required; Please sign in first with: copilot login',
+    exitCode: 1,
+  }).kind, 'auth_failed');
 });
 
 test('a successful run is not pattern-matched into a failure', () => {

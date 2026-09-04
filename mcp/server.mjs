@@ -18,7 +18,7 @@ import {
   startBridge,
   stopBridge,
 } from './bridge-client.mjs';
-import { classifyTask, estimateTokens, loadRoutingData, routeTask } from './router.mjs';
+import { classifyTask, estimateTokens, loadRoutingData } from './router.mjs';
 import {
   appendReceipt as persistReceipt,
   findReceiptByRequestId,
@@ -211,6 +211,7 @@ function providerSummaries(diagnostics = {}) {
         found: diag.found ?? null,
         ready: diag.ready ?? null,
         safeReady: diag.safeReady ?? null,
+        accountSelection: diag.accountSelection || null,
         detail: diag.detail || '',
         path: Array.isArray(diag.paths) ? diag.paths[0] || null : null,
         runtimeVersion: diag.runtimeVersion || null,
@@ -232,7 +233,11 @@ function providerSummaries(diagnostics = {}) {
 }
 
 const DIAGNOSTIC_CACHE_TTL_MS = Math.max(0, Math.min(Number(envFirst('RELAYBRIDGE_DIAGNOSTIC_CACHE_TTL_MS', 'PS_BRIDGE_DIAGNOSTIC_CACHE_TTL_MS')) || 5000, 60000));
-const DIAGNOSTIC_UPSTREAM_TIMEOUT_MS = 30000;
+// /api/diag runs each provider's auth and version probes concurrently. The
+// longest legal probe is 30s, and runProbe reserves 2s for a child that does
+// not emit close after termination; keep a small transport margin above both.
+export const DIAGNOSTIC_UPSTREAM_TIMEOUT_MS = 35000;
+export const ACCOUNT_AWARE_ROUTE_TIMEOUT_MS = DIAGNOSTIC_UPSTREAM_TIMEOUT_MS + 10000;
 let diagnosticCache = null;
 let diagnosticFlight = null;
 
@@ -252,9 +257,13 @@ function startDiagnosticFlight() {
     timeoutMs: DIAGNOSTIC_UPSTREAM_TIMEOUT_MS,
     signal: controller.signal,
   }).then((response) => {
-    const value = response.results || {};
-    diagnosticCache = { at: Date.now(), value };
-    return value;
+    // REST retains raw transport/auth diagnostics separately, while this
+    // projection reflects the linked account, cooldown, and authoritative
+    // vendor-quota state that routing will actually enforce.
+    const value = response.routing?.results || response.results || {};
+    const raw = response.results || value;
+    diagnosticCache = { at: Date.now(), value, raw };
+    return diagnosticCache;
   }).finally(() => {
     flight.settled = true;
     if (diagnosticFlight === flight) diagnosticFlight = null;
@@ -266,9 +275,11 @@ function startDiagnosticFlight() {
   return flight;
 }
 
-async function getDiagnostics(signal, timeoutMs = DIAGNOSTIC_UPSTREAM_TIMEOUT_MS) {
+async function getDiagnostics(signal, timeoutMs = DIAGNOSTIC_UPSTREAM_TIMEOUT_MS, { raw = false } = {}) {
   if (signal?.aborted) throw signal.reason || new Error('diagnostic request cancelled');
-  if (diagnosticCache && Date.now() - diagnosticCache.at <= DIAGNOSTIC_CACHE_TTL_MS) return diagnosticCache.value;
+  if (diagnosticCache && Date.now() - diagnosticCache.at <= DIAGNOSTIC_CACHE_TTL_MS) {
+    return raw ? diagnosticCache.raw : diagnosticCache.value;
+  }
 
   if (!diagnosticFlight) diagnosticFlight = startDiagnosticFlight();
 
@@ -302,11 +313,65 @@ async function getDiagnostics(signal, timeoutMs = DIAGNOSTIC_UPSTREAM_TIMEOUT_MS
     callerSignal.addEventListener('abort', abortHandler, { once: true });
   });
   try {
-    return await Promise.race([flight.promise, callerAbort]);
+    const entry = await Promise.race([flight.promise, callerAbort]);
+    return raw ? entry.raw : entry.value;
   } finally {
     if (abortHandler) callerSignal.removeEventListener('abort', abortHandler);
     releaseFlight();
   }
+}
+
+export async function runAccountAwareRouteStages({
+  timeoutMs = ACCOUNT_AWARE_ROUTE_TIMEOUT_MS,
+  signal,
+  loadDiagnostics,
+  requestRoute,
+}) {
+  const parsedTimeout = Number(timeoutMs);
+  const totalMs = Number.isFinite(parsedTimeout) && parsedTimeout > 0
+    ? Math.max(1, Math.trunc(parsedTimeout)) : 20000;
+  const deadlineAt = Date.now() + totalMs;
+  const deadlineSignal = AbortSignal.timeout(totalMs);
+  const stageSignal = signal ? AbortSignal.any([signal, deadlineSignal]) : deadlineSignal;
+  const remaining = () => Math.max(1, deadlineAt - Date.now());
+
+  const diagnostics = await loadDiagnostics(stageSignal, remaining());
+  if (stageSignal.aborted || Date.now() >= deadlineAt) {
+    throw stageSignal.reason || new Error('account-aware routing deadline exceeded after diagnostics');
+  }
+  // The second stage receives only what the first stage left. stageSignal is
+  // the hard overall clock as well, so bridgeRequest's 1s minimum cannot
+  // accidentally extend a nearly exhausted route/committee deadline.
+  return requestRoute(stageSignal, remaining(), diagnostics);
+}
+
+async function getAccountAwareRoute(args, signal, timeoutMs = ACCOUNT_AWARE_ROUTE_TIMEOUT_MS) {
+  // Populate the bridge's live diagnostic snapshot first; /api/route then
+  // applies its single authoritative account/quota/filesystem projection.
+  return runAccountAwareRouteStages({
+    timeoutMs,
+    signal,
+    loadDiagnostics: (routeSignal, routeTimeoutMs) => getDiagnostics(
+      routeSignal, routeTimeoutMs, { raw: true },
+    ),
+    requestRoute: (routeSignal, routeTimeoutMs, diagnostics) => bridgeRequest('/api/route', {
+      method: 'POST',
+      body: {
+        task: args.task,
+        preferKinds: Array.isArray(args.preferredProviders) ? args.preferredProviders : [],
+        excludeKinds: Array.isArray(args.excludedProviders) ? args.excludedProviders : [],
+        localOnly: args.localOnly === true,
+        ...(Number.isInteger(args.maxProviders) ? { maxProviders: args.maxProviders } : {}),
+        committeeMode: args.committeeMode || 'advisory',
+        dangerous: args.dangerous === true,
+        acknowledgeFilesystemWrites: args.acknowledgeFilesystemWrites === true,
+        diagnostics,
+        ...(args.providerBudget ? { providerBudget: args.providerBudget } : {}),
+      },
+      timeoutMs: routeTimeoutMs,
+      signal: routeSignal,
+    }),
+  });
 }
 
 async function buildContextBundle({
@@ -671,6 +736,10 @@ const PROVIDER_FAILURE_CLASSES = new Set([
   'provider_error', 'admission_limit', 'bridge_identity_mismatch',
   'incomplete_response', 'token_budget', 'plan_restriction',
   'client_cancelled', 'mcp_deadline_cancelled',
+  'validation', 'configuration', 'safe_filesystem_unverified',
+  'safe_isolation_setup', 'isolation_cleanup', 'workspace_grounding',
+  'account_registry_invalid', 'account_configuration_invalid',
+  'account_unavailable', 'vendor_quota_exhausted',
 ]);
 
 const PROVIDER_BUDGET_SCHEMA = z.object({
@@ -1082,8 +1151,20 @@ function providerSucceeded(response) {
 function bridgeFailureResult(error, { kind, signal }) {
   const bridgeStatus = error instanceof BridgeError && Number.isInteger(error.status)
     ? error.status : null;
-  const deterministicPreflightRejection = bridgeStatus !== null
-    && bridgeStatus >= 400 && bridgeStatus < 500;
+  const rawFailureClass = error instanceof BridgeError
+    ? strictBoundedString(error.detail?.failureClass) : null;
+  const preflightFailureClass = PROVIDER_FAILURE_CLASSES.has(rawFailureClass)
+    ? rawFailureClass : null;
+  // Most deterministic admission rejections are 4xx. Some local authority or
+  // isolation failures correctly use 5xx while still proving that no provider
+  // process was started. Preserve that signed bridge accounting only when the
+  // payload explicitly says not-invoked and carries an allowlisted class.
+  const declaredPreflightRejection = error instanceof BridgeError
+    && error.detail?.model_invocation === false
+    && error.detail?.token_usage_source === 'not_invoked'
+    && preflightFailureClass !== null;
+  const deterministicPreflightRejection = (bridgeStatus !== null
+    && bridgeStatus >= 400 && bridgeStatus < 500) || declaredPreflightRejection;
   const authRequired = error instanceof BridgeError && error.detail?.auth_required === true;
   const transportTimedOut = !signal?.aborted && error instanceof BridgeError
     && (error.cause?.name === 'TimeoutError' || error.cause?.cause?.name === 'TimeoutError');
@@ -1118,7 +1199,7 @@ function bridgeFailureResult(error, { kind, signal }) {
       transportReceiptPersistenceError: transportReceiptId
         ? strictBoundedString(error.detail?.receiptPersistenceError, 500) : null,
       failureClass: deterministicPreflightRejection
-        ? (error.detail?.failureClass || 'policy') : cancellationClass,
+        ? (preflightFailureClass || 'policy') : cancellationClass,
       stopReason: cancellationClass,
       actionPreflight: error.detail?.actionPreflight || null,
       errorCode: validation?.code || null,
@@ -1667,11 +1748,10 @@ export function buildServer() {
     }),
     annotations: AUDITED_READ,
   }, safeHandler(async (args, context) => {
-    const diagnostics = await getDiagnostics(context?.mcpReq?.signal);
     if (args.dangerous !== args.acknowledgeFilesystemWrites) {
       return result({ ok: false, blocked: true, error: 'dangerous=true requires acknowledgeFilesystemWrites=true, and acknowledgement is invalid for safe planning' }, { isError: true });
     }
-    const route = routeTask({ ...args, diagnostics });
+    const route = await getAccountAwareRoute(args, context?.mcpReq?.signal);
     const receipt = appendReceipt({
       event: 'route_preview',
       routeId: route.routeId,
@@ -2042,13 +2122,11 @@ export function buildServer() {
   }, safeHandler(async (args, context) => {
     const signal = context?.mcpReq?.signal;
     const requestedDeadlineAt = Date.now() + args.timeoutMs;
-    const diagnostics = await getDiagnostics(signal, remainingTime(requestedDeadlineAt, 1));
-    const route = routeTask({
+    const route = await getAccountAwareRoute({
       ...args,
-      diagnostics,
       excludedProviders: [...args.excludedProviders, 'powershell'],
       maxProviders: 4,
-    });
+    }, signal, remainingTime(requestedDeadlineAt, 1));
     if (route.humanGateRequired && !args.acknowledgeHumanGate) {
       return result({ ok: false, blocked: true, route, error: 'High-stakes route requires acknowledgeHumanGate=true and remains advisory.' }, { isError: true });
     }
@@ -2190,16 +2268,15 @@ export function buildServer() {
   }, safeHandler(async (args, context) => {
     const signal = context?.mcpReq?.signal;
     const requestedDeadlineAt = Date.now() + args.timeoutMs;
-    const diagnostics = await getDiagnostics(signal, remainingTime(requestedDeadlineAt, 1));
-    const route = routeTask({
+    const route = await getAccountAwareRoute({
       task: args.task,
-      diagnostics,
       preferredProviders: args.providers,
       excludedProviders: [...args.excludedProviders, 'powershell'],
       localOnly: args.localOnly,
       maxProviders: args.maxProviders,
       committeeMode: args.mode,
-    });
+      providerBudget: args.providerBudget,
+    }, signal, remainingTime(requestedDeadlineAt, 1));
     if (route.humanGateRequired && !args.acknowledgeHumanGate) {
       return result({ ok: false, blocked: true, route, error: 'High-stakes committee requires acknowledgeHumanGate=true and remains advisory.' }, { isError: true });
     }

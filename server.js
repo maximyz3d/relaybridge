@@ -1043,6 +1043,8 @@ function sendOneShotResult(res, payload, meta) {
         : payload.rate_limited ? 'rate_limited'
         : payload.auth_failed ? 'auth_failed'
         : payload.failureClass || (classified.kind !== 'ok' ? classified.kind : null);
+      const effectiveQuotaSeat = payload.route?.quota_seat || meta.route?.quota_seat
+        || quotaSeatForProvider(meta.kind);
       if (failureKind === 'rate_limited') {
         const vendorQuota = parseGrokQuota429({
           provider: meta.kind,
@@ -1051,7 +1053,12 @@ function sendOneShotResult(res, payload, meta) {
           text: `${payload.stdout || ''}\n${payload.stderr || ''}`,
           model: payload.route?.resolved_model_identity || payload.model || null,
         });
-        if (vendorQuota) payload.vendor_quota = usageLedger.observeVendorQuota(vendorQuota);
+        if (vendorQuota) {
+          payload.vendor_quota = usageLedger.observeVendorQuota({
+            ...vendorQuota,
+            quotaSeat: effectiveQuotaSeat,
+          });
+        }
       }
       recordRunUsage({
         kind: meta.kind, route: payload.route || meta.route, usage: payload.usage,
@@ -1072,22 +1079,44 @@ function sendOneShotResult(res, payload, meta) {
         }
       } catch { /* verification is advisory; never fail a run over it */ }
       try {
-        const quotaSeat = quotaSeatForProvider(meta.kind);
         if (ok) {
-          cooldowns.noteSuccess(quotaSeat);
-          if (quotaSeat !== meta.kind) cooldowns.noteSuccess(meta.kind);
+          cooldowns.noteSuccess(effectiveQuotaSeat);
+          // A model-scoped cooldown is keyed by provider rather than account.
+          // A successful call through any linked account proves that model is
+          // available again, while the account-specific clear above remains
+          // isolated to the subscription that paid for this run.
+          const providerCooldown = cooldowns.status(meta.kind);
+          if (effectiveQuotaSeat !== meta.kind && providerCooldown.cooling
+            && providerCooldown.scope === 'model') cooldowns.noteSuccess(meta.kind);
         }
         else if (failureKind) {
           // An explicitly model-scoped vendor observation must not cool every
           // model on the account. Generic 429/overload evidence has no narrower
           // scope, so it conservatively applies to the shared quota seat.
-          const cooldownSeat = payload.vendor_quota?.scope === 'model' ? meta.kind : quotaSeat;
+          const cooldownSeat = payload.vendor_quota?.scope === 'model' ? meta.kind : effectiveQuotaSeat;
           cooldowns.noteFailure(cooldownSeat, failureKind, {
             retryAfterSec: parseRetryAfter(`${payload.stdout || ''}\n${payload.stderr || ''}`, payload.retry_after),
             scope: payload.vendor_quota?.scope === 'model' ? 'model' : 'account',
           });
         }
       } catch { /* cooldown bookkeeping must never break a response */ }
+      try {
+        const selectedAccountId = meta.accountId || payload.route?.account || meta.route?.account || null;
+        if (selectedAccountId) {
+          const changed = ok
+            ? providerAccounts.clearAccountAuthFailure(DATA_DIR, meta.kind, selectedAccountId)
+            : payload.auth_failed === true
+              ? providerAccounts.noteAccountAuthFailure(
+                  DATA_DIR, meta.kind, selectedAccountId, loadConfig()[meta.kind] || {},
+                )
+              : null;
+          if (changed) invalidateAccountRegistry();
+          if (selectedAccountId === providerAccounts.DEFAULT_ACCOUNT_ID) {
+            if (ok) updateDefaultAccountRuntimeAuth(meta.kind, true);
+            else if (payload.auth_failed === true) updateDefaultAccountRuntimeAuth(meta.kind, false);
+          }
+        }
+      } catch { /* account health bookkeeping must never break a response */ }
     }
   } catch { /* ignored on purpose */ }
   try {
@@ -1646,12 +1675,8 @@ function claudeTerminalReasonFailureClass(reason) {
   return reason;
 }
 
-function claudeApiStatusFailureClass(status) {
-  if (status === 401 || status === 403) return 'auth';
-  if (status === 408 || status === 504) return 'timeout';
-  if (status === 429) return 'rate_limit';
-  if (status === 402) return 'budget';
-  return status === null ? null : 'provider_error';
+function claudeApiStatusFailureClass(status, diagnostic = '') {
+  return status === null ? null : classifyProviderHttpFailure(status, diagnostic);
 }
 
 function normalizeClaudeResultString(value, maxChars = 128) {
@@ -1827,7 +1852,7 @@ function parseConfiguredOneShotOutput(entry, rawOutput) {
       isError,
       resultSubtype: subtype || null,
       failureClass: subtype === 'error_max_budget_usd' ? 'budget'
-        : claudeApiStatusFailureClass(apiErrorStatus)
+        : claudeApiStatusFailureClass(apiErrorStatus, errors.retained.join('\n'))
         || claudeStopReasonFailureClass(providerStopReason)
         || claudeTerminalReasonFailureClass(terminalReasonRaw)
         || claudeResultFailureClass(subtype)
@@ -1938,7 +1963,9 @@ function hostedApiKey(entry) {
     const value = process.env[name];
     if (value && String(value).trim()) return { name, value: String(value) };
   }
-  throw new Error(`hosted provider key is not set; define ${names[0] || 'the configured API key environment variable'}`);
+  const error = new Error(`hosted provider key is not set; define ${names[0] || 'the configured API key environment variable'}`);
+  error.code = HOSTED_API_KEY_MISSING_CODE;
+  throw error;
 }
 
 function rejectedHttpModelInvocation(status) {
@@ -1959,7 +1986,7 @@ function terminalProviderBudgetOutcome(usage, providerBudget, turns = null) {
     : { exceeded: false, detail: '', budget: supervisor.snapshot().providerBudget };
 }
 
-async function runOpenAIChatOneShot({ entry, prompt, timeoutMs, res, route, startedAt, providerBudget }) {
+async function runOpenAIChatOneShot({ entry, prompt, timeoutMs, res, route, startedAt, providerBudget, accountId }) {
   const bounded = capPrompt(prompt, Number(entry.prompt_max_chars || 12000));
   route.prompt_transport = 'hosted_openai_compatible';
   route.prompt_truncated = bounded.truncated;
@@ -2030,6 +2057,7 @@ async function runOpenAIChatOneShot({ entry, prompt, timeoutMs, res, route, star
     try { payload = responseText ? JSON.parse(responseText) : {}; } catch {}
     if (!response.ok) {
       const detail = cleanOutput(payload.error?.message || payload.error || responseText || `hosted provider HTTP ${response.status}`);
+      const httpFailure = classifyProviderHttpFailure(response.status, detail);
       if (!clientGone && !res.writableEnded) {
         sendOneShotResult(res, {
           kind: route.provider,
@@ -2037,13 +2065,15 @@ async function runOpenAIChatOneShot({ entry, prompt, timeoutMs, res, route, star
           exitCode: response.status,
           stdout: '',
           stderr: detail,
-          rate_limited: response.status === 429,
-          budget_exceeded: /budget|credit|quota/i.test(detail),
-          auth_failed: response.status === 401 || response.status === 403,
+          failureClass: httpFailure,
+          rate_limited: httpFailure === 'rate_limit',
+          budget_exceeded: httpFailure === 'budget',
+          auth_failed: httpFailure === 'auth',
+          permission_denied: httpFailure === 'permission',
           timed_out: isUpstreamTimeoutStatus(response.status),
           dropped_out: true,
           model_invocation: rejectedHttpModelInvocation(response.status),
-        }, { kind: route.provider, prompt, route, startedAt });
+        }, { kind: route.provider, prompt, route, startedAt, accountId });
       }
       return;
     }
@@ -2089,7 +2119,7 @@ async function runOpenAIChatOneShot({ entry, prompt, timeoutMs, res, route, star
         timed_out: false,
         dropped_out: budgetOutcome.exceeded || !stdout,
         model_invocation: true,
-      }, { kind: route.provider, prompt, route, startedAt });
+      }, { kind: route.provider, prompt, route, startedAt, accountId });
     }
   } catch (error) {
     if (!clientGone && !res.writableEnded) {
@@ -2099,18 +2129,18 @@ async function runOpenAIChatOneShot({ entry, prompt, timeoutMs, res, route, star
         exitCode: -1,
         stdout: '',
         stderr: cleanOutput(error?.message || String(error)),
-        auth_failed: /key is not set|401|403/i.test(error?.message || ''),
+        auth_failed: isHostedApiKeyMissingError(error),
         timed_out: timedOut,
         dropped_out: true,
         model_invocation: requestStarted ? null : false,
-      }, { kind: route.provider, prompt, route, startedAt });
+      }, { kind: route.provider, prompt, route, startedAt, accountId });
     }
   } finally {
     clearTimeout(timer);
   }
 }
 
-async function runOllamaApiOneShot({ entry, prompt, timeoutMs, res, route, startedAt, providerBudget }) {
+async function runOllamaApiOneShot({ entry, prompt, timeoutMs, res, route, startedAt, providerBudget, accountId }) {
   const bounded = capPrompt(prompt, Number(entry.prompt_max_chars || 24000));
   route.prompt_transport = 'local_http';
   route.prompt_truncated = bounded.truncated;
@@ -2178,7 +2208,7 @@ async function runOllamaApiOneShot({ entry, prompt, timeoutMs, res, route, start
           timed_out: isUpstreamTimeoutStatus(response.status),
           dropped_out: true,
           model_invocation: rejectedHttpModelInvocation(response.status),
-        }, { kind: route.provider, prompt, route, startedAt });
+        }, { kind: route.provider, prompt, route, startedAt, accountId });
       }
       return;
     }
@@ -2225,7 +2255,7 @@ async function runOllamaApiOneShot({ entry, prompt, timeoutMs, res, route, start
         timed_out: false,
         dropped_out: budgetOutcome.exceeded || !stdout,
         model_invocation: true,
-      }, { kind: route.provider, prompt, route, startedAt });
+      }, { kind: route.provider, prompt, route, startedAt, accountId });
     }
   } catch (error) {
     if (!clientGone && !res.writableEnded) {
@@ -2238,7 +2268,7 @@ async function runOllamaApiOneShot({ entry, prompt, timeoutMs, res, route, start
         timed_out: timedOut,
         dropped_out: true,
         model_invocation: requestStarted ? null : false,
-      }, { kind: route.provider, prompt, route, startedAt });
+      }, { kind: route.provider, prompt, route, startedAt, accountId });
     }
   } finally {
     clearTimeout(timer);
@@ -2971,6 +3001,77 @@ function runProbe(slotRaw, timeoutMs = 15000, stripEnv = [], signal) {
 // spawning fresh readiness probes on every listing.
 let lastDiagnostics = null;
 
+function updateDefaultAccountRuntimeAuth(kind, authenticated) {
+  if (!kind) return;
+  const priorResults = lastDiagnostics?.results && typeof lastDiagnostics.results === 'object'
+    ? lastDiagnostics.results : {};
+  const prior = priorResults[kind] && typeof priorResults[kind] === 'object'
+    ? priorResults[kind] : {};
+  lastDiagnostics = {
+    at: Date.now(),
+    results: {
+      ...priorResults,
+      [kind]: {
+        ...prior,
+        found: true,
+        ready: authenticated,
+        authFailed: !authenticated,
+        authAuthoritative: true,
+        detail: authenticated
+          ? 'authenticated by successful default-account dispatch'
+          : 'default account authentication failed during live dispatch',
+      },
+    },
+  };
+}
+
+function armDefaultAccountRuntimeAuthRetry(kind) {
+  const priorResults = lastDiagnostics?.results && typeof lastDiagnostics.results === 'object'
+    ? lastDiagnostics.results : {};
+  const prior = priorResults[kind] && typeof priorResults[kind] === 'object'
+    ? priorResults[kind] : {};
+  // Pending is intentionally neither ready nor signed out. The operator action
+  // authorizes one live validation; only that dispatch may prove success.
+  lastDiagnostics = {
+    at: Date.now(),
+    results: {
+      ...priorResults,
+      [kind]: {
+        ...prior,
+        ready: null,
+        authFailed: false,
+        authAuthoritative: false,
+        detail: 'operator requested an authentication retry; live validation is pending',
+      },
+    },
+  };
+}
+
+// A refreshed provider probe is the generic positive signal that the implicit
+// credential home was repaired. Keep the persisted managed-default quarantine
+// aligned with that live evidence; linked account markers remain independent.
+function reconcileManagedDefaultAuth(cfg, results) {
+  let changed = false;
+  for (const [kind, result] of Object.entries(results || {})) {
+    const entry = cfg?.[kind];
+    if (!entry || !providerAccounts.credentialEnvFor(entry) || !result?.found
+      || entry.probe_auth_authoritative !== true) continue;
+    try {
+      const mutation = result.ready === true
+        ? providerAccounts.clearAccountAuthFailure(
+            DATA_DIR, kind, providerAccounts.DEFAULT_ACCOUNT_ID,
+          )
+        : result.authFailed === true
+          ? providerAccounts.noteAccountAuthFailure(
+              DATA_DIR, kind, providerAccounts.DEFAULT_ACCOUNT_ID, entry,
+            )
+          : null;
+      changed = !!mutation || changed;
+    } catch { /* diagnostics must still return when account authority needs repair */ }
+  }
+  if (changed) invalidateAccountRegistry();
+}
+
 const PROVIDER_TAG_RE = /^[a-z][a-z0-9-]{0,23}$/;
 const MAX_PROVIDER_TAGS = 16;
 
@@ -3113,6 +3214,21 @@ async function coldPlanningDiagnostics(cfg, pathDetail) {
     return [kind, { found, ready: found, detail: pathDetail }];
   }));
   return Object.fromEntries(pairs);
+}
+
+// Live dispatch can update one provider's authentication state before a full
+// readiness sweep has ever run. Such a partial snapshot must not make every
+// absent provider look eligible. Fill only missing configured keys with cheap
+// path/transport evidence and preserve every live result already observed.
+async function completePlanningDiagnostics(cfg, existing, pathDetail) {
+  const preserved = existing && typeof existing === 'object' && !Array.isArray(existing)
+    ? existing : {};
+  const missingKinds = Object.keys(cfg).filter((kind) => !kind.startsWith('_')
+    && !Object.prototype.hasOwnProperty.call(preserved, kind));
+  if (!missingKinds.length) return preserved;
+  const missingConfig = Object.fromEntries(missingKinds.map((kind) => [kind, cfg[kind]]));
+  const missing = await coldPlanningDiagnostics(missingConfig, pathDetail);
+  return { ...missing, ...preserved };
 }
 
 function normalizeProviderTags(raw) {
@@ -3287,24 +3403,31 @@ app.post('/api/plan', async (req, res) => {
   try {
     const router = await import('./mcp/router.mjs');
     const cfg = loadConfig();
-    let diagnostics = lastDiagnostics?.results || null;
-    if (!diagnostics) {
-      diagnostics = await coldPlanningDiagnostics(cfg, 'path-only check');
-    }
+    let diagnostics = await completePlanningDiagnostics(
+      cfg,
+      lastDiagnostics?.results,
+      'path-only check',
+    );
     const gauges = usageLedger.gaugeAll(seatCostClasses());
-    const fleetInput = applyCooldownsToDiagnostics(diagnostics, coolingQuotaStates(), kind ? [kind] : []);
-    const vendorQuotaInput = applyVendorQuotaExhaustionToDiagnostics(fleetInput.diagnostics, gauges);
+    const routingInputs = accountAwareRoutingInputs(cfg, diagnostics, gauges, coolingQuotaStates());
+    const fleetInput = applyCooldownsToDiagnostics(
+      routingInputs.diagnostics, routingInputs.cooling, kind ? [kind] : [],
+    );
+    const vendorQuotaInput = applyVendorQuotaExhaustionToDiagnostics(
+      fleetInput.diagnostics, routingInputs.gauges,
+    );
     const filesystemInput = applyFilesystemEligibilityToDiagnostics(vendorQuotaInput.diagnostics, cfg, filesystemAuthority);
     diagnostics = filesystemInput.diagnostics;
     let route = router.routeTask({ task, diagnostics, dangerous: filesystemAuthority.dangerous });
-    route = levelRouteSelection(route, gauges, seatCostClassMap());
+    route = levelRouteSelection(route, routingInputs.gauges, seatCostClassMap());
     route.fleetState = {
       cooldownSkipped: fleetInput.skipped,
       vendorQuotaSkipped: vendorQuotaInput.skipped,
       balance: fleetBalance(gauges),
       vendorQuota: vendorQuotaFleet(gauges),
       operatorQuota: operatorQuotaFleet(gauges),
-      quotaSeats: quotaSeatRegistry.groups,
+      quotaSeats: currentQuotaSeatGroups(),
+      accountSelection: routingInputs.accountSelection,
       filesystemSkipped: filesystemInput.skipped,
       filesystemAuthority,
     };
@@ -3326,9 +3449,19 @@ app.post('/api/plan', async (req, res) => {
 // Delegation: classify a task, rank providers by tier, and pick the model
 // weight class inside each. Advisory — it returns a plan, it does not dispatch.
 app.post('/api/route', async (req, res) => {
-  const { task, diagnostics: supplied, preferKinds, excludeKinds, providerBudget: rawBudget } = req.body || {};
+  const {
+    task, diagnostics: supplied, preferKinds, excludeKinds, providerBudget: rawBudget,
+    localOnly = false, maxProviders, committeeMode = 'advisory',
+  } = req.body || {};
   if (!task || typeof task !== 'string' || !task.trim()) {
     return res.status(400).json({ error: 'task (non-empty string) required' });
+  }
+  if (maxProviders !== undefined
+    && (!Number.isInteger(maxProviders) || maxProviders < 1 || maxProviders > 4)) {
+    return res.status(400).json({ error: 'maxProviders must be an integer from 1 to 4' });
+  }
+  if (!['advisory', 'consensus'].includes(committeeMode)) {
+    return res.status(400).json({ error: 'committeeMode must be advisory or consensus' });
   }
   let requestedProviderBudget;
   try {
@@ -3342,14 +3475,20 @@ app.post('/api/route', async (req, res) => {
   try {
     const router = await import('./mcp/router.mjs');
     const cfg = loadConfig();
-    let diagnostics = supplied && typeof supplied === 'object' ? supplied : (lastDiagnostics?.results || null);
-    if (!diagnostics) {
-      diagnostics = await coldPlanningDiagnostics(cfg, 'path-only check; run /api/diag for auth status');
-    }
+    let diagnostics = await completePlanningDiagnostics(
+      cfg,
+      supplied && typeof supplied === 'object' ? supplied : lastDiagnostics?.results,
+      'path-only check; run /api/diag for auth status',
+    );
     const explicitKinds = Array.isArray(preferKinds) ? preferKinds : [];
     const gauges = usageLedger.gaugeAll(seatCostClasses());
-    const fleetInput = applyCooldownsToDiagnostics(diagnostics, coolingQuotaStates(), explicitKinds);
-    const vendorQuotaInput = applyVendorQuotaExhaustionToDiagnostics(fleetInput.diagnostics, gauges);
+    const routingInputs = accountAwareRoutingInputs(cfg, diagnostics, gauges, coolingQuotaStates());
+    const fleetInput = applyCooldownsToDiagnostics(
+      routingInputs.diagnostics, routingInputs.cooling, explicitKinds,
+    );
+    const vendorQuotaInput = applyVendorQuotaExhaustionToDiagnostics(
+      fleetInput.diagnostics, routingInputs.gauges,
+    );
     const filesystemInput = applyFilesystemEligibilityToDiagnostics(vendorQuotaInput.diagnostics, cfg, filesystemAuthority);
     diagnostics = filesystemInput.diagnostics;
     let route = router.routeTask({
@@ -3357,15 +3496,19 @@ app.post('/api/route', async (req, res) => {
       dangerous: filesystemAuthority.dangerous,
       preferredProviders: explicitKinds.length ? explicitKinds : undefined,
       excludedProviders: Array.isArray(excludeKinds) ? excludeKinds : undefined,
+      localOnly: localOnly === true,
+      maxProviders,
+      committeeMode,
     });
-    route = levelRouteSelection(route, gauges, seatCostClassMap());
+    route = levelRouteSelection(route, routingInputs.gauges, seatCostClassMap());
     route.fleetState = {
       cooldownSkipped: fleetInput.skipped,
       vendorQuotaSkipped: vendorQuotaInput.skipped,
       balance: fleetBalance(gauges),
       vendorQuota: vendorQuotaFleet(gauges),
       operatorQuota: operatorQuotaFleet(gauges),
-      quotaSeats: quotaSeatRegistry.groups,
+      quotaSeats: currentQuotaSeatGroups(),
+      accountSelection: routingInputs.accountSelection,
       filesystemSkipped: filesystemInput.skipped,
       filesystemAuthority,
     };
@@ -3404,7 +3547,7 @@ function signedOutProviders(diagnostics, cfg) {
   const results = diagnostics?.results || diagnostics || {};
   const out = [];
   for (const [kind, info] of Object.entries(results)) {
-    if (!info || !info.found || info.ready) continue;
+    if (!info || !info.found || info.ready || info.authFailed !== true) continue;
     const entry = cfg[kind];
     if (!entry) continue;
     out.push({
@@ -3416,6 +3559,11 @@ function signedOutProviders(diagnostics, cfg) {
     });
   }
   return out;
+}
+
+const AUTH_FAILURE_RE = /(?:not (?:logged|signed) in|not authenticated|unauthenticated|authentication required|please (?:log|sign) in|login required|no active (?:session|account)|invalid (?:api key|credentials)|"loggedIn"\s*:\s*false)/i;
+function probeIndicatesAuthFailure(text) {
+  return AUTH_FAILURE_RE.test(String(text || ''));
 }
 
 app.get('/api/auth/status', async (req, res) => {
@@ -3446,9 +3594,18 @@ app.get('/api/auth/status', async (req, res) => {
         } catch { found = false; }
         if (!found) return [kind, { found: false, ready: false, detail: 'not installed' }];
         const result = await runProbe(entry.probe, Number(entry.probe_timeout_ms || 30000), entry.strip_env || []);
-        return [kind, { found: true, ready: result.exitCode === 0, detail: result.exitCode === 0 ? 'authenticated' : (result.stderr || '').split('\n')[0].slice(0, 160) }];
+        const probeText = cleanOutput([result.stdout, result.stderr].filter(Boolean).join('\n'));
+        return [kind, {
+          found: true,
+          ready: result.exitCode === 0,
+          authFailed: result.exitCode !== 0 && probeIndicatesAuthFailure(probeText),
+          authAuthoritative: entry.probe_auth_authoritative === true,
+          detail: result.exitCode === 0 ? 'authenticated' : probeText.split('\n')[0].slice(0, 160),
+        }];
       }));
-      diagnostics = { at: Date.now(), results: Object.fromEntries(pairs.filter(([, v]) => v)) };
+      const refreshedResults = Object.fromEntries(pairs.filter(([, v]) => v));
+      reconcileManagedDefaultAuth(cfg, refreshedResults);
+      diagnostics = { at: Date.now(), results: refreshedResults };
       lastDiagnostics = diagnostics;
     } catch (err) {
       return res.status(500).json({ ok: false, error: err.message });
@@ -3545,20 +3702,33 @@ app.get('/api/diag', async (req, res) => {
     let ready = found;
     let detail = '';
     let probeExitCode = null;
+    let authFailed = false;
     // Say WHY a CLI that is plainly on PATH is not being offered, instead of
     // reporting a bare "not installed" the operator cannot act on.
     if (!found && resolvedInfo.interopSkipped.length) {
       detail = `found only as a Windows binary (${resolvedInfo.interopSkipped[0]}) — `
         + 'install the native Linux CLI, or set RELAYBRIDGE_ALLOW_WIN_INTEROP=1 to use it over WSL interop';
     }
-    if (found && Array.isArray(entry.probe) && entry.probe.length) {
-      const probe = await runProbe(entry.probe, Number(entry.probe_timeout_ms || 30000), entry.strip_env || [], controller.signal);
+    // Authentication and version probes are independent read-only calls. Run
+    // them under one wall-clock envelope instead of spending up to 30s and
+    // then another 15s sequentially; the MCP diagnostic deadline can now cover
+    // every server-legal probe plus process-close grace.
+    const [probe, versionProbe] = await Promise.all([
+      found && Array.isArray(entry.probe) && entry.probe.length
+        ? runProbe(entry.probe, Number(entry.probe_timeout_ms || 30000), entry.strip_env || [], controller.signal)
+        : Promise.resolve(null),
+      found && Array.isArray(entry.version_probe) && entry.version_probe.length
+        ? runProbe(entry.version_probe, 15000, entry.strip_env || [], controller.signal)
+        : Promise.resolve(null),
+    ]);
+    if (probe) {
       probeExitCode = probe.exitCode;
       ready = !probe.timedOut && probe.exitCode === 0;
       const probeText = cleanOutput([probe.stdout, probe.stderr].filter(Boolean).join('\n'));
       if (entry.probe_expect && !probeText.toLowerCase().includes(String(entry.probe_expect).toLowerCase())) ready = false;
       const probeReject = Array.isArray(entry.probe_reject) ? entry.probe_reject : [];
       if (probeReject.some((value) => probeText.toLowerCase().includes(String(value).toLowerCase()))) ready = false;
+      authFailed = !ready && probeIndicatesAuthFailure(probeText);
       detail = ready && entry.probe_success_detail
         ? String(entry.probe_success_detail).slice(0, 300)
         : (entry.probe_redact ? (ready ? 'readiness check passed' : 'readiness check failed') : probeText.split('\n')[0].slice(0, 300));
@@ -3566,8 +3736,7 @@ app.get('/api/diag', async (req, res) => {
       if (probe.aborted) detail = 'readiness check cancelled';
     }
     let runtimeVersion = '';
-    if (!controller.signal.aborted && found && Array.isArray(entry.version_probe) && entry.version_probe.length) {
-      const versionProbe = await runProbe(entry.version_probe, 15000, entry.strip_env || [], controller.signal);
+    if (versionProbe) {
       if (!versionProbe.timedOut && versionProbe.exitCode === 0) {
         runtimeVersion = cleanOutput(versionProbe.stdout || versionProbe.stderr).split('\n')[0].slice(0, 200);
       }
@@ -3580,14 +3749,45 @@ app.get('/api/diag', async (req, res) => {
       label: entry.label,
       detail,
       probeExitCode,
+      authFailed,
+      authAuthoritative: entry.probe_auth_authoritative === true,
       runtimeVersion,
       usageCapability: providerUsageCapability(entry, { runtimeVersion }),
     }];
   }));
   const rawResults = Object.fromEntries(pairs);
   const results = applyFilesystemEligibilityToDiagnostics(rawResults, cfg).diagnostics;
-  if (!controller.signal.aborted) lastDiagnostics = { at: Date.now(), results };
-  if (!clientGone && !res.writableEnded) res.json({ results });
+  if (!controller.signal.aborted) {
+    reconcileManagedDefaultAuth(cfg, results);
+    lastDiagnostics = { at: Date.now(), results };
+  }
+  if (!clientGone && !res.writableEnded) {
+    let routing = null;
+    try {
+      const gauges = usageLedger.gaugeAll(seatCostClasses());
+      const accountInputs = accountAwareRoutingInputs(cfg, results, gauges, coolingQuotaStates());
+      const cooldownInput = applyCooldownsToDiagnostics(accountInputs.diagnostics, accountInputs.cooling, []);
+      const vendorInput = applyVendorQuotaExhaustionToDiagnostics(
+        cooldownInput.diagnostics, accountInputs.gauges,
+      );
+      const filesystemInput = applyFilesystemEligibilityToDiagnostics(vendorInput.diagnostics, cfg);
+      const projectedResults = Object.fromEntries(Object.entries(filesystemInput.diagnostics)
+        .map(([kind, info]) => [kind, info && typeof info === 'object' ? {
+          ...info,
+          accountSelection: accountInputs.accountSelection[kind] || null,
+        } : info]));
+      routing = {
+        results: projectedResults,
+        accountSelection: accountInputs.accountSelection,
+        cooldownSkipped: cooldownInput.skipped,
+        vendorQuotaSkipped: vendorInput.skipped,
+        filesystemSkipped: filesystemInput.skipped,
+      };
+    } catch (err) {
+      routing = { results, unavailable: true, detail: err.message };
+    }
+    res.json({ results, routing });
+  }
 });
 
 app.get('/api/permissions', (req, res) => {
@@ -3807,24 +4007,15 @@ async function executeOneShot(body, res) {
   if (body?.maxEffortOverride === true && requestedEffort !== 'max') {
     return rejectBeforeAdmission(400, 'validation', { error: 'maxEffortOverride is valid only with effort=max' });
   }
-  // Pre-flight auth gate. If the last readiness sweep saw this CLI installed but
-  // signed out, the call would fail with an opaque provider error and the prompt
-  // would be wasted. Report it as an actionable auth_required instead, so the
-  // caller can open a sign-in terminal and retry. Only a *positive* signed-out
-  // observation blocks: an unprobed provider is attempted as before.
+  // A provider-wide readiness probe describes the operator's implicit/default
+  // login. Linked credential directories are separate authority domains, so a
+  // positive signed-out result excludes only that implicit account; account
+  // selection below may still choose a provisioned linked login.
   const readiness = lastDiagnostics?.results?.[kind];
-  if (readiness && readiness.found && readiness.ready === false && Array.isArray(entry.login_command)) {
-    return rejectBeforeAdmission(409, 'auth', {
-      ok: false,
-      auth_required: true,
-      kind,
-      label: entry.label || kind,
-      login_command: entry.login_command,
-      detail: readiness.detail || 'the provider CLI reports no active session',
-      error: `${entry.label || kind} is installed but not signed in`,
-      dropped_out: true,
-    });
-  }
+  const defaultAccountSignedOut = !!(readiness && readiness.found
+    && readiness.ready === false && readiness.authFailed === true
+    && readiness.authAuthoritative === true
+    && Array.isArray(entry.login_command));
   let oneShotEnv;
   try {
     oneShotEnv = normalizeEnvOverrides(entry.oneshot_env);
@@ -3934,6 +4125,78 @@ async function executeOneShot(body, res) {
       validation: err.validation || null,
     });
   }
+  // Account selection is part of admission, not spawn setup. If every linked
+  // account is disabled, unsigned, or cooling, an empty env would silently run
+  // against the operator's default credentials and misattribute the receipt.
+  const dispatchAccount = resolveDispatchAccount(kind, entry, {
+    unavailableAccountIds: defaultAccountSignedOut
+      ? new Set([providerAccounts.DEFAULT_ACCOUNT_ID]) : new Set(),
+  });
+  if (dispatchAccount.exhausted) {
+    if (defaultAccountSignedOut && !dispatchAccount.resolutionError
+      && !dispatchAccount.providerManaged) {
+      return rejectBeforeAdmission(409, 'auth', {
+        ok: false,
+        auth_required: true,
+        kind,
+        label: entry.label || kind,
+        login_command: entry.login_command,
+        detail: readiness.detail || 'the provider CLI reports no active session',
+        error: `${entry.label || kind} is installed but not signed in`,
+        dropped_out: true,
+      });
+    }
+    const registryInvalid = dispatchAccount.reason === 'registry_invalid';
+    const vendorExhausted = dispatchAccount.reason === 'vendor_exhausted';
+    const relocationMissing = dispatchAccount.reason === 'credential_relocation_unavailable';
+    const isolationUnsupported = dispatchAccount.reason === 'linked_account_isolation_unsupported';
+    const failureClass = registryInvalid ? 'account_registry_invalid'
+      : relocationMissing || isolationUnsupported ? 'account_configuration_invalid'
+        : vendorExhausted ? 'vendor_quota_exhausted' : 'account_unavailable';
+    return rejectBeforeAdmission(registryInvalid || relocationMissing ? 500 : 409, failureClass, {
+      ok: false,
+      account_unavailable: !vendorExhausted,
+      vendor_quota_exhausted: vendorExhausted,
+      kind,
+      error: registryInvalid
+        ? 'The linked-account registry is invalid; dispatch is disabled to protect credential attribution'
+        : relocationMissing
+          ? `Managed linked accounts for ${entry.label || kind} cannot be isolated because credential_env is missing or invalid`
+        : isolationUnsupported
+          ? `Linked accounts are disabled for ${entry.label || kind} because its authentication cannot be isolated safely`
+        : vendorExhausted
+          ? `Every available account for ${entry.label || kind} has authoritative exhausted-quota evidence`
+          : `No enabled and provisioned account is available for ${entry.label || kind}`,
+      remedy: registryInvalid
+        ? 'Repair the account registry shown by /api/accounts before retrying.'
+        : relocationMissing
+          ? 'Restore this provider\'s credential_env configuration before dispatching any managed linked account.'
+        : isolationUnsupported
+          ? (entry.linked_accounts_unavailable_reason || 'Use this provider\'s implicit default account only.')
+        : vendorExhausted
+          ? 'Use another provider or wait until the reported vendor reset.'
+          : 'Check /api/accounts, then sign in or enable an account.',
+      retryAt: dispatchAccount.retryAt || null,
+      dropped_out: true,
+      usage: { input_tokens: 0, output_tokens: 0 },
+    }, {
+      provider: kind,
+      account: null,
+      quota_seat: null,
+      request_id: requestId,
+    });
+  }
+  if (dispatchAccount.account && !dispatchAccount.account.implicit) {
+    try {
+      slot = [...slot, ...providerAccounts.linkedAccountArgsFor(entry)];
+    } catch (err) {
+      return rejectBeforeAdmission(500, 'account_configuration_invalid', {
+        error: `invalid linked-account arguments for ${kind}: ${err.message}`,
+        model_invocation: false,
+        dropped_out: true,
+      });
+    }
+  }
   if (!acquireOneShot(kind, res)) {
     return rejectBeforeAdmission(429, 'admission_limit', {
       error: 'provider concurrency limit reached; retry with backoff',
@@ -4010,7 +4273,6 @@ async function executeOneShot(body, res) {
   const [bin, ...args] = slotResolved;
   // Multi-account: point the CLI's credential directory at the selected
   // account before anything resolves the binary or builds the route metadata.
-  const dispatchAccount = resolveDispatchAccount(kind, entry);
   const childEnv = buildEnv(
     { ...oneShotEnv, ...(isolatedProviderHome?.env || {}) },
     entry.strip_env || [],
@@ -4037,7 +4299,8 @@ async function executeOneShot(body, res) {
     // Which of the provider's accounts paid for this run. Null for a seat with
     // a single sign-in, so existing receipts are unchanged. It rides on the
     // route because that is what reaches both the receipt and the ledger.
-    account: dispatchAccount.account ? dispatchAccount.account.id : null,
+    account: dispatchAccount.account && !dispatchAccount.account.implicit
+      ? dispatchAccount.account.id : null,
     quota_seat: dispatchAccount.quotaSeat || null,
     transport: entry.transport || 'cli',
     configured_binary: bin,
@@ -4148,11 +4411,19 @@ async function executeOneShot(body, res) {
   }).providerBudget;
   if (entry.oneshot_adapter === 'ollama_api') {
     cleanupPromptFile();
-    return runOllamaApiOneShot({ entry, prompt, timeoutMs: adapterTimeoutMs, res, route, startedAt, providerBudget: resolvedProviderBudget });
+    return runOllamaApiOneShot({
+      entry, prompt, timeoutMs: adapterTimeoutMs, res, route, startedAt,
+      providerBudget: resolvedProviderBudget,
+      accountId: dispatchAccount.account?.id || null,
+    });
   }
   if (entry.oneshot_adapter === 'openai_chat_api') {
     cleanupPromptFile();
-    return runOpenAIChatOneShot({ entry, prompt, timeoutMs: adapterTimeoutMs, res, route, startedAt, providerBudget: resolvedProviderBudget });
+    return runOpenAIChatOneShot({
+      entry, prompt, timeoutMs: adapterTimeoutMs, res, route, startedAt,
+      providerBudget: resolvedProviderBudget,
+      accountId: dispatchAccount.account?.id || null,
+    });
   }
   const isWindows = process.platform === 'win32';
   let proc;
@@ -4208,7 +4479,10 @@ async function executeOneShot(body, res) {
         validation: err.validation,
       });
     }
-    return sendOneShotResult(res, { kind, route, exitCode: -1, stdout: '', stderr: err.message, error: 'spawn failed', dropped_out: true, model_invocation: false }, { kind, prompt, route, startedAt, cwd: resolvedCwd });
+    return sendOneShotResult(res, { kind, route, exitCode: -1, stdout: '', stderr: err.message, error: 'spawn failed', dropped_out: true, model_invocation: false }, {
+      kind, prompt, route, startedAt, cwd: resolvedCwd,
+      accountId: dispatchAccount.account?.id || null,
+    });
   }
   let stdout = '';
   let stderr = '';
@@ -4355,7 +4629,10 @@ async function executeOneShot(body, res) {
       if (res._relayIsolationReceiptDeferred) persistCancellationReceipt();
       return;
     }
-    sendOneShotResult(res, { kind, route, exitCode: -1, stdout, stderr: stderr + '\n' + err.message, error: err.message, failureClass: isolationCleanup.ok ? null : 'isolation_cleanup', dropped_out: true }, { kind, prompt, route, startedAt, cwd: resolvedCwd });
+    sendOneShotResult(res, { kind, route, exitCode: -1, stdout, stderr: stderr + '\n' + err.message, error: err.message, failureClass: isolationCleanup.ok ? null : 'isolation_cleanup', dropped_out: true }, {
+      kind, prompt, route, startedAt, cwd: resolvedCwd,
+      accountId: dispatchAccount.account?.id || null,
+    });
   });
   const settleFromClose = (code) => {
     if (settled) return;
@@ -4416,22 +4693,10 @@ async function executeOneShot(body, res) {
       'upgrade to pro', '429', 'credit balance is too low', 'usage limit', 'out of credits',
     ];
     const budget_signals = ['exceeded usd budget','exceeded the usd budget','max-budget-usd','budget exceeded','budget cap reached'];
-    // Word boundaries avoid false positives such as "deSIGN INtent" in a
-    // perfectly valid model response.
-    const auth_signals = [
-      /\benoent\b/,
-      /\bnot authenticated\b/,
-      /\bnot logged in\b/,
-      /\bplease log in\b/,
-      /\bplease run \/login\b/,
-      /\bsign in\b/,
-      /\blogin required\b/,
-      /\bauthentication required\b/,
-      /\binvalid api key\b/,
-      /\bauthentication[_ ]error\b/,
-      /\boauth\b.{0,40}\b(?:revoked|expired)\b/,
-    ];
-    const authoritativeApiFailure = claudeApiStatusFailureClass(parsedOutput.apiErrorStatus);
+    const authoritativeApiFailure = claudeApiStatusFailureClass(
+      parsedOutput.apiErrorStatus,
+      cleanOutput([stderr, parsedOutput.diagnostic].filter(Boolean).join('\n')),
+    );
     const copilotQuotaEvidence = detectCopilotMonthlyQuota({
       provider: kind,
       stdout: cleanedStdout,
@@ -4461,9 +4726,10 @@ async function executeOneShot(body, res) {
     // provider route as unauthenticated when the command failed or produced no
     // usable answer.
     const auth_failed = authoritativeApiFailure === 'auth'
-      || (auth_signals.some((pattern) => pattern.test(failureBlob))
-        && (code !== 0 || !cleanedStdout || parsedOutput.isError));
-    const permission_denied = runClassification.kind === 'headless_command_permission_auto_denied';
+      || ((code !== 0 || !cleanedStdout || parsedOutput.isError)
+        && runClassification.kind === 'auth_failed');
+    const permission_denied = authoritativeApiFailure === 'permission'
+      || runClassification.kind === 'headless_command_permission_auto_denied';
     // Provider CLIs can enforce their own request deadline before RelayBridge's
     // progress supervisor fires. Promote only authoritative failed/no-answer
     // diagnostics; healthy model prose that discusses timeouts must remain a
@@ -4542,7 +4808,10 @@ async function executeOneShot(body, res) {
       timed_out: providerTimedOut,
       dropped_out,
       model_invocation: true,
-    }, { kind, prompt, route, startedAt, cwd: resolvedCwd, transportStdout: stdout });
+    }, {
+      kind, prompt, route, startedAt, cwd: resolvedCwd, transportStdout: stdout,
+      accountId: dispatchAccount.account?.id || null,
+    });
     // GitHub middleware: only successful runs checkpoint — a dropped-out run
     // may have left half-applied edits, which the human should triage first.
     if (sentPayload && !sentPayload.dropped_out) {
@@ -4624,7 +4893,13 @@ app.post('/api/tasks/:id/cancel', (req, res) => {
 // subscription plans.
 const { createCooldownStore, parseRetryAfter } = require('./lib/provider-cooldown');
 const { checkGrounding, verifyReferencedPaths } = require('./lib/workspace-grounding');
-const { classifyRunFailure, detectCopilotMonthlyQuota } = require('./lib/provider-failure');
+const {
+  classifyRunFailure,
+  classifyProviderHttpFailure,
+  detectCopilotMonthlyQuota,
+  isHostedApiKeyMissingError,
+  HOSTED_API_KEY_MISSING_CODE,
+} = require('./lib/provider-failure');
 // Issue #17: readiness proves auth, not quota. A seat that returned 429 stays
 // "ready" forever unless the 429 is remembered, so remember it durably and
 // share it with every client.
@@ -4643,7 +4918,8 @@ const {
 } = require('./lib/cancellation-state');
 const {
   levelCandidates, suggestTierAdjustment, fleetBalance,
-  applyCooldownsToDiagnostics, applyVendorQuotaExhaustionToDiagnostics,
+  applyCooldownsToDiagnostics, activeVendorQuotaExhaustion,
+  applyVendorQuotaExhaustionToDiagnostics,
   levelRouteSelection,
 } = require('./lib/load-leveller');
 
@@ -4671,9 +4947,9 @@ function coolingQuotaStates() {
     };
   });
 }
-function filterCandidatesByQuotaCooldown(candidates = [], explicit = null) {
+function filterCandidatesByQuotaCooldown(candidates = [], explicit = null, coolingStates = coolingQuotaStates()) {
   const byAlias = new Map();
-  for (const state of coolingQuotaStates()) {
+  for (const state of coolingStates || []) {
     for (const alias of state.aliases || []) byAlias.set(alias, state);
   }
   const usable = [];
@@ -4700,36 +4976,95 @@ const usageLedger = createUsageLedger({
 // Returns the implicit single-account shape for every seat the operator has not
 // added a second plan to, so this is a no-op for an ordinary install: no env is
 // injected and the quotaSeat is exactly the one configured in cli-config.json.
-function resolveDispatchAccount(kind, entry) {
+function resolveDispatchAccount(kind, entry, { unavailableAccountIds = new Set() } = {}) {
   try {
-    const registry = accountRegistry();
-    const cooling = new Set(coolingQuotaStates().map((s) => s.quotaSeat).filter(Boolean));
+    // Dispatch is an authority boundary: a malformed or unreadable registry
+    // must not be treated as "no accounts configured", which would silently
+    // fall back to the operator's default credentials.
+    const registry = providerAccounts.loadRegistry(DATA_DIR, { strict: true });
+    const accounts = providerAccounts.accountsFor(kind, entry, registry);
+    const hasExplicitAccounts = accounts.some((account) => !account.implicit);
+    const providerManaged = Object.prototype.hasOwnProperty.call(registry.providers, kind);
+    const enabledLinkedAccounts = accounts.some((candidate) => !candidate.implicit && candidate.enabled);
+    const relocationMissing = providerManaged
+      && !providerAccounts.credentialEnvFor(entry)
+      && enabledLinkedAccounts;
+    if (relocationMissing) {
+      return {
+        account: null, env: {}, quotaSeat: null, exhausted: true,
+        hasExplicitAccounts, providerManaged, resolutionError: false,
+        reason: 'credential_relocation_unavailable', retryAt: null,
+      };
+    }
+    const isolationUnsupported = providerManaged && enabledLinkedAccounts
+      && !providerAccounts.supportsLinkedAccounts(entry);
+    if (isolationUnsupported) {
+      return {
+        account: null, env: {}, quotaSeat: null, exhausted: true,
+        hasExplicitAccounts, providerManaged, resolutionError: false,
+        reason: 'linked_account_isolation_unsupported', retryAt: null,
+      };
+    }
+    const cooling = new Set(coolingQuotaStates()
+      .filter((state) => state.scope !== 'model')
+      .map((state) => state.quotaSeat).filter(Boolean));
     let gauges = {};
     try {
       // Keyed by seat; re-key by quotaSeat so a per-account gauge can be found.
-      for (const gauge of Object.values(usageLedger.gaugeAll(seatCostClasses()) || {})) {
+      for (const [gaugeSeat, gauge] of Object.entries(usageLedger.gaugeAll(seatCostClasses()) || {})) {
+        if (gaugeSeat !== kind && !gaugeSeat.startsWith(`${kind}#`)) continue;
         if (gauge && gauge.quotaSeat) gauges[gauge.quotaSeat] = gauge;
       }
     } catch { gauges = {}; }
     const account = providerAccounts.selectAccount({
       kind, entry, registry, dataDir: DATA_DIR, gauges, coolingQuotaSeats: cooling,
+      unavailableAccountIds,
+      allowCoolingFallback: true,
     });
-    if (!account) return { account: null, env: {}, quotaSeat: null, exhausted: true };
+    if (!account) {
+      const usable = accounts.filter((candidate) => candidate.enabled
+        && !unavailableAccountIds.has(candidate.id)
+        && providerAccounts.accountIsProvisioned({ entry, account: candidate, dataDir: DATA_DIR, kind })
+        && providerAccounts.accountAuthAvailable({ entry, account: candidate, dataDir: DATA_DIR, kind }));
+      const vendorBlocks = usable.map((candidate) => ({
+        account: candidate,
+        block: activeVendorQuotaExhaustion(gauges[candidate.quotaSeat]),
+      })).filter((item) => item.block);
+      const vendorExhausted = usable.length > 0 && vendorBlocks.length === usable.length;
+      return {
+        account: null, env: {}, quotaSeat: null, exhausted: true,
+        hasExplicitAccounts, providerManaged, resolutionError: false,
+        reason: vendorExhausted ? 'vendor_exhausted' : 'auth_unavailable',
+        retryAt: vendorExhausted
+          ? vendorBlocks.map((item) => item.block.reset?.expiresAt).filter(Boolean).sort()[0] || null
+          : null,
+      };
+    }
     return {
       account,
       env: providerAccounts.envForAccount({ entry, account, dataDir: DATA_DIR, kind }),
       quotaSeat: account.quotaSeat,
       exhausted: false,
+      hasExplicitAccounts,
+      providerManaged,
+      resolutionError: false,
+      reason: null,
+      retryAt: null,
     };
   } catch (err) {
-    // Never let account resolution break a dispatch that used to work.
-    console.log('[RelayBridge] account resolution failed, using the default sign-in: ' + err.message);
-    return { account: null, env: {}, quotaSeat: null, exhausted: false };
+    // Never run on a different login than the receipt will attribute.
+    console.log('[RelayBridge] account resolution failed: ' + err.message);
+    return {
+      account: null, env: {}, quotaSeat: null, exhausted: true,
+      hasExplicitAccounts: false, providerManaged: false, resolutionError: true,
+      reason: 'registry_invalid', retryAt: null,
+    };
   }
 }
 
 function seatCostClasses() {
   const cfg = loadConfig();
+  const groups = currentQuotaSeatGroups();
   const out = {};
   for (const [seat, entry] of Object.entries(cfg)) {
     if (seat.startsWith('_')) continue;
@@ -4737,7 +5072,7 @@ function seatCostClasses() {
       costClass: costClassFor(entry, seat),
       model: entry.model || null,
       quotaSeat: quotaSeatForProvider(seat),
-      aliases: quotaSeatRegistry.groups[quotaSeatForProvider(seat)]?.providers || [seat],
+      aliases: groups[quotaSeatForProvider(seat)]?.providers || [seat],
     };
     out[seat] = base;
     // One gauge per linked account. gauge() already filters ledger rows by
@@ -4749,7 +5084,11 @@ function seatCostClasses() {
     try {
       for (const account of providerAccounts.accountsFor(seat, entry, accountRegistry())) {
         if (account.implicit) continue;
-        out[`${seat}#${account.id}`] = { ...base, quotaSeat: account.quotaSeat, aliases: [seat] };
+        out[`${seat}#${account.id}`] = {
+          ...base,
+          quotaSeat: account.quotaSeat,
+          aliases: groups[account.quotaSeat]?.providers || [seat],
+        };
       }
     } catch { /* a malformed registry must not break fleet accounting */ }
   }
@@ -4765,6 +5104,266 @@ function accountRegistry() {
   if (now - _accountRegistryCache.at < 2000) return _accountRegistryCache.value;
   _accountRegistryCache = { at: now, value: providerAccounts.loadRegistry(DATA_DIR) };
   return _accountRegistryCache.value;
+}
+
+function invalidateAccountRegistry() {
+  _accountRegistryCache = { at: 0, value: { providers: {} } };
+}
+
+function currentQuotaSeatGroups() {
+  const groups = Object.fromEntries(Object.entries(quotaSeatRegistry.groups).map(([quotaSeat, group]) => [
+    quotaSeat,
+    { ...group, providers: [...group.providers] },
+  ]));
+  const cfg = loadConfig();
+  const registry = accountRegistry();
+  for (const [kind, entry] of Object.entries(cfg)) {
+    if (kind.startsWith('_') || !entry || typeof entry !== 'object') continue;
+    for (const account of providerAccounts.accountsFor(kind, entry, registry)) {
+      if (account.implicit) continue;
+      const group = groups[account.quotaSeat] || (groups[account.quotaSeat] = {
+        quotaSeat: account.quotaSeat,
+        providers: [],
+        transport: entry.transport || null,
+        explicitlyGrouped: true,
+        account: { id: account.id, providers: [] },
+      });
+      if (!group.providers.includes(kind)) group.providers.push(kind);
+      group.providers.sort();
+      if (group.transport !== (entry.transport || null)) group.transport = null;
+      if (!group.account || group.account.id !== account.id) {
+        throw new Error(`linked account quota-seat collision at ${account.quotaSeat}`);
+      }
+      group.account.providers = [...group.providers];
+    }
+  }
+  return groups;
+}
+
+function providerGaugeMap(kind, gauges) {
+  const byQuotaSeat = {};
+  for (const [gaugeSeat, gauge] of Object.entries(gauges || {})) {
+    if (gaugeSeat !== kind && !gaugeSeat.startsWith(`${kind}#`)) continue;
+    if (gauge?.quotaSeat) byQuotaSeat[gauge.quotaSeat] = gauge;
+  }
+  return byQuotaSeat;
+}
+
+// Project account-level capacity onto provider-level routing without pretending
+// that one drained/default account exhausts every linked subscription. The
+// router still consumes provider keys; this picks the gauge and cooldown state
+// of an actually selectable account for each key.
+function accountAwareRoutingInputs(config, diagnostics, gauges, coolingStates) {
+  const adjustedDiagnostics = Object.fromEntries(Object.entries(diagnostics || {}).map(([kind, info]) => [
+    kind,
+    info && typeof info === 'object' ? { ...info } : info,
+  ]));
+  const routeGauges = {};
+  const routeCooling = [];
+  const accountSelection = {};
+  const coolingKeys = new Set();
+  const addCooling = (kind, state) => {
+    if (!state) return;
+    const key = `${kind}\u0000${state.seat}\u0000${state.scope}`;
+    if (coolingKeys.has(key)) return;
+    coolingKeys.add(key);
+    routeCooling.push({ ...state, aliases: [kind] });
+  };
+  const projectGauge = (kind, gauge) => gauge ? { ...gauge, aliases: [kind] } : gauge;
+  let registry = { providers: {} };
+  let registryError = null;
+  try {
+    registry = providerAccounts.loadRegistry(DATA_DIR, { strict: true });
+  } catch (err) {
+    registryError = err;
+  }
+
+  for (const [kind, entry] of Object.entries(config || {})) {
+    if (kind.startsWith('_') || !entry || typeof entry !== 'object') continue;
+    const byQuotaSeat = providerGaugeMap(kind, gauges);
+    routeGauges[kind] = projectGauge(
+      kind, byQuotaSeat[quotaSeatForProvider(kind)] || gauges?.[kind],
+    );
+    const aliasedStates = (coolingStates || []).filter((state) =>
+      (state.aliases || [state.seat]).map(String).includes(kind));
+    const providerManaged = !registryError
+      && Object.prototype.hasOwnProperty.call(registry.providers, kind);
+    if (registryError) {
+      const prior = adjustedDiagnostics[kind] && typeof adjustedDiagnostics[kind] === 'object'
+        ? adjustedDiagnostics[kind] : {};
+      adjustedDiagnostics[kind] = {
+        ...prior,
+        ready: false,
+        accountUnavailable: true,
+        accountUnavailableReason: 'registry_invalid',
+        detail: 'linked-account registry is invalid; dispatch is disabled until it is repaired',
+      };
+      accountSelection[kind] = { available: false, reason: 'registry_invalid' };
+      continue;
+    }
+    if (!providerAccounts.credentialEnvFor(entry) && !providerManaged) {
+      for (const state of aliasedStates) addCooling(kind, state);
+      continue;
+    }
+
+    let accounts;
+    let linkedAccountsSupported;
+    try {
+      accounts = providerAccounts.accountsFor(kind, entry, registry);
+      linkedAccountsSupported = providerAccounts.supportsLinkedAccounts(entry);
+    } catch (err) {
+      const prior = adjustedDiagnostics[kind] && typeof adjustedDiagnostics[kind] === 'object'
+        ? adjustedDiagnostics[kind] : {};
+      adjustedDiagnostics[kind] = {
+        ...prior,
+        ready: false,
+        accountUnavailable: true,
+        accountUnavailableReason: 'registry_invalid',
+        detail: `linked-account configuration is invalid for ${kind}`,
+      };
+      accountSelection[kind] = { available: false, reason: 'registry_invalid' };
+      continue;
+    }
+    const enabledLinkedAccounts = accounts.some((account) => !account.implicit && account.enabled);
+    if (providerManaged && enabledLinkedAccounts
+      && entry.linked_accounts_supported === false && !linkedAccountsSupported) {
+      const prior = adjustedDiagnostics[kind] && typeof adjustedDiagnostics[kind] === 'object'
+        ? adjustedDiagnostics[kind] : {};
+      adjustedDiagnostics[kind] = {
+        ...prior,
+        ready: false,
+        accountUnavailable: true,
+        accountUnavailableReason: 'linked_account_isolation_unsupported',
+        detail: entry.linked_accounts_unavailable_reason
+          || 'linked accounts are disabled because this provider cannot isolate authentication safely',
+      };
+      accountSelection[kind] = {
+        available: false,
+        reason: 'linked_account_isolation_unsupported',
+      };
+      continue;
+    }
+    const relocationMissing = providerManaged
+      && !providerAccounts.credentialEnvFor(entry)
+      && enabledLinkedAccounts;
+    if (relocationMissing) {
+      const prior = adjustedDiagnostics[kind] && typeof adjustedDiagnostics[kind] === 'object'
+        ? adjustedDiagnostics[kind] : {};
+      adjustedDiagnostics[kind] = {
+        ...prior,
+        ready: false,
+        accountUnavailable: true,
+        accountUnavailableReason: 'credential_relocation_unavailable',
+        detail: 'managed linked accounts exist but credential_env is missing or invalid',
+      };
+      accountSelection[kind] = {
+        available: false,
+        reason: 'credential_relocation_unavailable',
+      };
+      continue;
+    }
+    const readiness = adjustedDiagnostics[kind];
+    const defaultSignedOut = !!(readiness && readiness.found && readiness.ready === false
+      && readiness.authFailed === true && readiness.authAuthoritative === true
+      && Array.isArray(entry.login_command));
+    const unavailableAccountIds = defaultSignedOut
+      ? new Set([providerAccounts.DEFAULT_ACCOUNT_ID]) : new Set();
+    const eligible = accounts.filter((account) => account.enabled
+      && !unavailableAccountIds.has(account.id)
+      && providerAccounts.accountIsProvisioned({ entry, account, dataDir: DATA_DIR, kind })
+      && providerAccounts.accountAuthAvailable({ entry, account, dataDir: DATA_DIR, kind }));
+    const accountCooldowns = new Map((coolingStates || [])
+      .filter((state) => state.scope !== 'model')
+      .map((state) => [state.quotaSeat, state]));
+    const ownCoolingSeats = new Set(accountCooldowns.keys());
+    const vendorBlockFor = (account) => activeVendorQuotaExhaustion(byQuotaSeat[account.quotaSeat]);
+    const nonExhausted = eligible.filter((account) => !vendorBlockFor(account));
+    const selected = providerAccounts.selectAccount({
+      kind,
+      entry,
+      registry,
+      dataDir: DATA_DIR,
+      gauges: byQuotaSeat,
+      coolingQuotaSeats: ownCoolingSeats,
+      unavailableAccountIds,
+      // Retain one concrete cooled account in the projection. The cooldown
+      // layer below still hides it from normal routing, while an explicitly
+      // requested provider can exercise the established one-shot retry path.
+      allowCoolingFallback: true,
+    });
+
+    if (selected) {
+      const selectedCooldown = accountCooldowns.get(selected.quotaSeat) || null;
+      routeGauges[kind] = projectGauge(
+        kind, byQuotaSeat[selected.quotaSeat] || routeGauges[kind],
+      );
+      accountSelection[kind] = selectedCooldown ? {
+        available: false,
+        reason: 'cooling',
+        account: selected.implicit ? null : selected.id,
+        quotaSeat: selected.quotaSeat,
+        retryAt: selectedCooldown.until || null,
+      } : {
+        available: true,
+        account: selected.implicit ? null : selected.id,
+        quotaSeat: selected.quotaSeat,
+      };
+      if (defaultSignedOut && !selected.implicit) {
+        adjustedDiagnostics[kind] = {
+          ...readiness,
+          ready: true,
+          linkedAccountReady: true,
+          selectedAccount: selected.id,
+          detail: `default sign-in unavailable; linked account '${selected.id}' is provisioned`,
+        };
+      }
+      if (selectedCooldown) addCooling(kind, selectedCooldown);
+      // Model-scoped cooldowns apply to the provider/model regardless of which
+      // account holds the credential directory. Account-scoped cooldowns do not.
+      for (const state of aliasedStates.filter((item) => item.scope === 'model')) addCooling(kind, state);
+      continue;
+    }
+
+    if (!eligible.length) {
+      const prior = adjustedDiagnostics[kind] && typeof adjustedDiagnostics[kind] === 'object'
+        ? adjustedDiagnostics[kind] : {};
+      adjustedDiagnostics[kind] = {
+        ...prior,
+        ready: false,
+        accountUnavailable: true,
+        accountUnavailableReason: 'auth_unavailable',
+        detail: 'no enabled and provisioned linked account is available',
+      };
+      accountSelection[kind] = { available: false, reason: 'auth_unavailable' };
+      continue;
+    }
+    if (!nonExhausted.length) {
+      // Hard vendor evidence cannot be bypassed, even for an explicitly named
+      // provider. Project one exhausted account gauge onto the provider key so
+      // the existing typed reset guidance remains intact.
+      routeGauges[kind] = projectGauge(
+        kind, byQuotaSeat[eligible[0].quotaSeat] || routeGauges[kind],
+      );
+      accountSelection[kind] = { available: false, reason: 'vendor_exhausted' };
+      continue;
+    }
+
+    // Every non-exhausted account is cooling. Normal routing blocks the
+    // provider, while the established explicit-provider override can still
+    // probe one account and clear a recovered cooldown.
+    const cooled = nonExhausted[0];
+    routeGauges[kind] = projectGauge(
+      kind, byQuotaSeat[cooled.quotaSeat] || routeGauges[kind],
+    );
+    addCooling(kind, accountCooldowns.get(cooled.quotaSeat));
+    accountSelection[kind] = {
+      available: false,
+      reason: 'cooling',
+      retryAt: accountCooldowns.get(cooled.quotaSeat)?.until || null,
+    };
+  }
+
+  return { diagnostics: adjustedDiagnostics, gauges: routeGauges, cooling: routeCooling, accountSelection };
 }
 
 function seatCostClassMap() {
@@ -4827,8 +5426,8 @@ function recordRunUsage({ kind, route, usage, model, startedAt, ok, failureKind,
       // these until it is taught to read them.
       cacheReadTokens: usage?.cache_read_input_tokens ?? 0,
       cacheCreationTokens: usage?.cache_creation_input_tokens ?? 0,
-      totalTokens: Number.isFinite(Number(usage?.total_tokens)) ? Number(usage.total_tokens) : null,
-      providerCostUsd: Number.isFinite(Number(usage?.cost_usd)) ? Number(usage.cost_usd) : null,
+      totalTokens: nonnegativeUsageNumber(usage?.total_tokens),
+      providerCostUsd: nonnegativeCostNumber(usage?.cost_usd),
       elapsedMs: startedAt ? Date.now() - startedAt : 0,
       ok, failureKind: failureKind || null, taskId: taskId || null,
     });
@@ -4843,7 +5442,15 @@ function recordRunUsage({ kind, route, usage, model, startedAt, ok, failureKind,
 // turn. Three Claude plans behave as three seats to spend, not one.
 app.get('/api/accounts', (req, res) => {
   const cfg = loadConfig();
-  const registry = providerAccounts.loadRegistry(DATA_DIR);
+  let registry;
+  try {
+    registry = providerAccounts.loadRegistry(DATA_DIR, { strict: true });
+  } catch (err) {
+    return res.status(500).json({
+      error: 'account registry is invalid; dispatch is disabled until it is repaired',
+      detail: err.message,
+    });
+  }
   const cooling = new Set(coolingQuotaStates().map((s) => s.quotaSeat).filter(Boolean));
   let gauges = {};
   try {
@@ -4855,24 +5462,47 @@ app.get('/api/accounts', (req, res) => {
   for (const [kind, entry] of Object.entries(cfg)) {
     if (kind.startsWith('_') || !entry || typeof entry !== 'object') continue;
     const credentialEnv = providerAccounts.credentialEnvFor(entry);
-    const accounts = providerAccounts.accountsFor(kind, entry, registry).map((a) => ({
-      id: a.id,
-      label: a.label,
-      quotaSeat: a.quotaSeat,
-      enabled: a.enabled,
-      implicit: a.implicit,
-      provisioned: providerAccounts.accountIsProvisioned({ entry, account: a, dataDir: DATA_DIR, kind }),
-      cooling: cooling.has(a.quotaSeat),
-      percentRemaining: Number.isFinite(Number(gauges[a.quotaSeat]?.percentRemaining))
-        ? Number(gauges[a.quotaSeat].percentRemaining) : null,
-    }));
+    let supportsMultipleAccounts = false;
+    try { supportsMultipleAccounts = providerAccounts.supportsLinkedAccounts(entry); }
+    catch { supportsMultipleAccounts = false; }
+    const accounts = providerAccounts.accountsFor(kind, entry, registry).map((a) => {
+      const runtimeAuthUnavailable = a.implicit
+        && lastDiagnostics?.results?.[kind]?.ready === false
+        && lastDiagnostics?.results?.[kind]?.authFailed === true
+        && lastDiagnostics?.results?.[kind]?.authAuthoritative === true;
+      const authUnavailable = runtimeAuthUnavailable || !providerAccounts.accountAuthAvailable({
+        entry, account: a, dataDir: DATA_DIR, kind,
+      });
+      return {
+        id: a.id,
+        label: a.label,
+        quotaSeat: a.quotaSeat,
+        enabled: a.enabled,
+        implicit: a.implicit,
+        provisioned: providerAccounts.accountIsProvisioned({ entry, account: a, dataDir: DATA_DIR, kind }),
+        authUnavailable,
+        authFailedAt: a.authFailedAt ? new Date(a.authFailedAt).toISOString() : null,
+        authRetry: authUnavailable ? {
+          method: 'POST',
+          path: `/api/accounts/${encodeURIComponent(kind)}/${encodeURIComponent(a.id)}/auth/retry`,
+          body: { retry: true },
+          note: 'Use only after signing in again. The next live dispatch revalidates the credentials and quarantines them again if authentication still fails.',
+        } : null,
+        cooling: cooling.has(a.quotaSeat),
+        percentRemaining: typeof gauges[a.quotaSeat]?.percentRemaining === 'number'
+          && Number.isFinite(gauges[a.quotaSeat].percentRemaining)
+          ? gauges[a.quotaSeat].percentRemaining : null,
+      };
+    });
     // Only report seats that can actually hold more than one account, so the
     // dashboard does not offer to link a second plan to a seat whose CLI has
     // no way to relocate its credentials.
     out[kind] = {
       label: entry.label || kind,
       credentialEnv,
-      supportsMultipleAccounts: !!credentialEnv,
+      supportsMultipleAccounts,
+      linkedAccountsUnavailableReason: supportsMultipleAccounts
+        ? null : (entry.linked_accounts_unavailable_reason || null),
       accounts,
     };
   }
@@ -4883,46 +5513,136 @@ app.post('/api/accounts/:kind', (req, res) => {
   const kind = String(req.params.kind);
   const entry = loadConfig()[kind];
   if (!entry || kind.startsWith('_')) return res.status(404).json({ error: `unknown provider '${kind}'` });
-  if (!providerAccounts.credentialEnvFor(entry)) {
+  let supportsMultipleAccounts = false;
+  try { supportsMultipleAccounts = providerAccounts.supportsLinkedAccounts(entry); }
+  catch (err) { return res.status(400).json({ error: err.message }); }
+  if (!supportsMultipleAccounts) {
     return res.status(400).json({
-      error: `${kind} does not declare credential_env, so its credentials cannot be separated per account`,
-      hint: 'add "credential_env": "<ENV_VAR>" to this provider in cli-config.json',
+      error: entry.linked_accounts_supported === false
+        ? `${kind} does not support attribution-safe linked accounts`
+        : `${kind} does not declare credential_env, so its credentials cannot be separated per account`,
+      hint: entry.linked_accounts_unavailable_reason
+        || 'add "credential_env": "<ENV_VAR>" to this provider in cli-config.json',
     });
   }
   try {
     providerAccounts.addAccount(DATA_DIR, kind, { id: req.body?.id, label: req.body?.label });
+    invalidateAccountRegistry();
   } catch (err) { return res.status(400).json({ error: err.message }); }
   const dir = providerAccounts.accountDir(DATA_DIR, kind, String(req.body.id));
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const login = Array.isArray(entry.login_command) ? entry.login_command : null;
+  const credentialEnv = providerAccounts.credentialEnvFor(entry);
+  const signInEnvironment = providerAccounts.credentialEnvironmentFor(entry, dir);
   res.json({
     ok: true, kind, id: String(req.body.id), credentialDir: dir,
     // The bridge cannot complete an interactive OAuth flow on the operator's
     // behalf, so hand back the exact command that signs THIS account in.
-    signInCommand: login
-      ? `${providerAccounts.credentialEnvFor(entry)}=${dir} ${login.join(' ')}`
-      : `${providerAccounts.credentialEnvFor(entry)}=${dir} <this provider's login command>`,
+    signIn: { environment: signInEnvironment, argv: login },
+    signInCommand: providerAccounts.formatSignInCommand({
+      envName: credentialEnv,
+      credentialDir: dir,
+      environment: signInEnvironment,
+      argv: login,
+    }),
     note: 'Run that command in a terminal, complete the sign-in, then this account becomes selectable.',
   });
 });
 
 app.post('/api/accounts/:kind/:id/enabled', (req, res) => {
+  const kind = String(req.params.kind);
+  const entry = loadConfig()[kind];
+  if (!entry || kind.startsWith('_')) return res.status(404).json({ error: `unknown provider '${kind}'` });
+  const body = req.body;
+  if (!body || typeof body !== 'object' || Array.isArray(body)
+    || Object.keys(body).length !== 1 || typeof body.enabled !== 'boolean') {
+    return res.status(400).json({ error: 'body must contain only enabled as a boolean' });
+  }
   try {
-    providerAccounts.setAccountEnabled(DATA_DIR, String(req.params.kind), String(req.params.id), !!req.body?.enabled);
+    providerAccounts.setAccountEnabled(DATA_DIR, kind, String(req.params.id), body.enabled);
+    invalidateAccountRegistry();
     res.json({ ok: true });
   } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// Some CLIs (notably Copilot) expose a version probe but no non-interactive
+// authentication-status command. A live auth failure must still quarantine the
+// default account, yet a successful re-login cannot be inferred from that
+// version-only probe. Give the operator one explicit, typed way to arm a single
+// retry. If the credentials are still bad, normal dispatch accounting writes
+// the quarantine marker straight back.
+app.post('/api/accounts/:kind/:id/auth/retry', (req, res) => {
+  const kind = String(req.params.kind);
+  const id = String(req.params.id);
+  const entry = loadConfig()[kind];
+  if (!entry || kind.startsWith('_')) return res.status(404).json({ error: `unknown provider '${kind}'` });
+  const body = req.body;
+  if (!body || typeof body !== 'object' || Array.isArray(body)
+    || Object.keys(body).length !== 1 || body.retry !== true) {
+    return res.status(400).json({ error: 'body must contain only retry: true' });
+  }
+  try {
+    const registry = providerAccounts.loadRegistry(DATA_DIR, { strict: true });
+    const account = providerAccounts.accountsFor(kind, entry, registry)
+      .find((candidate) => candidate.id === id);
+    if (!account) return res.status(404).json({ error: `unknown account '${id}' for ${kind}` });
+    const cleared = providerAccounts.clearAccountAuthFailure(DATA_DIR, kind, id);
+    if (id === providerAccounts.DEFAULT_ACCOUNT_ID) {
+      armDefaultAccountRuntimeAuthRetry(kind);
+    }
+    invalidateAccountRegistry();
+    return res.json({
+      ok: true,
+      kind,
+      id,
+      authRetryArmed: true,
+      priorAuthFailureCleared: !!cleared,
+      note: 'The next live dispatch will validate this account and quarantine it again if authentication still fails.',
+    });
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
 });
 
 app.delete('/api/accounts/:kind/:id', (req, res) => {
   const kind = String(req.params.kind);
   const id = String(req.params.id);
+  const entry = loadConfig()[kind];
+  if (!entry || kind.startsWith('_')) return res.status(404).json({ error: `unknown provider '${kind}'` });
+  // Validate and persist the registry change before deleting credentials. A
+  // malformed registry or unknown account must leave its recoverable token
+  // directory untouched rather than deleting first and failing afterward.
   try {
-    // Removing the registry entry alone would leave a live session token on
-    // disk, so forget the credentials too unless the caller asks to keep them.
-    if (req.query.keepCredentials !== '1') providerAccounts.forgetAccountCredentials(DATA_DIR, kind, id);
     providerAccounts.removeAccount(DATA_DIR, kind, id);
-    res.json({ ok: true, credentialsRemoved: req.query.keepCredentials !== '1' });
-  } catch (err) { res.status(400).json({ error: err.message }); }
+    invalidateAccountRegistry();
+  } catch (err) {
+    return res.status(400).json({ error: err.message, accountRemoved: false, credentialsRemoved: false });
+  }
+  const implicitDefault = id === providerAccounts.DEFAULT_ACCOUNT_ID;
+  const removeManagedCredentials = req.query.keepCredentials !== '1' && !implicitDefault;
+  if (removeManagedCredentials) {
+    try {
+      providerAccounts.forgetAccountCredentials(DATA_DIR, kind, id);
+    } catch (err) {
+      return res.json({
+        ok: false,
+        accountRemoved: true,
+        credentialsRemoved: false,
+        credentialCleanupRequired: true,
+        credentialDir: providerAccounts.accountDir(DATA_DIR, kind, id),
+        error: `account was removed, but its credential directory could not be deleted: ${err.message}`,
+      });
+    }
+  }
+  return res.json({
+    ok: true,
+    accountRemoved: true,
+    credentialsRemoved: removeManagedCredentials,
+    ...(implicitDefault ? {
+      requiresProviderLogout: true,
+      note: 'The default account uses the provider CLI home; run the provider logout command to revoke that session.',
+    } : {}),
+  });
 });
 
 app.get('/api/usage/gauges', (req, res) => {
@@ -4934,7 +5654,7 @@ app.get('/api/usage/gauges', (req, res) => {
     res.json({
       gauges,
       balance: fleetBalance(gauges),
-      quotaSeats: quotaSeatRegistry.groups,
+      quotaSeats: currentQuotaSeatGroups(),
       operatorQuota: operatorQuotaFleet(gauges),
       providerUsageCapabilities: providerUsageCapabilities(loadConfig(), runtimeVersions),
       totals: usageLedger.totals(windowMs),
@@ -4944,7 +5664,7 @@ app.get('/api/usage/gauges', (req, res) => {
 app.get('/api/usage/operator-quota', (req, res) => {
   res.json({
     observations: usageLedger.operatorQuotaObservations(),
-    quotaSeats: quotaSeatRegistry.groups,
+    quotaSeats: currentQuotaSeatGroups(),
     provenanceOptions: OPERATOR_QUOTA_PROVENANCE,
     maxTtlMs: MAX_OPERATOR_QUOTA_TTL_MS,
   });
@@ -4960,7 +5680,7 @@ app.put('/api/usage/operator-quota', (req, res) => {
     return res.status(400).json({ error: `unsupported fields: ${unknown.join(', ')}; credentials and free-form notes are never stored` });
   }
   const quotaSeat = typeof body.quotaSeat === 'string' ? body.quotaSeat.trim() : '';
-  if (!quotaSeatRegistry.groups[quotaSeat]) return res.status(400).json({ error: 'quotaSeat must name a configured quota seat' });
+  if (!currentQuotaSeatGroups()[quotaSeat]) return res.status(400).json({ error: 'quotaSeat must name a configured quota seat' });
   if (!Number.isInteger(body.percentRemaining) || body.percentRemaining < 0 || body.percentRemaining > 100) {
     return res.status(400).json({ error: 'percentRemaining must be an integer from 0 to 100' });
   }
@@ -4987,12 +5707,12 @@ app.delete('/api/usage/operator-quota', (req, res) => {
     return res.status(400).json({ error: 'body must contain only quotaSeat' });
   }
   const quotaSeat = typeof body.quotaSeat === 'string' ? body.quotaSeat.trim() : '';
-  if (!quotaSeatRegistry.groups[quotaSeat]) return res.status(400).json({ error: 'quotaSeat must name a configured quota seat' });
+  if (!currentQuotaSeatGroups()[quotaSeat]) return res.status(400).json({ error: 'quotaSeat must name a configured quota seat' });
   if (!usageLedger.clearOperatorQuota(quotaSeat)) return res.status(500).json({ error: 'operator quota clear could not be persisted' });
   return res.json({ ok: true, quotaSeat, cleared: true });
 });
 app.get('/api/cooldowns', (req, res) => {
-  res.json({ cooldowns: cooldowns.all(), cooling: coolingQuotaStates(), quotaSeats: quotaSeatRegistry.groups });
+  res.json({ cooldowns: cooldowns.all(), cooling: coolingQuotaStates(), quotaSeats: currentQuotaSeatGroups() });
 });
 
 app.get('/api/usage/totals', (req, res) => {
@@ -5017,17 +5737,44 @@ app.post('/api/usage/advise', (req, res) => {
     const candidateDiagnostics = Object.fromEntries(filesystemUsable.map((item) => [item.seat, {
       found: true, ready: true,
     }]));
-    const vendorQuotaInput = applyVendorQuotaExhaustionToDiagnostics(candidateDiagnostics, gauges);
+    // Advice is a routing surface too. Project the healthiest selectable linked
+    // account onto each provider key before applying quota gates; otherwise a
+    // cooling/exhausted default account hides a healthy second subscription.
+    const routingInputs = accountAwareRoutingInputs(
+      cfg, candidateDiagnostics, gauges, coolingQuotaStates(),
+    );
+    const accountUnavailableKinds = new Set(Object.entries(routingInputs.accountSelection)
+      .filter(([, state]) => state?.available === false
+        && (state.reason === 'auth_unavailable' || state.reason === 'registry_invalid'
+          || state.reason === 'credential_relocation_unavailable'))
+      .map(([kind]) => kind));
+    const accountUnavailableSkipped = filesystemUsable
+      .filter((item) => accountUnavailableKinds.has(item.seat))
+      .map((item) => ({
+        ...item,
+        blocked: true,
+        reason: routingInputs.accountSelection[item.seat].reason,
+      }));
+    const accountUsable = filesystemUsable.filter((item) => !accountUnavailableKinds.has(item.seat));
+    const vendorQuotaInput = applyVendorQuotaExhaustionToDiagnostics(
+      routingInputs.diagnostics, routingInputs.gauges,
+    );
     const vendorQuotaKinds = new Set(vendorQuotaInput.skipped.map((item) => item.kind));
-    const quotaUsable = filesystemUsable.filter((item) => !vendorQuotaKinds.has(item.seat));
+    const quotaUsable = accountUsable.filter((item) => !vendorQuotaKinds.has(item.seat));
     const vendorQuotaSkipped = vendorQuotaInput.skipped.filter((item) => candidateDiagnostics[item.kind]);
     // Quota state first: a cooling seat cannot do the work at any rank.
     const { usable, skipped, allCooling } = filterCandidatesByQuotaCooldown(
-      quotaUsable, explicitProvider ? (req.body?.explicitSeat || null) : null);
-    const ranked = levelCandidates(usable, gauges);
-    const top = ranked[0] ? gauges[ranked[0].seat] : null;
+      quotaUsable,
+      explicitProvider ? (req.body?.explicitSeat || null) : null,
+      routingInputs.cooling,
+    );
+    const ranked = levelCandidates(usable, routingInputs.gauges);
+    const top = ranked[0] ? routingInputs.gauges[ranked[0].seat] : null;
     res.json({
       ranked, skipped, allCooling,
+      allAccountsUnavailable: accountUsable.length === 0 && accountUnavailableSkipped.length > 0,
+      accountUnavailableSkipped,
+      accountSelection: routingInputs.accountSelection,
       allVendorQuotaExhausted: quotaUsable.length === 0 && vendorQuotaSkipped.length > 0,
       vendorQuotaSkipped, filesystemSkipped, filesystemAuthority,
       tierAdjustment: suggestTierAdjustment({ tier, gauge: top, highStakes, explicitProvider }),
