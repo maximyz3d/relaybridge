@@ -47,7 +47,6 @@
     "code_review": ["ollama_coder", "copilot", "claude_fable", "claude", "codex", "cursor", "gemini", "grok"],
     "research": ["perplexity", "grok", "gemini", "ollama"],
     "reasoning": ["ollama", "ollama_llama", "claude", "claude_fable", "gemini", "grok", "codex"],
-    "vision": [],
     "hardware": ["gemini", "claude", "codex", "grok"],
     "general": ["ollama_fast", "ollama_llama", "ollama", "copilot", "claude_fable", "claude", "gemini", "grok", "codex", "cursor"]
   },

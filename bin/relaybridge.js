@@ -28,6 +28,13 @@ const BASE = (process.env.RELAYBRIDGE_URL || process.env.PS_BRIDGE_URL || `http:
 // uses, so the CLI works from anywhere without configuration.
 function findToken() {
   if (process.env.RELAYBRIDGE_TOKEN) return process.env.RELAYBRIDGE_TOKEN;
+  const configuredTokenFile = process.env.RELAYBRIDGE_TOKEN_FILE || process.env.PS_BRIDGE_TOKEN_FILE;
+  if (configuredTokenFile) {
+    try {
+      const value = fs.readFileSync(path.resolve(configuredTokenFile), 'utf8').trim();
+      if (value) return value;
+    } catch { /* keep looking in the standard install locations */ }
+  }
   const candidates = [
     path.join(process.cwd(), '.bridge-token'),
     path.join(process.env.LOCALAPPDATA || '', 'RelayBridge', '.bridge-token'),

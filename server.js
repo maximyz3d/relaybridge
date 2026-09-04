@@ -15,6 +15,7 @@ const { buildRegistry, parseModelList, pinIsRetired } = require('./lib/model-reg
 const { buildTaskPlan, EFFORT_ORDER, costClassFor } = require('./lib/task-plan');
 const { buildQuotaSeatGroups } = require('./lib/quota-seat');
 const { providerUsageCapability, providerUsageCapabilities } = require('./lib/provider-usage-capability');
+const platform = require('./lib/platform');
 const { receiptStoreIdentity } = require('./lib/receipt-store-identity.cjs');
 const {
   resolveFilesystemPolicy, providerFilesystemEligibility,
@@ -24,6 +25,10 @@ const { WebSocketServer } = require('ws');
 const { spawn, spawnSync } = require('child_process');
 const TIMEOUT_POLICY = require('./timeout-policy.cjs');
 const ROOT = __dirname;
+// USERPROFILE is Windows-only. On POSIX the same idea is HOME; without this
+// fallback the allowed roots collapse to ROOT and the bridge can only reach
+// its own source tree.
+const USER_HOME = process.env.USERPROFILE || process.env.HOME || os.homedir() || ROOT;
 const BRIDGE_VERSION = require('./package.json').version;
 function loadBuildId() {
   const testValue = process.env.NODE_ENV === 'test' ? process.env.RELAYBRIDGE_TEST_BUILD_ID : '';
@@ -175,8 +180,8 @@ const ALLOWED_ROOTS_SETTING = firstDefinedEnv(
 );
 const ALLOWED_ROOTS_VALUE = ALLOWED_ROOTS_SETTING.value;
 const ALLOWED_ROOTS = (ALLOWED_ROOTS_SETTING.defined
-  ? ALLOWED_ROOTS_VALUE.split(';')
-  : [process.env.USERPROFILE || ROOT, ROOT])
+  ? ALLOWED_ROOTS_VALUE.split(';')  // ';' is the bridge's own cross-platform convention, not path.delimiter
+  : [USER_HOME, ROOT])
   .map((value) => String(value).trim())
   .filter(Boolean)
   .map((value) => path.resolve(value));
@@ -326,7 +331,7 @@ function isInsideAllowedRoot(candidate) {
 }
 
 function defaultAllowedCwd() {
-  const preferred = path.resolve(process.env.USERPROFILE || ROOT);
+  const preferred = path.resolve(USER_HOME);
   const candidates = [preferred, ...ALLOWED_ROOTS];
   const seen = new Set();
   for (const candidate of candidates) {
@@ -396,7 +401,7 @@ function workspacePolicy() {
   let error = null;
   try { defaultCwd = defaultAllowedCwd(); }
   catch (err) { error = err.message; }
-  const userProfile = path.resolve(process.env.USERPROFILE || ROOT);
+  const userProfile = path.resolve(USER_HOME);
   return {
     explicit: ALLOWED_ROOTS_SETTING.defined,
     allowedRoots: [...ALLOWED_ROOTS],
@@ -1088,8 +1093,8 @@ function buildEnv(extras = {}, stripNames = []) {
     const candidates = [
       path.join(process.env.LOCALAPPDATA || '', 'agy', 'bin'),
       path.join(process.env.LOCALAPPDATA || '', 'cursor-agent'),
-      path.join(process.env.USERPROFILE || '', '.local', 'bin'),
-      path.join(process.env.USERPROFILE || '', '.cursor', 'bin'),
+      path.join(USER_HOME, '.local', 'bin'),
+      path.join(USER_HOME, '.cursor', 'bin'),
       path.join(process.env.APPDATA || '', 'npm'),
       path.join(process.env.LOCALAPPDATA || '', 'npm'),
       path.join(process.env.LOCALAPPDATA || '', 'RelayBridge', 'tools', 'perplexity-web-mcp', '.venv', 'Scripts'),
@@ -1119,10 +1124,52 @@ function normalizeEnvOverrides(raw, fieldName = 'oneshot_env') {
   return normalized;
 }
 
-function resolveExecutable(command, env = buildEnv()) {
-  if (!command || process.platform !== 'win32') return command;
-  if (path.isAbsolute(command)) return command;
+// Windows interop binaries are executable-by-mode on WSL, so a naive POSIX PATH
+// walk happily "finds" them. Opt back in with RELAYBRIDGE_ALLOW_WIN_INTEROP=1.
+const ALLOW_WIN_INTEROP = /^(1|true|yes)$/i.test(String(process.env.RELAYBRIDGE_ALLOW_WIN_INTEROP || ''));
+const WIN_EXEC_SUFFIX = /\.(exe|cmd|bat|ps1|com)$/i;
+
+// Like resolveExecutable, but also reports what it deliberately walked past, so
+// the dashboard can say WHY a seemingly-installed CLI is not on offer.
+function resolveExecutableInfo(command, env = buildEnv()) {
+  const none = { resolved: command, interopSkipped: [] };
+  if (!command) return none;
+  if (path.isAbsolute(command)) return { resolved: command, interopSkipped: [] };
   const pathKey = Object.keys(env).find((k) => k.toUpperCase() === 'PATH') || 'Path';
+  // POSIX: no PATHEXT and no case-folding — walk PATH and take the first entry
+  // that is a file with an execute bit. Returning `command` unchanged here (the
+  // old non-win32 early return) made seat discovery's `resolved !== binary`
+  // test permanently false, so every CLI reported "not installed" on Linux.
+  if (process.platform !== 'win32') {
+    if (command.includes('/')) return { resolved: command, interopSkipped: [] };
+    // A .exe/.cmd name cannot be a native POSIX seat. On WSL it resolves
+    // through /mnt interop and launches a Win32 process that cannot chdir into
+    // the POSIX workspace; on plain Linux it never resolves at all.
+    const namedWindowsBinary = !ALLOW_WIN_INTEROP && WIN_EXEC_SUFFIX.test(command);
+    const interopSkipped = [];
+    for (const dir of String(env[pathKey] || '').split(path.delimiter).filter(Boolean)) {
+      const candidate = path.join(dir, command);
+      try {
+        const st = fs.statSync(candidate);
+        if (!st.isFile() || !(st.mode & 0o111)) continue;
+        // /mnt is the Windows filesystem reached over 9p. Everything there is
+        // mode 777, so the execute bit proves nothing, and the Windows npm
+        // prefix on the inherited PATH shadows real Linux installs.
+        const isInterop = !ALLOW_WIN_INTEROP && candidate.startsWith('/mnt/');
+        if (isInterop || namedWindowsBinary) { interopSkipped.push(candidate); continue; }
+        return { resolved: candidate, interopSkipped };
+      } catch {}
+    }
+    return { resolved: command, interopSkipped };
+  }
+  return { resolved: resolveExecutableWin32(command, env, pathKey), interopSkipped: [] };
+}
+
+function resolveExecutable(command, env = buildEnv()) {
+  return resolveExecutableInfo(command, env).resolved;
+}
+
+function resolveExecutableWin32(command, env, pathKey) {
   const dirs = String(env[pathKey] || '').split(';').filter(Boolean);
   const hasExt = !!path.extname(command);
   const pathExt = String(env.PATHEXT || '.COM;.EXE;.BAT;.CMD').split(';').filter(Boolean);
@@ -1729,11 +1776,11 @@ function parseConfiguredOneShotOutput(entry, rawOutput) {
 }
 
 function ollamaManifestIdentity(entry) {
-  if (entry?.transport !== 'local:ollama' || !entry.model || !process.env.USERPROFILE) return null;
+  if (entry?.transport !== 'local:ollama' || !entry.model || !USER_HOME) return null;
   const match = /^([A-Za-z0-9._-]+)(?::([A-Za-z0-9._-]+))?$/.exec(String(entry.model));
   if (!match) return null;
   const manifestPath = path.join(
-    process.env.USERPROFILE,
+    USER_HOME,
     '.ollama', 'models', 'manifests', 'registry.ollama.ai', 'library',
     match[1], match[2] || 'latest',
   );
@@ -2130,20 +2177,12 @@ function trackChild(proc) {
 // shims can leave the actual AI CLI running and consuming quota.  Kill the
 // verified wrapper tree on timeout or client disconnect.
 function killProcessTree(proc) {
-  if (!proc || !proc.pid) return;
-  try {
-    if (process.platform === 'win32') {
-      const killer = spawn('taskkill.exe', ['/PID', String(proc.pid), '/T', '/F'], {
-        windowsHide: true,
-        stdio: 'ignore',
-      });
-      killer.unref();
-    } else {
-      proc.kill('SIGTERM');
-    }
-  } catch {
-    try { proc.kill(); } catch {}
-  }
+  // Delegated to lib/platform.js. The old POSIX branch was proc.kill('SIGTERM')
+  // — the CLI died but the subprocesses it spawned (node shims, MCP servers)
+  // survived, holding ports and file locks. killTree signals the whole tree,
+  // group-kill first, ps-walk fallback, SIGKILL escalation after 3s.
+  try { platform.killTree(proc); }
+  catch { try { proc?.kill(); } catch { /* already gone */ } }
 }
 
 // ---- session management ----
@@ -2161,44 +2200,7 @@ let modelRegistry = null;
 let discoveryInFlight = null;
 const MODEL_REGISTRY_FILE = path.join(DATA_DIR, 'model-registry.json');
 
-// Cumulative CPU milliseconds for a process tree. This separates "the model is
-// thinking and has not printed yet" from "the stage is wedged": print-mode CLIs
-// buffer their whole answer, so silence alone proves nothing. Best effort â€”
-// resolves null when it cannot be read.
-function sampleTreeCpuMs(rootPid) {
-  return new Promise((resolve) => {
-    if (process.platform !== 'win32' || !rootPid) return resolve(null);
-    const script = [
-      "$ErrorActionPreference='SilentlyContinue';",
-      `$root=${Number(rootPid)};`,
-      '$all=Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,KernelModeTime,UserModeTime;',
-      'if(-not $all){exit 0};',
-      '$byId=@{};foreach($p in $all){$byId[[int]$p.ProcessId]=$p};',
-      '$kids=@{};foreach($p in $all){$k=[int]$p.ParentProcessId;if(-not $kids.ContainsKey($k)){$kids[$k]=@()};$kids[$k]+=[int]$p.ProcessId};',
-      '$stack=New-Object System.Collections.Stack;$stack.Push($root);$seen=@{};$total=0.0;',
-      'while($stack.Count -gt 0){$cur=[int]$stack.Pop();if($seen.ContainsKey($cur)){continue};$seen[$cur]=$true;',
-      '$proc=$byId[$cur];if($proc){$total+=([double]$proc.KernelModeTime+[double]$proc.UserModeTime)/10000.0};',
-      'if($kids.ContainsKey($cur)){foreach($c in $kids[$cur]){$stack.Push($c)}}};',
-      '[math]::Round($total)',
-    ].join('');
-    let done = false;
-    let out = '';
-    let child;
-    const finish = (value) => { if (done) return; done = true; try { child?.kill(); } catch {} resolve(value); };
-    try {
-      child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script], { windowsHide: true });
-    } catch { return resolve(null); }
-    const guard = setTimeout(() => finish(null), 8000);
-    if (typeof guard.unref === 'function') guard.unref();
-    child.stdout.on('data', (d) => { out += d.toString(); });
-    child.on('error', () => { clearTimeout(guard); finish(null); });
-    child.on('close', () => {
-      clearTimeout(guard);
-      const parsed = Number(String(out).trim());
-      finish(Number.isFinite(parsed) ? parsed : null);
-    });
-  });
-}
+const sampleTreeCpuMs = platform.sampleTreeCpuMs;
 
 async function discoverModels() {
   if (discoveryInFlight) return discoveryInFlight;
@@ -2257,7 +2259,7 @@ class Session {
     this.label = label;
     this.command = command;
     this.args = args;
-    this.cwd = cwd || process.env.USERPROFILE || ROOT;
+    this.cwd = cwd || USER_HOME || ROOT;
     this.buffer = []; // ring buffer of recent output
     this.bufferMax = 2000; // lines
     this.clients = new Set(); // WebSocket clients
@@ -2322,6 +2324,13 @@ class Session {
       this._onData(`\r\n[RelayBridge] spawn error: ${err.message}\r\n`);
       this._onExit(-1);
     });
+    // The child has an 'error' handler; its stdin stream does not. Writing to a
+    // CLI that has already exited raises EPIPE as an 'error' event ON THE
+    // STREAM, and an unhandled one exits the whole bridge. Keystrokes into a
+    // dead pipe-mode tab are the normal way to hit this.
+    this.proc.stdin.on('error', (err) => {
+      this._onData(`\r\n[RelayBridge] input not delivered: ${err.code || err.message}\r\n`);
+    });
   }
 
   _onData(text) {
@@ -2349,10 +2358,15 @@ class Session {
 
   write(input) {
     if (this.exited) return false;
-    if (this._mode === 'pty') {
-      this.proc.write(input);
-    } else {
-      this.proc.stdin.write(input);
+    try {
+      if (this._mode === 'pty') {
+        this.proc.write(input);
+      } else {
+        if (!this.proc.stdin || this.proc.stdin.destroyed) return false;
+        this.proc.stdin.write(input);
+      }
+    } catch {
+      return false; // stream torn down between the exited check and the write
     }
     return true;
   }
@@ -2397,7 +2411,16 @@ class Session {
 
 function createSessionFromKind(kind, opts = {}) {
   const cfg = loadConfig();
-  const entry = cfg[kind];
+  let entry = cfg[kind];
+  // The terminal kind is platform-resolved: on Windows it is PowerShell as
+  // configured; on WSL/Linux/macOS the same request opens the platform shell.
+  // Aliasing here (not in config) keeps one cli-config.json valid everywhere
+  // and keeps every existing client that sends kind:"powershell" working.
+  if ((kind === 'powershell' || kind === 'shell') && process.platform !== 'win32') {
+    entry = platform.platformShellEntry();
+  } else if (kind === 'shell' && !entry) {
+    entry = cfg.powershell;
+  }
   if (!entry) throw new Error(`unknown CLI kind: ${kind}`);
   const useDanger = typeof opts.dangerous === 'boolean' ? opts.dangerous : state.fullPermissions;
   // Sign-in mode runs the provider's own interactive login flow in a real PTY.
@@ -2827,6 +2850,68 @@ function agentSummary(kind, entry) {
   };
 }
 
+async function probeOllamaReadiness(entry) {
+  let found = false;
+  let ready = false;
+  let detail = '';
+  let runtimeVersion = '';
+  const model = entry.model || entry.oneshot_model
+    || (Array.isArray(entry.safe) ? entry.safe[2] : '') || '';
+  try {
+    const base = localOllamaUrl();
+    const tagsUrl = new URL('/api/tags', base.origin);
+    const resp = await fetch(tagsUrl, { signal: AbortSignal.timeout(4000) });
+    found = true;
+    if (!resp.ok) {
+      detail = `ollama daemon at ${base.origin} returned HTTP ${resp.status}`;
+    } else {
+      const body = await resp.json();
+      const names = Array.isArray(body?.models) ? body.models.map((item) => String(item?.name || '')) : [];
+      runtimeVersion = `${names.length} model(s) loaded`;
+      ready = !model || names.some((name) => name === model
+        || name.split(':')[0] === String(model).split(':')[0]);
+      detail = ready
+        ? `daemon up at ${base.origin} with ${model || 'any model'}`
+        : `daemon up at ${base.origin} but ${model} is not pulled (have: ${names.slice(0, 4).join(', ') || 'none'})`;
+    }
+  } catch (err) {
+    detail = err.name === 'TimeoutError'
+      ? `no ollama daemon answering at ${String(envFirst('RELAYBRIDGE_OLLAMA_URL', 'PS_BRIDGE_OLLAMA_URL') || 'http://127.0.0.1:11434')} (timed out)`
+      : `no ollama daemon reachable: ${err.message}`;
+  }
+  return {
+    binary: null,
+    found,
+    ready,
+    paths: [],
+    label: entry.label,
+    detail,
+    probeExitCode: null,
+    runtimeVersion,
+    usageCapability: providerUsageCapability(entry, { runtimeVersion }),
+  };
+}
+
+async function coldPlanningDiagnostics(cfg, pathDetail) {
+  const env = buildEnv();
+  const pairs = await Promise.all(Object.keys(cfg).filter((kind) => !kind.startsWith('_')).map(async (kind) => {
+    const entry = cfg[kind];
+    if (entry.oneshot_adapter === 'ollama_api') {
+      return [kind, await probeOllamaReadiness(entry)];
+    }
+    let found = false;
+    try {
+      const probeBin = (entry.version_probe || entry.probe || entry.safe || [])[0];
+      // resolveExecutable returns an unresolved command unchanged. Only a
+      // changed or already-absolute path proves that a CLI transport exists.
+      const resolvedProbe = probeBin ? resolveExecutable(probeBin, env) : '';
+      found = !!probeBin && (resolvedProbe !== probeBin || path.isAbsolute(resolvedProbe));
+    } catch { found = false; }
+    return [kind, { found, ready: found, detail: pathDetail }];
+  }));
+  return Object.fromEntries(pairs);
+}
+
 function normalizeProviderTags(raw) {
   if (!Array.isArray(raw)) throw new Error('tags must be an array of strings');
   if (raw.length > MAX_PROVIDER_TAGS) throw new Error(`tags cannot exceed ${MAX_PROVIDER_TAGS} entries`);
@@ -3001,16 +3086,7 @@ app.post('/api/plan', async (req, res) => {
     const cfg = loadConfig();
     let diagnostics = lastDiagnostics?.results || null;
     if (!diagnostics) {
-      const env = buildEnv();
-      diagnostics = {};
-      for (const k of Object.keys(cfg).filter((x) => !x.startsWith('_'))) {
-        let found = false;
-        try {
-          const probeBin = (cfg[k].version_probe || cfg[k].probe || cfg[k].safe || [])[0];
-          found = !!(probeBin && resolveExecutable(probeBin, env));
-        } catch { found = false; }
-        diagnostics[k] = { found, ready: found, detail: 'path-only check' };
-      }
+      diagnostics = await coldPlanningDiagnostics(cfg, 'path-only check');
     }
     const gauges = usageLedger.gaugeAll(seatCostClasses());
     const fleetInput = applyCooldownsToDiagnostics(diagnostics, coolingQuotaStates(), kind ? [kind] : []);
@@ -3065,17 +3141,7 @@ app.post('/api/route', async (req, res) => {
     const cfg = loadConfig();
     let diagnostics = supplied && typeof supplied === 'object' ? supplied : (lastDiagnostics?.results || null);
     if (!diagnostics) {
-      const env = buildEnv();
-      diagnostics = {};
-      for (const kind of Object.keys(cfg).filter((k) => !k.startsWith('_'))) {
-        const entry = cfg[kind];
-        let found = false;
-        try {
-          const probeBin = (entry.version_probe || entry.probe || entry.safe || [])[0];
-          found = !!(probeBin && resolveExecutable(probeBin, env));
-        } catch { found = false; }
-        diagnostics[kind] = { found, ready: found, detail: 'path-only check; run /api/diag for auth status' };
-      }
+      diagnostics = await coldPlanningDiagnostics(cfg, 'path-only check; run /api/diag for auth status');
     }
     const explicitKinds = Array.isArray(preferKinds) ? preferKinds : [];
     const gauges = usageLedger.gaugeAll(seatCostClasses());
@@ -3160,11 +3226,20 @@ app.get('/api/auth/status', async (req, res) => {
       const kinds = Object.keys(cfg).filter((k) => !k.startsWith('_') && k !== 'powershell');
       const pairs = await Promise.all(kinds.map(async (kind) => {
         const entry = cfg[kind];
+        if (entry?.oneshot_adapter === 'ollama_api') {
+          return [kind, await probeOllamaReadiness(entry)];
+        }
         if (!entry || !Array.isArray(entry.probe) || !entry.probe.length) return [kind, null];
         let found = false;
         try {
           const probeBin = (entry.version_probe || entry.probe || entry.safe || [])[0];
-          found = !!(probeBin && resolveExecutable(probeBin, env));
+          // resolveExecutable returns the command UNCHANGED when it cannot
+          // resolve it, and a non-empty string is truthy — so the old
+          // `!!resolveExecutable(...)` was true for every provider, including
+          // ones that are not installed. Compare against the input the way the
+          // main /api/diag sweep does.
+          const resolvedProbe = probeBin ? resolveExecutable(probeBin, env) : '';
+          found = !!probeBin && (resolvedProbe !== probeBin || path.isAbsolute(resolvedProbe));
         } catch { found = false; }
         if (!found) return [kind, { found: false, ready: false, detail: 'not installed' }];
         const result = await runProbe(entry.probe, Number(entry.probe_timeout_ms || 30000), entry.strip_env || []);
@@ -3249,14 +3324,30 @@ app.get('/api/diag', async (req, res) => {
         usageCapability: providerUsageCapability(entry),
       }];
     }
+    // Probe the transport that actually executes. These seats run over
+    // localOllamaUrl() HTTP, but their configured probe shells out to the
+    // ollama binary — so a machine with the CLI installed and the daemon down
+    // reported ready and then failed every dispatch with "fetch failed". Worse,
+    // routing-policy scores local seats +30 and a "live diagnostic ready" seat
+    // +20, so those dead seats won the default utility route.
+    if (entry.oneshot_adapter === 'ollama_api') {
+      return [kind, await probeOllamaReadiness(entry)];
+    }
     const binary = entry.diagnostic_binary ||
       (entry.safe && entry.safe[0]) || (entry.dangerous && entry.dangerous[0]);
     if (!binary) return [kind, { binary: null, found: false, ready: false, paths: [], label: entry.label }];
-    const resolved = resolveExecutable(binary, env);
+    const resolvedInfo = resolveExecutableInfo(binary, env);
+    const resolved = resolvedInfo.resolved;
     const found = resolved !== binary || path.isAbsolute(resolved) && fs.existsSync(resolved);
     let ready = found;
     let detail = '';
     let probeExitCode = null;
+    // Say WHY a CLI that is plainly on PATH is not being offered, instead of
+    // reporting a bare "not installed" the operator cannot act on.
+    if (!found && resolvedInfo.interopSkipped.length) {
+      detail = `found only as a Windows binary (${resolvedInfo.interopSkipped[0]}) — `
+        + 'install the native Linux CLI, or set RELAYBRIDGE_ALLOW_WIN_INTEROP=1 to use it over WSL interop';
+    }
     if (found && Array.isArray(entry.probe) && entry.probe.length) {
       const probe = await runProbe(entry.probe, Number(entry.probe_timeout_ms || 30000), entry.strip_env || [], controller.signal);
       probeExitCode = probe.exitCode;
@@ -3356,21 +3447,29 @@ app.post('/api/exec', (req, res) => {
   if (!command || typeof command !== 'string') {
     return res.status(400).json({ error: 'command (string) required' });
   }
-  const exe = shell === 'pwsh' ? 'pwsh.exe' : 'powershell.exe';
-  const args = ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', command];
   let execCwd;
   try { execCwd = resolveAllowedCwd(cwd); }
   catch (err) { return res.status(400).json({ error: err.message }); }
-  const proc = trackChild(spawn(exe, args, {
+  // Route through the platform abstraction rather than hardcoding
+  // powershell.exe: off Windows that name only resolves through WSL interop,
+  // which runs the caller's command as Win32 PowerShell against a POSIX cwd.
+  // buildExecSpawn also sets detached on POSIX, which killProcessTree needs to
+  // signal the whole group instead of orphaning grandchildren.
+  const built = platform.buildExecSpawn(command, {
+    shell,
     cwd: execCwd,
     env: buildEnv(),
-    windowsHide: true,
-  }));
+  });
+  const proc = trackChild(spawn(built.exe, built.args, built.options));
   let stdout = '';
   let stderr = '';
+  // 'error' and 'close' can both fire for one spawn (ENOENT emits error, then
+  // close), so a single reply guard keeps the second one from throwing
+  // ERR_HTTP_HEADERS_SENT out of an EventEmitter callback.
+  let settled = false;
   const t = setTimeout(() => {
     killProcessTree(proc);
-  }, timeoutMs);
+  }, TIMEOUT_POLICY.normalizeOneShotTimeoutMs(timeoutMs));
   res.on('close', () => { if (!res.writableEnded) killProcessTree(proc); });
   proc.stdout.setEncoding('utf8');
   proc.stderr.setEncoding('utf8');
@@ -3378,10 +3477,14 @@ app.post('/api/exec', (req, res) => {
   proc.stderr.on('data', (d) => { stderr += d; });
   proc.on('close', (code) => {
     clearTimeout(t);
-    res.json({ stdout, stderr, exitCode: code });
+    if (settled) return;
+    settled = true;
+    res.json({ stdout, stderr, exitCode: code, shell: built.shellKind, shellNote: built.fallbackNote || undefined });
   });
   proc.on('error', (err) => {
     clearTimeout(t);
+    if (settled) return;
+    settled = true;
     res.status(500).json({ error: err.message, stdout, stderr });
   });
 });
@@ -4805,21 +4908,48 @@ app.post('/api/open-url', (req, res) => {
   const { url } = req.body || {};
   if (!url || typeof url !== 'string') return res.status(400).json({ error: 'url required' });
   if (!/^https?:\/\//i.test(url)) return res.status(400).json({ error: 'only http(s) urls allowed' });
-  const isWindows = process.platform === 'win32';
-  const isMac = process.platform === 'darwin';
-  try {
-    if (isWindows) {
-      // 'start "" "url"' â€” the "" is an empty title arg required by start when the url is quoted
-      spawn('explorer.exe', [url], { windowsHide: true, detached: true, stdio: 'ignore' }).unref();
-    } else if (isMac) {
-      spawn('open', [url], { detached: true }).unref();
-    } else {
-      spawn('xdg-open', [url], { detached: true }).unref();
+  const plat = platform.detectPlatform();
+  // Openers to try, in order. A spawn ENOENT is an ASYNC 'error' event, not a
+  // throw, so the try/catch below cannot see it — an unhandled 'error' on a
+  // ChildProcess takes the whole bridge down. Every candidate gets a handler
+  // and we fall through to the next one instead.
+  //
+  // On WSL a Linux-side xdg-open cannot reach the user's Windows browser even
+  // when xdg-utils is installed, so interop openers come first there.
+  let openers;
+  if (plat.isWindows) openers = ['explorer.exe'];
+  else if (plat.isMac) openers = ['open'];
+  else if (plat.isWSL) openers = ['wslview', 'explorer.exe', 'xdg-open'];
+  else openers = ['xdg-open', 'gio', 'x-www-browser'];
+
+  let replied = false;
+  const reply = (fn) => { if (replied) return; replied = true; fn(); };
+
+  const tryOpener = (i) => {
+    if (i >= openers.length) {
+      return reply(() => res.status(501).json({
+        error: `no URL opener available on ${plat.label} (tried: ${openers.join(', ')})`,
+        hint: plat.isWSL
+          ? 'install wslu for wslview, or open the URL manually'
+          : 'install xdg-utils, or open the URL manually',
+        url,
+      }));
     }
-    res.json({ ok: true, url });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+    const bin = openers[i];
+    const args = bin === 'gio' ? ['open', url] : [url];
+    let child;
+    try {
+      child = spawn(bin, args, { windowsHide: true, detached: true, stdio: 'ignore' });
+    } catch (err) {
+      return tryOpener(i + 1); // synchronous failure (e.g. EACCES on the path)
+    }
+    child.on('error', () => { tryOpener(i + 1); });
+    child.on('spawn', () => {
+      child.unref();
+      reply(() => res.json({ ok: true, url, opener: bin }));
+    });
+  };
+  tryOpener(0);
 });
 
 
@@ -4985,6 +5115,39 @@ server.listen(PORT, HOST, () => {
       console.log(`[RelayBridge] model registry loaded from cache (${Math.round(cachedAge / 3600000)}h old)`);
     }
   }
+  // Optional readiness warm-up, OFF by default.
+  //
+  // Why it exists: the router penalises a seat it knows is down by -10000, but
+  // readinessFor() yields null when nothing has been probed yet, and null is
+  // neutral — so on a bridge nobody has opened the dashboard against, a dead
+  // seat is fully selectable. That is the normal case for a headless / MCP-only
+  // deployment, which is exactly where a silent route to a dead provider is
+  // hardest to notice.
+  //
+  // Why it is not the default: a readiness sweep spawns one process per
+  // provider (the same reason /api/auth/status only probes on demand), and
+  // those probes occupy one-shot admission slots, so a bridge that warms on
+  // boot reports a non-zero activeOneShotCount for its first seconds — the
+  // metric operators watch as the canary for slot leaks. Opt in on headless
+  // deployments; leave it off where a dashboard will populate readiness anyway.
+  if (String(process.env.RELAYBRIDGE_WARM_DIAG || '') === '1') {
+    setTimeout(() => {
+      const req = http.request({
+        host: HOST, port: PORT, path: '/api/diag', method: 'GET',
+        headers: { 'X-RelayBridge-Token': CAPABILITY_TOKEN },
+      }, (resp) => {
+        resp.resume();
+        resp.on('end', () => {
+          const n = lastDiagnostics?.results
+            ? Object.values(lastDiagnostics.results).filter((r) => r && r.ready).length
+            : 0;
+          if (lastDiagnostics) console.log(`[RelayBridge] readiness warmed — ${n} seat(s) ready`);
+        });
+      });
+      req.on('error', (err) => console.warn('[RelayBridge] readiness warm-up skipped: ' + err.message));
+      req.end();
+    }, 250).unref();
+  }
 });
 
 let shuttingDown = false;
@@ -5003,3 +5166,19 @@ function shutdown() {
 }
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
+
+// Last-resort backstop. This bridge holds every live PTY session, every
+// in-flight provider run and the background task queue in one process, so a
+// stray throw from an EventEmitter callback — where Express cannot catch it —
+// costs far more than the bad request that triggered it. Three such paths were
+// found and fixed above (/api/exec, /api/open-url, pipe-mode stdin); this
+// catches the fourth nobody has found yet.
+//
+// Deliberately NOT a silent swallow: it logs the full stack so the defect stays
+// visible and reportable, and it does not re-enter shutdown().
+process.on('uncaughtException', (err) => {
+  console.error('[RelayBridge] uncaught exception — staying up:', err && err.stack ? err.stack : err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[RelayBridge] unhandled rejection — staying up:', reason && reason.stack ? reason.stack : reason);
+});

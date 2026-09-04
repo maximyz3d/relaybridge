@@ -9,6 +9,7 @@ const path = require('node:path');
 const { spawn } = require('node:child_process');
 
 const {
+  findToken,
   parseFlags,
   resolveTaskInput,
   USAGE,
@@ -85,6 +86,24 @@ test('usage documents stdin and prompt-file for both planning and asking', () =>
   assert.match(USAGE, /relaybridge ask --prompt-file/);
   assert.match(USAGE, /choose exactly one/);
   assert.match(USAGE, /unique request ID/);
+});
+
+test('CLI reads the capability token from the configured cross-platform token file', (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'relaybridge-cli-token-'));
+  const tokenFile = path.join(directory, 'capability-token');
+  fs.writeFileSync(tokenFile, 'linux-token\n', { encoding: 'utf8', mode: 0o600 });
+  const previousToken = process.env.RELAYBRIDGE_TOKEN;
+  const previousTokenFile = process.env.RELAYBRIDGE_TOKEN_FILE;
+  delete process.env.RELAYBRIDGE_TOKEN;
+  process.env.RELAYBRIDGE_TOKEN_FILE = tokenFile;
+  t.after(() => {
+    if (previousToken === undefined) delete process.env.RELAYBRIDGE_TOKEN;
+    else process.env.RELAYBRIDGE_TOKEN = previousToken;
+    if (previousTokenFile === undefined) delete process.env.RELAYBRIDGE_TOKEN_FILE;
+    else process.env.RELAYBRIDGE_TOKEN_FILE = previousTokenFile;
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+  assert.equal(findToken(), 'linux-token');
 });
 
 test('ask transports a long stdin prompt in request bodies, never argv', async (t) => {
