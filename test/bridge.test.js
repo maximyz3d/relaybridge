@@ -296,7 +296,12 @@ test('MCP bridge startup rejects a healthy same-version listener with a differen
   const listener = http.createServer((req, res) => {
     if (req.url === '/api/health') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ version: '2.0.1', buildId: '2.0.1+stale-build', capabilityAuth: true }));
+      return res.end(JSON.stringify({
+        version: '2.0.1',
+        buildId: '2.0.1+aaaaaaaaaaaaaaaa',
+        buildIdentityReady: true,
+        capabilityAuth: true,
+      }));
     }
     res.writeHead(404);
     res.end();
@@ -321,7 +326,12 @@ test('MCP bridge startup rejects a healthy same-version listener with a differen
   `;
   const child = spawn(process.execPath, ['--input-type=module', '--eval', childScript], {
     cwd: ROOT,
-    env: { ...process.env, RELAYBRIDGE_URL: `http://127.0.0.1:${port}` },
+    env: {
+      ...process.env,
+      NODE_ENV: 'test',
+      RELAYBRIDGE_TEST_BUILD_ID: '2.0.1+bbbbbbbbbbbbbbbb',
+      RELAYBRIDGE_URL: `http://127.0.0.1:${port}`,
+    },
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -333,7 +343,7 @@ test('MCP bridge startup rejects a healthy same-version listener with a differen
     child.once('close', resolve);
   });
   assert.equal(exitCode, 0, output);
-  assert.match(output, /stale-build/);
+  assert.match(output, /2\.0\.1\+aaaaaaaaaaaaaaaa/);
 });
 
 function reservePort() {
@@ -785,6 +795,10 @@ test('prompt-file transport preserves long special-character prompts and cleans 
       ...process.env,
       NODE_ENV: 'test',
       RELAYBRIDGE_TEST_BUILD_ID: TEST_BUILD_ID,
+      RELAYBRIDGE_ALLOW_STICKY_DANGEROUS: '0',
+      RELAYBRIDGE_START_FULL_PERMISSIONS: '0',
+      PS_BRIDGE_ALLOW_STICKY_DANGEROUS: '0',
+      PS_BRIDGE_START_FULL_PERMISSIONS: '0',
       PORT: String(port),
       PTY_MODE: 'none',
       PS_BRIDGE_CONFIG_FILE: configPath,
@@ -834,6 +848,9 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   const runningHealth = await (await fetch(baseUrl + '/api/health')).json();
   assert.equal(runningHealth.fullPermissions, false);
   assert.equal(runningHealth.buildId, TEST_BUILD_ID);
+  assert.equal(runningHealth.buildIdentityReady, true);
+  assert.equal(runningHealth.buildIdentitySource, 'test_override');
+  assert.equal(runningHealth.buildIdentityReason, null);
   assert.equal(runningHealth.stickyDangerousEnabled, false);
   assert.equal(runningHealth.startFullPermissionsEnabled, false);
   assert.equal(typeof runningHealth.runtime.platform, 'string');

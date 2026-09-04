@@ -8,7 +8,8 @@ directory (default `%LOCALAPPDATA%\RelayBridge`).
 
 ### `GET /api/health`
 Liveness and mode. Returns `ptyMode`, `fullPermissions`, `sessionCount`,
-`activeOneShotCount`, `maxActiveOneShots`, `version`, `buildId`, and the
+`activeOneShotCount`, `maxActiveOneShots`, `version`, `buildId`,
+`buildIdentityReady`, bounded build-identity source/reason diagnostics, and the
 privacy-safe `receiptStoreId` hash. Use it to confirm the bridge is up before
 anything else. MCP action calls compare both identities before admission and
 send them with the action request to close restart races. A mismatch blocks the

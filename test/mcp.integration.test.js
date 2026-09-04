@@ -509,6 +509,9 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   const healthPayload = JSON.parse(healthResource.contents[0].text);
   assert.equal(healthPayload.version, '2.0.1');
   assert.equal(healthPayload.buildId, 'integration-current');
+  assert.equal(healthPayload.buildIdentityReady, true);
+  assert.equal(healthPayload.buildIdentitySource, 'test_override');
+  assert.equal(healthPayload.buildIdentityReason, null);
   assert.match(healthPayload.receiptStoreId, /^[0-9a-f]{64}$/);
   assert.equal(healthPayload.receiptStoreIdentityReady, true);
   assert.ok(!JSON.stringify(healthPayload).includes(dataDir));

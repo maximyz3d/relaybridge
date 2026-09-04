@@ -21,6 +21,7 @@ const { providerUsageCapability, providerUsageCapabilities } = require('./lib/pr
 const platform = require('./lib/platform');
 const { validateBrowserUrl, browserOpeners } = require('./lib/browser-launch');
 const { receiptStoreIdentity } = require('./lib/receipt-store-identity.cjs');
+const { loadBuildIdentity } = require('./lib/build-identity.cjs');
 const {
   resolveFilesystemPolicy, providerFilesystemEligibility,
   createIsolatedProviderHome, cleanupIsolatedProviderHome,
@@ -33,17 +34,21 @@ const ROOT = __dirname;
 // fallback the allowed roots collapse to ROOT and the bridge can only reach
 // its own source tree.
 const USER_HOME = process.env.USERPROFILE || process.env.HOME || os.homedir() || ROOT;
-const BRIDGE_VERSION = require('./package.json').version;
-function loadBuildId() {
-  const testValue = process.env.NODE_ENV === 'test' ? process.env.RELAYBRIDGE_TEST_BUILD_ID : '';
-  if (/^[A-Za-z0-9._+-]{1,128}$/.test(String(testValue || ''))) return String(testValue);
-  try {
-    const value = JSON.parse(fs.readFileSync(path.join(ROOT, 'build-info.json'), 'utf8')).buildId;
-    if (/^[A-Za-z0-9._+-]{1,128}$/.test(String(value || ''))) return String(value);
-  } catch {}
-  return BRIDGE_VERSION;
+const BRIDGE_BUILD_IDENTITY = loadBuildIdentity(ROOT);
+const BRIDGE_VERSION = BRIDGE_BUILD_IDENTITY.version;
+const BRIDGE_BUILD_ID = BRIDGE_BUILD_IDENTITY.buildId;
+const LAUNCH_EXPECTED_BUILD_ID = String(process.env.RELAYBRIDGE_EXPECTED_BUILD_ID || '');
+if (LAUNCH_EXPECTED_BUILD_ID &&
+    (!BRIDGE_BUILD_IDENTITY.ready || BRIDGE_BUILD_ID !== LAUNCH_EXPECTED_BUILD_ID)) {
+  throw new Error('RelayBridge source changed after build identity preparation; refusing to start');
 }
-const BRIDGE_BUILD_ID = loadBuildId();
+
+// Start every repo-local ESM load before constructing the runtime, then await
+// the same cached promises before opening the listener. Route handlers reuse
+// these promises; they must never discover new executable source after the
+// final build-identity check.
+const ROUTER_MODULE_PROMISE = import('./mcp/router.mjs');
+const MCP_SERVER_MODULE_PROMISE = import('./mcp/server.mjs');
 
 // Cross-provider effort vocabulary.  `max` is deliberately an intent rather
 // than a value we blindly pass to every CLI: Codex's highest normal value is
@@ -3041,6 +3046,9 @@ app.get('/api/health', (req, res) => {
     },
     version: BRIDGE_VERSION,
     buildId: BRIDGE_BUILD_ID,
+    buildIdentityReady: BRIDGE_BUILD_IDENTITY.ready,
+    buildIdentitySource: BRIDGE_BUILD_IDENTITY.source,
+    buildIdentityReason: BRIDGE_BUILD_IDENTITY.reason,
     receiptStoreId: RECEIPT_STORE_IDENTITY.id,
     receiptStoreIdentityReady: RECEIPT_STORE_IDENTITY.ready,
     capabilityAuth: true,
@@ -3143,7 +3151,9 @@ app.use('/api', (req, res, next) => {
   if (!requiresMcpActionIdentity(req)) return next();
   const expectedBuildId = String(req.get('x-relaybridge-expected-build-id') || '');
   const expectedReceiptStoreId = String(req.get('x-relaybridge-expected-receipt-store-id') || '');
-  const buildMatches = expectedBuildId !== '' && expectedBuildId === BRIDGE_BUILD_ID;
+  const buildMatches = BRIDGE_BUILD_IDENTITY.ready
+    && expectedBuildId !== ''
+    && expectedBuildId === BRIDGE_BUILD_ID;
   const receiptStoreMatches = expectedReceiptStoreId !== ''
     && RECEIPT_STORE_IDENTITY.ready
     && expectedReceiptStoreId === RECEIPT_STORE_IDENTITY.id;
@@ -3159,6 +3169,7 @@ app.use('/api', (req, res, next) => {
       ok: false,
       expectedBuildId: expectedBuildId || null,
       currentBuildId: BRIDGE_BUILD_ID,
+      currentBuildIdentityReady: BRIDGE_BUILD_IDENTITY.ready,
       expectedReceiptStoreId: expectedReceiptStoreId || null,
       currentReceiptStoreId: RECEIPT_STORE_IDENTITY.id,
       buildMatches,
@@ -3687,7 +3698,7 @@ app.post('/api/plan', async (req, res) => {
   try { filesystemAuthority = planningFilesystemAuthority(req.body || {}); }
   catch (err) { return res.status(400).json({ error: err.message }); }
   try {
-    const router = await import('./mcp/router.mjs');
+    const router = await ROUTER_MODULE_PROMISE;
     const cfg = loadConfig();
     let diagnostics = await completePlanningDiagnostics(
       cfg,
@@ -3763,7 +3774,7 @@ app.post('/api/route', async (req, res) => {
   try { filesystemAuthority = planningFilesystemAuthority(req.body || {}); }
   catch (err) { return res.status(400).json({ error: err.message }); }
   try {
-    const router = await import('./mcp/router.mjs');
+    const router = await ROUTER_MODULE_PROMISE;
     const cfg = loadConfig();
     let diagnostics = await completePlanningDiagnostics(
       cfg,
@@ -5191,7 +5202,7 @@ app.post('/api/tasks', async (req, res) => {
   try {
     const input = req.body || {};
     const providerBudget = validateProviderBudget(input.providerBudget);
-    const { classifyTask } = await import('./mcp/router.mjs');
+    const { classifyTask } = await ROUTER_MODULE_PROMISE;
     const classifiedTaskTier = typeof input.prompt === 'string'
       ? classifyTask(input.prompt).tier : undefined;
     const taskTier = typeof input.taskTier === 'string' ? input.taskTier : classifiedTaskTier;
@@ -6367,7 +6378,7 @@ app.post('/api/broadcast', async (req, res) => {
   } catch (err) {
     return res.status(400).json({ error: err.message });
   }
-  const { classifyTask } = await import('./mcp/router.mjs');
+  const { classifyTask } = await ROUTER_MODULE_PROMISE;
   const cfg = loadConfig();
   let targets;
   try {
@@ -6727,15 +6738,14 @@ wss.on('connection', (ws, req) => {
 // Off unless RELAYBRIDGE_REMOTE_MCP=1. Reuses the stdio adapter's buildServer()
 // so both transports always expose the same tools, minus the terminal/exec
 // tools which are never remotely reachable. See docs/CONNECTOR.md.
-// mcp/server.mjs is ESM. require() of ESM only works on Node >=22.12, and
-// package.json allows >=20.3, so the module is loaded with dynamic import and
-// the route is mounted once it resolves. Express accepts routes added after
-// listen(), so this costs nothing and works on every supported Node.
+// mcp/server.mjs is ESM. Its import starts with the other repo-local runtime
+// modules near the top of this file, then startup awaits that cached promise
+// before the final identity check. The route still mounts after this terminal
+// error handler, so it keeps its own bounded try/catch.
+const { mountRemoteMcp } = require('./lib/remote-mcp');
 let remoteMcpStatus = { enabled: false, reason: 'initializing' };
-(async () => {
+function configureRemoteMcp(mcpModule) {
   try {
-    const { mountRemoteMcp } = require('./lib/remote-mcp');
-    const mcpModule = await import('./mcp/server.mjs');
     remoteMcpStatus = mountRemoteMcp(app, {
       token: CAPABILITY_TOKEN,
       buildServer: () => mcpModule.buildServer(),
@@ -6744,7 +6754,7 @@ let remoteMcpStatus = { enabled: false, reason: 'initializing' };
   } catch (err) {
     remoteMcpStatus = { enabled: false, reason: err.message };
   }
-})();
+}
 app.get('/api/remote-mcp/status', (req, res) => res.json(remoteMcpStatus));
 
 // Terminal error handler. Without one, Express's finalhandler answers with
@@ -6766,8 +6776,36 @@ app.use((err, req, res, next) => {
     .json({ error: err && err.expose && err.message ? err.message : 'request failed' });
 });
 
+function startupIdentityMatches(initial, current) {
+  return initial.version === current.version
+    && initial.buildId === current.buildId
+    && initial.ready === current.ready
+    && initial.source === current.source
+    && initial.reason === current.reason;
+}
 
-server.listen(PORT, HOST, () => {
+async function startBridgeListener() {
+  // Await every repo-local ESM module that a REST handler or the remote MCP
+  // surface can use. All CJS requires above have already run synchronously.
+  // After the check below, request handling may read runtime configuration and
+  // static assets, but it must not invoke another local module loader.
+  const [, mcpModule] = await Promise.all([
+    ROUTER_MODULE_PROMISE,
+    MCP_SERVER_MODULE_PROMISE,
+  ]);
+  configureRemoteMcp(mcpModule);
+
+  const currentIdentity = loadBuildIdentity(ROOT);
+  const launchIdentityMatches = !LAUNCH_EXPECTED_BUILD_ID
+    || (currentIdentity.ready && currentIdentity.buildId === LAUNCH_EXPECTED_BUILD_ID);
+  if (!startupIdentityMatches(BRIDGE_BUILD_IDENTITY, currentIdentity)
+      || (BRIDGE_BUILD_IDENTITY.ready
+        && (!currentIdentity.ready || currentIdentity.buildId !== BRIDGE_BUILD_ID))
+      || !launchIdentityMatches) {
+    throw new Error('RelayBridge source changed while runtime modules were loading; refusing to listen');
+  }
+
+  server.listen(PORT, HOST, () => {
   console.log(`[RelayBridge] listening on http://${HOST}:${PORT}`);
   console.log(`[RelayBridge] open the URL above in Chrome.`);
   console.log(`[RelayBridge] full permissions: ${state.fullPermissions ? 'ON' : 'off'} (toggle in UI)`);
@@ -6816,6 +6854,12 @@ server.listen(PORT, HOST, () => {
       req.end();
     }, 250).unref();
   }
+  });
+}
+
+startBridgeListener().catch((err) => {
+  console.error(`[RelayBridge] startup failed before listen: ${err.message}`);
+  process.exitCode = 1;
 });
 
 let shuttingDown = false;

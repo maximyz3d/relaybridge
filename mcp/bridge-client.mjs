@@ -4,22 +4,15 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import TIMEOUT_POLICY from '../timeout-policy.cjs';
 import receiptStoreIdentityModule from '../lib/receipt-store-identity.cjs';
+import buildIdentityModule from '../lib/build-identity.cjs';
 
 const { receiptStoreIdentity } = receiptStoreIdentityModule;
+const { loadBuildIdentity } = buildIdentityModule;
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const BRIDGE_ROOT = path.resolve(HERE, '..');
-const PACKAGE = JSON.parse(fs.readFileSync(path.join(BRIDGE_ROOT, 'package.json'), 'utf8'));
-function loadExpectedBuildId() {
-  const testValue = process.env.NODE_ENV === 'test' ? process.env.RELAYBRIDGE_TEST_BUILD_ID : '';
-  if (/^[A-Za-z0-9._+-]{1,128}$/.test(String(testValue || ''))) return String(testValue);
-  try {
-    const value = JSON.parse(fs.readFileSync(path.join(BRIDGE_ROOT, 'build-info.json'), 'utf8')).buildId;
-    if (/^[A-Za-z0-9._+-]{1,128}$/.test(String(value || ''))) return String(value);
-  } catch {}
-  return PACKAGE.version;
-}
-const EXPECTED_BUILD_ID = loadExpectedBuildId();
+const EXPECTED_BUILD_IDENTITY = loadBuildIdentity(BRIDGE_ROOT);
+const EXPECTED_BUILD_ID = EXPECTED_BUILD_IDENTITY.buildId;
 function envFirst(...names) {
   for (const name of names) {
     const value = process.env[name];
@@ -185,7 +178,12 @@ export async function health({ signal } = {}) {
 function actionIdentityDetail(live) {
   const currentBuildId = String(live?.buildId || '');
   const currentReceiptStoreId = typeof live?.receiptStoreId === 'string' ? live.receiptStoreId : null;
-  const buildMatches = !!currentBuildId && currentBuildId === EXPECTED_BUILD_ID;
+  const expectedBuildIdentityReady = EXPECTED_BUILD_IDENTITY.ready;
+  const currentBuildIdentityReady = live?.buildIdentityReady === true;
+  const buildMatches = expectedBuildIdentityReady
+    && currentBuildIdentityReady
+    && !!currentBuildId
+    && currentBuildId === EXPECTED_BUILD_ID;
   const receiptStoreMatches = EXPECTED_RECEIPT_STORE_IDENTITY.ready
     && currentReceiptStoreId !== null
     && currentReceiptStoreId === EXPECTED_RECEIPT_STORE_IDENTITY.id;
@@ -193,6 +191,8 @@ function actionIdentityDetail(live) {
     ok: buildMatches && receiptStoreMatches,
     expectedBuildId: EXPECTED_BUILD_ID,
     currentBuildId: currentBuildId || null,
+    expectedBuildIdentityReady,
+    currentBuildIdentityReady,
     expectedReceiptStoreId: EXPECTED_RECEIPT_STORE_IDENTITY.id,
     currentReceiptStoreId,
     buildMatches,

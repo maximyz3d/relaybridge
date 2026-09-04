@@ -211,6 +211,27 @@ recovery action so status reads cannot overlap a potentially surviving process.
 
 MCP actions that cross into REST or provider admission fail closed unless the MCP process and REST listener report the same exact build and receipt store. The store identity is a SHA-256 value bound to a persisted random seed and the canonical store location; health, errors, and receipts never expose the raw data path. Read-only status tools and local cache replays remain available during a mismatch so an operator can inspect the listener and use the lifecycle tools to replace a stale build. A rejected provider action records `modelInvocation:false`, `tokenUsageSource:not_invoked`, zero retries, and no transport receipt.
 
+In a Git source checkout, the POSIX and Windows MCP/start scripts atomically
+refresh the ignored `build-info.json` from exact tracked and nonignored
+working-tree bytes plus Git's canonical executable modes. Dirty source changes
+therefore receive a different build ID, while tokens, data, dependencies,
+pidfiles, logs, and other ignored runtime state are never read into the digest.
+The manifest is deterministic generated state, not client configuration: a
+failed MCP registration rolls client files and any newly created capability
+token back, but never restores an older manifest over one that another launcher
+may have prepared concurrently. MCP registration transactions are serialized by
+one private OS-user lock outside the checkout, so registrations from distinct
+RelayBridge worktrees cannot overlap while touching the same Codex or Claude
+configuration. A legacy checkout-local `.mcp-install.lock/` remains ignored and
+excluded from releases. Detached
+POSIX starts obtain the server PID from inside its new session and accept
+health only from that exact PID with
+capability authentication and the prepared, ready build identity.
+Secret-looking nonignored paths and symlinks that escape the identified source
+set fail preparation before their target bytes are read. A missing, malformed,
+or stale manifest leaves `buildIdentityReady:false`; matching package versions
+alone can never authorize an MCP mutation.
+
 Useful checks:
 
 ```powershell
@@ -525,6 +546,7 @@ Runtime files that should not be committed:
 - `.bridge-token`
 - `.state.json`
 - `.mcp-start.lock`
+- `.mcp-install.lock/` (legacy checkout-local registration lock)
 - `build-info.json`
 - `data/`
 - `node_modules/`
