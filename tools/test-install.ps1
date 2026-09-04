@@ -60,10 +60,19 @@ function Invoke-TestInstall([string]$FailAt = '', [switch]$Start, [int]$Port = 0
   if (-not $Port) { $Port = Get-FreePort }
   $previousFailAt = $env:RELAYBRIDGE_INSTALL_TEST_FAIL_AT
   $previousErrorFile = $env:RELAYBRIDGE_INSTALL_TEST_ERROR_FILE
+  $previousGitHubRegistry = $env:RELAYBRIDGE_GITHUB_REPOS
+  $previousDataDir = $env:RELAYBRIDGE_DATA_DIR
+  $previousPsDataDir = $env:PS_BRIDGE_DATA_DIR
   $errorFile = Join-Path $testRoot ('install-error-' + [Guid]::NewGuid().ToString('N') + '.txt')
   try {
     $env:RELAYBRIDGE_INSTALL_TEST_FAIL_AT = $FailAt
     $env:RELAYBRIDGE_INSTALL_TEST_ERROR_FILE = $errorFile
+    # Host-specific runtime paths must never leak into the disposable Windows
+    # fixture (especially when this script is launched through powershell.exe
+    # from WSL and inherited a /home/... override).
+    $env:RELAYBRIDGE_GITHUB_REPOS = $null
+    $env:RELAYBRIDGE_DATA_DIR = $null
+    $env:PS_BRIDGE_DATA_DIR = $null
     $arguments = @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $installer,
       '-SourceDir', $repoRoot, '-InstallDir', $installRoot, '-SkipProviderSetup', '-SkipCliPathRegistration', '-NoBrowser', '-Port', [string]$Port)
     if (-not $Start) { $arguments += '-NoStart' }
@@ -82,6 +91,9 @@ function Invoke-TestInstall([string]$FailAt = '', [switch]$Start, [int]$Port = 0
   } finally {
     $env:RELAYBRIDGE_INSTALL_TEST_FAIL_AT = $previousFailAt
     $env:RELAYBRIDGE_INSTALL_TEST_ERROR_FILE = $previousErrorFile
+    $env:RELAYBRIDGE_GITHUB_REPOS = $previousGitHubRegistry
+    $env:RELAYBRIDGE_DATA_DIR = $previousDataDir
+    $env:PS_BRIDGE_DATA_DIR = $previousPsDataDir
   }
 }
 
@@ -493,6 +505,17 @@ server.listen(port, '127.0.0.1');
   [IO.File]::WriteAllText((Join-Path $installRoot 'cli-config.json'), (($operatorConfig | ConvertTo-Json -Depth 20) + "`n"), [Text.UTF8Encoding]::new($false))
   $operatorRouting = [ordered]@{ taskPriorities = [ordered]@{ general = @('custom_provider') }; operatorNote = 'preserve me' }
   [IO.File]::WriteAllText((Join-Path $installRoot 'config\routing-policy.json'), (($operatorRouting | ConvertTo-Json -Depth 20) + "`n"), [Text.UTF8Encoding]::new($false))
+  $legacyGitHubRegistry = [ordered]@{
+    repos = @([ordered]@{
+      name = 'owner/repository'
+      path = $installRoot
+      autoCommit = $true
+      autoPush = $false
+      dryRun = $true
+      trackingMode = 'checkpoint-on-branch'
+    })
+  }
+  [IO.File]::WriteAllText((Join-Path $installRoot 'config\github-repos.json'), (($legacyGitHubRegistry | ConvertTo-Json -Depth 10) + "`n"), [Text.UTF8Encoding]::new($false))
 
   $before = Get-TreeFingerprint $installRoot
   $renameFailed = Invoke-TestInstall 'after-old-rename'
@@ -545,6 +568,12 @@ server.listen(port, '127.0.0.1');
   Assert-True (-not (Test-Path -LiteralPath (Join-Path $installRoot 'stale-code.js'))) 'stale release files must not survive promotion'
   Assert-True ((Get-Content -LiteralPath (Join-Path $installRoot '.bridge-token') -Raw).Trim() -eq ('a' * 64)) 'capability token bytes must be preserved'
   Assert-True (Test-Path -LiteralPath (Join-Path $installRoot 'data\receipts\preserved.jsonl')) 'retained data must be preserved'
+  Assert-True (-not (Test-Path -LiteralPath (Join-Path $installRoot 'config\github-repos.json'))) 'legacy machine-specific enrollment must not be copied back into release config'
+  $migratedGitHubRegistryPath = Join-Path $installRoot 'data\github-repos.json'
+  Assert-True (Test-Path -LiteralPath $migratedGitHubRegistryPath -PathType Leaf) 'legacy enrollment must migrate into preserved runtime data'
+  $migratedGitHubRegistry = [IO.File]::ReadAllText($migratedGitHubRegistryPath, [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
+  Assert-True ($migratedGitHubRegistry.repos[0].name -eq 'owner/repository') 'migration must preserve the enrolled repository identity'
+  Assert-True ($migratedGitHubRegistry.repos[0].path -eq $installRoot) 'migration must preserve the native checkout path'
 
   $merged = [IO.File]::ReadAllText((Join-Path $installRoot 'cli-config.json'), [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
   Assert-True ($merged._comment -eq "operator-owned config $emDash UTF-8 survives every merge") 'operator UTF-8 text must survive config merge byte-exactly'

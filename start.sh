@@ -96,7 +96,8 @@ if [[ -n "${WSL_DISTRO_NAME:-}" ]] || grep -qi microsoft /proc/version 2>/dev/nu
   for spec in \
     "data:${RELAYBRIDGE_DATA_DIR:-${PS_BRIDGE_DATA_DIR:-}}" \
     "token:${RELAYBRIDGE_TOKEN_FILE:-${PS_BRIDGE_TOKEN_FILE:-}}" \
-    "config:${RELAYBRIDGE_CONFIG_FILE:-${PS_BRIDGE_CONFIG_FILE:-}}"; do
+    "config:${RELAYBRIDGE_CONFIG_FILE:-${PS_BRIDGE_CONFIG_FILE:-}}" \
+    "github-registry:${RELAYBRIDGE_GITHUB_REPOS:-}"; do
     label="${spec%%:*}"
     candidate="${spec#*:}"
     [[ "$candidate" == /mnt || "$candidate" == /mnt/* ]] && slow_paths+=("$label")
@@ -107,6 +108,12 @@ if [[ -n "${WSL_DISTRO_NAME:-}" ]] || grep -qi microsoft /proc/version 2>/dev/nu
     exit 1
   fi
 fi
+
+# Validate (and, on the first post-upgrade launch, atomically migrate) GitHub
+# enrollment before replacing anything already bound to this port. A malformed
+# authority file or a symlink-hidden /mnt registry must fail without taking a
+# healthy bridge offline first.
+"$node_bin" "$ROOT/tools/migrate-github-registry.cjs" --root "$ROOT" --validate >/dev/null
 
 # Pin this launch to the exact Git working-tree bytes before replacing a live
 # listener. Ignored runtime state (token, data, logs, pidfiles, dependencies)

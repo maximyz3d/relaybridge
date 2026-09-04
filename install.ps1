@@ -791,7 +791,13 @@ function Merge-OperatorConfiguration([string]$StageRoot, [string]$ExistingRoot) 
   Get-ChildItem -LiteralPath $existingConfig -File -Recurse | ForEach-Object {
     $relative = $_.FullName.Substring($existingConfig.Length).TrimStart('\', '/')
     $target = Join-Path (Join-Path $StageRoot 'config') $relative
-    if ($_.Extension -ieq '.json') { Merge-JsonFile $target $_.FullName }
+    # This pre-2.1 file contains machine paths and is runtime enrollment, not
+    # release configuration. It is migrated into data/ transactionally after
+    # preserved runtime has moved; copying it into config would ship it again.
+    if ($relative.Replace('\', '/') -ieq 'github-repos.json') {
+      Write-Host '[RelayBridge] Deferring legacy GitHub registry to runtime-data migration.' -ForegroundColor DarkGray
+    }
+    elseif ($_.Extension -ieq '.json') { Merge-JsonFile $target $_.FullName }
     elseif (-not (Test-Path -LiteralPath $target)) {
       New-Item -ItemType Directory -Path (Split-Path -Parent $target) -Force | Out-Null
       Copy-Item -LiteralPath $_.FullName -Destination $target -Force
@@ -882,6 +888,27 @@ function Get-ReleaseIdentityFiles([string]$StageRoot) {
     }
   }
   return @($files)
+}
+
+function Migrate-LegacyGitHubRegistry([string]$StageRoot, [string]$LegacyFile) {
+  $tool = Join-Path $StageRoot 'tools\migrate-github-registry.cjs'
+  if (-not (Test-Path -LiteralPath $tool -PathType Leaf)) {
+    throw "GitHub registry migration helper is missing from staged release: $tool"
+  }
+  $args = @($tool, '--root', $StageRoot)
+  if ($LegacyFile -and (Test-Path -LiteralPath $LegacyFile -PathType Leaf)) { $args += @('--legacy-file', $LegacyFile) }
+  $result = & node.exe @args
+  if ($LASTEXITCODE -ne 0) { throw 'Legacy GitHub registry migration failed; runtime state was not promoted.' }
+  if ($result) {
+    try {
+      $migration = ($result | Out-String) | ConvertFrom-Json
+      if ($migration.status -eq 'migrated') {
+        Write-Host "[RelayBridge] Migrated legacy GitHub enrollment to $($migration.runtimeFile)" -ForegroundColor Yellow
+      }
+    } catch {
+      throw "GitHub registry migration helper returned invalid output: $result"
+    }
+  }
 }
 
 function Get-ReleaseBuildInfo([string]$StageRoot, [string]$SourceLabel) {
@@ -1039,6 +1066,7 @@ $failedRoot = Join-Path $installParent ($installLeaf + '.failed.' + [Guid]::NewG
 $sourceRootPath = ''
 $sourceLabel = ''
 $runtimeSource = ''
+$legacyRegistrySnapshot = ''
 $movedRuntime = @()
 $hadExistingInstall = Test-Path -LiteralPath $InstallDir -PathType Container
 $promoted = $false
@@ -1059,6 +1087,19 @@ $runtimeSource = if ($hadExistingInstall) { $InstallDir } elseif ($MigrateFrom) 
 
 New-Item -ItemType Directory -Path $tempRoot, $extractRoot -Force | Out-Null
 try {
+  # Keep a private snapshot outside both old and staged roots. The old release
+  # is renamed during cutover, while migration deliberately runs only after
+  # every fallible promotion/registration step has succeeded. A failed install
+  # therefore restores byte-for-byte without leaving a half-committed runtime
+  # registry behind.
+  if ($runtimeSource) {
+    $legacyCandidate = Join-Path $runtimeSource 'config\github-repos.json'
+    if (Test-Path -LiteralPath $legacyCandidate -PathType Leaf) {
+      $legacyRegistrySnapshot = Join-Path $tempRoot 'github-repos.legacy.json'
+      Copy-Item -LiteralPath $legacyCandidate -Destination $legacyRegistrySnapshot
+    }
+  }
+
   if ($SourceDir) {
     $sourceRootPath = Get-NormalizedPath $SourceDir
     if (-not (Test-Path -LiteralPath $sourceRootPath -PathType Container)) { throw "SourceDir is not a directory: $sourceRootPath" }
@@ -1153,6 +1194,12 @@ try {
       Write-Host "[RelayBridge] CLI path is already registered: $InstallDir" -ForegroundColor DarkGray
     }
   }
+
+  # Runtime data wins over the legacy config file. Run only after preserved
+  # data has reached the promoted tree and all fallible cutover/registration
+  # work has succeeded. The helper atomically creates an absent target and can
+  # never replace an existing registry.
+  Migrate-LegacyGitHubRegistry $InstallDir $legacyRegistrySnapshot
 
   if (Test-Path -LiteralPath $backupRoot) {
     try { Remove-Item -LiteralPath $backupRoot -Recurse -Force }

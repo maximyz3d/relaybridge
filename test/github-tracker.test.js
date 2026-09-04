@@ -5,9 +5,14 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { spawnSync } = require('child_process');
 
 const tracker = require('../lib/github-tracker');
 const onboard = require('../lib/github-onboard');
+const HOST_PLATFORM = process.platform === 'win32'
+  ? { isWindows: true, isWSL: false, label: 'Windows' }
+  : { isWindows: false, isWSL: false, label: 'POSIX' };
+const posixOnly = process.platform === 'win32' ? test.skip : test;
 
 // ---- run association -------------------------------------------------------
 
@@ -72,12 +77,441 @@ test('registry entries default to safe settings (autoPush off, bump dictation on
 test('loadRegistry validates names and tracking modes', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rbgh-'));
   const file = path.join(dir, 'repos.json');
-  fs.writeFileSync(file, JSON.stringify({ repos: [{ name: 'not a repo', path: '/x' }] }));
+  const repoPath = path.join(dir, 'repo');
+  fs.writeFileSync(file, JSON.stringify({ repos: [{ name: 'not a repo', path: repoPath }] }));
   assert.throws(() => tracker.loadRegistry(file), /invalid repo name/);
-  fs.writeFileSync(file, JSON.stringify({ repos: [{ name: 'o/r', path: '/x', trackingMode: 'yolo' }] }));
+  fs.writeFileSync(file, JSON.stringify({ repos: [{ name: 'o/r', path: repoPath, trackingMode: 'yolo' }] }));
   assert.throws(() => tracker.loadRegistry(file), /unknown trackingMode/);
-  fs.writeFileSync(file, JSON.stringify({ repos: [{ name: 'o/r', path: '/x' }] }));
+  fs.writeFileSync(file, JSON.stringify({ repos: [{ name: 'o/r', path: repoPath }] }));
   assert.equal(tracker.loadRegistry(file).repos[0].autoPush, false);
+});
+
+test('registry location precedence keeps machine state in ignored data', () => {
+  const root = path.join(os.tmpdir(), 'rb-registry-root');
+  const relayData = path.join(os.tmpdir(), 'rb-relay-data');
+  const psData = path.join(os.tmpdir(), 'rb-ps-data');
+  const explicit = path.join(os.tmpdir(), 'rb-explicit', 'repos.json');
+
+  assert.equal(tracker.registryPaths({ root, env: {} }).runtimeFile,
+    path.join(root, 'data', 'github-repos.json'));
+  assert.equal(tracker.registryPaths({ root, env: { PS_BRIDGE_DATA_DIR: psData } }).runtimeFile,
+    path.join(psData, 'github-repos.json'));
+  assert.equal(tracker.registryPaths({ root, env: {
+    PS_BRIDGE_DATA_DIR: psData,
+    RELAYBRIDGE_DATA_DIR: relayData,
+  } }).runtimeFile, path.join(relayData, 'github-repos.json'));
+  assert.equal(tracker.registryPaths({ root, env: {
+    PS_BRIDGE_DATA_DIR: psData,
+    RELAYBRIDGE_DATA_DIR: relayData,
+    RELAYBRIDGE_GITHUB_REPOS: explicit,
+  } }).runtimeFile, explicit);
+  assert.throws(() => tracker.registryPaths({
+    root,
+    env: { RELAYBRIDGE_GITHUB_REPOS: '/mnt/c/relay/github-repos.json' },
+    platform: { isWindows: false, isWSL: true, label: 'WSL' },
+  }), /GitHub registry must use the WSL Linux filesystem/);
+  for (const foreignPath of [
+    'C:\\Users\\person\\RelayBridge\\github-repos.json',
+    '\\\\fileserver\\relaybridge\\github-repos.json',
+  ]) {
+    for (const detected of [
+      { isWindows: false, isWSL: false, label: 'POSIX' },
+      { isWindows: false, isWSL: true, label: 'WSL' },
+    ]) {
+      assert.throws(() => tracker.registryPaths({
+        root,
+        env: { RELAYBRIDGE_GITHUB_REPOS: foreignPath },
+        platform: detected,
+      }), /GitHub registry file must be an absolute path/,
+      `${detected.label} must reject the raw Windows path before resolving it under cwd`);
+    }
+  }
+  assert.throws(() => tracker.registryPaths({
+    root,
+    env: { RELAYBRIDGE_DATA_DIR: 'C:\\Users\\person\\RelayBridge\\data' },
+    platform: { isWindows: false, isWSL: true, label: 'WSL' },
+  }), /GitHub registry data directory must be an absolute path/);
+  assert.throws(() => tracker.registryPaths({
+    root,
+    env: {},
+    runtimeFile: 'C:\\Users\\person\\RelayBridge\\github-repos.json',
+    platform: { isWindows: false, isWSL: true, label: 'WSL' },
+  }), /GitHub registry file must be an absolute path/);
+  assert.throws(() => tracker.registryPaths({
+    root,
+    env: {},
+    legacyFile: '\\\\fileserver\\relaybridge\\legacy.json',
+    platform: { isWindows: false, isWSL: false, label: 'POSIX' },
+  }), /legacy GitHub registry file must be an absolute path/);
+});
+
+posixOnly('migration CLI rejects raw Windows runtime paths before host normalization', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rbgh-cli-foreign-path-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const result = spawnSync(process.execPath, [
+    path.join(__dirname, '..', 'tools', 'migrate-github-registry.cjs'),
+    '--root', root,
+    '--runtime-file', 'C:\\Users\\person\\RelayBridge\\github-repos.json',
+  ], { encoding: 'utf8' });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /GitHub registry file must be an absolute path/);
+  assert.equal(fs.readdirSync(root).length, 0,
+    'a foreign path must be rejected before it can become a cwd-relative state path');
+});
+
+test('a valid legacy registry is atomically migrated only when runtime is absent', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rbgh-migrate-'));
+  const legacy = path.join(root, 'config', 'github-repos.json');
+  fs.mkdirSync(path.dirname(legacy), { recursive: true });
+  const old = { repos: [{ name: 'o/r', path: path.join(root, 'repo'), autoPush: true }] };
+  fs.writeFileSync(legacy, JSON.stringify(old));
+  const options = {
+    root,
+    env: {},
+    platform: HOST_PLATFORM,
+  };
+
+  const migrated = tracker.migrateLegacyRegistry(options);
+  assert.equal(migrated.status, 'migrated');
+  assert.equal(migrated.runtimeFile, path.join(root, 'data', 'github-repos.json'));
+  assert.equal(tracker.loadRegistry(undefined, options).repos[0].name, 'o/r');
+  if (process.platform !== 'win32') {
+    assert.equal(fs.statSync(migrated.runtimeFile).mode & 0o777, 0o600);
+  }
+});
+
+test('an existing runtime registry always wins and legacy is never read or overwritten', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rbgh-runtime-wins-'));
+  const runtime = path.join(root, 'data', 'github-repos.json');
+  const legacy = path.join(root, 'config', 'github-repos.json');
+  fs.mkdirSync(path.dirname(runtime), { recursive: true });
+  fs.mkdirSync(path.dirname(legacy), { recursive: true });
+  const current = `${JSON.stringify({ repos: [{ name: 'new/current', path: path.join(root, 'current') }] }, null, 2)}\n`;
+  fs.writeFileSync(runtime, current);
+  fs.writeFileSync(legacy, '{ definitely not JSON');
+  const options = {
+    root,
+    env: {},
+    platform: HOST_PLATFORM,
+  };
+
+  assert.equal(tracker.migrateLegacyRegistry(options).status, 'runtime-present');
+  assert.equal(fs.readFileSync(runtime, 'utf8'), current);
+  assert.equal(tracker.loadRegistry(undefined, options).repos[0].name, 'new/current');
+});
+
+test('a malformed runtime registry fails closed and is never replaced by valid legacy enrollment', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rbgh-invalid-runtime-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const runtime = path.join(root, 'data', 'github-repos.json');
+  const legacy = path.join(root, 'config', 'github-repos.json');
+  fs.mkdirSync(path.dirname(runtime), { recursive: true });
+  fs.mkdirSync(path.dirname(legacy), { recursive: true });
+  const invalidRuntime = '{ definitely not JSON';
+  fs.writeFileSync(runtime, invalidRuntime);
+  fs.writeFileSync(legacy, JSON.stringify({
+    repos: [{ name: 'valid/legacy', path: path.join(root, 'legacy') }],
+  }));
+  const options = { root, env: {}, platform: HOST_PLATFORM };
+
+  assert.throws(() => tracker.migrateLegacyRegistry(options), /not valid JSON/);
+  assert.throws(() => tracker.loadRegistry(undefined, options), /not valid JSON/);
+  assert.equal(fs.readFileSync(runtime, 'utf8'), invalidRuntime,
+    'fail-closed validation must never overwrite the current authority entry');
+});
+
+posixOnly('runtime registry symlinks fail closed without suppressing valid legacy enrollment', (t) => {
+  for (const linkedTargetExists of [false, true]) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rbgh-symlink-runtime-'));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const runtime = path.join(root, 'data', 'github-repos.json');
+    const legacy = path.join(root, 'config', 'github-repos.json');
+    const linkedTarget = path.join(root, 'outside-registry.json');
+    fs.mkdirSync(path.dirname(runtime), { recursive: true });
+    fs.mkdirSync(path.dirname(legacy), { recursive: true });
+    const legacyBytes = JSON.stringify({
+      repos: [{ name: 'valid/legacy', path: path.join(root, 'legacy') }],
+    });
+    fs.writeFileSync(legacy, legacyBytes);
+    if (linkedTargetExists) fs.writeFileSync(linkedTarget, JSON.stringify({ repos: [] }));
+    fs.symlinkSync(linkedTarget, runtime);
+    const options = { root, env: {}, platform: HOST_PLATFORM };
+    const originalReadFileSync = fs.readFileSync;
+    let linkedTargetReads = 0;
+    fs.readFileSync = (file, ...args) => {
+      if (path.resolve(String(file)) === linkedTarget) linkedTargetReads += 1;
+      return originalReadFileSync.call(fs, file, ...args);
+    };
+
+    try {
+      assert.throws(() => tracker.migrateLegacyRegistry(options), /must be a regular file; symbolic links are not allowed/);
+      assert.throws(() => tracker.loadRegistry(undefined, options), /must be a regular file; symbolic links are not allowed/,
+        'a dangling symlink must not be converted from ENOENT into an empty registry');
+    } finally {
+      fs.readFileSync = originalReadFileSync;
+    }
+    assert.equal(linkedTargetReads, 0, 'runtime symlink target bytes must never be read');
+    assert.equal(fs.lstatSync(runtime).isSymbolicLink(), true);
+    assert.equal(fs.readFileSync(legacy, 'utf8'), legacyBytes);
+  }
+});
+
+test('a nonregular runtime target fails closed before legacy migration', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rbgh-directory-runtime-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const runtime = path.join(root, 'data', 'github-repos.json');
+  const legacy = path.join(root, 'config', 'github-repos.json');
+  fs.mkdirSync(runtime, { recursive: true });
+  fs.mkdirSync(path.dirname(legacy), { recursive: true });
+  fs.writeFileSync(legacy, JSON.stringify({
+    repos: [{ name: 'valid/legacy', path: path.join(root, 'legacy') }],
+  }));
+  const options = { root, env: {}, platform: HOST_PLATFORM };
+
+  assert.throws(() => tracker.migrateLegacyRegistry(options), /target is not a regular file/);
+  assert.throws(() => tracker.loadRegistry(undefined, options), /target is not a regular file/);
+  assert.equal(fs.statSync(runtime).isDirectory(), true);
+});
+
+test('a migration race reports the winner and never overwrites its registry', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rbgh-migrate-race-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const runtime = path.join(root, 'data', 'github-repos.json');
+  const legacy = path.join(root, 'config', 'github-repos.json');
+  fs.mkdirSync(path.dirname(legacy), { recursive: true });
+  const old = `${JSON.stringify({ repos: [{ name: 'old/legacy', path: path.join(root, 'old') }] })}\n`;
+  const winner = `${JSON.stringify({ repos: [{ name: 'race/winner', path: path.join(root, 'winner') }] })}\n`;
+  fs.writeFileSync(legacy, old);
+
+  const originalLinkSync = fs.linkSync;
+  t.after(() => { fs.linkSync = originalLinkSync; });
+  let raced = false;
+  fs.linkSync = (source, target) => {
+    assert.equal(target, runtime);
+    assert.equal(fs.existsSync(target), false, 'the competing writer wins after the initial absence check');
+    fs.writeFileSync(target, winner, { mode: 0o600 });
+    raced = true;
+    const error = new Error('destination exists');
+    error.code = 'EEXIST';
+    throw error;
+  };
+
+  const result = tracker.migrateLegacyRegistry({ root, env: {}, platform: HOST_PLATFORM });
+  assert.equal(raced, true);
+  assert.equal(result.status, 'runtime-present');
+  assert.equal(fs.readFileSync(runtime, 'utf8'), winner, 'the losing migration must not replace the winner');
+  assert.deepEqual(fs.readdirSync(path.dirname(runtime)).filter((name) => name.endsWith('.tmp')), [],
+    'the losing private temp is removed');
+});
+
+test('a migration race rejects a malformed regular-file winner', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rbgh-migrate-invalid-race-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const runtime = path.join(root, 'data', 'github-repos.json');
+  const legacy = path.join(root, 'config', 'github-repos.json');
+  fs.mkdirSync(path.dirname(legacy), { recursive: true });
+  fs.writeFileSync(legacy, JSON.stringify({
+    repos: [{ name: 'valid/legacy', path: path.join(root, 'legacy') }],
+  }));
+
+  const originalLinkSync = fs.linkSync;
+  t.after(() => { fs.linkSync = originalLinkSync; });
+  fs.linkSync = (_source, target) => {
+    fs.writeFileSync(target, '{ malformed race winner', { mode: 0o600 });
+    const error = new Error('destination exists');
+    error.code = 'EEXIST';
+    throw error;
+  };
+
+  assert.throws(() => tracker.migrateLegacyRegistry({ root, env: {}, platform: HOST_PLATFORM }),
+    /not valid JSON/);
+  assert.equal(fs.readFileSync(runtime, 'utf8'), '{ malformed race winner');
+  assert.deepEqual(fs.readdirSync(path.dirname(runtime)).filter((name) => name.endsWith('.tmp')), []);
+});
+
+test('a migration race rejects a nonregular directory winner', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rbgh-migrate-directory-race-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const runtime = path.join(root, 'data', 'github-repos.json');
+  const legacy = path.join(root, 'config', 'github-repos.json');
+  fs.mkdirSync(path.dirname(legacy), { recursive: true });
+  fs.writeFileSync(legacy, JSON.stringify({
+    repos: [{ name: 'valid/legacy', path: path.join(root, 'legacy') }],
+  }));
+
+  const originalLinkSync = fs.linkSync;
+  t.after(() => { fs.linkSync = originalLinkSync; });
+  fs.linkSync = (_source, target) => {
+    fs.mkdirSync(target);
+    const error = new Error('destination exists');
+    error.code = 'EEXIST';
+    throw error;
+  };
+
+  assert.throws(() => tracker.migrateLegacyRegistry({ root, env: {}, platform: HOST_PLATFORM }),
+    /target is not a regular file/);
+  assert.equal(fs.statSync(runtime).isDirectory(), true);
+  assert.deepEqual(fs.readdirSync(path.dirname(runtime)).filter((name) => name.endsWith('.tmp')), []);
+});
+
+test('load fails closed if an accepted migration race winner disappears', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rbgh-migrate-disappear-race-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const runtime = path.join(root, 'data', 'github-repos.json');
+  const legacy = path.join(root, 'config', 'github-repos.json');
+  fs.mkdirSync(path.dirname(legacy), { recursive: true });
+  fs.writeFileSync(legacy, JSON.stringify({
+    repos: [{ name: 'valid/legacy', path: path.join(root, 'legacy') }],
+  }));
+  const winner = JSON.stringify({
+    repos: [{ name: 'race/winner', path: path.join(root, 'winner') }],
+  });
+
+  const originalLinkSync = fs.linkSync;
+  const originalReadFileSync = fs.readFileSync;
+  t.after(() => {
+    fs.linkSync = originalLinkSync;
+    fs.readFileSync = originalReadFileSync;
+  });
+  fs.linkSync = (_source, target) => {
+    fs.writeFileSync(target, winner, { mode: 0o600 });
+    const error = new Error('destination exists');
+    error.code = 'EEXIST';
+    throw error;
+  };
+  fs.readFileSync = (file, ...args) => {
+    const bytes = originalReadFileSync.call(fs, file, ...args);
+    if (path.resolve(String(file)) === runtime) fs.unlinkSync(runtime);
+    return bytes;
+  };
+
+  assert.throws(() => tracker.loadRegistry(undefined, { root, env: {}, platform: HOST_PLATFORM }),
+    /GitHub registry disappeared before it could be loaded/);
+  assert.deepEqual(fs.readdirSync(path.dirname(runtime)).filter((name) => name.endsWith('.tmp')), []);
+});
+
+posixOnly('a migration race rejects a symlink winner without following it', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rbgh-migrate-symlink-race-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const runtime = path.join(root, 'data', 'github-repos.json');
+  const legacy = path.join(root, 'config', 'github-repos.json');
+  const linkedTarget = path.join(root, 'winner-target.json');
+  fs.mkdirSync(path.dirname(legacy), { recursive: true });
+  fs.writeFileSync(legacy, JSON.stringify({
+    repos: [{ name: 'valid/legacy', path: path.join(root, 'legacy') }],
+  }));
+  const targetBytes = JSON.stringify({ repos: [] });
+  fs.writeFileSync(linkedTarget, targetBytes);
+
+  const originalLinkSync = fs.linkSync;
+  const originalReadFileSync = fs.readFileSync;
+  let linkedTargetReads = 0;
+  t.after(() => { fs.linkSync = originalLinkSync; });
+  t.after(() => { fs.readFileSync = originalReadFileSync; });
+  fs.readFileSync = (file, ...args) => {
+    if (path.resolve(String(file)) === linkedTarget) linkedTargetReads += 1;
+    return originalReadFileSync.call(fs, file, ...args);
+  };
+  fs.linkSync = (_source, target) => {
+    fs.symlinkSync(linkedTarget, target);
+    const error = new Error('destination exists');
+    error.code = 'EEXIST';
+    throw error;
+  };
+
+  assert.throws(() => tracker.migrateLegacyRegistry({ root, env: {}, platform: HOST_PLATFORM }),
+    /must be a regular file; symbolic links are not allowed/);
+  fs.readFileSync = originalReadFileSync;
+  assert.equal(linkedTargetReads, 0, 'an EEXIST symlink winner must be rejected before target bytes are read');
+  assert.equal(fs.lstatSync(runtime).isSymbolicLink(), true);
+  assert.equal(fs.readFileSync(linkedTarget, 'utf8'), targetBytes);
+  assert.deepEqual(fs.readdirSync(path.dirname(runtime)).filter((name) => name.endsWith('.tmp')), []);
+});
+
+test('invalid legacy enrollment fails closed without creating a runtime file', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rbgh-invalid-legacy-'));
+  const legacy = path.join(root, 'config', 'github-repos.json');
+  const runtime = path.join(root, 'data', 'github-repos.json');
+  fs.mkdirSync(path.dirname(legacy), { recursive: true });
+  fs.writeFileSync(legacy, JSON.stringify({ repos: [{ name: 'o/r', path: 'relative/repo' }] }));
+  assert.throws(() => tracker.migrateLegacyRegistry({
+    root,
+    env: {},
+    platform: HOST_PLATFORM,
+  }), /not migrated/);
+  assert.equal(fs.existsSync(runtime), false);
+});
+
+test('registry paths are native to the host and WSL rejects DrvFs enrollments', () => {
+  const windows = { isWindows: true, isWSL: false, label: 'Windows' };
+  const linux = { isWindows: false, isWSL: false, label: 'Linux' };
+  const wsl = { isWindows: false, isWSL: true, label: 'WSL' };
+
+  assert.equal(tracker.normalizeRepoPath('C:\\Users\\person\\repo', {
+    platform: windows, skipRealpath: true,
+  }), 'C:\\Users\\person\\repo');
+  assert.throws(() => tracker.normalizeRepoPath('\\rooted-but-drive-relative', {
+    platform: windows, skipRealpath: true,
+  }), /drive or UNC share/);
+  assert.throws(() => tracker.normalizeRepoPath('C:\\Users\\person\\repo', {
+    platform: linux, skipRealpath: true,
+  }), /absolute|Windows path/);
+  assert.equal(tracker.normalizeRepoPath('/home/person/repo', {
+    platform: wsl, env: {}, skipRealpath: true,
+  }), '/home/person/repo');
+  assert.throws(() => tracker.normalizeRepoPath('/mnt/c/Users/person/repo', {
+    platform: wsl, env: {}, skipRealpath: true,
+  }), /Linux filesystem, not \/mnt/);
+  assert.equal(tracker.normalizeRepoPath('/mnt/c/Users/person/repo', {
+    platform: wsl,
+    env: { RELAYBRIDGE_ALLOW_SLOW_WSL_FS: '1' },
+    skipRealpath: true,
+  }), '/mnt/c/Users/person/repo');
+});
+
+test('WSL native-path enforcement resolves an existing symlink parent', (t) => {
+  if (process.platform === 'win32' || !fs.existsSync('/mnt')) {
+    t.skip('requires a POSIX host with /mnt');
+    return;
+  }
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rbgh-wsl-link-'));
+  const linked = path.join(root, 'mounted');
+  fs.symlinkSync('/mnt', linked, 'dir');
+  const hiddenDrvFsPath = path.join(linked, 'future-repository');
+  assert.equal(require('../lib/platform').isSlowWslInteropPath(hiddenDrvFsPath), true);
+  assert.throws(() => tracker.normalizeRepoPath(hiddenDrvFsPath, {
+    platform: { isWindows: false, isWSL: true, label: 'WSL' }, env: {},
+  }), /Linux filesystem, not \/mnt/);
+});
+
+test('saveRegistry writes through the same data-dir precedence', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rbgh-save-'));
+  const dataDir = path.join(root, 'durable-data');
+  const options = {
+    root,
+    env: { RELAYBRIDGE_DATA_DIR: dataDir },
+    platform: HOST_PLATFORM,
+  };
+  tracker.saveRegistry({ repos: [{ name: 'o/r', path: path.join(root, 'repo') }] }, undefined, options);
+  assert.equal(fs.existsSync(path.join(dataDir, 'github-repos.json')), true);
+  assert.equal(tracker.loadRegistry(undefined, options).repos[0].name, 'o/r');
+});
+
+test('directory fsync is attempted after registry publication where supported', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rbgh-dir-fsync-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const target = path.join(root, 'data', 'github-repos.json');
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  const result = tracker.fsyncParentDirectory(target);
+  assert.equal(typeof result, 'boolean');
+  if (process.platform === 'linux') assert.equal(result, true);
+});
+
+test('the tracked registry example contains no machine-specific path', () => {
+  const example = fs.readFileSync(path.join(__dirname, '..', 'config', 'github-repos.example.json'), 'utf8');
+  const parsed = JSON.parse(example);
+  assert.deepEqual(parsed.repos, []);
+  assert.doesNotMatch(example, /[A-Za-z]:\\\\|\/(?:home|mnt)\//);
 });
 
 test('repoForCwd matches nested paths and prefers the deepest enrolled root', () => {

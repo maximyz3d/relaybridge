@@ -29,6 +29,62 @@ function resolvePosixCommand(name) {
   });
 }
 
+async function createStartRegistryFixture(t) {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'relaybridge-start-registry-'));
+  const binDir = path.join(tempRoot, 'bin');
+  fs.mkdirSync(path.join(tempRoot, 'tools'), { recursive: true });
+  fs.mkdirSync(path.join(tempRoot, 'lib'), { recursive: true });
+  fs.mkdirSync(binDir);
+  for (const file of ['start.sh', 'tools/migrate-github-registry.cjs',
+    'tools/prepare-build-info.cjs',
+    'lib/github-tracker.js', 'lib/platform.js']) {
+    const target = path.join(tempRoot, file);
+    fs.copyFileSync(path.join(__dirname, '..', file), target);
+  }
+  for (const command of ['cat', 'dirname', 'grep', 'rm', 'seq']) {
+    fs.symlinkSync(await resolvePosixCommand(command), path.join(binDir, command));
+  }
+  fs.symlinkSync(process.execPath, path.join(binDir, 'node'));
+
+  const sentinel = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+    stdio: 'ignore',
+  });
+  const port = 62000 + Math.floor(Math.random() * 2000);
+  fs.writeFileSync(path.join(tempRoot, `.bridge.${port}.pid`), `${sentinel.pid}\n`);
+  t.after(() => {
+    if (sentinel.exitCode === null && sentinel.signalCode === null) sentinel.kill('SIGKILL');
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  });
+  return { tempRoot, binDir, sentinel, port };
+}
+
+async function runRejectedStart(t, registryFile, expected) {
+  const fixture = await createStartRegistryFixture(t);
+  const child = spawn('/bin/bash', [path.join(fixture.tempRoot, 'start.sh')], {
+    env: {
+      ...process.env,
+      PATH: fixture.binDir,
+      PORT: String(fixture.port),
+      RELAYBRIDGE_PORT: String(fixture.port),
+      RELAYBRIDGE_GITHUB_REPOS: registryFile,
+      RELAYBRIDGE_ALLOW_SLOW_WSL_FS: '0',
+      WSL_DISTRO_NAME: 'RelayBridge-Test',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let output = '';
+  child.stdout.on('data', (chunk) => { output += chunk; });
+  child.stderr.on('data', (chunk) => { output += chunk; });
+  const code = await new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('close', resolve);
+  });
+  assert.notEqual(code, 0);
+  assert.match(output, expected);
+  assert.doesNotThrow(() => process.kill(fixture.sentinel.pid, 0),
+    'registry preflight must fail before replacing the port-scoped process');
+}
+
 // ---- detection -------------------------------------------------------------
 
 test('platform detection is coherent', () => {
@@ -60,12 +116,13 @@ test('WSL native-runtime policy rejects /mnt state and Windows-side Node', () =>
     checkout: '/home/example/project',
     data: '/mnt/c/relay-data',
     token: '/home/example/project/.bridge-token',
+    githubRegistry: '/mnt/c/relay-data/github-repos.json',
     node: '/mnt/c/Program Files/nodejs/node.exe',
   }, { platform: { isWSL: true }, allowSlow: false });
   assert.equal(status.applicable, true);
   assert.equal(status.enforced, true);
   assert.equal(status.ok, false);
-  assert.deepEqual(status.issues, ['data', 'node']);
+  assert.deepEqual(status.issues, ['data', 'githubRegistry', 'node']);
   assert.equal(status.nativeFilesystem, false);
   assert.equal(status.nativeNode, false);
 });
@@ -76,6 +133,32 @@ test('non-WSL hosts are unaffected by the WSL-native policy', () => {
   });
   assert.equal(status.applicable, false);
   assert.equal(status.ok, true);
+});
+
+posixOnly('start.sh rejects a malformed GitHub registry before replacing a bridge', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'relaybridge-bad-registry-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const registry = path.join(dir, 'github-repos.json');
+  fs.writeFileSync(registry, '{ definitely not JSON');
+  await runRejectedStart(t, registry, /not valid JSON/);
+});
+
+posixOnly('start.sh rejects an explicit /mnt GitHub registry before replacing a bridge', async (t) => {
+  await runRejectedStart(t, '/mnt/c/relaybridge-test/github-repos.json',
+    /refusing slow WSL \/mnt execution for: github-registry/);
+});
+
+posixOnly('start.sh rejects a symlink-hidden /mnt GitHub registry before replacing a bridge', async (t) => {
+  if (!fs.existsSync('/mnt')) {
+    t.skip('requires /mnt to exercise a symlink-hidden WSL path');
+    return;
+  }
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'relaybridge-linked-registry-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const linked = path.join(dir, 'mounted');
+  fs.symlinkSync('/mnt', linked, 'dir');
+  await runRejectedStart(t, path.join(linked, 'relaybridge-test', 'github-repos.json'),
+    /GitHub registry must use the WSL Linux filesystem, not \/mnt/);
 });
 
 // ---- shells ----------------------------------------------------------------

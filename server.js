@@ -503,11 +503,13 @@ let state = loadState();
 
 // ---- Persistent collabs (group chats) + projects -----------------------
 const DATA_DIR = path.resolve(envFirst('RELAYBRIDGE_DATA_DIR', 'PS_BRIDGE_DATA_DIR') || path.join(ROOT, 'data'));
+const GITHUB_REGISTRY_FILE = path.resolve(envFirst('RELAYBRIDGE_GITHUB_REPOS') || path.join(DATA_DIR, 'github-repos.json'));
 const WSL_NATIVE_RUNTIME = platform.wslNativeRuntimeStatus({
   checkout: ROOT,
   data: DATA_DIR,
   token: TOKEN_FILE,
   config: CONFIG_FILE,
+  githubRegistry: GITHUB_REGISTRY_FILE,
   node: process.execPath,
 });
 if (!WSL_NATIVE_RUNTIME.ok) {
@@ -6262,11 +6264,23 @@ app.post('/api/usage/advise', (req, res) => {
 
 // ---- GitHub integration (lib/github-tracker.js) --------------------------
 // Fire-and-forget middleware on the run-completion path. Activates only for
-// runs whose cwd sits inside an enrolled repo (config/github-repos.json);
+// runs whose cwd sits inside an enrolled repo (data/github-repos.json by
+// default, or RELAYBRIDGE_GITHUB_REPOS when explicitly configured);
 // strict no-op otherwise. It commits/documents/labels as side effects of a
 // run — the provider response is never delayed or failed by tracking.
 const githubTracker = require('./lib/github-tracker');
 const githubOnboard = require('./lib/github-onboard');
+if (path.resolve(githubTracker.REGISTRY_FILE) !== GITHUB_REGISTRY_FILE) {
+  throw new Error('GitHub registry path resolution drifted between server and tracker');
+}
+const githubRegistryMigration = githubTracker.migrateLegacyRegistry();
+// Validate eagerly. A malformed authority file must stop startup instead of
+// letting the bridge look healthy while every completed run silently fails to
+// checkpoint.
+githubTracker.loadRegistry();
+if (githubRegistryMigration.status === 'migrated') {
+  console.log(`[RelayBridge] migrated legacy GitHub enrollment to ${githubRegistryMigration.runtimeFile}`);
+}
 githubTracker.setActivityFile(path.join(DATA_DIR, 'github-activity.jsonl'));
 
 function trackRunAfterResponse(meta) {

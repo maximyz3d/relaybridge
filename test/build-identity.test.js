@@ -28,6 +28,19 @@ function write(file, content) {
   fs.writeFileSync(file, content);
 }
 
+function copyStartPreflightFixture(root) {
+  for (const file of [
+    'start.sh',
+    'tools/migrate-github-registry.cjs',
+    'lib/github-tracker.js',
+    'lib/platform.js',
+  ]) {
+    const target = path.join(root, file);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.copyFileSync(path.join(ROOT, file), target);
+  }
+}
+
 function git(root, ...args) {
   const result = spawnSync('git', ['-C', root, ...args], { encoding: 'utf8', windowsHide: true });
   assert.equal(result.status, 0, result.stderr || result.stdout);
@@ -835,7 +848,7 @@ test('a launcher-pinned expected identity makes server startup fail before liste
 posixOnly('start.sh owns the exact server across a forced setsid fork', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relaybridge-start-fork-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  fs.copyFileSync(path.join(ROOT, 'start.sh'), path.join(root, 'start.sh'));
+  copyStartPreflightFixture(root);
   write(path.join(root, 'tools', 'prepare-build-info.cjs'),
     "process.stdout.write('2.0.1+aaaaaaaaaaaaaaaa\\n');\n");
   write(path.join(root, 'server.js'), `
@@ -897,7 +910,7 @@ posixOnly('start.sh owns the exact server across a forced setsid fork', async (t
 posixOnly('start.sh aborts a forced-fork child when its inside-session PID handoff cannot be written', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relaybridge-start-handoff-fail-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  fs.copyFileSync(path.join(ROOT, 'start.sh'), path.join(root, 'start.sh'));
+  copyStartPreflightFixture(root);
   write(path.join(root, 'tools', 'prepare-build-info.cjs'),
     "process.stdout.write('2.0.1+aaaaaaaaaaaaaaaa\\n');\n");
   const serverMarker = path.join(root, 'server-started.marker');
@@ -958,7 +971,7 @@ posixOnly('start.sh never signals an unproven PID injected into its handoff', as
   });
   await waitUntil(() => isLiveProcess(victim.pid));
 
-  fs.copyFileSync(path.join(ROOT, 'start.sh'), path.join(root, 'start.sh'));
+  copyStartPreflightFixture(root);
   write(path.join(root, 'tools', 'prepare-build-info.cjs'),
     "process.stdout.write('2.0.1+aaaaaaaaaaaaaaaa\\n');\n");
   write(path.join(root, 'server.js'), 'throw new Error("must not execute");\n');
@@ -1017,7 +1030,7 @@ posixOnly('start.sh rejects an unrelated valid session leader without signaling 
     return status.status === 0 && pgid === victim.pid && sid === victim.pid;
   });
 
-  fs.copyFileSync(path.join(ROOT, 'start.sh'), path.join(root, 'start.sh'));
+  copyStartPreflightFixture(root);
   write(path.join(root, 'tools', 'prepare-build-info.cjs'),
     "process.stdout.write('2.0.1+aaaaaaaaaaaaaaaa\\n');\n");
   write(path.join(root, 'server.js'), 'throw new Error("must not execute");\n');
@@ -1078,7 +1091,7 @@ posixOnly('start.sh removes wrong or unready exact candidates without leaving a 
         }
         fs.rmSync(root, { recursive: true, force: true });
       });
-      fs.copyFileSync(path.join(ROOT, 'start.sh'), path.join(root, 'start.sh'));
+      copyStartPreflightFixture(root);
       write(path.join(root, 'tools', 'prepare-build-info.cjs'),
         "process.stdout.write('2.0.1+aaaaaaaaaaaaaaaa\\n');\n");
       const serverPidFile = path.join(root, 'server.pid');
@@ -1132,7 +1145,7 @@ posixOnly('start.sh signal cleanup terminates its exact detached session', async
     if (serverPid && isLiveProcess(serverPid)) { try { process.kill(serverPid, 'SIGKILL'); } catch {} }
     fs.rmSync(root, { recursive: true, force: true });
   });
-  fs.copyFileSync(path.join(ROOT, 'start.sh'), path.join(root, 'start.sh'));
+  copyStartPreflightFixture(root);
   write(path.join(root, 'tools', 'prepare-build-info.cjs'),
     "process.stdout.write('2.0.1+aaaaaaaaaaaaaaaa\\n');\n");
   write(path.join(root, 'server.js'), `
