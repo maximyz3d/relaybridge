@@ -112,6 +112,13 @@ test('the restart script never force-kills by wildcard', () => {
   }
 });
 
+test('the restart script excludes the native Claude Code CLI from Desktop restarts', () => {
+  const script = fs.readFileSync(path.join(ROOT, 'restart-ai-clients.ps1'), 'utf8');
+  assert.match(script, /ExcludePathPattern/);
+  assert.match(script, /ExcludePathPattern = .*\.local.*bin.*claude/);
+  assert.match(script, /Get-ClientProcesses/, 'every process refresh must retain the exclusion');
+});
+
 test('the restart script leaves the bridge and browsers alone', () => {
   const script = fs.readFileSync(path.join(ROOT, 'restart-ai-clients.ps1'), 'utf8');
   for (const forbidden of ["'node'", "'chrome'", "'powershell'", "'msedge'"]) {

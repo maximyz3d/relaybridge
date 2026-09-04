@@ -165,7 +165,7 @@ test('an explicitly requested provider is planned even if unrouted', () => {
 test('the CLI exposes plan before ask and documents effort', () => {
   const { USAGE } = require('../bin/relaybridge.js');
   assert.match(USAGE, /relaybridge plan/);
-  assert.match(USAGE, /minimal\|low\|medium\|high\|max/);
+  assert.match(USAGE, /minimal\|low\|medium\|high\|xhigh\|max/);
   assert.ok(USAGE.indexOf('plan') < USAGE.indexOf('ask'), 'plan should be presented before ask');
 });
 
@@ -188,6 +188,39 @@ test('the CLI ask payload preserves the caller working directory', () => {
   assert.equal(body.kind, 'claude');
   assert.equal(body.dangerous, false);
   assert.equal(body.requestId, 'cli:test-request-0001');
+});
+
+test('the CLI ask payload propagates the planned model tier and effort', () => {
+  const { buildAskBody } = require('../bin/relaybridge.js');
+  const plan = {
+    primary: { kind: 'codex', modelTier: 'heavy' },
+    tier: 'complex',
+    effort: 'high',
+  };
+  const body = buildAskBody(plan, 'debug the architecture', '/repo', 'cli:test-controls-1');
+  assert.equal(body.taskTier, 'complex');
+  assert.equal(body.modelTier, 'heavy');
+  assert.equal(body.effort, 'high');
+  assert.equal(body.maxEffortOverride, undefined);
+});
+
+test('the CLI extreme-effort gate reflects explicit user intent, not a returned plan', () => {
+  const { buildAskBody } = require('../bin/relaybridge.js');
+  const plan = {
+    primary: { kind: 'codex', modelTier: 'heavy' },
+    tier: 'complex',
+    effort: 'max',
+  };
+  const inferred = buildAskBody(plan, 'hard task', '/repo', 'cli:test-controls-2');
+  assert.equal(inferred.effort, 'max');
+  assert.equal(inferred.maxEffortOverride, undefined, 'a plan cannot silently authorize maximum effort');
+
+  for (const effort of ['xhigh', 'max']) {
+    const explicit = buildAskBody(plan, 'hard task', '/repo', `cli:test-controls-${effort}`, null, effort);
+    assert.equal(explicit.maxEffortOverride, true);
+  }
+  const merelyHigh = buildAskBody(plan, 'hard task', '/repo', 'cli:test-controls-high', null, 'high');
+  assert.equal(merelyHigh.maxEffortOverride, undefined);
 });
 
 test('the CLI generates unique request IDs and rejects mismatched response attribution', () => {

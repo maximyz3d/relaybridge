@@ -32,6 +32,20 @@ const settled = async (q, id, tries = 60) => {
   throw new Error(`task ${id} never settled (status ${q.get(id)?.status})`);
 };
 
+test('a caller-reserved task id is persisted exactly once', async () => {
+  const dir = tmpdir();
+  const q = createTaskQueue({
+    dataDir: dir,
+    executeOneShot: fakeExecutor(async () => ({ payload: { stdout: 'reserved', exitCode: 0 } })),
+  });
+  const task = q.submitReserved('t_reserved_1', { kind: 'claude', prompt: 'bounded work' });
+  assert.equal(task.id, 't_reserved_1');
+  assert.throws(() => q.submitReserved('t_reserved_1', { kind: 'claude', prompt: 'duplicate' }),
+    /task id already exists/);
+  assert.equal((await settled(q, task.id)).status, 'done');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 test('submit returns immediately with an id; the result arrives later', async () => {
   const dir = tmpdir();
   let released;
@@ -127,14 +141,21 @@ test('a result written by one caller is readable by any other (durable on disk)'
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test('a failing run is recorded as failed with its reason, not silently lost', async () => {
+test('a failing run preserves typed retry evidence with its reason', async () => {
   const dir = tmpdir();
-  const q = createTaskQueue({ dataDir: dir, executeOneShot: fakeExecutor(async () => ({ payload: { stdout: '', exitCode: 1, dropped_out: true, stop_detail: 'provider stalled' } })) });
+  const q = createTaskQueue({ dataDir: dir, executeOneShot: fakeExecutor(async () => ({ payload: {
+    stdout: '', exitCode: 1, dropped_out: true, stop_detail: 'provider stalled',
+    failureClass: 'rate_limit', rate_limited: true, retry_after: 17, retry_at: 1234567,
+  } })) });
   const { id } = q.submit({ kind: 'grok', prompt: 'x' });
   const t = await settled(q, id);
   assert.equal(t.status, 'failed');
   assert.match(t.error, /stalled/);
   assert.equal(t.flags.dropped_out, true);
+  assert.equal(t.failureClass, 'rate_limit');
+  assert.equal(t.retryAfterSec, 17);
+  assert.equal(t.retryAt, 1234567);
+  assert.equal(q.list({ status: 'failed' })[0].failureClass, 'rate_limit');
   fs.rmSync(dir, { recursive: true, force: true });
 });
 

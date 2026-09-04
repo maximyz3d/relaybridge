@@ -82,6 +82,30 @@ fi
 
 command -v node >/dev/null 2>&1 || { echo "[RelayBridge] node not found — run setup-wsl.sh first" >&2; exit 1; }
 
+# Git/npm/model-CLI workloads are metadata-heavy. On WSL, placing any runtime
+# component under /mnt crosses DrvFs/9p and is both slower and less reliable for
+# POSIX permissions. Refuse that topology by default; Chrome remains the one
+# intentional Windows-side GUI and is reached through a narrow launcher/CDP.
+if [[ -n "${WSL_DISTRO_NAME:-}" ]] || grep -qi microsoft /proc/version 2>/dev/null; then
+  slow_paths=()
+  node_bin="$(command -v node)"
+  [[ "$ROOT" == /mnt || "$ROOT" == /mnt/* ]] && slow_paths+=(checkout)
+  [[ "$node_bin" == /mnt || "$node_bin" == /mnt/* ]] && slow_paths+=(node)
+  for spec in \
+    "data:${RELAYBRIDGE_DATA_DIR:-${PS_BRIDGE_DATA_DIR:-}}" \
+    "token:${RELAYBRIDGE_TOKEN_FILE:-${PS_BRIDGE_TOKEN_FILE:-}}" \
+    "config:${RELAYBRIDGE_CONFIG_FILE:-${PS_BRIDGE_CONFIG_FILE:-}}"; do
+    label="${spec%%:*}"
+    candidate="${spec#*:}"
+    [[ "$candidate" == /mnt || "$candidate" == /mnt/* ]] && slow_paths+=("$label")
+  done
+  if (( ${#slow_paths[@]} )) && [[ "${RELAYBRIDGE_ALLOW_SLOW_WSL_FS:-}" != 1 ]]; then
+    echo "[RelayBridge] refusing slow WSL /mnt execution for: ${slow_paths[*]}" >&2
+    echo "Move RelayBridge, data, token, config, and Linux Node under /home, then retry." >&2
+    exit 1
+  fi
+fi
+
 # One bridge per port: replace, never stack.
 existing="$(listening_pid || true)"
 if [[ -n "${existing:-}" ]]; then

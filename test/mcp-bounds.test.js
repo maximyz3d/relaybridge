@@ -8,9 +8,9 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-let buildServer, describeNumericBounds, z;
+let buildServer, describeNumericBounds, workflowPermissionDefaults, z;
 test.before(async () => {
-  ({ buildServer, describeNumericBounds } = await import('../mcp/server.mjs'));
+  ({ buildServer, describeNumericBounds, workflowPermissionDefaults } = await import('../mcp/server.mjs'));
   ({ z } = await import('zod'));
 });
 
@@ -83,5 +83,59 @@ test('one-sided and unbounded parameters are handled honestly', () => {
 test('a malformed schema yields null rather than throwing', () => {
   for (const bad of [null, undefined, {}, 'nope', 42]) {
     assert.equal(describeNumericBounds(bad), null);
+  }
+});
+
+test('pipeline permissions default to full only when both explicit host gates are enabled', () => {
+  assert.deepEqual(workflowPermissionDefaults({}, {}), {
+    permissionMode: 'safe', acknowledgeFilesystemWrites: false,
+  });
+  assert.deepEqual(workflowPermissionDefaults({}, {
+    RELAYBRIDGE_ALLOW_STICKY_DANGEROUS: '1',
+  }), { permissionMode: 'safe', acknowledgeFilesystemWrites: false });
+  assert.deepEqual(workflowPermissionDefaults({}, {
+    RELAYBRIDGE_START_FULL_PERMISSIONS: '1',
+  }), { permissionMode: 'safe', acknowledgeFilesystemWrites: false });
+  const fullEnvironment = {
+    RELAYBRIDGE_ALLOW_STICKY_DANGEROUS: '1',
+    RELAYBRIDGE_START_FULL_PERMISSIONS: '1',
+  };
+  assert.deepEqual(workflowPermissionDefaults({}, fullEnvironment), {
+    permissionMode: 'full', acknowledgeFilesystemWrites: true,
+  });
+  assert.deepEqual(workflowPermissionDefaults({}, {
+    PS_BRIDGE_ALLOW_STICKY_DANGEROUS: '1',
+    PS_BRIDGE_START_FULL_PERMISSIONS: '1',
+  }), { permissionMode: 'full', acknowledgeFilesystemWrites: true });
+  assert.deepEqual(workflowPermissionDefaults({}, {
+    RELAYBRIDGE_ALLOW_STICKY_DANGEROUS: '0',
+    RELAYBRIDGE_START_FULL_PERMISSIONS: '1',
+    PS_BRIDGE_ALLOW_STICKY_DANGEROUS: '1',
+    PS_BRIDGE_START_FULL_PERMISSIONS: '1',
+  }), { permissionMode: 'safe', acknowledgeFilesystemWrites: false });
+  assert.deepEqual(workflowPermissionDefaults({ permissionMode: 'safe' }, fullEnvironment), {
+    permissionMode: 'safe', acknowledgeFilesystemWrites: false,
+  });
+  assert.deepEqual(workflowPermissionDefaults({ permissionMode: 'full' }, fullEnvironment), {
+    permissionMode: 'full', acknowledgeFilesystemWrites: false,
+  });
+  assert.deepEqual(workflowPermissionDefaults({ acknowledgeFilesystemWrites: true }, fullEnvironment), {
+    permissionMode: 'safe', acknowledgeFilesystemWrites: true,
+  });
+
+  const previousSticky = process.env.RELAYBRIDGE_ALLOW_STICKY_DANGEROUS;
+  const previousStart = process.env.RELAYBRIDGE_START_FULL_PERMISSIONS;
+  try {
+    process.env.RELAYBRIDGE_ALLOW_STICKY_DANGEROUS = '1';
+    process.env.RELAYBRIDGE_START_FULL_PERMISSIONS = '1';
+    const schema = tools().start_codex_claude_pipeline.inputSchema;
+    const parsed = schema.parse({ cwd: '/tmp', objective: 'x', acceptance: 'y' });
+    assert.equal(parsed.permissionMode, undefined, 'pair injection happens atomically in the handler');
+    assert.equal(parsed.acknowledgeFilesystemWrites, undefined);
+  } finally {
+    if (previousSticky === undefined) delete process.env.RELAYBRIDGE_ALLOW_STICKY_DANGEROUS;
+    else process.env.RELAYBRIDGE_ALLOW_STICKY_DANGEROUS = previousSticky;
+    if (previousStart === undefined) delete process.env.RELAYBRIDGE_START_FULL_PERMISSIONS;
+    else process.env.RELAYBRIDGE_START_FULL_PERMISSIONS = previousStart;
   }
 });

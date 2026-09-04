@@ -122,6 +122,10 @@ test('ask transports a long stdin prompt in request bodies, never argv', async (
   assert.equal(requests[0].body.task, prompt);
   assert.equal(requests[1].url, '/api/oneshot');
   assert.equal(requests[1].body.prompt, prompt);
+  assert.equal(requests[1].body.taskTier, 'standard');
+  assert.equal(requests[1].body.modelTier, 'standard');
+  assert.equal(requests[1].body.effort, 'medium');
+  assert.equal(requests[1].body.maxEffortOverride, undefined);
   assert.match(requests[1].body.requestId, /^cli:[0-9a-f-]{36}$/);
   assert.match(result.stderr, new RegExp(`# request ${requests[1].body.requestId}`));
   assert.match(

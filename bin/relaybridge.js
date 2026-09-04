@@ -223,7 +223,14 @@ function parseProviderBudgetFlag(raw) {
   }
 }
 
-function buildAskBody(plan, task, cwd = process.cwd(), requestId = newCliRequestId(), providerBudget = null) {
+function buildAskBody(
+  plan,
+  task,
+  cwd = process.cwd(),
+  requestId = newCliRequestId(),
+  providerBudget = null,
+  explicitlyRequestedEffort = null,
+) {
   const body = {
     kind: plan.primary.kind,
     prompt: task,
@@ -232,6 +239,13 @@ function buildAskBody(plan, task, cwd = process.cwd(), requestId = newCliRequest
     cwd,
     requestId,
   };
+  if (plan.primary.modelTier) body.modelTier = plan.primary.modelTier;
+  if (plan.effort) body.effort = plan.effort;
+  const explicitEffort = typeof explicitlyRequestedEffort === 'string'
+    ? explicitlyRequestedEffort.trim().toLowerCase() : null;
+  if (explicitEffort === 'max' || explicitEffort === 'xhigh') {
+    body.maxEffortOverride = true;
+  }
   if (providerBudget) body.providerBudget = providerBudget;
   return body;
 }
@@ -269,7 +283,7 @@ const USAGE = `relaybridge — delegate work to AI CLIs on seats you already pay
   relaybridge mcp-config               MCP server JSON for any client
 
 Prompt: positional text | --stdin | --prompt-file <path>  (choose exactly one)
-Flags: --effort minimal|low|medium|high|max   --kind <provider>   --provider-budget '<json>'   --json
+Flags: --effort minimal|low|medium|high|xhigh|max   --kind <provider>   --provider-budget '<json>'   --json
 Correlation: ask prints its unique request ID, then the exact returned receipt tuple.
 
 Effort exists so a simple edit does not burn a frontier reasoning budget, and a
@@ -308,7 +322,9 @@ async function main() {
           console.error('\nthis task is critical tier: re-run with --force if you accept advisory-only output');
           return 1;
         }
-        const askBody = buildAskBody(plan, task, process.cwd(), newCliRequestId(), providerBudget);
+        const askBody = buildAskBody(
+          plan, task, process.cwd(), newCliRequestId(), providerBudget, flags.effort || null,
+        );
         console.error(`# request ${askBody.requestId} · ${plan.primary.kind} · ${plan.primary.model || 'default'} · effort ${plan.effort}`);
         const result = await call('/api/oneshot', {
           method: 'POST',

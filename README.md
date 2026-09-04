@@ -100,7 +100,114 @@ For a staged bridge:
 .\install-mcp.ps1 -BridgeUrl 'http://127.0.0.1:8788'
 ```
 
-The installer registers a user-scoped MCP server named `relaybridge` with Codex and Claude when those CLIs are available. It stores the loopback URL and the path to the local token file, not the token value itself. After the canonical registration succeeds, recognized legacy names (`ps_bridge` and `ps-bridge`) are removed only when their command is confirmed to target a RelayBridge `mcp/server.mjs`; unrelated lookalikes are retained. A partial registration restores both client configuration files to their original bytes. Restart Codex or Claude after registration so they reload MCP configuration.
+For the recommended WSL-native Codex + Claude deployment, keep this checkout
+under the Linux home filesystem (for example `~/src/relaybridge`) and run:
+
+```bash
+./install-skill.sh --register-mcp --register-chrome --full-permissions
+./start-chrome-debug.sh
+```
+
+The first command links the pipeline skill and roles, registers this exact
+checkout's RelayBridge MCP server, and registers the pinned Chrome DevTools MCP
+in slim mode. The second starts a dedicated Chrome debugging profile. Restart
+open Codex and Claude clients after registration. On plain Linux or macOS, omit
+`--register-chrome` unless a compatible local Chrome debugging endpoint is
+available. To install only the pipeline and RelayBridge integration, use
+`./install-skill.sh --register-mcp --full-permissions`; omit the final flag for
+the safe-reset default. Existing client config and role targets are backed up
+before replacement, registrations are verified, and the Codex MCP tool timeout
+is derived from `config/timeout-policy.json`.
+
+This deployment uses `--full-permissions` because the owner explicitly
+requested persistent auto/full-permission operation. The option adds
+the sticky and start-full permission variables to both RelayBridge MCP
+registrations and pre-approves the Codex-side MCP tool policy for the registered
+servers. It is off by default for general installations; omit it to make Full
+Permissions reset off after restart.
+
+For MCP pipeline creation, that owner-level opt-in also establishes the
+per-workflow default: when a `start_codex_claude_pipeline` call omits both
+permission fields, the MCP handler atomically sends
+`permissionMode:"full"` and `acknowledgeFilesystemWrites:true`. This shortcut
+applies only when both fields are absent. Explicit `permissionMode:"full"`
+without `acknowledgeFilesystemWrites:true`, or an explicit acknowledgement
+without `full`, is not completed from the environment and fails closed. Send
+`permissionMode:"safe"` and `acknowledgeFilesystemWrites:false` to override the
+installed default for one workflow. Raw REST workflow creation does not use the
+MCP shortcut: omitted REST fields remain `safe`/`false`.
+
+The resolved pair is stored on that workflow; it does not bypass planning,
+review, accepted-finding, or exclusive writer-lease gates. Existing workflows
+are not changed when MCP registration defaults change.
+
+The POSIX installers register `relaybridge` and, when requested,
+`chrome-devtools` in the current user's Codex and Claude configuration. Skill
+and agent links are also user-scoped under `~/.agents`, `~/.codex`, and
+`~/.claude`; they point back to this exact checkout, so do not move or delete it
+without reinstalling. The RelayBridge registration stores the loopback URL and
+the path to the local token file, not the token value itself, and rolls back
+both client configurations after a partial registration. The PowerShell installer
+also removes recognized legacy names (`ps_bridge` and `ps-bridge`) only when
+their command is confirmed to target a RelayBridge `mcp/server.mjs`; unrelated
+lookalikes are retained. Restart Codex or Claude after registration so they
+reload MCP configuration.
+
+### WSL-native runtime and Chrome boundary
+
+On WSL, RelayBridge, its checkout, state/data/token/config files, Node, npm/npx,
+and provider CLIs should all be Linux-native and live under the Linux
+filesystem. The POSIX installers refuse a checkout or Node/npx resolved through
+`/mnt`; the server also fails closed when its checkout, data, token, config, or
+Node path crosses that boundary. This avoids DrvFs/9p latency, path translation,
+and mixed Windows/Linux process trees. The server has an explicit
+`RELAYBRIDGE_ALLOW_SLOW_WSL_FS=1` diagnostic override, but the installers still
+require a native checkout. Windows-only provider binaries are not selected by
+default; install their Linux CLI instead of relying on WSL interop.
+
+Windows Chrome is the intentional GUI exception. `start-chrome-debug.sh` uses
+`powershell.exe` only to launch Windows Chrome with a separate profile at
+`%LOCALAPPDATA%\RelayBridge\ChromeDevToolsProfile`, bound to
+`http://127.0.0.1:9222`; the MCP process and AI clients remain in WSL. Mirrored
+networking reaches that endpoint directly. Under WSL NAT, the launcher instead
+creates a narrow two-hop forward: Linux-native `socat` listens only on WSL
+`127.0.0.1:9222`, and Windows `node.exe` listens on a distinct high port only
+on the verified Hyper-V WSL adapter. The Windows helper accepts only the current
+distro IP and forwards only to Chrome's Windows loopback. It does not add or
+weaken firewall rules. The NAT fallback therefore requires Linux `socat` and
+Windows Node; installing either under `/mnt` is still not allowed for the main
+RelayBridge runtime.
+This profile is separate from normal Chrome, but it is persistent and may retain
+cookies or site data. Treat anyone able to reach its DevTools port as able to
+control that browser: do not publish either listener to wildcard, LAN, VPN, or
+internet addresses, use only accounts appropriate for automation, and close the
+dedicated Chrome when finished. Mirrored networking remains the preferred path;
+the source-restricted private adapter hop exists only for WSL NAT compatibility.
+
+Chrome MCP installs in slim mode by default. Slim mode covers the usual
+navigation, page evaluation, and screenshot workflow while keeping the tool
+surface and context cost small. When a task genuinely requires console,
+network, or performance tooling, replace the user-scoped registration and then
+restart open AI clients:
+
+```bash
+./install-chrome-mcp.sh --full-tools --full-permissions
+```
+
+For the staged Codex-orchestrated planning, implementation, and review workflow,
+see [Codex-Claude pipeline](docs/CODEX-CLAUDE-PIPELINE.md).
+At the start of each new or resumed client session, use `list_pipelines` before
+creating a workflow. Resume a matching active run with status-only
+`get_pipeline` and follow its `nextActions`; active provider phases advance only
+through the identity-gated `reconcile_pipeline` action. Do not duplicate durable
+work after a disconnect or while a provider phase is merely slow. The pipeline guide maps every MCP phase tool to
+its authenticated `/api/workflows...` REST operation. The closing review gate
+is a fresh read-only Claude Sonnet/high run; Codex verification may add focused
+evidence but does not replace that final Claude verdict. Typed transient
+read-only failures use durable bounded backoff; older terminalized 429/timeout
+runs can use `retry_failed_pipeline_provider`, while writer and semantic
+failures remain terminal. Restart-interrupted tasks require that explicit
+recovery action so status reads cannot overlap a potentially surviving process.
 
 MCP actions that cross into REST or provider admission fail closed unless the MCP process and REST listener report the same exact build and receipt store. The store identity is a SHA-256 value bound to a persisted random seed and the canonical store location; health, errors, and receipts never expose the raw data path. Read-only status tools and local cache replays remain available during a mismatch so an operator can inspect the listener and use the lifecycle tools to replace a stale build. A rejected provider action records `modelInvocation:false`, `tokenUsageSource:not_invoked`, zero retries, and no transport receipt.
 
@@ -170,10 +277,14 @@ fails, RelayBridge preserves that exact temp directory for inspection and marks
 the run dropped as `isolation_cleanup`; it never broadens deletion to the real
 provider home. `dangerous:true` remains the only explicit human-authorized
 writer path, and no safe rejection is automatically retried as dangerous.
-Claude plan mode is currently `unverified_provider_policy`: it is known to
-create plan artifacts in its provider home, while authentication from an empty
-isolated home has not been proven without copying credentials. Other unproven
-subscription CLIs are likewise temporarily unavailable for safe one-shots.
+Claude and Fable safe one-shots are `read_only_enforced` only because their
+launch vectors combine `--safe-mode`, `--restricted`, an explicit empty strict
+MCP config, `--tools Read,Glob,Grep`, plan permission mode, no session
+persistence, and a 150k auto-compact window. Restricted mode confines built-in
+file tools to the working directories and refuses bypass-permissions mode.
+Changing or removing that complete launch boundary requires returning the
+provider to `unverified_provider_policy` until the replacement is verified.
+Other unproven subscription CLIs remain unavailable for safe one-shots.
 
 Filesystem eligibility is applied before routing, not only at execution.
 `/api/diag`, `/api/agents`, MCP provider summaries, route candidates, plans,
@@ -213,9 +324,13 @@ usage. Gemini diagnostics, agent status, and the Fuel panel therefore publish
 output characters into a token estimate. The version and inspection evidence
 are carried with the capability so a future CLI upgrade can be re-evaluated.
 
-Claude and Fable default to `high` effort. Maximum effort is never inferred: a
-caller must send both `effort: "max"` and `maxEffortOverride: true`. Explicit
-human requests using both fields remain supported.
+Standard Claude planning defaults to Sonnet/medium; complex plans route to
+Opus/high and the hardest plans can use Fable's explicit heavy tier. Fable has
+no dangerous slot. Bounded Claude revisions use the `claude` provider's
+Sonnet/medium writer slot. Maximum effort is never inferred: a caller must send
+both `effort: "max"` and `maxEffortOverride: true`. Claude accepts max directly;
+Codex maps that cross-provider request to `xhigh`, its highest supported normal
+CLI configuration value, rather than silently reducing it to high.
 
 Provider prompts default to a 20-minute deadline and accept an explicit
 `timeoutMs` up to 45 minutes. The liveness supervisor also grants buffered
@@ -226,8 +341,8 @@ broadcasts, the REST one-shot path, and the MCP transport all use
 `config/timeout-policy.json`; direct REST values above the cap are clamped and
 reported as `route.effective_timeout_ms`. Routed work still shares one overall
 tier deadline, and caller cancellation still terminates the provider process
-tree. Rerun `install-mcp.ps1` after changing this policy so Codex receives a
-host-side tool timeout long enough to cover the provider cap and transport
+tree. Rerun `install-mcp.ps1` or `install-mcp.sh` after changing this policy so
+Codex receives a host-side tool timeout long enough to cover the provider cap and transport
 grace. These longer deadlines do not change `dangerous:false`, advisory-only
 committee behavior, or any human gate.
 
@@ -390,6 +505,7 @@ Core routes:
 | GET | `/api/agents` | AI providers with tags, autoRoute, and cached readiness |
 | POST | `/api/agents/:id/tags` | Replace one provider's routing tags in `cli-config.json` |
 | POST | `/api/broadcast` | Fan one prompt out to many providers (by `providers`, `tag`, or `all:true`) |
+| GET/POST | `/api/workflows...` | List/resume and advance the phase-gated Codex-Claude pipeline; see the pipeline guide for the one-to-one MCP mapping |
 | POST | `/api/install` | Run a configured provider installer |
 | GET/POST/PUT/DELETE | `/api/collabs...` | Collaboration rooms |
 | GET/POST | `/api/projects` | Saved project labels |
@@ -427,6 +543,16 @@ npm test
 npm run test:install
 npm run test:install-mcp
 npm audit --omit=dev
+```
+
+POSIX installer and metadata checks:
+
+```bash
+sh -n install-mcp.sh
+sh -n install-skill.sh
+sh -n install-chrome-mcp.sh
+bash -n start-chrome-debug.sh
+node -e "JSON.parse(require('fs').readFileSync('cli-config.json', 'utf8'))"
 ```
 
 Local MCP smoke:

@@ -1,0 +1,7 @@
+interface:
+  display_name: "Codex-Claude Pipeline"
+  short_description: "Coordinate staged Codex and Claude work"
+  default_prompt: "Use $codex-claude-pipeline to coordinate this task through bounded planning, implementation, review, and verification gates."
+
+policy:
+  allow_implicit_invocation: true

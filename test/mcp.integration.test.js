@@ -7,6 +7,7 @@ const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
+const { createWorkflowPipeline } = require('../lib/workflow-pipeline');
 
 const ROOT = path.resolve(__dirname, '..');
 
@@ -135,16 +136,37 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
       label: 'Echo',
       safe: [process.execPath, helper, '--version'],
       dangerous: [process.execPath, helper, '--version'],
-      oneshot_safe: [process.execPath, helper, '--prompt-file', '{prompt_file}'],
+      oneshot_safe: [
+        process.execPath, helper, '--prompt-file', '{prompt_file}',
+        '--reasoning-effort', 'medium',
+      ],
       oneshot_dangerous: [process.execPath, helper, '--prompt-file', '{prompt_file}', '--exit', '9'],
       diagnostic_binary: process.execPath,
       probe: [process.execPath, helper, '--version'],
+      effort_flags: {
+        minimal: ['--reasoning-effort', 'minimal'],
+        low: ['--reasoning-effort', 'low'],
+        medium: ['--reasoning-effort', 'medium'],
+        high: ['--reasoning-effort', 'high'],
+        xhigh: ['--reasoning-effort', 'xhigh'],
+        max: ['--reasoning-effort', 'max'],
+      },
   };
   fs.writeFileSync(configPath, JSON.stringify({
     echo: echoProvider,
     ollama: { ...echoProvider, label: 'Fake local utility' },
     ollama_coder: { ...echoProvider, label: 'Fake local coder' },
-    codex: { ...echoProvider, label: 'Fake Codex' },
+    codex: {
+      ...echoProvider,
+      label: 'Fake Codex',
+      effort_flags: {
+        minimal: ['--config', 'model_reasoning_effort=minimal'],
+        low: ['--config', 'model_reasoning_effort=low'],
+        medium: ['--config', 'model_reasoning_effort=medium'],
+        high: ['--config', 'model_reasoning_effort=high'],
+        max: ['--config', 'model_reasoning_effort=xhigh'],
+      },
+    },
     claude: {
       ...echoProvider,
       label: 'Fake Claude',
@@ -357,7 +379,17 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
 
   const listedTools = await client.listTools();
   const toolNames = new Set(listedTools.tools.map((tool) => tool.name));
-  for (const expected of ['bridge_status', 'list_providers', 'get_context_bundle', 'route_preview', 'ask_provider', 'route_and_ask', 'run_committee', 'get_receipt', 'restart_bridge', 'list_agents', 'set_agent_tags', 'broadcast']) {
+  for (const expected of [
+    'bridge_status', 'list_providers', 'get_context_bundle', 'route_preview',
+    'ask_provider', 'route_and_ask', 'run_committee', 'get_receipt',
+    'restart_bridge', 'list_agents', 'set_agent_tags', 'broadcast',
+    'start_codex_claude_pipeline', 'list_pipelines', 'get_pipeline', 'reconcile_pipeline',
+    'submit_pipeline_research', 'claim_pipeline_implementation',
+    'complete_pipeline_implementation', 'start_pipeline_revision',
+    'start_pipeline_final_review', 'retry_failed_pipeline_provider',
+    'renew_pipeline_writer_lease', 'cancel_pipeline',
+    'open_in_chrome',
+  ]) {
     assert.ok(toolNames.has(expected), `missing MCP tool ${expected}`);
   }
   for (const toolName of ['ask_provider', 'route_and_ask', 'run_committee', 'broadcast']) {
@@ -367,6 +399,108 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   }
   assert.ok(!toolNames.has('exec'), 'raw command execution must not be exposed over MCP');
   assert.ok(!toolNames.has('set_full_permissions'), 'the sticky dangerous toggle must not be exposed over MCP');
+
+  const missingFullAcknowledgement = await client.callTool({
+    name: 'start_codex_claude_pipeline',
+    arguments: {
+      cwd: allowedRootA,
+      objective: 'This full workflow must fail closed without acknowledgement.',
+      acceptance: ['It is rejected before any provider call.'],
+      permissionMode: 'full',
+    },
+  });
+  assert.equal(missingFullAcknowledgement.isError, true);
+  assert.match(JSON.stringify(missingFullAcknowledgement.structuredContent), /acknowledgeFilesystemWrites/);
+
+  const startedPipeline = await client.callTool({
+    name: 'start_codex_claude_pipeline',
+    arguments: {
+      cwd: allowedRootA,
+      objective: 'Exercise the durable staged workflow surface.',
+      constraints: ['Remain inside the allowed root.'],
+      nonGoals: ['Do not invoke a provider in this setup check.'],
+      fileScope: ['lib/target.js'],
+      baseRevision: 'test-base',
+      acceptance: ['The workflow can be read by its exact ID.'],
+      taskTier: 'standard',
+      permissionMode: 'safe',
+    },
+  });
+  assert.equal(startedPipeline.isError, undefined, JSON.stringify(startedPipeline.structuredContent));
+  const pipelineId = startedPipeline.structuredContent.workflow.runId;
+  assert.match(pipelineId, /^wf_[a-z0-9]+_[a-f0-9]{12}$/);
+  assert.equal(startedPipeline.structuredContent.workflow.phase, 'scoping');
+
+  const listedPipelines = await client.callTool({ name: 'list_pipelines', arguments: { limit: 10 } });
+  assert.ok(listedPipelines.structuredContent.workflows.some((item) => item.runId === pipelineId));
+  const fetchedPipeline = await client.callTool({
+    name: 'get_pipeline', arguments: { runId: pipelineId, includeArtifacts: true },
+  });
+  assert.equal(fetchedPipeline.structuredContent.artifactContents['base-revision'], 'test-base');
+  assert.match(fetchedPipeline.structuredContent.artifactContents['file-scope'], /lib\/target\.js/);
+  assert.deepEqual(fetchedPipeline.structuredContent.nextActions, ['submit_pipeline_research']);
+
+  // Build a due retry without invoking a provider. GET must remain a pure
+  // status read, and the action-identity middleware must reject reconciliation
+  // from a stale MCP before it can admit the replacement provider process.
+  const durablePipeline = createWorkflowPipeline({ dataDir });
+  const dueRetry = durablePipeline.createWorkflow({
+    cwd: allowedRootA,
+    objective: 'Prove stale status clients cannot dispatch a due provider retry.',
+    acceptance: 'No provider process starts before a matching action identity is accepted.',
+    providerPreferences: { planning: ['identity_guard'] },
+  });
+  durablePipeline.completeResearch(dueRetry.runId, { markdown: 'Bounded research.' });
+  durablePipeline.startPlanning(dueRetry.runId);
+  durablePipeline.bindProviderTask(dueRetry.runId, {
+    actor: 'claude-planner', taskId: 't_due_retry_original', provider: 'identity_guard',
+    purpose: 'planning', attempt: 1,
+  });
+  durablePipeline.scheduleProviderRetry(dueRetry.runId, {
+    actor: 'claude-planner', taskId: 't_due_retry_original', failureClass: 'rate_limit',
+    reason: 'Synthetic terminal 429.', delayMs: 0, maxAttempts: 3,
+  });
+  const dueCapability = await (await fetch(`${baseUrl}/api/capability`)).json();
+  const dueHeaders = {
+    'X-PS-Bridge-Token': dueCapability.token,
+    'Content-Type': 'application/json',
+  };
+
+  const inertRead = await fetch(`${baseUrl}/api/workflows/${dueRetry.runId}?includeArtifacts=false`, {
+    headers: { ...dueHeaders, 'X-RelayBridge-Client': 'mcp' },
+  });
+  assert.equal(inertRead.status, 200);
+  const inertStatus = await inertRead.json();
+  assert.equal(inertStatus.workflow.providerTask, null);
+  assert.equal(inertStatus.workflow.providerRetry.nextAttempt, 2);
+  assert.deepEqual(inertStatus.nextActions, ['reconcile_pipeline']);
+  assert.equal(fs.existsSync(invocationMarker), false, 'GET status must not dispatch a due retry');
+
+  const mismatchedReconcile = await fetch(`${baseUrl}/api/workflows/${dueRetry.runId}/reconcile`, {
+    method: 'POST',
+    headers: {
+      ...dueHeaders,
+      'X-RelayBridge-Client': 'mcp',
+      'X-RelayBridge-Expected-Build-Id': 'integration-current',
+      'X-RelayBridge-Expected-Receipt-Store-Id': '0'.repeat(64),
+    },
+    body: JSON.stringify({ includeArtifacts: false }),
+  });
+  assert.equal(mismatchedReconcile.status, 409);
+  const rejectedReconcile = await mismatchedReconcile.json();
+  assert.equal(rejectedReconcile.failureClass, 'bridge_identity_mismatch');
+  assert.equal(rejectedReconcile.actionPreflight.buildMatches, true);
+  assert.equal(rejectedReconcile.actionPreflight.receiptStoreMatches, false);
+  assert.equal(fs.existsSync(invocationMarker), false,
+    'mismatched reconciliation must fail before provider admission');
+  assert.equal(durablePipeline.get(dueRetry.runId).providerTask, null);
+  assert.equal(durablePipeline.get(dueRetry.runId).providerRetry.nextAttempt, 2);
+  durablePipeline.cancel(dueRetry.runId, { actor: 'fixture', reason: 'Identity guard fixture complete.' });
+
+  const cancelledPipeline = await client.callTool({
+    name: 'cancel_pipeline', arguments: { runId: pipelineId, reason: 'Fixture complete.' },
+  });
+  assert.equal(cancelledPipeline.structuredContent.phase, 'cancelled');
 
   const listedResources = await client.listResources();
   assert.ok(listedResources.resources.some((resource) => resource.uri === 'psbridge://health'));
@@ -699,6 +833,47 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   assert.equal(staleOuterReceipt.transportReceiptId, null);
   assert.equal(staleOuterReceipt.receiptStoreId, staleProvider.structuredContent.actionPreflight.expectedReceiptStoreId);
 
+  const controlledProvider = await client.callTool({
+    name: 'ask_provider',
+    arguments: {
+      kind: 'codex', prompt: 'MCP_EXPLICIT_ROUTE_CONTROLS', useCache: false,
+      taskTier: 'complex', modelTier: 'heavy', effort: 'high',
+    },
+  });
+  assert.equal(controlledProvider.isError, undefined, JSON.stringify(controlledProvider.structuredContent));
+  assert.equal(controlledProvider.structuredContent.route.task_tier, 'complex');
+  assert.equal(controlledProvider.structuredContent.route.requested_model_tier, 'heavy');
+  assert.equal(controlledProvider.structuredContent.route.model_tier, 'heavy');
+  assert.equal(controlledProvider.structuredContent.route.requested_effort, 'high');
+  assert.equal(controlledProvider.structuredContent.route.applied_effort, 'high');
+  assert.equal(controlledProvider.structuredContent.route.effort_method, 'effort_flags');
+
+  const tieredCachePrompt = 'MCP_ROUTE_CONTROL_CACHE_IDENTITY';
+  const lightCache = await client.callTool({
+    name: 'ask_provider',
+    arguments: {
+      kind: 'codex', prompt: tieredCachePrompt, useCache: true,
+      taskTier: 'utility', modelTier: 'light', effort: 'low',
+    },
+  });
+  assert.equal(lightCache.structuredContent.cacheHit, false);
+  const heavyCache = await client.callTool({
+    name: 'ask_provider',
+    arguments: {
+      kind: 'codex', prompt: tieredCachePrompt, useCache: true,
+      taskTier: 'complex', modelTier: 'heavy', effort: 'high',
+    },
+  });
+  assert.equal(heavyCache.structuredContent.cacheHit, false, 'routing controls are part of cache identity');
+  const heavyReplay = await client.callTool({
+    name: 'ask_provider',
+    arguments: {
+      kind: 'codex', prompt: tieredCachePrompt, useCache: true,
+      taskTier: 'complex', modelTier: 'heavy', effort: 'high',
+    },
+  });
+  assert.equal(heavyReplay.structuredContent.cacheHit, true);
+
   const usageProvider = await client.callTool({
     name: 'ask_provider',
     arguments: { kind: 'usage_json', prompt: 'MCP_USAGE_LINK_MARKER', useCache: false },
@@ -1014,6 +1189,18 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   });
   assert.equal(routedProvider.isError, undefined, JSON.stringify(routedProvider.structuredContent));
   assert.equal(routedProvider.structuredContent.winner.kind, 'codex');
+  const routedTier = routedProvider.structuredContent.route.classification.tier;
+  const routedModelTier = routedTier === 'utility' ? 'light'
+    : ['complex', 'critical'].includes(routedTier) ? 'heavy' : 'standard';
+  const routedEffort = routedTier === 'utility' ? 'low'
+    : ['complex', 'critical'].includes(routedTier) ? 'high' : 'medium';
+  assert.equal(routedProvider.structuredContent.winner.route.task_tier, routedTier);
+  assert.equal(routedProvider.structuredContent.winner.route.requested_model_tier, routedModelTier);
+  assert.equal(routedProvider.structuredContent.winner.route.model_tier, routedModelTier);
+  assert.equal(routedProvider.structuredContent.winner.route.requested_effort, null);
+  assert.equal(routedProvider.structuredContent.winner.route.applied_effort, routedEffort);
+  assert.equal(routedProvider.structuredContent.winner.route.effort_explicit, false);
+  assert.equal(routedProvider.structuredContent.winner.route.effort_source, 'task_tier');
   assert.ok(routedProvider.structuredContent.winner.route.effective_timeout_ms > 300000);
 
   const linkedClaudeRoute = await client.callTool({
@@ -1052,6 +1239,14 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   });
   assert.equal(strictCommittee.isError, undefined, JSON.stringify(strictCommittee.structuredContent));
   assert.deepEqual(strictCommittee.structuredContent.members.map((member) => member.kind), ['codex']);
+  assert.equal(strictCommittee.structuredContent.members[0].route.task_tier,
+    strictCommittee.structuredContent.route.classification.tier);
+  assert.equal(strictCommittee.structuredContent.members[0].route.requested_model_tier,
+    strictCommittee.structuredContent.route.classification.tier === 'utility' ? 'light'
+      : ['complex', 'critical'].includes(strictCommittee.structuredContent.route.classification.tier)
+        ? 'heavy' : 'standard');
+  assert.equal(strictCommittee.structuredContent.members[0].route.effort_explicit, false);
+  assert.equal(strictCommittee.structuredContent.members[0].route.effort_source, 'task_tier');
   assert.ok(strictCommittee.structuredContent.members[0].route.effective_timeout_ms > 300000);
 
   const localConsensus = await client.callTool({
@@ -1086,6 +1281,10 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
     },
   });
   assert.equal(unprovenConsensus.structuredContent.synthesisCompleted, true);
+  assert.equal(unprovenConsensus.structuredContent.synthesis.route.task_tier,
+    unprovenConsensus.structuredContent.route.classification.tier);
+  assert.equal(unprovenConsensus.structuredContent.synthesis.route.effort_explicit, false);
+  assert.equal(unprovenConsensus.structuredContent.synthesis.route.effort_source, 'task_tier');
   assert.equal(unprovenConsensus.structuredContent.consensusAchieved, false, 'successful chair text must not be mislabeled as consensus');
   assert.equal(unprovenConsensus.structuredContent.consensusVerdict, 'unknown');
   assert.equal(unprovenConsensus.structuredContent.status, 'partial');

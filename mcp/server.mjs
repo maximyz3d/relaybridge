@@ -46,6 +46,31 @@ function envFirst(...names) {
 }
 
 const CLI_CONFIG_PATH = path.resolve(envFirst('RELAYBRIDGE_CONFIG_FILE', 'PS_BRIDGE_CONFIG_FILE') || path.join(BRIDGE_ROOT, 'cli-config.json'));
+const TASK_TIERS = ['utility', 'standard', 'complex', 'critical'];
+const MODEL_TIERS = ['light', 'standard', 'heavy'];
+const EFFORT_LEVELS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+
+export function workflowPermissionDefaults(input = {}, env = process.env) {
+  const setting = (current, legacy) => {
+    const preferred = env[current];
+    return preferred !== undefined && String(preferred).trim() !== '' ? preferred : env[legacy];
+  };
+  const autoFull = setting('RELAYBRIDGE_ALLOW_STICKY_DANGEROUS', 'PS_BRIDGE_ALLOW_STICKY_DANGEROUS') === '1'
+    && setting('RELAYBRIDGE_START_FULL_PERMISSIONS', 'PS_BRIDGE_START_FULL_PERMISSIONS') === '1';
+  const bothOmitted = input.permissionMode === undefined
+    && input.acknowledgeFilesystemWrites === undefined;
+  return {
+    permissionMode: input.permissionMode ?? (autoFull && bothOmitted ? 'full' : 'safe'),
+    acknowledgeFilesystemWrites: input.acknowledgeFilesystemWrites
+      ?? (autoFull && bothOmitted),
+  };
+}
+
+function modelTierForTaskTier(taskTier) {
+  if (taskTier === 'utility') return 'light';
+  if (taskTier === 'complex' || taskTier === 'critical') return 'heavy';
+  return 'standard';
+}
 
 const READ_ONLY = {
   readOnlyHint: true,
@@ -396,11 +421,12 @@ async function buildContextBundle({
     }
   };
   const routing = loadRoutingData();
-  const [diagnostics, sessionsRaw, collabsRaw, projectsRaw] = await Promise.all([
+  const [diagnostics, sessionsRaw, collabsRaw, projectsRaw, workflowsRaw] = await Promise.all([
     includeDiagnostics ? capture('diagnostics', () => getDiagnostics(signal), {}) : {},
     capture('sessions', () => bridgeRequest('/api/sessions', { signal }), []),
     capture('collaborations', () => bridgeRequest('/api/collabs', { signal }), { collabs: [] }),
     capture('projects', () => bridgeRequest('/api/projects', { signal }), { projects: [] }),
+    capture('pipelines', () => bridgeRequest('/api/workflows?limit=20', { signal }), { workflows: [] }),
   ]);
   // Read health after diagnostics so the bundle does not count its own short-
   // lived readiness probes as active delegated work.
@@ -475,6 +501,7 @@ async function buildContextBundle({
       runningRuns: runningRuns.slice(0, MAX_RUNNING_RUNS),
       runningRunsTotal: runningRuns.length,
       runningRunsTruncated: runningRuns.length > MAX_RUNNING_RUNS,
+      pipelines: Array.isArray(workflowsRaw?.workflows) ? workflowsRaw.workflows : [],
     },
     sessions: {
       total: Array.isArray(sessionsRaw) ? sessionsRaw.length : 0,
@@ -495,6 +522,8 @@ async function buildContextBundle({
       terminalDetail: ['list_sessions', 'read_session_output'],
       collaborationDetail: ['list_collabs', 'read_collab', 'list_projects'],
       delegatedWork: ['list_runs', 'get_run', 'list_receipts', 'get_receipt'],
+      stagedWorkflows: ['list_pipelines', 'get_pipeline', 'reconcile_pipeline'],
+      browserActions: ['open_in_chrome', 'chrome-devtools (separate user-scoped MCP)'],
       safeActions: ['start_safe_session', 'ask_provider', 'route_and_ask', 'run_committee'],
       lifecycleActions: ['start_bridge', 'restart_bridge', 'stop_bridge', 'send_session_input', 'stop_session'],
       resources: [
@@ -1294,6 +1323,8 @@ async function callProvider({
   purpose = 'ask_provider',
   signal,
   providerBudget,
+  taskTier,
+  modelTier,
   effort,
   maxEffortOverride = false,
 }) {
@@ -1302,6 +1333,9 @@ async function callProvider({
   const attemptId = `${requestId}:attempt:1`;
   const outerReceiptId = `rcpt_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 8)}`;
   const classification = classifyTask(prompt);
+  const effectiveTaskTier = TASK_TIERS.includes(taskTier) ? taskTier : classification.tier;
+  const effectiveModelTier = MODEL_TIERS.includes(modelTier)
+    ? modelTier : modelTierForTaskTier(effectiveTaskTier);
   const ttl = cacheTtlFor(classification, cacheTtlMs);
   const configFingerprint = stableHash({
     config: fs.readFileSync(CLI_CONFIG_PATH, 'utf8'),
@@ -1334,6 +1368,8 @@ async function callProvider({
     configFingerprint,
     purpose,
     providerBudget: providerBudget || null,
+    taskTier: effectiveTaskTier,
+    modelTier: effectiveModelTier,
     effort: effort || null,
     maxEffortOverride: maxEffortOverride === true,
     cwdIdentityHash: workspaceAdmission?.cwdIdentityHash || null,
@@ -1428,7 +1464,9 @@ async function callProvider({
         expectedCwdPolicyId: workspaceAdmission.cwdPolicyId,
         timeoutMs: TIMEOUT_POLICY.normalizeOneShotTimeoutMs(timeoutMs),
         providerBudget,
-        budgetTaskTier: classification.tier,
+        budgetTaskTier: effectiveTaskTier,
+        taskTier: effectiveTaskTier,
+        modelTier: effectiveModelTier,
         effort,
         maxEffortOverride,
         dangerous: false,
@@ -1676,7 +1714,7 @@ function numericBoundsOf(field, depth = 0) {
 
 export function buildServer() {
   const server = new McpServer({ name: 'relaybridge', version: PACKAGE.version }, {
-    instructions: 'Read before acting: call get_context_bundle when taking over existing work, then use bridge_status, list_providers, and route_preview as needed. AI provider one-shots (ask_provider, route_and_ask, run_committee) always force dangerous:false, so they consume subscription quotas or local compute in the provider CLI\'s own safe/headless mode. Terminals are different: start_safe_session only forces the vendor bypass flags off, and start_safe_session(kind="powershell") opens a real host PowerShell shell running with your account\'s full privileges. Anything sent through send_session_input executes on the host with no sandbox and no filesystem confinement, so it needs host approval and human review. The /api/exec route, provider installs, and the global full-permissions toggle are not exposed as tools. Routing scores are operator preferences, not universal model-quality claims; use receipts and preserve the human gate for high-stakes work.',
+    instructions: 'Read before acting: call get_context_bundle when taking over existing work, then use bridge_status, list_providers, list_pipelines, and route_preview as needed. For staged code work, Codex owns orchestration and primary implementation: create one workflow, submit a bounded research brief, follow nextActions, use reconcile_pipeline while provider phases are active, and never overlap writer leases. get_pipeline is status-only and never spends provider quota. AI provider one-shots (ask_provider, route_and_ask, run_committee) always force dangerous:false, so they consume subscription quotas or local compute in the provider CLI\'s own safe/headless mode. Terminals are different: start_safe_session only forces the vendor bypass flags off, and start_safe_session(kind="powershell") opens a real host PowerShell shell running with your account\'s full privileges. Anything sent through send_session_input executes on the host with no sandbox and no filesystem confinement, so it needs host approval and human review. The /api/exec route, provider installs, and the global full-permissions toggle are not exposed as tools. Routing scores are operator preferences, not universal model-quality claims; use receipts and preserve the human gate for high-stakes work.',
     capabilities: { tools: {}, resources: {} },
     cacheHints: {
       'tools/list': { ttlMs: 60000, cacheScope: 'private' },
@@ -1770,7 +1808,7 @@ export function buildServer() {
     description: 'Given a task description, returns the cheapest capable execution plan: which company/provider, which model inside it, and how much reasoning effort — plus fallbacks and why. Call this BEFORE delegating anything you are unsure about. It exists to stop frontier seats being spent on mechanical edits and max-effort reasoning being spent on arithmetic.',
     inputSchema: z.object({
       task: z.string().min(1).describe('what needs doing, in a sentence or two'),
-      effort: z.enum(['minimal', 'low', 'medium', 'high', 'max']).optional().describe('override the effort the tier would pick'),
+      effort: z.enum(EFFORT_LEVELS).optional().describe('override the effort the tier would pick; xhigh/max require an explicit maxEffortOverride when executed'),
       kind: z.string().optional().describe('force a specific provider and plan around it'),
       dangerous: z.boolean().default(false).describe('plan an explicit writer-capable provider invocation'),
       acknowledgeFilesystemWrites: z.boolean().default(false).describe('required with dangerous=true; confirms persistent writes are authorized'),
@@ -2044,6 +2082,15 @@ export function buildServer() {
     return result({ session, receiptId: receipt.receiptId });
   }));
 
+  server.registerTool('open_in_chrome', {
+    title: 'Open a URL in Google Chrome',
+    description: 'Open one bounded HTTP(S) URL in the host Google Chrome browser. This launches a tab only; use the separately registered Chrome DevTools MCP when inspection or interaction is required.',
+    inputSchema: z.object({ url: z.string().url().max(8192) }),
+    annotations: EXTERNAL_ACTION,
+  }, safeHandler(async ({ url }, context) => result(await bridgeRequest('/api/open-url', {
+    method: 'POST', body: { url, browser: 'chrome' }, signal: context?.mcpReq?.signal, actionIdentity: true,
+  }))));
+
   server.registerTool('send_session_input', {
     title: 'Send terminal input',
     description: 'Send bounded text to an existing terminal. For a PowerShell session this executes the text as a real host command with your account\'s privileges and no sandbox; for an AI CLI session it drives that CLI interactively. Always requires host approval and human review.',
@@ -2078,7 +2125,9 @@ export function buildServer() {
       useCache: z.boolean().default(true),
       cacheTtlMs: z.number().int().min(0).max(86400000).optional(),
       providerBudget: PROVIDER_BUDGET_SCHEMA.optional(),
-      effort: z.enum(['low', 'medium', 'high', 'max']).optional(),
+      taskTier: z.enum(TASK_TIERS).optional(),
+      modelTier: z.enum(MODEL_TIERS).optional(),
+      effort: z.enum(EFFORT_LEVELS).optional(),
       maxEffortOverride: z.boolean().default(false),
       acknowledgeHumanGate: z.boolean().default(false),
     }),
@@ -2115,7 +2164,7 @@ export function buildServer() {
       allowModelForDeterministic: z.boolean().default(false),
       allowInputTruncation: z.boolean().default(false),
       providerBudget: PROVIDER_BUDGET_SCHEMA.optional(),
-      effort: z.enum(['low', 'medium', 'high', 'max']).optional(),
+      effort: z.enum(EFFORT_LEVELS).optional(),
       maxEffortOverride: z.boolean().default(false),
     }),
     annotations: EXTERNAL_ACTION,
@@ -2199,6 +2248,8 @@ export function buildServer() {
         purpose: 'route_and_ask',
         signal,
         providerBudget: args.providerBudget,
+        taskTier: route.classification.tier,
+        modelTier: modelTierForTaskTier(route.classification.tier),
         effort: args.effort,
         maxEffortOverride: args.maxEffortOverride,
       });
@@ -2261,7 +2312,7 @@ export function buildServer() {
       acknowledgeHumanGate: z.boolean().default(false),
       acknowledgeTruncatedEvidence: z.boolean().default(false),
       providerBudget: PROVIDER_BUDGET_SCHEMA.optional(),
-      effort: z.enum(['low', 'medium', 'high', 'max']).optional(),
+      effort: z.enum(EFFORT_LEVELS).optional(),
       maxEffortOverride: z.boolean().default(false),
     }),
     annotations: EXTERNAL_ACTION,
@@ -2341,6 +2392,8 @@ export function buildServer() {
           purpose: `committee:${role}`,
           signal,
           providerBudget: args.providerBudget,
+          taskTier: route.classification.tier,
+          modelTier: modelTierForTaskTier(route.classification.tier),
           effort: args.effort,
           maxEffortOverride: args.maxEffortOverride,
         });
@@ -2396,6 +2449,8 @@ export function buildServer() {
           purpose: 'committee:chair',
           signal,
           providerBudget: args.providerBudget,
+          taskTier: route.classification.tier,
+          modelTier: modelTierForTaskTier(route.classification.tier),
           effort: args.effort,
           maxEffortOverride: args.maxEffortOverride,
         });
@@ -2515,7 +2570,7 @@ export function buildServer() {
       cwd: z.string().max(1000).optional(),
       timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).max(TIMEOUT_POLICY.oneShotMaxMs).default(TIMEOUT_POLICY.oneShotDefaultMs),
       providerBudget: PROVIDER_BUDGET_SCHEMA.optional(),
-      effort: z.enum(['low', 'medium', 'high', 'max']).optional(),
+      effort: z.enum(EFFORT_LEVELS).optional(),
       maxEffortOverride: z.boolean().default(false),
     }),
     annotations: { ...ACTION, openWorldHint: true },
@@ -2652,6 +2707,211 @@ export function buildServer() {
 
   // ---- Async tasks --------------------------------------------------------
 
+  // ---- Codex -> Claude staged workflow ----------------------------------
+  // These tools deliberately mirror the durable REST state machine one phase
+  // at a time.  The workflow ID is the correlation key; callers poll it rather
+  // than replaying transcripts or guessing which background task finished.
+  const workflowIdSchema = z.string().regex(/^wf_[a-z0-9]+_[a-f0-9]{12}$/);
+  const markdownOrListSchema = z.union([
+    z.string().min(1).max(24000),
+    z.array(z.string().min(1).max(2000)).max(80),
+  ]);
+  const providerPreferencesSchema = z.object({
+    planning: z.array(z.string().regex(/^[a-z][a-z0-9_-]{0,63}$/)).max(16).optional(),
+    implementation: z.array(z.string().regex(/^[a-z][a-z0-9_-]{0,63}$/)).max(16).optional(),
+    review: z.array(z.string().regex(/^[a-z][a-z0-9_-]{0,63}$/)).max(16).optional(),
+    revision: z.array(z.string().regex(/^[a-z][a-z0-9_-]{0,63}$/)).max(16).optional(),
+    finalReview: z.array(z.string().regex(/^[a-z][a-z0-9_-]{0,63}$/)).max(16).optional(),
+  }).strict();
+
+  server.registerTool('start_codex_claude_pipeline', {
+    title: 'Start a Codex-Claude pipeline',
+    description: 'Create one durable phase-gated run. Codex remains orchestrator and primary writer; no provider is called until research is submitted. Use list_pipelines first when duplicate work may already exist.',
+    inputSchema: z.object({
+      cwd: z.string().min(1).max(1024),
+      objective: z.string().min(1).max(12000),
+      constraints: markdownOrListSchema.optional(),
+      nonGoals: markdownOrListSchema.optional(),
+      fileScope: markdownOrListSchema.optional(),
+      baseRevision: z.string().max(1024).optional(),
+      acceptance: markdownOrListSchema,
+      taskTier: z.enum(TASK_TIERS).default('standard'),
+      permissionMode: z.enum(['safe', 'full']).optional(),
+      acknowledgeFilesystemWrites: z.boolean().optional(),
+      providerPreferences: providerPreferencesSchema.optional(),
+    }),
+    annotations: ACTION,
+  }, safeHandler(async (input, context) => {
+    const permissions = workflowPermissionDefaults(input);
+    const response = await bridgeRequest('/api/workflows', {
+      method: 'POST', body: { ...input, ...permissions }, signal: context?.mcpReq?.signal, actionIdentity: true,
+    });
+    return result(response);
+  }));
+
+  server.registerTool('list_pipelines', {
+    title: 'List Codex-Claude pipelines',
+    description: 'List bounded workflow summaries newest first. Check this before starting similar work so an active run is not duplicated.',
+    inputSchema: z.object({
+      phase: z.enum([
+        'scoping', 'research_ready', 'planning', 'plan_ready', 'implementing',
+        'implementation_ready', 'reviewing', 'review_ready', 'revising',
+        'revision_ready', 'final_reviewing', 'complete', 'failed', 'cancelled',
+      ]).optional(),
+      limit: z.number().int().min(1).max(200).default(50),
+    }),
+    annotations: READ_ONLY,
+  }, safeHandler(async ({ phase, limit }, context) => {
+    const query = new URLSearchParams({ limit: String(limit) });
+    if (phase) query.set('phase', phase);
+    return result(await bridgeRequest(`/api/workflows?${query}`, { signal: context?.mcpReq?.signal }));
+  }));
+
+  server.registerTool('get_pipeline', {
+    title: 'Get pipeline status',
+    description: 'Read one workflow and its bounded artifacts without dispatching or settling provider work. Follow nextActions; active provider phases require the identity-gated reconcile_pipeline action.',
+    inputSchema: z.object({
+      runId: workflowIdSchema,
+      includeArtifacts: z.boolean().default(true),
+    }),
+    annotations: READ_ONLY,
+  }, safeHandler(async ({ runId, includeArtifacts }, context) => result(await bridgeRequest(
+    `/api/workflows/${encodeURIComponent(runId)}?includeArtifacts=${includeArtifacts ? 'true' : 'false'}`,
+    { signal: context?.mcpReq?.signal },
+  ))));
+
+  server.registerTool('reconcile_pipeline', {
+    title: 'Reconcile and advance pipeline',
+    description: 'Identity-gated status advance for an active workflow. It may settle finished provider work, repair a persisted handoff, or dispatch a due read-only provider retry and therefore can consume provider quota.',
+    inputSchema: z.object({
+      runId: workflowIdSchema,
+      includeArtifacts: z.boolean().default(true),
+    }),
+    annotations: EXTERNAL_ACTION,
+  }, safeHandler(async ({ runId, includeArtifacts }, context) => result(await bridgeRequest(
+    `/api/workflows/${encodeURIComponent(runId)}/reconcile`, {
+      method: 'POST', body: { includeArtifacts }, signal: context?.mcpReq?.signal, actionIdentity: true,
+    },
+  ))));
+
+  server.registerTool('submit_pipeline_research', {
+    title: 'Submit Codex research and dispatch Claude planning',
+    description: 'Store the compact Codex research brief, then queue one fresh read-only Claude planning task. Repeated calls are rejected by the phase gate.',
+    inputSchema: z.object({
+      runId: workflowIdSchema,
+      markdown: z.string().min(1).max(100000),
+    }),
+    annotations: EXTERNAL_ACTION,
+  }, safeHandler(async ({ runId, markdown }, context) => result(await bridgeRequest(
+    `/api/workflows/${encodeURIComponent(runId)}/research`, {
+      method: 'POST', body: { actor: 'codex', markdown }, signal: context?.mcpReq?.signal, actionIdentity: true,
+    },
+  ))));
+
+  server.registerTool('claim_pipeline_implementation', {
+    title: 'Claim the Codex implementation lease',
+    description: 'After Claude planning is ready, give Codex the one writer lease for this canonical workspace. Preserve the returned lease token until completion or renewal.',
+    inputSchema: z.object({
+      runId: workflowIdSchema,
+      leaseMs: z.number().int().min(60000).max(86400000).optional(),
+    }),
+    annotations: ACTION,
+  }, safeHandler(async ({ runId, leaseMs }, context) => result(await bridgeRequest(
+    `/api/workflows/${encodeURIComponent(runId)}/implementation/claim`, {
+      method: 'POST', body: { actor: 'codex', ...(leaseMs == null ? {} : { leaseMs }) },
+      signal: context?.mcpReq?.signal, actionIdentity: true,
+    },
+  ))));
+
+  server.registerTool('complete_pipeline_implementation', {
+    title: 'Complete Codex implementation and dispatch review',
+    description: 'Release Codex\'s writer lease, store exact changed-file and verification evidence, and queue one fresh read-only Claude review.',
+    inputSchema: z.object({
+      runId: workflowIdSchema,
+      leaseToken: z.string().regex(/^[a-f0-9]{64}$/),
+      markdown: z.string().min(1).max(100000),
+    }),
+    annotations: EXTERNAL_ACTION,
+  }, safeHandler(async ({ runId, leaseToken, markdown }, context) => result(await bridgeRequest(
+    `/api/workflows/${encodeURIComponent(runId)}/implementation/complete`, {
+      method: 'POST', body: { actor: 'codex', leaseToken, markdown },
+      signal: context?.mcpReq?.signal, actionIdentity: true,
+    },
+  ))));
+
+  server.registerTool('start_pipeline_revision', {
+    title: 'Transfer the writer lease to Claude revision',
+    description: 'For accepted review findings in a full-permission workflow, queue one bounded Sonnet revision as the exclusive writer. Fable is never a writer.',
+    inputSchema: z.object({
+      runId: workflowIdSchema,
+      leaseMs: z.number().int().min(60000).max(86400000).optional(),
+    }),
+    annotations: DESTRUCTIVE,
+  }, safeHandler(async ({ runId, leaseMs }, context) => result(await bridgeRequest(
+    `/api/workflows/${encodeURIComponent(runId)}/revision/start`, {
+      method: 'POST', body: leaseMs == null ? {} : { leaseMs },
+      signal: context?.mcpReq?.signal, actionIdentity: true,
+    },
+  ))));
+
+  server.registerTool('start_pipeline_final_review', {
+    title: 'Dispatch the fresh final Claude review',
+    description: 'After an approved review or completed revision, queue an independent read-only final review in a fresh session.',
+    inputSchema: z.object({ runId: workflowIdSchema }),
+    annotations: EXTERNAL_ACTION,
+  }, safeHandler(async ({ runId }, context) => result(await bridgeRequest(
+    `/api/workflows/${encodeURIComponent(runId)}/final-review/start`, {
+      method: 'POST', body: {}, signal: context?.mcpReq?.signal, actionIdentity: true,
+    },
+  ))));
+
+  server.registerTool('retry_failed_pipeline_provider', {
+    title: 'Retry a failed read-only pipeline provider',
+    description: 'Recover an older terminal workflow only when its last planning/review task has typed transient failure evidence such as a rate limit, timeout, overload, or bridge interruption. Confirm an interrupted provider process is gone before calling. Writer failures and semantic failures remain terminal; retries are bounded.',
+    inputSchema: z.object({ runId: workflowIdSchema }),
+    annotations: EXTERNAL_ACTION,
+  }, safeHandler(async ({ runId }, context) => result(await bridgeRequest(
+    `/api/workflows/${encodeURIComponent(runId)}/provider/retry`, {
+      method: 'POST', body: { actor: 'codex' }, signal: context?.mcpReq?.signal, actionIdentity: true,
+    },
+  ))));
+
+  server.registerTool('renew_pipeline_writer_lease', {
+    title: 'Renew the Codex writer lease',
+    description: 'Extend a live Codex implementation lease without changing ownership or phase.',
+    inputSchema: z.object({
+      runId: workflowIdSchema,
+      leaseToken: z.string().regex(/^[a-f0-9]{64}$/),
+      leaseMs: z.number().int().min(60000).max(86400000).optional(),
+    }),
+    annotations: ACTION,
+  }, safeHandler(async ({ runId, leaseToken, leaseMs }, context) => result(await bridgeRequest(
+    `/api/workflows/${encodeURIComponent(runId)}/lease/renew`, {
+      method: 'POST',
+      body: { actor: 'codex', leaseToken, ...(leaseMs == null ? {} : { leaseMs }) },
+      signal: context?.mcpReq?.signal,
+      actionIdentity: true,
+    },
+  ))));
+
+  server.registerTool('cancel_pipeline', {
+    title: 'Cancel a Codex-Claude pipeline',
+    description: 'Cancel a workflow and its queued provider task. A running Claude writer is not cancelled until it exits because releasing its lease early would permit overlapping writers.',
+    inputSchema: z.object({
+      runId: workflowIdSchema,
+      reason: z.string().min(1).max(2000).optional(),
+      leaseToken: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+    }),
+    annotations: DESTRUCTIVE,
+  }, safeHandler(async ({ runId, reason, leaseToken }, context) => result(await bridgeRequest(
+    `/api/workflows/${encodeURIComponent(runId)}/cancel`, {
+      method: 'POST',
+      body: { actor: 'codex', ...(reason ? { reason } : {}), ...(leaseToken ? { leaseToken } : {}) },
+      signal: context?.mcpReq?.signal,
+      actionIdentity: true,
+    },
+  ))));
+
   server.registerTool('submit_task', {
     title: 'Submit a background task',
     description: 'Queue a prompt to a provider and return a task id IMMEDIATELY without waiting for the run. Use for work longer than a chat turn, or when the result should be collectable later from a different surface. Link a collab id to append the result to that shared thread.',
@@ -2662,7 +2922,7 @@ export function buildServer() {
       providerBudget: PROVIDER_BUDGET_SCHEMA.optional(),
       taskTier: z.enum(['utility', 'standard', 'complex', 'critical']).optional(),
       modelTier: z.enum(['light', 'standard', 'heavy']).optional(),
-      effort: z.enum(['low', 'medium', 'high', 'max']).optional(),
+      effort: z.enum(EFFORT_LEVELS).optional(),
       maxEffortOverride: z.boolean().default(false),
       groundingOverride: z.boolean().default(false),
     }),
