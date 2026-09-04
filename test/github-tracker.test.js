@@ -126,18 +126,88 @@ test('canonical templates exist and carry rb-template versions', () => {
   }
   assert.ok(onboard.canonicalVersion() >= 1);
   assert.equal(onboard.templateVersion('# rb-template v3\nname: x'), 3);
+  assert.equal(onboard.templateVersion(
+    '<!-- BEGIN relaybridge-contributing (rb-template v3) -->\ntext\n<!-- END relaybridge-contributing -->\n'), 3);
   assert.equal(onboard.templateVersion('no header'), 0);
 });
 
-test('version-on-merge template keeps history append-only and claim template warns on duplicates', () => {
+test('managed CONTRIBUTING upgrades preserve user bytes and refuse edited or malformed blocks', () => {
+  const current = fs.readFileSync(path.join(onboard.TEMPLATE_DIR, 'CONTRIBUTING-snippet.md'), 'utf8');
+  const prior = fs.readFileSync(path.join(onboard.TEMPLATE_DIR, 'history', 'CONTRIBUTING-snippet.v1.md'), 'utf8');
+  const prefix = '# Operator guidance\n\nKeep this exactly.\n\n';
+  const suffix = '\n\n## Local policy\n\nAlso exact.\n';
+  const upgraded = onboard.planContributingUpdate(prefix + prior.trimEnd() + suffix, current);
+  assert.equal(upgraded.action, 'replace');
+  assert.equal(upgraded.text, prefix + current.trimEnd() + suffix);
+
+  const edited = onboard.planContributingUpdate(
+    prefix + prior.replace('Pick a bump label', 'Choose our custom release policy').trimEnd() + suffix,
+    current,
+  );
+  assert.equal(edited.action, 'manual');
+  assert.match(edited.reason, /edited|not a known shipped block/);
+
+  const malformed = onboard.planContributingUpdate(
+    prefix + '<!-- BEGIN relaybridge-contributing (rb-template v1) -->\nbroken\n' + suffix,
+    current,
+  );
+  assert.equal(malformed.action, 'manual');
+  assert.equal(onboard.planContributingUpdate(
+    '# Local\n<!-- END relaybridge-contributing -->\n', current).action, 'manual');
+  assert.equal(onboard.planContributingUpdate('# No managed block\n', current).action, 'append');
+});
+
+test('repository onboarding files are exact copies of their canonical templates', () => {
+  const root = path.resolve(__dirname, '..');
+  for (const target of onboard.TEMPLATE_TARGETS) {
+    const canonical = fs.readFileSync(path.join(onboard.TEMPLATE_DIR, target.src), 'utf8');
+    const installed = fs.readFileSync(path.join(root, target.dest), 'utf8');
+    assert.equal(installed, canonical, `${target.dest} must match ${target.src}`);
+  }
+});
+
+test('version-on-merge is serialized, strict, immutable, and history append-only', () => {
   const vm = fs.readFileSync(path.join(onboard.TEMPLATE_DIR, 'version-on-merge.yml'), 'utf8');
   assert.match(vm, /aborting to keep history append-only/);
   assert.match(vm, /bump:major/);
+  assert.match(vm, /group: version-on-merge-\$\{\{ github\.repository \}\}/);
+  assert.match(vm, /cancel-in-progress: false/);
+  assert.match(vm, /queue: max/);
+  assert.match(vm, /pull_request_target:/);
+  assert.match(vm, /base\.ref == github\.event\.repository\.default_branch/);
+  assert.doesNotMatch(vm, /checkout[^\n]*\n(?:.*\n){0,8}\s+ref:\s*\$\{\{\s*github\.event\.pull_request\.head/,
+    'target-context release workflow must never check out the untrusted PR head');
+  assert.match(vm, /node \.github\/scripts\/compute-version\.cjs/);
+  assert.match(vm, /HEAD:refs\/heads\/\$BASE_REF/);
+  assert.match(vm, /refs\/tags\/v\$NEW_VERSION:refs\/tags\/v\$NEW_VERSION/);
+  assert.match(vm, /actions\/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6\.0\.2/);
+  assert.match(vm, /actions\/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9\.0\.0/);
   assert.doesNotMatch(vm, /--notes[^\n]*\$\{\{\s*github\.event\.pull_request\.title\s*\}\}/,
     'untrusted PR titles must not be interpolated directly into a shell script');
   assert.match(vm, /RELEASE_NOTES:/, 'release notes must cross into the shell through env');
+});
+
+test('claim workflow warns on duplicates and uses least required immutable action permissions', () => {
   const claim = fs.readFileSync(path.join(onboard.TEMPLATE_DIR, 'claim-on-start.yml'), 'utf8');
   assert.match(claim, /Possible duplicate work/);
+  assert.match(claim, /pull-requests: read/);
+  assert.doesNotMatch(claim, /pull-requests: write/);
+  assert.doesNotMatch(claim, /contents: read/);
+  assert.match(claim, /head\.repo\.full_name == github\.repository/);
+  assert.match(claim, /pull_request\.user\.login != 'dependabot\[bot\]'/);
+  assert.match(claim, /actions\/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9\.0\.0/);
+});
+
+test('RelayBridge CI uses Node 24, immutable actions, least permissions, and stale-run cancellation', () => {
+  const ci = fs.readFileSync(path.resolve(__dirname, '..', '.github', 'workflows', 'ci.yml'), 'utf8');
+  assert.match(ci, /^permissions:\n  contents: read$/m);
+  assert.match(ci, /actions\/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6\.0\.2/);
+  assert.match(ci, /actions\/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7\.0\.0/);
+  assert.match(ci, /node-version: 24/);
+  assert.match(ci, /cancel-in-progress: \$\{\{ github\.event_name == 'pull_request' \}\}/);
+  for (const command of ['npm ci', 'npm test', 'npm audit --omit=dev']) {
+    assert.match(ci, new RegExp(`run: ${command.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+  }
 });
 
 test('labels.json provides every label the workflows key off', () => {
