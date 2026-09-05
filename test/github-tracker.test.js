@@ -180,7 +180,7 @@ test('version-on-merge is serialized, strict, immutable, and history append-only
   assert.match(vm, /node \.github\/scripts\/compute-version\.cjs/);
   assert.match(vm, /HEAD:refs\/heads\/\$BASE_REF/);
   assert.match(vm, /refs\/tags\/v\$NEW_VERSION:refs\/tags\/v\$NEW_VERSION/);
-  assert.match(vm, /actions\/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6\.0\.2/);
+  assert.match(vm, /actions\/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7\.0\.1/);
   assert.match(vm, /actions\/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9\.0\.0/);
   assert.doesNotMatch(vm, /--notes[^\n]*\$\{\{\s*github\.event\.pull_request\.title\s*\}\}/,
     'untrusted PR titles must not be interpolated directly into a shell script');
@@ -207,14 +207,14 @@ test('claim workflow warns on duplicates and uses least required immutable actio
     'a write-token workflow must never execute PR-controlled head/base helper code');
   assert.match(claim, /\.github', 'scripts', 'claim-issues\.cjs/);
   assert.match(claim, /steps\.claim-helper\.outputs\.available == 'true'/);
-  assert.match(claim, /actions\/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6\.0\.2/);
+  assert.match(claim, /actions\/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7\.0\.1/);
   assert.match(claim, /actions\/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9\.0\.0/);
 });
 
 test('RelayBridge CI uses Node 24, immutable actions, least permissions, and stale-run cancellation', () => {
   const ci = fs.readFileSync(path.resolve(__dirname, '..', '.github', 'workflows', 'ci.yml'), 'utf8');
   assert.match(ci, /^permissions:\n  contents: read$/m);
-  assert.match(ci, /actions\/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6\.0\.2/);
+  assert.match(ci, /actions\/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7\.0\.1/);
   assert.match(ci, /actions\/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7\.0\.0/);
   assert.match(ci, /node-version: 24/);
   assert.match(ci, /cancel-in-progress: \$\{\{ github\.event_name == 'pull_request' \}\}/);
