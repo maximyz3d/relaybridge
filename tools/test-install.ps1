@@ -577,12 +577,26 @@ server.listen(port, '127.0.0.1');
   Assert-True ($null -eq $merged.cursor.PSObject.Properties['model_tiers_locked']) 'the draft-added lock must not survive as a fake operator override'
   Assert-True ($merged.cursor.model_tiers_mode -eq 'account_default') 'the release must record why Cursor has no named-model tiers'
   Assert-True ($merged.claude.model_tiers.standard.model -eq 'operator-custom-model') 'a genuinely custom locked operator tier must still be preserved'
-  foreach ($providerName in @('claude', 'claude_fable')) {
-    foreach ($slotName in @('safe', 'dangerous', 'oneshot_safe', 'oneshot_dangerous')) {
-      $slotArgs = @($merged.$providerName.$slotName)
-      $effortIndex = [Array]::IndexOf($slotArgs, '--effort')
-      Assert-True ($effortIndex -ge 0 -and $slotArgs[$effortIndex + 1] -eq 'high') "$providerName.$slotName must migrate legacy maximum effort to the shipped safe baseline"
+  $shippedConfig = [IO.File]::ReadAllText((Join-Path $repoRoot 'cli-config.json'), [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
+  foreach ($providerSpec in $shippedConfig._config_merge.managed_provider_args.PSObject.Properties) {
+    $providerName = $providerSpec.Name
+    foreach ($slotName in @($providerSpec.Value.slots)) {
+      $mergedArgs = @($merged.$providerName.$slotName)
+      $shippedArgs = @($shippedConfig.$providerName.$slotName)
+      foreach ($argSpec in @($providerSpec.Value.args)) {
+        $flag = [string]$argSpec.flag
+        $valueCount = [int]$argSpec.value_count
+        $mergedIndex = [Array]::IndexOf($mergedArgs, $flag)
+        $shippedIndex = [Array]::IndexOf($shippedArgs, $flag)
+        Assert-True ($mergedIndex -ge 0 -and $shippedIndex -ge 0) "$providerName.$slotName must retain managed flag $flag"
+        for ($offset = 1; $offset -le $valueCount; $offset++) {
+          Assert-True ([string]$mergedArgs[$mergedIndex + $offset] -ceq [string]$shippedArgs[$shippedIndex + $offset]) "$providerName.$slotName $flag must follow the shipped managed baseline"
+        }
+      }
     }
+  }
+  foreach ($slotName in @('dangerous', 'oneshot_dangerous')) {
+    Assert-True (Test-ExactJsonStringArray @($merged.claude_fable.$slotName) @($operatorConfig.claude_fable.$slotName)) "undeclared claude_fable.$slotName operator arguments must remain byte-exact"
   }
   Assert-True ($merged.claude.safe[[Array]::IndexOf(@($merged.claude.safe), '--model') + 1] -eq 'operator-claude-model') 'managed-argument migration must preserve an operator model choice'
   Assert-True (@($merged.claude.safe) -contains '--operator-flag') 'managed-argument migration must preserve unrelated operator flags'
@@ -593,7 +607,6 @@ server.listen(port, '127.0.0.1');
   Assert-True ((Test-ExactJsonStringArray $merged.copilot.credential_markers @('config.json'))) 'the installed retired Copilot marker must migrate end-to-end'
   Assert-True ((Test-ExactJsonStringArray $merged.copilot.login_command @('copilot', 'login'))) 'the installed retired Copilot login command must migrate end-to-end'
   Assert-True ($merged.copilot.linked_accounts_supported -eq $false) 'upgrades must disable unsafe profile-only Copilot account pooling'
-  $shippedConfig = [IO.File]::ReadAllText((Join-Path $repoRoot 'cli-config.json'), [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
   foreach ($providerName in @('claude', 'claude_fable', 'codex', 'copilot')) {
     foreach ($requiredName in @($shippedConfig.$providerName.strip_env)) {
       Assert-True (@($merged.$providerName.strip_env) -contains $requiredName) "$providerName must gain required identity exclusion $requiredName on upgrade"
