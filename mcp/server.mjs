@@ -8,6 +8,8 @@ import { McpServer } from '@modelcontextprotocol/server';
 import { serveStdio } from '@modelcontextprotocol/server/stdio';
 import { z } from 'zod';
 import TIMEOUT_POLICY from '../timeout-policy.cjs';
+import { normalizeGenericValidation } from '../lib/validation-contract.js';
+import { promptTransportLimits, preparePrompt } from '../lib/prompt-transport.js';
 import {
   BASE_URL,
   BRIDGE_ROOT,
@@ -820,7 +822,12 @@ function normalizeValidationDiagnostic(value) {
       guidance: 'Repeat admission with the intended working directory. RelayBridge did not execute a provider.',
     };
   }
-  if (value.code !== CWD_OUTSIDE_ALLOWED_ROOTS || value.field !== 'cwd') return null;
+  if (value.code !== CWD_OUTSIDE_ALLOWED_ROOTS) {
+    // Never let malformed authority claims fall through to generic acceptance.
+    if (value.code === CWD_IDENTITY_CHANGED || value.field === 'cwd') return null;
+    return normalizeGenericValidation(value);
+  }
+  if (value.field !== 'cwd') return null;
   const requestedRootHash = strictSha256(value.requestedRootHash);
   const normalizedRootHash = strictSha256(value.normalizedRootHash);
   const canonicalRootHash = value.canonicalRootHash === null
@@ -1219,6 +1226,7 @@ function bridgeFailureResult(error, { kind, signal }) {
       authFailed: authRequired,
       admissionLimited: bridgeStatus === 429,
       modelInvocation: deterministicPreflightRejection ? false : null,
+      physicalAttemptCount: deterministicPreflightRejection ? 0 : null,
       tokenUsageSource: deterministicPreflightRejection ? 'not_invoked' : 'unknown',
       transportRetryCount: 0,
       providerRetries: deterministicPreflightRejection || cancellationClass
@@ -1347,6 +1355,17 @@ async function callProvider({
   let workspaceAdmission = null;
   if (signal?.aborted) throw signal.reason || new Error('provider call cancelled before admission');
   try {
+    // Validate the complete semantic input before workspace admission or cache
+    // lookup. The server independently repeats this against its current config.
+    const entry = loadCliConfig()[kind] || {};
+    try { preparePrompt(prompt, { ...promptTransportLimits(entry, entry.oneshot_safe || []),
+      policyPrefix: typeof entry.oneshot_safe_prompt_prefix === 'string' ? entry.oneshot_safe_prompt_prefix.trim() : '' }); }
+    catch (error) {
+      throw new BridgeError(error.message, { status: 400, detail: {
+        failureClass: 'validation', validation: error.validation,
+        model_invocation: false, token_usage_source: 'not_invoked', physical_attempt_count: 0,
+      } });
+    }
     const response = await bridgeRequest('/api/workspace/validate', {
       method: 'POST',
       body: { kind, prompt, cwd, requestId },
@@ -1618,8 +1637,6 @@ function eligibleOneShotKinds(route, config, { selectedOnly = false, allowedKind
 }
 
 function rolePrompt(task, role, classification, policy) {
-  const cap = policy.tiers[classification.tier].maxInputChars;
-  const bounded = clip(task, cap);
   const roleInstructions = {
     primary: 'Propose the strongest concrete solution and state assumptions and verification steps.',
     critic: 'Independently find failure modes, unsupported assumptions, security risks, and cheaper alternatives.',
@@ -1632,10 +1649,9 @@ function rolePrompt(task, role, classification, policy) {
     'Do not edit files, run tools, or claim that a proposal was implemented. Return concise analysis only.',
     roleInstructions[role] || roleInstructions.primary,
     `Task tier: ${classification.tier}. Tags: ${classification.tags.join(', ')}.`,
-    bounded.truncated ? `The task was bounded from ${bounded.originalChars} characters for this seat.` : '',
     '',
     'TASK:',
-    bounded.text,
+    task,
   ].filter(Boolean).join('\n');
 }
 
@@ -2124,7 +2140,7 @@ export function buildServer() {
       timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).max(TIMEOUT_POLICY.oneShotMaxMs).default(TIMEOUT_POLICY.oneShotDefaultMs),
       useCache: z.boolean().default(true),
       cacheTtlMs: z.number().int().min(0).max(86400000).optional(),
-      providerBudget: PROVIDER_BUDGET_SCHEMA.optional(),
+      providerBudget: PROVIDER_BUDGET_SCHEMA.nullish(),
       taskTier: z.enum(TASK_TIERS).optional(),
       modelTier: z.enum(MODEL_TIERS).optional(),
       effort: z.enum(EFFORT_LEVELS).optional(),
@@ -2162,8 +2178,8 @@ export function buildServer() {
       useCache: z.boolean().default(true),
       acknowledgeHumanGate: z.boolean().default(false),
       allowModelForDeterministic: z.boolean().default(false),
-      allowInputTruncation: z.boolean().default(false),
-      providerBudget: PROVIDER_BUDGET_SCHEMA.optional(),
+      allowInputTruncation: z.boolean().default(false).describe('Deprecated compatibility field; semantic input is never truncated, even when true.'),
+      providerBudget: PROVIDER_BUDGET_SCHEMA.nullish(),
       effort: z.enum(EFFORT_LEVELS).optional(),
       maxEffortOverride: z.boolean().default(false),
     }),
@@ -2200,8 +2216,7 @@ export function buildServer() {
     }
     const { policy } = loadRoutingData();
     const tierPolicy = policy.tiers[route.classification.tier];
-    const boundedTask = clip(args.task, tierPolicy.maxInputChars);
-    if (boundedTask.truncated && !args.allowInputTruncation) {
+    if (args.task.length > tierPolicy.maxInputChars) {
       const receipt = appendReceipt({
         event: 'route_execute',
         routeId: route.routeId,
@@ -2214,11 +2229,17 @@ export function buildServer() {
         ok: false,
         blocked: true,
         inputBudgetExceeded: true,
+        modelInvocation: false,
+        physicalAttemptCount: 0,
+        tokenUsageSource: 'not_invoked',
+        validation: { code: 'prompt_too_large', field: 'task', retryable: false,
+          reason: 'Complete task exceeds the routing input limit.', inputChars: args.task.length,
+          maxChars: tierPolicy.maxInputChars, inputHash: stableHash(args.task), inputTruncated: false },
         route,
         receiptId: receipt.receiptId,
         inputChars: args.task.length,
         maxInputChars: tierPolicy.maxInputChars,
-        recommendation: 'Reduce the task/context or explicitly set allowInputTruncation=true.',
+        recommendation: 'Shorten the complete task or use a suitable full-input provider; input truncation is disabled.',
       }, { isError: true });
     }
     const config = loadCliConfig();
@@ -2240,7 +2261,7 @@ export function buildServer() {
       if (signal?.aborted || Date.now() >= deadlineAt) break;
       const response = await callProvider({
         kind: candidate.kind,
-        prompt: boundedTask.text,
+        prompt: args.task,
         cwd: args.cwd,
         timeoutMs: remainingTime(deadlineAt),
         useCache: args.useCache,
@@ -2311,7 +2332,7 @@ export function buildServer() {
       synthesisProvider: z.string().max(64).optional(),
       acknowledgeHumanGate: z.boolean().default(false),
       acknowledgeTruncatedEvidence: z.boolean().default(false),
-      providerBudget: PROVIDER_BUDGET_SCHEMA.optional(),
+      providerBudget: PROVIDER_BUDGET_SCHEMA.nullish(),
       effort: z.enum(EFFORT_LEVELS).optional(),
       maxEffortOverride: z.boolean().default(false),
     }),
@@ -2354,6 +2375,28 @@ export function buildServer() {
       const receipt = appendReceipt({ event: 'committee', routeId: route.routeId, taskHash: route.classification.taskHash, status: 'no_eligible_provider' });
       return result({ ok: false, blocked: true, route, receiptId: receipt.receiptId, error: 'No eligible safe provider matched this committee policy.' }, { isError: true });
     }
+    const roles = policy.committee.roles.filter((role) => role !== 'chair');
+    const seatPrompts = eligible.map((candidate, index) =>
+      rolePrompt(args.task, roles[Math.min(index, roles.length - 1)], route.classification, policy));
+    // Validate every complete member packet before starting ANY member.
+    // A later seat's deterministic size failure must not waste earlier seats.
+    try {
+      for (let index = 0; index < eligible.length; index++) {
+        const entry = config[eligible[index].kind];
+        const limits = promptTransportLimits(entry, entry.oneshot_safe || []);
+        preparePrompt(seatPrompts[index], { ...limits,
+          maxChars: limits.maxChars === null ? tierPolicy.maxInputChars : Math.min(limits.maxChars, tierPolicy.maxInputChars),
+          policyPrefix: typeof entry.oneshot_safe_prompt_prefix === 'string' ? entry.oneshot_safe_prompt_prefix.trim() : '' });
+      }
+    } catch (error) {
+      const validation = normalizeGenericValidation(error.validation);
+      const receipt = appendReceipt({ event: 'committee', routeId: route.routeId,
+        taskHash: route.classification.taskHash, status: 'input_budget_gate',
+        modelInvocation: false, physicalAttemptCount: 0, validation });
+      return result({ ok: false, blocked: true, route, receiptId: receipt.receiptId,
+        error: error.message, validation, inputTruncated: false, modelInvocation: false,
+        physicalAttemptCount: 0, tokenUsageSource: 'not_invoked' }, { isError: true });
+    }
     const deadlineAt = Math.min(requestedDeadlineAt, Date.now() + tierPolicy.defaultTimeoutMs);
     const rootReceipt = appendReceipt({
       event: 'committee',
@@ -2373,7 +2416,6 @@ export function buildServer() {
       parentReceiptId: rootReceipt.receiptId,
       deadlineAt: new Date(deadlineAt).toISOString(),
     });
-    const roles = policy.committee.roles.filter((role) => role !== 'chair');
     const membersByIndex = new Array(eligible.length);
     const settledMembers = await Promise.allSettled(eligible.map(async (candidate, index) => {
       const role = roles[Math.min(index, roles.length - 1)];
@@ -2381,7 +2423,7 @@ export function buildServer() {
       try {
         if (signal?.aborted) throw signal.reason || new Error('committee cancelled before provider admission');
         if (Date.now() >= deadlineAt) throw new Error('committee deadline exceeded before provider admission');
-        const seatPrompt = rolePrompt(args.task, role, route.classification, policy);
+        const seatPrompt = seatPrompts[index];
         const response = await callProvider({
           kind: candidate.kind,
           prompt: seatPrompt,
@@ -2400,7 +2442,7 @@ export function buildServer() {
         member = {
           ...response,
           role,
-          inputTruncated: args.task.length > tierPolicy.maxInputChars,
+          inputTruncated: false,
           originalTaskChars: args.task.length,
           seatPromptChars: seatPrompt.length,
           taskSha256: route.classification.taskHash,
@@ -2420,26 +2462,36 @@ export function buildServer() {
     let synthesisAssessment = null;
     const memberEvidenceIncomplete = successes.some((member) =>
       member.inputTruncated || member.outputTruncated || member.route?.prompt_truncated);
-    let synthesisInputTruncated = false;
+    let synthesisInputRejected = false;
     if (args.mode === 'consensus' && successes.length >= 2 && !signal?.aborted && Date.now() < deadlineAt) {
       const chairKind = args.synthesisProvider || successes[0].kind;
       if (!successes.some((member) => member.kind === chairKind)) {
         synthesis = { kind: chairKind, exitCode: -1, droppedOut: true, stdout: '', stderr: 'synthesisProvider must be one of the successful, policy-eligible committee members', failureClass: 'policy' };
       } else {
-        const packet = clip(successes.map((member) => `## ${member.kind} (${member.role})\n${member.stdout}`).join('\n\n'), policy.committee.maxSynthesisChars);
-        const originalTask = clip(args.task, 8000);
-        synthesisInputTruncated = packet.truncated || originalTask.truncated;
+        const packet = successes.map((member) => `## ${member.kind} (${member.role})\n${member.stdout}`).join('\n\n');
         const synthesisPrompt = [
           'You are the read-only chair of a multi-provider committee.',
           'Assess actual agreement; successful text generation alone is not consensus. Preserve material disagreements, distinguish evidence from opinion, propose explicit gates, and do not claim implementation.',
           'Return JSON only with this schema:',
           '{"verdict":"agreement|mixed|disagreement","confidence":0.0,"agreements":["..."],"dissent":["..."],"recommendation":"..."}',
           '',
-          `ORIGINAL TASK:\n${originalTask.text}`,
+          `ORIGINAL TASK:\n${args.task}`,
           '',
-          `MEMBER RESPONSES:\n${packet.text}`,
+          `MEMBER RESPONSES:\n${packet}`,
         ].join('\n');
-        synthesis = await callProvider({
+        try {
+          const entry = config[chairKind];
+          const limits = promptTransportLimits(entry, entry.oneshot_safe || []);
+          preparePrompt(synthesisPrompt, { ...limits,
+            maxChars: limits.maxChars === null ? policy.committee.maxSynthesisChars : Math.min(limits.maxChars, policy.committee.maxSynthesisChars),
+            policyPrefix: typeof entry.oneshot_safe_prompt_prefix === 'string' ? entry.oneshot_safe_prompt_prefix.trim() : '' });
+        } catch (error) {
+          synthesisInputRejected = true;
+          synthesis = { kind: chairKind, exitCode: -1, droppedOut: true, stdout: '',
+            stderr: error.message, failureClass: 'validation', validation: normalizeGenericValidation(error.validation),
+            modelInvocation: false, physicalAttemptCount: 0, tokenUsageSource: 'not_invoked', inputTruncated: false };
+        }
+        if (!synthesisInputRejected) synthesis = await callProvider({
           kind: chairKind,
           prompt: synthesisPrompt,
           cwd: args.cwd,
@@ -2464,7 +2516,7 @@ export function buildServer() {
     // Any truncation on the way in or out — seat prompt clipping, the chair
     // packet, the provider's own prompt cap reported by the bridge, or the
     // sanitized stdout cap — means the committee did not see the whole task.
-    const evidenceIncomplete = memberEvidenceIncomplete || synthesisInputTruncated || !!synthesis?.outputTruncated || !!synthesis?.route?.prompt_truncated;
+    const evidenceIncomplete = memberEvidenceIncomplete || synthesisInputRejected || !!synthesis?.outputTruncated || !!synthesis?.route?.prompt_truncated;
     const evidenceComplete = !evidenceIncomplete || args.acknowledgeTruncatedEvidence;
     const consensusMinConfidence = Number(policy.committee.consensusMinConfidence ?? 0.6);
     const allSeatsSucceeded = successes.length === eligible.length;
@@ -2485,11 +2537,12 @@ export function buildServer() {
     const consensusBlockedReasons = args.mode !== 'consensus' ? [] : [
       successes.length < 2 ? 'fewer than two successful independent members' : null,
       !synthesisCompleted ? 'chair seat did not return a usable response' : null,
+      synthesisInputRejected ? 'complete chair input exceeded its limit; no chair invocation was made' : null,
       synthesisCompleted && !synthesisAssessment ? 'chair response was not a complete structured verdict' : null,
       synthesisAssessment && synthesisAssessment.verdict !== 'agreement' ? `chair verdict was ${synthesisAssessment.verdict}` : null,
       synthesisAssessment?.verdict === 'agreement' && synthesisAssessment.confidence < consensusMinConfidence
         ? `chair confidence ${synthesisAssessment.confidence} is below the policy floor ${consensusMinConfidence}` : null,
-      evidenceIncomplete && !args.acknowledgeTruncatedEvidence ? 'evidence was truncated and acknowledgeTruncatedEvidence was not set' : null,
+      memberEvidenceIncomplete && !args.acknowledgeTruncatedEvidence ? 'member evidence was truncated and acknowledgeTruncatedEvidence was not set' : null,
     ].filter(Boolean);
     run = writeRun({
       ...run,
@@ -2501,6 +2554,7 @@ export function buildServer() {
       synthesis,
       synthesisAssessment,
       synthesisCompleted,
+      synthesisInputRejected,
       consensusAchieved,
       consensusMinConfidence,
       consensusBlockedReasons,
@@ -2517,6 +2571,7 @@ export function buildServer() {
       deadlineExceeded,
       synthesisCompleted,
       consensusAchieved,
+      synthesisInputRejected,
       consensusVerdict: synthesisAssessment?.verdict || (args.mode === 'consensus' ? 'unknown' : 'not_requested'),
       consensusMinConfidence,
       consensusBlockedReasons,
@@ -2569,7 +2624,7 @@ export function buildServer() {
       all: z.boolean().default(false),
       cwd: z.string().max(1000).optional(),
       timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).max(TIMEOUT_POLICY.oneShotMaxMs).default(TIMEOUT_POLICY.oneShotDefaultMs),
-      providerBudget: PROVIDER_BUDGET_SCHEMA.optional(),
+      providerBudget: PROVIDER_BUDGET_SCHEMA.nullish(),
       effort: z.enum(EFFORT_LEVELS).optional(),
       maxEffortOverride: z.boolean().default(false),
     }),
@@ -2919,7 +2974,7 @@ export function buildServer() {
       kind: z.string().min(1).max(64), prompt: z.string().min(1).max(100000),
       collab: z.string().max(64).optional(), title: z.string().max(120).optional(),
       cwd: z.string().max(1024).optional(), user: z.string().max(64).optional(),
-      providerBudget: PROVIDER_BUDGET_SCHEMA.optional(),
+      providerBudget: PROVIDER_BUDGET_SCHEMA.nullish(),
       taskTier: z.enum(['utility', 'standard', 'complex', 'critical']).optional(),
       modelTier: z.enum(['light', 'standard', 'heavy']).optional(),
       effort: z.enum(EFFORT_LEVELS).optional(),

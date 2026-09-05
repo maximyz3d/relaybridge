@@ -944,6 +944,7 @@
     ],
     "company": "Perplexity",
     "transport": "subscription:pwm",
+    "prompt_input_max_chars": 12000,
     "model": "auto",
     "color": "#20b8cd",
     "safe": [

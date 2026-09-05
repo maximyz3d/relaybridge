@@ -357,7 +357,7 @@ test('direct REST pre-admission failures persist deduplicated zero-invocation re
   await assertRejected({
     body: { kind: 'mixed_transport', prompt: 'must not start', requestId: 'request:configuration:mixed' },
     status: 400,
-    failureClass: 'configuration',
+    failureClass: 'validation',
   });
   assert.equal(fs.existsSync(invocationMarker), false, 'validation/config rejections must not start a provider process');
 

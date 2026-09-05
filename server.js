@@ -10,6 +10,10 @@ const os = require('os');
 const crypto = require('crypto');
 const { RunSupervisor, resolveSupervisorOptions, normalizeProviderBudget } = require('./lib/run-supervisor');
 const { validateProviderBudget } = require('./lib/provider-budget');
+const { promptTransportLimits, preparePrompt, renderPromptSlot } = require('./lib/prompt-transport');
+const { SUPPORTED_EFFORTS, EXTREME_EFFORTS, EFFORT_BY_TASK_TIER,
+  normalizeEffort, findEffortControl, stripEffortControls, configuredEffortArgs,
+  configuredReasoningEffortFamily, modelImpliedEffort, applyProviderEffort } = require('./lib/effort-controls');
 const { resolveModelArgs, applyModelArgs, modelConfigStaleness, modelTierForTaskTier } = require('./lib/model-tiers');
 const { buildRegistry, parseModelList, pinIsRetired } = require('./lib/model-registry');
 const { buildTaskPlan, costClassFor } = require('./lib/task-plan');
@@ -21,6 +25,7 @@ const { providerUsageCapability, providerUsageCapabilities } = require('./lib/pr
 const platform = require('./lib/platform');
 const { resolveWindowsLaunch } = require('./lib/win-shim-launch');
 const { createRequestLimiter, createOperationSlots, createReadOperationPool } = require('./lib/operation-admission');
+const { readBoundedJson } = require('./lib/bounded-json-read');
 const { validateBrowserUrl, browserOpeners } = require('./lib/browser-launch');
 const { receiptStoreIdentity } = require('./lib/receipt-store-identity.cjs');
 const { loadBuildIdentity } = require('./lib/build-identity.cjs');
@@ -57,15 +62,6 @@ const MCP_SERVER_MODULE_PROMISE = import('./mcp/server.mjs');
 // `xhigh`, while other providers may expose a literal `max` flag.  The adapter
 // below resolves the intent through provider-declared controls and records the
 // value that was actually sent.
-const SUPPORTED_EFFORTS = Object.freeze(['minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
-const EXTREME_EFFORTS = new Set(['xhigh', 'max']);
-const EFFORT_BY_TASK_TIER = Object.freeze({
-  deterministic: 'minimal',
-  utility: 'low',
-  standard: 'medium',
-  complex: 'high',
-  critical: 'high',
-});
 
 // ---- config ----
 const PORT = parseInt(process.env.PORT || '8787', 10);
@@ -1211,192 +1207,6 @@ function resolveSlot(slot) {
   });
 }
 
-function normalizeEffort(value) {
-  const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
-  return SUPPORTED_EFFORTS.includes(normalized) ? normalized : null;
-}
-
-function parseReasoningEffortAssignment(value) {
-  const match = /^(model_reasoning_effort|reasoning_effort)\s*=\s*(.+)$/i.exec(String(value || '').trim());
-  if (!match) return null;
-  const rawValue = match[2].trim().replace(/^(["'])(.*)\1$/, '$2').toLowerCase();
-  const effort = normalizeEffort(rawValue);
-  return effort ? { key: match[1], effort } : null;
-}
-
-// Inspect only the explicit, documented effort forms RelayBridge knows how to
-// reason about.  Unknown config assignments are left alone rather than being
-// guessed at and then reported as an applied control.
-function findEffortControl(args) {
-  if (!Array.isArray(args)) return null;
-  for (let index = 0; index < args.length; index++) {
-    const arg = args[index];
-    if ((arg === '--effort' || arg === '--reasoning-effort') && index + 1 < args.length) {
-      const effort = normalizeEffort(String(args[index + 1]));
-      if (effort) return { index, width: 2, effort, flag: arg, method: 'flag' };
-    }
-    if ((arg === '--config' || arg === '-c') && index + 1 < args.length) {
-      const assignment = parseReasoningEffortAssignment(args[index + 1]);
-      if (assignment) {
-        return {
-          index, width: 2, effort: assignment.effort, flag: arg,
-          configKey: assignment.key, method: 'config',
-        };
-      }
-    }
-    const inlineConfig = /^--config=(.*)$/i.exec(String(arg || ''));
-    const assignment = inlineConfig ? parseReasoningEffortAssignment(inlineConfig[1]) : null;
-    if (assignment) {
-      return {
-        index, width: 1, effort: assignment.effort, flag: '--config',
-        configKey: assignment.key, method: 'config',
-      };
-    }
-  }
-  return null;
-}
-
-function stripEffortControls(args) {
-  const out = [];
-  let firstRemovedAt = null;
-  for (let index = 0; index < args.length;) {
-    const control = findEffortControl(args.slice(index));
-    if (!control) {
-      out.push(...args.slice(index));
-      break;
-    }
-    const absoluteIndex = index + control.index;
-    out.push(...args.slice(index, absoluteIndex));
-    if (firstRemovedAt == null) firstRemovedAt = out.length;
-    index = absoluteIndex + control.width;
-  }
-  return { args: out, firstRemovedAt };
-}
-
-function effortArgsInsertIndex(slot, entry = {}, preferredIndex = null) {
-  if (Number.isInteger(preferredIndex)) return Math.max(1, Math.min(preferredIndex, slot.length));
-  if (Number.isInteger(entry.effort_arg_index)) {
-    return Math.max(1, Math.min(entry.effort_arg_index, slot.length));
-  }
-  const promptFileAt = slot.findIndex((arg) => typeof arg === 'string' && arg.includes('{prompt_file}'));
-  if (promptFileAt >= 0) {
-    // Keep `--prompt-file {prompt_file}` together.  This also leaves a script
-    // path immediately after `node`, which makes deterministic CLI fixtures a
-    // faithful stand-in for real providers.
-    return promptFileAt > 0 && String(slot[promptFileAt - 1]).startsWith('-')
-      ? promptFileAt - 1 : promptFileAt;
-  }
-  const inlinePromptAt = slot.findIndex((arg) => typeof arg === 'string' && arg.includes('{prompt}'));
-  if (inlinePromptAt >= 0) return inlinePromptAt;
-  if (slot.length > 1 && slot.at(-1) === '-') return slot.length - 1;
-  return slot.length;
-}
-
-function insertEffortArgs(slot, effortArgs, entry = {}, preferredIndex = null) {
-  const out = slot.slice();
-  const at = effortArgsInsertIndex(out, entry, preferredIndex);
-  out.splice(at, 0, ...effortArgs);
-  return out;
-}
-
-function configuredEffortArgs(entry, requestedEffort) {
-  const configured = entry?.effort_flags?.[requestedEffort];
-  if (!Array.isArray(configured) || !configured.length || configured.some((arg) => typeof arg !== 'string')) {
-    return null;
-  }
-  return configured.slice();
-}
-
-function configuredReasoningEffortFamily(entry) {
-  const values = entry?.effort_flags && typeof entry.effort_flags === 'object'
-    ? Object.values(entry.effort_flags) : [];
-  for (const args of values) {
-    const control = findEffortControl(args);
-    if (control?.method === 'config' && control.configKey) {
-      return { flag: control.flag === '-c' ? '-c' : '--config', key: control.configKey };
-    }
-  }
-  return null;
-}
-
-function modelImpliedEffort(modelChoice, entry = {}) {
-  if (!modelChoice?.model) return null;
-  const suffix = /(?:^|-)(minimal|low|medium|high|xhigh|max)$/i.exec(String(modelChoice.model));
-  if (suffix) return suffix[1].toLowerCase();
-  // A configured weight class is the only effort expression for several local
-  // providers.  Do not make this claim for Codex-style seats, where model size
-  // and reasoning effort are independent controls.
-  if (entry.effort_flags && Object.keys(entry.effort_flags).length) return null;
-  return { light: 'low', standard: 'medium', heavy: 'high' }[modelChoice.modelTier] || null;
-}
-
-function applyProviderEffort({ slot, entry = {}, modelChoice = {}, requestedEffort = null }) {
-  const existing = findEffortControl(slot);
-  if (!requestedEffort) {
-    if (existing) {
-      return {
-        slot, appliedEffort: existing.effort,
-        method: existing.method === 'config' ? 'effort_flags' : 'flag',
-        control: existing.configKey ? `${existing.flag} ${existing.configKey}` : existing.flag,
-      };
-    }
-    const implied = modelImpliedEffort(modelChoice, entry);
-    return {
-      slot, appliedEffort: implied,
-      method: implied ? 'model_choice' : 'account_default',
-      control: implied ? 'model' : null,
-    };
-  }
-
-  let effortArgs = configuredEffortArgs(entry, requestedEffort);
-  let method = effortArgs ? 'effort_flags' : null;
-
-  // Current Codex accepts xhigh through model_reasoning_effort, but older
-  // configurations may predate an explicit xhigh row.  Seeing that exact
-  // configuration family is enough to construct xhigh safely.  Never perform
-  // the same synthesis for max: Codex does not accept a literal max and must
-  // use the provider's declared max fallback instead.
-  const configFamily = configuredReasoningEffortFamily(entry)
-    || (existing?.method === 'config' && existing.configKey
-      ? { flag: existing.flag, key: existing.configKey } : null);
-  if (!effortArgs && requestedEffort === 'xhigh' && configFamily) {
-    effortArgs = [configFamily.flag, `${configFamily.key}=xhigh`];
-    method = 'effort_flags';
-  }
-
-  if (!effortArgs && existing?.method === 'flag') {
-    effortArgs = [existing.flag, requestedEffort];
-    method = 'flag';
-  }
-  if (!effortArgs && existing?.method === 'config' && requestedEffort !== 'max') {
-    effortArgs = [existing.flag, `${existing.configKey}=${requestedEffort}`];
-    method = 'effort_flags';
-  }
-
-  if (effortArgs) {
-    const actual = findEffortControl(effortArgs);
-    if (!actual) {
-      return { error: 'configured effort_flags do not contain a recognized effort control' };
-    }
-    const stripped = stripEffortControls(slot);
-    return {
-      slot: insertEffortArgs(stripped.args, effortArgs, entry, stripped.firstRemovedAt),
-      appliedEffort: actual.effort,
-      method,
-      control: actual.configKey ? `${actual.flag} ${actual.configKey}` : actual.flag,
-    };
-  }
-
-  const implied = modelImpliedEffort(modelChoice, entry);
-  if (implied === requestedEffort) {
-    return { slot, appliedEffort: implied, method: 'model_choice', control: 'model' };
-  }
-  return {
-    error: `provider cannot express requested effort=${requestedEffort}`
-      + (implied ? `; selected model tier applies ${implied}` : ''),
-  };
-}
-
 function annotateRequestedPlanEffort(plan, config, requestedEffort) {
   plan.effort = requestedEffort;
   const candidates = new Set([
@@ -1603,17 +1413,6 @@ function qualifiedProviderLaunch(file, args, env) {
     });
   }
   return { ...launch, env: { ...env, ...launch.envPatch } };
-}
-
-function capPrompt(prompt, maxChars) {
-  if (!maxChars || prompt.length <= maxChars) return { text: prompt, truncated: false };
-  const headChars = Math.min(1800, Math.floor(maxChars / 4));
-  const marker = '\n\n...[earlier conversation trimmed by RelayBridge to fit this CLI]...\n\n';
-  const tailChars = Math.max(0, maxChars - headChars - marker.length);
-  return {
-    text: prompt.slice(0, headChars) + marker + prompt.slice(-tailChars),
-    truncated: true,
-  };
 }
 
 // Strip terminal noise from a CLI's captured output so Collab Mode shows clean
@@ -2304,10 +2103,9 @@ function terminalProviderBudgetOutcome(usage, providerBudget, turns = null) {
     : { exceeded: false, detail: '', budget: supervisor.snapshot().providerBudget };
 }
 
-async function runOpenAIChatOneShot({ entry, prompt, timeoutMs, res, route, startedAt, providerBudget, accountId }) {
-  const bounded = capPrompt(prompt, Number(entry.prompt_max_chars || 12000));
+async function runOpenAIChatOneShot({ entry, prompt, effectivePrompt, timeoutMs, res, route, startedAt, providerBudget, accountId }) {
   route.prompt_transport = 'hosted_openai_compatible';
-  route.prompt_truncated = bounded.truncated;
+  route.prompt_truncated = false;
   route.allow_paid_fallback = entry.allow_paid_fallback === true;
   route.hosting_region = entry.hosting_region || null;
   route.requires_explicit_preference = entry.autoRoute === false || null;
@@ -2362,7 +2160,7 @@ async function runOpenAIChatOneShot({ entry, prompt, timeoutMs, res, route, star
         model: entry.model,
         messages: [
           ...(entry.system_prompt ? [{ role: 'system', content: String(entry.system_prompt) }] : []),
-          { role: 'user', content: bounded.text },
+          { role: 'user', content: effectivePrompt },
         ],
         temperature: Number.isFinite(Number(entry.temperature)) ? Number(entry.temperature) : 0.2,
         max_tokens: Math.max(64, Math.min(Number(entry.max_output_tokens || 1024), 4096)),
@@ -2458,10 +2256,9 @@ async function runOpenAIChatOneShot({ entry, prompt, timeoutMs, res, route, star
   }
 }
 
-async function runOllamaApiOneShot({ entry, prompt, timeoutMs, res, route, startedAt, providerBudget, accountId }) {
-  const bounded = capPrompt(prompt, Number(entry.prompt_max_chars || 24000));
+async function runOllamaApiOneShot({ entry, prompt, effectivePrompt, timeoutMs, res, route, startedAt, providerBudget, accountId }) {
   route.prompt_transport = 'local_http';
-  route.prompt_truncated = bounded.truncated;
+  route.prompt_truncated = false;
   const controller = new AbortController();
   let timedOut = false;
   let clientGone = false;
@@ -2502,7 +2299,7 @@ async function runOllamaApiOneShot({ entry, prompt, timeoutMs, res, route, start
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: entry.model,
-        prompt: bounded.text,
+        prompt: effectivePrompt,
         stream: false,
         think: false,
         options: {
@@ -2944,6 +2741,7 @@ function createSessionFromKind(kind, opts = {}) {
 // ---- HTTP / WS server ----
 const app = express();
 const diagnosticRequestLimit = createRequestLimiter({ family: 'diagnostics', limit: 120 });
+const planningRequestLimit = createRequestLimiter({ family: 'planning', limit: 120 });
 const execRequestLimit = createRequestLimiter({ family: 'host_exec', limit: 60 });
 const accountMutationLimit = createRequestLimiter({ family: 'account_mutation', limit: 60 });
 const usageAdviceLimit = createRequestLimiter({ family: 'usage_advice', limit: 120 });
@@ -3508,22 +3306,43 @@ function agentSummary(kind, entry) {
   };
 }
 
-async function probeOllamaReadiness(entry) {
+async function readOllamaTags(tagsUrl, signal) {
+  const key = crypto.createHash('sha256').update(JSON.stringify({
+    type: 'ollama_tags', url: tagsUrl.href, timeoutMs: 4000, maxBytes: 1048576, redirect: 'manual',
+  })).digest('hex');
+  const deadline = new AbortController();
+  const timer = setTimeout(() => deadline.abort(), 6000);
+  timer.unref?.();
+  try {
+    return await probePool.run(key, (workerSignal) => readBoundedJson(tagsUrl, { signal: workerSignal }),
+      { signal: signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal });
+  } catch (error) {
+    return { completed: false, error: error.message, aborted: !!signal?.aborted,
+      timedOut: deadline.signal.aborted && !signal?.aborted,
+      admissionRejected: error.code === 'operation_admission_limit' };
+  } finally { clearTimeout(timer); }
+}
+
+async function probeOllamaReadiness(entry, signal) {
   let found = false;
   let ready = false;
   let detail = '';
   let runtimeVersion = '';
+  let transientProbeFailure = false;
   const model = entry.model || entry.oneshot_model
     || (Array.isArray(entry.safe) ? entry.safe[2] : '') || '';
   try {
     const base = localOllamaUrl();
     const tagsUrl = new URL('/api/tags', base.origin);
-    const resp = await fetch(tagsUrl, { signal: AbortSignal.timeout(4000) });
-    found = true;
-    if (!resp.ok) {
+    const resp = await readOllamaTags(tagsUrl, signal);
+    found = !!resp.status;
+    transientProbeFailure = !resp.completed;
+    if (!resp.completed) {
+      detail = resp.timedOut ? 'ollama metadata read timed out' : resp.error || 'ollama metadata read cancelled';
+    } else if (resp.status !== 200) {
       detail = `ollama daemon at ${base.origin} returned HTTP ${resp.status}`;
     } else {
-      const body = await resp.json();
+      const body = resp.body;
       const names = Array.isArray(body?.models) ? body.models.map((item) => String(item?.name || '')) : [];
       runtimeVersion = `${names.length} model(s) loaded`;
       ready = !model || names.some((name) => name === model
@@ -3533,6 +3352,7 @@ async function probeOllamaReadiness(entry) {
         : `daemon up at ${base.origin} but ${model} is not pulled (have: ${names.slice(0, 4).join(', ') || 'none'})`;
     }
   } catch (err) {
+    transientProbeFailure = true;
     detail = err.name === 'TimeoutError'
       ? `no ollama daemon answering at ${String(envFirst('RELAYBRIDGE_OLLAMA_URL', 'PS_BRIDGE_OLLAMA_URL') || 'http://127.0.0.1:11434')} (timed out)`
       : `no ollama daemon reachable: ${err.message}`;
@@ -3546,16 +3366,19 @@ async function probeOllamaReadiness(entry) {
     detail,
     probeExitCode: null,
     runtimeVersion,
+    transientProbeFailure,
+    authFailed: false,
+    authAuthoritative: false,
     usageCapability: providerUsageCapability(entry, { runtimeVersion }),
   };
 }
 
-async function coldPlanningDiagnostics(cfg, pathDetail) {
+async function coldPlanningDiagnostics(cfg, pathDetail, signal) {
   const env = buildEnv();
   const pairs = await Promise.all(Object.keys(cfg).filter((kind) => !kind.startsWith('_')).map(async (kind) => {
     const entry = cfg[kind];
     if (entry.oneshot_adapter === 'ollama_api') {
-      return [kind, await probeOllamaReadiness(entry)];
+      return [kind, await probeOllamaReadiness(entry, signal)];
     }
     let found = false;
     try {
@@ -3574,14 +3397,14 @@ async function coldPlanningDiagnostics(cfg, pathDetail) {
 // readiness sweep has ever run. Such a partial snapshot must not make every
 // absent provider look eligible. Fill only missing configured keys with cheap
 // path/transport evidence and preserve every live result already observed.
-async function completePlanningDiagnostics(cfg, existing, pathDetail) {
+async function completePlanningDiagnostics(cfg, existing, pathDetail, signal) {
   const preserved = existing && typeof existing === 'object' && !Array.isArray(existing)
     ? existing : {};
   const missingKinds = Object.keys(cfg).filter((kind) => !kind.startsWith('_')
     && !Object.prototype.hasOwnProperty.call(preserved, kind));
   if (!missingKinds.length) return preserved;
   const missingConfig = Object.fromEntries(missingKinds.map((kind) => [kind, cfg[kind]]));
-  const missing = await coldPlanningDiagnostics(missingConfig, pathDetail);
+  const missing = await coldPlanningDiagnostics(missingConfig, pathDetail, signal);
   return { ...missing, ...preserved };
 }
 
@@ -3737,7 +3560,9 @@ app.post('/api/models/refresh', async (req, res) => {
 // a CSS tweak to a frontier seat, or arithmetic to a max-effort reasoning model,
 // costs real money for no gain. This returns the cheapest capable combination
 // and says why, so callers do not have to guess.
-app.post('/api/plan', async (req, res) => {
+app.post('/api/plan', planningRequestLimit, async (req, res) => {
+  const controller = new AbortController();
+  res.once('close', () => { if (!res.writableEnded) controller.abort(); });
   const { task, effort, kind, providerBudget: rawBudget } = req.body || {};
   if (!task || typeof task !== 'string' || !task.trim()) {
     return res.status(400).json({ error: 'task (non-empty string) required' });
@@ -3758,11 +3583,17 @@ app.post('/api/plan', async (req, res) => {
   try {
     const router = await ROUTER_MODULE_PROMISE;
     const cfg = loadConfig();
+    const generation = diagnosticGeneration(cfg);
     let diagnostics = await completePlanningDiagnostics(
       cfg,
       lastDiagnostics?.results,
       'path-only check',
+      controller.signal,
     );
+    if (controller.signal.aborted) return;
+    if (generation !== diagnosticGeneration(loadConfig())) {
+      return res.status(409).json({ error: 'diagnostic authority changed; refresh again', errorCode: 'diagnostic_stale' });
+    }
     const gauges = usageLedger.gaugeAll(seatCostClasses());
     const routingInputs = accountAwareRoutingInputs(cfg, diagnostics, gauges, coolingQuotaStates());
     const fleetInput = applyCooldownsToDiagnostics(
@@ -3801,13 +3632,15 @@ app.post('/api/plan', async (req, res) => {
     if (requestedEffort) annotateRequestedPlanEffort(plan, cfg, requestedEffort);
     res.json({ ok: true, task: task.slice(0, 400), ...plan, fleetState: route.fleetState });
   } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
+    if (!res.destroyed && !res.writableEnded) res.status(500).json({ ok: false, error: err.message });
   }
 });
 
 // Delegation: classify a task, rank providers by tier, and pick the model
 // weight class inside each. Advisory — it returns a plan, it does not dispatch.
-app.post('/api/route', async (req, res) => {
+app.post('/api/route', planningRequestLimit, async (req, res) => {
+  const controller = new AbortController();
+  res.once('close', () => { if (!res.writableEnded) controller.abort(); });
   const {
     task, diagnostics: supplied, preferKinds, excludeKinds, providerBudget: rawBudget,
     localOnly = false, maxProviders, committeeMode = 'advisory',
@@ -3834,11 +3667,17 @@ app.post('/api/route', async (req, res) => {
   try {
     const router = await ROUTER_MODULE_PROMISE;
     const cfg = loadConfig();
+    const generation = diagnosticGeneration(cfg);
     let diagnostics = await completePlanningDiagnostics(
       cfg,
       supplied && typeof supplied === 'object' ? supplied : lastDiagnostics?.results,
       'path-only check; run /api/diag for auth status',
+      controller.signal,
     );
+    if (controller.signal.aborted) return;
+    if (generation !== diagnosticGeneration(loadConfig())) {
+      return res.status(409).json({ error: 'diagnostic authority changed; refresh again', errorCode: 'diagnostic_stale' });
+    }
     const explicitKinds = Array.isArray(preferKinds) ? preferKinds : [];
     const gauges = usageLedger.gaugeAll(seatCostClasses());
     const routingInputs = accountAwareRoutingInputs(cfg, diagnostics, gauges, coolingQuotaStates());
@@ -3894,7 +3733,7 @@ app.post('/api/route', async (req, res) => {
     });
     res.json({ ok: true, ...route, selected, modelTier: modelTierForTaskTier(taskTier), modelConfig: modelConfigStaleness(cfg._models || {}) });
   } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
+    if (!res.destroyed && !res.writableEnded) res.status(500).json({ ok: false, error: err.message });
   }
 });
 
@@ -3940,7 +3779,7 @@ app.get('/api/auth/status', diagnosticRequestLimit, async (req, res) => {
       const pairs = await Promise.all(kinds.map(async (kind) => {
         const entry = cfg[kind];
         if (entry?.oneshot_adapter === 'ollama_api') {
-          return [kind, await probeOllamaReadiness(entry)];
+          return [kind, await probeOllamaReadiness(entry, controller.signal)];
         }
         if (!entry || !Array.isArray(entry.probe) || !entry.probe.length) return [kind, null];
         let found = false;
@@ -4067,7 +3906,7 @@ app.get('/api/diag', diagnosticRequestLimit, async (req, res) => {
     // routing-policy scores local seats +30 and a "live diagnostic ready" seat
     // +20, so those dead seats won the default utility route.
     if (entry.oneshot_adapter === 'ollama_api') {
-      return [kind, await probeOllamaReadiness(entry)];
+      return [kind, await probeOllamaReadiness(entry, controller.signal)];
     }
     const binary = entry.diagnostic_binary ||
       (entry.safe && entry.safe[0]) || (entry.dangerous && entry.dangerous[0]);
@@ -4517,16 +4356,16 @@ async function executeOneShot(body, res) {
   slot = effortResolution.slot;
   const safePromptPrefix = !useDanger && typeof entry.oneshot_safe_prompt_prefix === 'string'
     ? entry.oneshot_safe_prompt_prefix.trim() : '';
-  if (safePromptPrefix.length > 4096) {
-    return rejectBeforeAdmission(400, 'configuration', {
-      error: 'oneshot_safe_prompt_prefix exceeds the 4096-character safety limit',
+  let preparedPrompt;
+  try {
+    preparedPrompt = preparePrompt(prompt, { ...promptTransportLimits(entry, slot), policyPrefix: safePromptPrefix });
+  } catch (err) {
+    return rejectBeforeAdmission(400, 'validation', {
+      error: err.message, errorCode: err.code, validation: err.validation,
     });
   }
-  const hasInlinePrompt = slot.some((a) => typeof a === 'string' && a.includes('{prompt}'));
-  const hasPromptFile = slot.some((a) => typeof a === 'string' && a.includes('{prompt_file}'));
-  if (hasInlinePrompt && hasPromptFile) {
-    return rejectBeforeAdmission(400, 'configuration', { error: 'oneshot config cannot mix {prompt} and {prompt_file}' });
-  }
+  const hasInlinePrompt = preparedPrompt.evidence.transport === 'argument';
+  const hasPromptFile = preparedPrompt.evidence.transport === 'file';
   let resolvedCwd;
   let resolvedCwdIdentity;
   const expectedCwdIdentityHash = body?.expectedCwdIdentityHash;
@@ -4655,18 +4494,7 @@ async function executeOneShot(body, res) {
     }
   }
   let promptFile = '';
-  let userPromptForProvider = prompt;
-  let promptTruncated = false;
-  if (hasInlinePrompt) {
-    // Preserve the established user-prompt allowance. The policy prefix is a
-    // separate bounded transport envelope, not text that silently consumes
-    // the tail of a request which previously fit prompt_max_chars.
-    const capped = capPrompt(prompt, Number(entry.prompt_max_chars || 6000));
-    userPromptForProvider = capped.text;
-    promptTruncated = capped.truncated;
-  }
-  const effectivePrompt = safePromptPrefix
-    ? `${safePromptPrefix}\n\nUser request:\n${userPromptForProvider}` : userPromptForProvider;
+  const effectivePrompt = preparedPrompt.text;
   const promptForArgs = effectivePrompt;
   if (hasPromptFile) {
     try {
@@ -4689,14 +4517,8 @@ async function executeOneShot(body, res) {
       });
     }
   }
-  const slotResolved = slot.map((arg) => {
-    if (typeof arg !== 'string') return arg;
-    return arg
-      .replace('{prompt_file}', promptFile)
-      .replace('{prompt}', promptForArgs)
-      .replace('{cwd}', resolvedCwd);
-  });
-  const promptTransport = hasPromptFile ? 'file' : (hasInlinePrompt ? 'argument' : 'stdin');
+  const slotResolved = renderPromptSlot(slot, { prompt_file: promptFile, prompt: promptForArgs, cwd: resolvedCwd });
+  const promptTransport = preparedPrompt.evidence.transport;
   const cleanupPromptFile = () => {
     if (!promptFileDir) return;
     try { fs.rmSync(promptFileDir, { recursive: true, force: true }); } catch {}
@@ -4762,7 +4584,8 @@ async function executeOneShot(body, res) {
     isolated_home_id: isolatedProviderHome?.id || null,
     isolated_home_cleanup: isolatedProviderHome ? 'pending' : 'not_applicable',
     prompt_transport: promptTransport,
-    prompt_truncated: promptTruncated,
+    prompt_truncated: false,
+    prompt_evidence: preparedPrompt.evidence,
     prompt_policy: safePromptPrefix
       ? (entry.oneshot_safe_prompt_policy || 'configured_safe_prompt_prefix') : null,
     prompt_policy_chars: safePromptPrefix.length,
@@ -4864,7 +4687,7 @@ async function executeOneShot(body, res) {
   if (entry.oneshot_adapter === 'ollama_api') {
     cleanupPromptFile();
     return runOllamaApiOneShot({
-      entry, prompt, timeoutMs: adapterTimeoutMs, res, route, startedAt,
+      entry, prompt, effectivePrompt, timeoutMs: adapterTimeoutMs, res, route, startedAt,
       providerBudget: resolvedProviderBudget,
       accountId: dispatchAccount.account?.id || null,
     });
@@ -4872,7 +4695,7 @@ async function executeOneShot(body, res) {
   if (entry.oneshot_adapter === 'openai_chat_api') {
     cleanupPromptFile();
     return runOpenAIChatOneShot({
-      entry, prompt, timeoutMs: adapterTimeoutMs, res, route, startedAt,
+      entry, prompt, effectivePrompt, timeoutMs: adapterTimeoutMs, res, route, startedAt,
       providerBudget: resolvedProviderBudget,
       accountId: dispatchAccount.account?.id || null,
     });
@@ -6165,7 +5988,7 @@ app.post('/api/accounts/:kind', accountMutationLimit, (req, res) => {
   });
 });
 
-app.post('/api/accounts/:kind/:id/enabled', (req, res) => {
+app.post('/api/accounts/:kind/:id/enabled', accountMutationLimit, (req, res) => {
   const kind = String(req.params.kind);
   const entry = loadConfig()[kind];
   if (!entry || kind.startsWith('_')) return res.status(404).json({ error: `unknown provider '${kind}'` });
@@ -6220,7 +6043,7 @@ app.post('/api/accounts/:kind/:id/auth/retry', accountMutationLimit, (req, res) 
   }
 });
 
-app.delete('/api/accounts/:kind/:id', (req, res) => {
+app.delete('/api/accounts/:kind/:id', accountMutationLimit, (req, res) => {
   const kind = String(req.params.kind);
   const id = String(req.params.id);
   const entry = loadConfig()[kind];

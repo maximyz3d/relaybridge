@@ -77,7 +77,11 @@ test('server has no request-time repo-local module loader after its final identi
     .map((match) => match[2]);
   assert.deepEqual(dynamicImports, ['./mcp/router.mjs', './mcp/server.mjs'],
     'repo-local ESM must be represented only by the two eager cached imports');
-  assert.doesNotMatch(source, /^[ \t]+.*\brequire\((['"])\.\/[^'"]+\1\)/m,
+  // A multiline top-level destructuring import has indented continuation
+  // lines, but still loads eagerly. Remove only declarations beginning in
+  // column zero; indented handler declarations remain subject to the gate.
+  const withoutEagerDestructuring = source.replace(/^const \{[^;]*?\} = require\((['"])\.\/[^'"]+\1\);/gm, '');
+  assert.doesNotMatch(withoutEagerDestructuring, /^[ \t]+.*\brequire\((['"])\.\/[^'"]+\1\)/m,
     'a handler-scoped repo-local require could load changed source after the final gate');
 
   const finalGate = source.lastIndexOf('const currentIdentity = loadBuildIdentity(ROOT);');
@@ -184,7 +188,10 @@ if (startupIdentityBarrier) {
   });
 
   assert.notEqual(exitCode, 0, output);
-  assert.match(output, /source changed while runtime modules were loading; refusing to listen/);
+  // Mutation can be caught during the final fingerprint read itself or by
+  // comparing that finished read with the initial identity. Both must refuse
+  // the listener; scheduling must not pick the expected error wording.
+  assert.match(output, /source changed while runtime modules were loading; refusing to listen|source checkout changed while build identity was being computed/);
   assert.doesNotMatch(output, /listening on http:/);
   await assert.rejects(fetch(`http://127.0.0.1:${port}/api/health`, {
     signal: AbortSignal.timeout(500),
