@@ -110,6 +110,7 @@ try {
   Copy-Item -LiteralPath (Join-Path $repoRoot 'config\timeout-policy.json') -Destination (Join-Path $bridgeRoot 'config\timeout-policy.json')
   Copy-Item -LiteralPath (Join-Path $repoRoot 'lib\build-identity.cjs') -Destination (Join-Path $bridgeRoot 'lib\build-identity.cjs')
   Copy-Item -LiteralPath (Join-Path $repoRoot 'lib\github-tracker.js') -Destination (Join-Path $bridgeRoot 'lib\github-tracker.js')
+  Copy-Item -LiteralPath (Join-Path $repoRoot 'lib\platform.js') -Destination (Join-Path $bridgeRoot 'lib\platform.js')
   Copy-Item -LiteralPath (Join-Path $repoRoot 'tools\prepare-build-info.cjs') -Destination (Join-Path $bridgeRoot 'tools\prepare-build-info.cjs')
   Copy-Item -LiteralPath (Join-Path $repoRoot 'package.json') -Destination (Join-Path $bridgeRoot 'package.json')
   [IO.File]::WriteAllText((Join-Path $bridgeRoot 'mcp\server.mjs'), "// fake MCP entrypoint`n", [Text.UTF8Encoding]::new($false))

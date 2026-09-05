@@ -162,9 +162,24 @@ test('direct REST pre-admission failures persist deduplicated zero-invocation re
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let serverOutput = '';
+  let shutdownToken = '';
   proc.stdout.on('data', (chunk) => { serverOutput += chunk; });
   proc.stderr.on('data', (chunk) => { serverOutput += chunk; });
   t.after(async () => {
+    if (proc.exitCode === null && shutdownToken) {
+      try {
+        await fetch(`${baseUrl}/api/admin/shutdown`, {
+          method: 'POST',
+          headers: { 'X-RelayBridge-Token': shutdownToken },
+        });
+      } catch {}
+    }
+    if (proc.exitCode === null) {
+      await Promise.race([
+        new Promise((resolve) => proc.once('exit', resolve)),
+        new Promise((resolve) => setTimeout(resolve, 6000)),
+      ]);
+    }
     if (proc.exitCode === null) proc.kill('SIGTERM');
     await new Promise((resolve) => proc.exitCode !== null ? resolve() : proc.once('exit', resolve));
     // Remove the deliberately retargeted reparse points before recursively
@@ -184,6 +199,7 @@ test('direct REST pre-admission failures persist deduplicated zero-invocation re
   catch (error) { throw new Error(`${error.message}\n${serverOutput}`); }
   const capability = await (await fetch(`${baseUrl}/api/capability`)).json();
   pathHashKey = capability.token;
+  shutdownToken = capability.token;
   const headers = {
     'Content-Type': 'application/json',
     'X-RelayBridge-Token': capability.token,

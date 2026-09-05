@@ -56,16 +56,35 @@ function Test-ProcessRunning([int]$ProcessId) {
   } catch { return $false }
 }
 
-function Invoke-TestInstall([string]$FailAt = '', [switch]$Start, [int]$Port = 0) {
+function Invoke-TestInstall(
+  [string]$FailAt = '',
+  [switch]$Start,
+  [int]$Port = 0,
+  [string]$TargetInstallDir = '',
+  [string]$MigrationSource = '',
+  [string]$InstallSource = ''
+) {
   if (-not $Port) { $Port = Get-FreePort }
+  if (-not $TargetInstallDir) { $TargetInstallDir = $installRoot }
+  if (-not $InstallSource) { $InstallSource = $repoRoot }
   $previousFailAt = $env:RELAYBRIDGE_INSTALL_TEST_FAIL_AT
   $previousErrorFile = $env:RELAYBRIDGE_INSTALL_TEST_ERROR_FILE
+  $previousGitHubRegistry = $env:RELAYBRIDGE_GITHUB_REPOS
+  $previousDataDir = $env:RELAYBRIDGE_DATA_DIR
+  $previousPsDataDir = $env:PS_BRIDGE_DATA_DIR
   $errorFile = Join-Path $testRoot ('install-error-' + [Guid]::NewGuid().ToString('N') + '.txt')
   try {
     $env:RELAYBRIDGE_INSTALL_TEST_FAIL_AT = $FailAt
     $env:RELAYBRIDGE_INSTALL_TEST_ERROR_FILE = $errorFile
+    # Host-specific runtime paths must never leak into the disposable Windows
+    # fixture (especially when this script is launched through powershell.exe
+    # from WSL and inherited a /home/... override).
+    $env:RELAYBRIDGE_GITHUB_REPOS = $null
+    $env:RELAYBRIDGE_DATA_DIR = $null
+    $env:PS_BRIDGE_DATA_DIR = $null
     $arguments = @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $installer,
-      '-SourceDir', $repoRoot, '-InstallDir', $installRoot, '-SkipProviderSetup', '-SkipCliPathRegistration', '-NoBrowser', '-Port', [string]$Port)
+      '-SourceDir', $InstallSource, '-InstallDir', $TargetInstallDir, '-SkipProviderSetup', '-SkipCliPathRegistration', '-NoBrowser', '-Port', [string]$Port)
+    if ($MigrationSource) { $arguments += @('-MigrateFrom', $MigrationSource) }
     if (-not $Start) { $arguments += '-NoStart' }
     # Do not pipe or redirect the child PowerShell output. On Windows a
     # detached candidate server can inherit the pipeline/file handle, keeping
@@ -78,10 +97,16 @@ function Invoke-TestInstall([string]$FailAt = '', [switch]$Start, [int]$Port = 0
     $diagnostic = if (Test-Path -LiteralPath $errorFile -PathType Leaf) {
       [IO.File]::ReadAllText($errorFile, [Text.UTF8Encoding]::new($false)).Trim()
     } else { '' }
+    if ($exitCode -ne 0) {
+      Write-Host "[RelayBridge] Installer test diagnostic ($FailAt): $diagnostic" -ForegroundColor DarkGray
+    }
     return [pscustomobject]@{ ExitCode = $exitCode; Port = $Port; Diagnostic = $diagnostic }
   } finally {
     $env:RELAYBRIDGE_INSTALL_TEST_FAIL_AT = $previousFailAt
     $env:RELAYBRIDGE_INSTALL_TEST_ERROR_FILE = $previousErrorFile
+    $env:RELAYBRIDGE_GITHUB_REPOS = $previousGitHubRegistry
+    $env:RELAYBRIDGE_DATA_DIR = $previousDataDir
+    $env:PS_BRIDGE_DATA_DIR = $previousPsDataDir
   }
 }
 
@@ -175,8 +200,108 @@ function Test-RequiredStripEnvMigration([string]$InstalledStripEnvJson) {
   'Test-RetiredJsonNumber', 'Format-JsonScalar', 'Restore-ShippedManagedSupervisorBudget',
   'Test-ReleasePathExcluded', 'Test-SecretLikeReleasePath', 'Assert-ReleaseItemSafe',
   'Copy-ReleaseSource', 'Get-ReleaseIdentityFiles', 'Get-BridgeHealth',
-  'Test-LocalPortInUse', 'Start-StagedBridge'
+  'Test-LocalPortInUse', 'Start-StagedBridge',
+  'Move-InstallDirectoryOnce', 'Move-InstallRootForCutover',
+  'Get-BridgeShutdownProcessHandle', 'Stop-BridgeForCutover'
 ))))
+
+# Test the real no-replace primitive, then deterministic bounded retry paths.
+# Mocks live only in child scopes and cannot affect the full transaction below.
+$cutoverFixture = Join-Path $testRoot 'cutover-primitive'
+$cutoverSource = Join-Path $cutoverFixture 'source'
+$cutoverDestination = Join-Path $cutoverFixture 'destination'
+New-Item -ItemType Directory -Path $cutoverSource, $cutoverDestination -Force | Out-Null
+[IO.File]::WriteAllText((Join-Path $cutoverSource 'original'), 'source bytes')
+[IO.File]::WriteAllText((Join-Path $cutoverDestination 'original'), 'destination bytes')
+$collisionRejected = $false
+try { Move-InstallRootForCutover $cutoverSource $cutoverDestination }
+catch { $collisionRejected = $true }
+Assert-True $collisionRejected 'an existing cutover destination must reject, never nest or overwrite'
+Assert-True ([IO.File]::ReadAllText((Join-Path $cutoverSource 'original')) -ceq 'source bytes') 'collision must preserve source bytes'
+Assert-True ([IO.File]::ReadAllText((Join-Path $cutoverDestination 'original')) -ceq 'destination bytes') 'collision must preserve destination bytes'
+Assert-True (-not (Test-Path -LiteralPath (Join-Path $cutoverDestination 'source'))) 'collision must not nest the source'
+& {
+  $counter = @{ attempts = 0; pauses = 0 }
+  function Start-Sleep([int]$Milliseconds) {
+    Assert-True ($Milliseconds -eq 100) 'cutover retry pause must remain bounded'
+    $counter.pauses++
+  }
+  function Move-InstallDirectoryOnce([string]$FromRoot, [string]$ToRoot) {
+    $counter.attempts++
+    if ($counter.attempts -le 2) { throw [IO.IOException]::new('sharing violation', -2147024864) }
+    [IO.Directory]::Move($FromRoot, $ToRoot)
+  }
+  $target = Join-Path $cutoverFixture 'transient-result'
+  Move-InstallRootForCutover $cutoverSource $target
+  Assert-True ($counter.attempts -eq 3 -and $counter.pauses -eq 2) 'transient sharing retries must stop immediately on success'
+  Assert-True ([IO.File]::ReadAllText((Join-Path $target 'original')) -ceq 'source bytes') 'successful retry must preserve exact bytes'
+}
+& {
+  $counter = @{ attempts = 0; pauses = 0 }
+  function Start-Sleep([int]$Milliseconds) { $counter.pauses++ }
+  function Move-InstallDirectoryOnce([string]$FromRoot, [string]$ToRoot) {
+    $counter.attempts++
+    throw [IO.IOException]::new('persistent sharing violation', -2147024864)
+  }
+  $rejected = $false
+  try { Move-InstallRootForCutover $cutoverSource $cutoverDestination }
+  catch { $rejected = $true }
+  Assert-True ($rejected -and $counter.attempts -eq 50 -and $counter.pauses -eq 49) 'persistent sharing retries must exhaust exactly the bounded attempt count'
+}
+& {
+  $counter = @{ attempts = 0 }
+  function Start-Sleep([int]$Milliseconds) { throw 'non-sharing error must never retry' }
+  function Move-InstallDirectoryOnce([string]$FromRoot, [string]$ToRoot) {
+    $counter.attempts++
+    throw [IO.IOException]::new('access denied', -2147024891)
+  }
+  $rejected = $false
+  try { Move-InstallRootForCutover $cutoverSource $cutoverDestination }
+  catch { $rejected = $true }
+  Assert-True ($rejected -and $counter.attempts -eq 1) 'non-sharing errors must fail immediately'
+}
+& {
+  $counter = @{ attempts = 0 }
+  function Start-Sleep([int]$Milliseconds) {}
+  function Move-InstallDirectoryOnce([string]$FromRoot, [string]$ToRoot) {
+    $counter.attempts++
+    if ($counter.attempts -eq 1) {
+      New-Item -ItemType Directory -Path $ToRoot | Out-Null
+      throw [IO.IOException]::new('sharing violation before racing destination', -2147024864)
+    }
+    [IO.Directory]::Move($FromRoot, $ToRoot)
+  }
+  $source = Join-Path $cutoverFixture 'race-source'
+  $target = Join-Path $cutoverFixture 'race-destination'
+  New-Item -ItemType Directory -Path $source | Out-Null
+  [IO.File]::WriteAllText((Join-Path $source 'original'), 'racing source bytes')
+  $rejected = $false
+  try { Move-InstallRootForCutover $source $target }
+  catch { $rejected = $true }
+  Assert-True ($rejected -and $counter.attempts -eq 2) 'a destination appearing between retries must reject atomically'
+  Assert-True ([IO.File]::ReadAllText((Join-Path $source 'original')) -ceq 'racing source bytes') 'racing destination must leave source unchanged'
+  Assert-True (-not (Test-Path -LiteralPath (Join-Path $target 'race-source'))) 'racing destination must never nest the source'
+}
+Remove-Item -LiteralPath $cutoverFixture -Recurse -Force
+Write-Host '[RelayBridge] Atomic cutover collision and bounded retry tests passed.' -ForegroundColor DarkGray
+
+# Legacy enrollment is authority state. The installer must hand the original
+# post-cutover path to the hardened Node helper, never probe or copy it through
+# PowerShell (which would follow a reparse point before descriptor validation).
+$installerSource = [IO.File]::ReadAllText($installer, [Text.UTF8Encoding]::new($false))
+$migrationFunctionSource = Get-InstallerFunctionText @('Migrate-LegacyGitHubRegistry')
+Assert-True (-not $migrationFunctionSource.Contains('Test-Path -LiteralPath $LegacyFile')) 'the migration wrapper must not preflight the legacy registry'
+Assert-True ($migrationFunctionSource -notmatch '\bCopy-Item\b') 'the migration wrapper must not copy the legacy registry'
+Assert-True ($migrationFunctionSource.Contains("if (`$LegacyFile) { `$args += @('--legacy-file', `$LegacyFile) }")) 'the migration wrapper must always delegate a supplied legacy path to the hardened helper'
+Assert-True (-not $installerSource.Contains('$legacyRegistrySnapshot')) 'the installer must not create a PowerShell legacy-registry snapshot'
+Assert-True ($installerSource.Contains("Join-Path `$backupRoot 'config\github-repos.json'")) 'an existing InstallDir must be read from its rollback root after cutover'
+Assert-True ($installerSource.Contains("Join-Path `$MigrateFrom 'config\github-repos.json'")) 'an explicit MigrateFrom legacy registry must remain at its unchanged source path'
+Assert-True ($installerSource.Contains('Migrate-LegacyGitHubRegistry $InstallDir $legacyRegistrySource')) 'the post-cutover migration must use the mapped source path'
+$promotionIndex = $installerSource.IndexOf("Assert-NoInjectedInstallFailure 'after-promote'", [StringComparison]::Ordinal)
+$migrationIndex = $installerSource.IndexOf('Migrate-LegacyGitHubRegistry $InstallDir $legacyRegistrySource', $promotionIndex, [StringComparison]::Ordinal)
+$candidateStartIndex = $installerSource.IndexOf('if (-not $NoStart)', $promotionIndex, [StringComparison]::Ordinal)
+Assert-True ($promotionIndex -ge 0 -and $migrationIndex -gt $promotionIndex -and $candidateStartIndex -gt $migrationIndex) 'legacy migration must run immediately after promotion and before candidate startup'
+Write-Host '[RelayBridge] Hardened legacy-registry installer delegation passed.' -ForegroundColor DarkGray
 
 $retiredCopilot = Test-CopilotMetadataMigration '{ "credential_env": "GH_CONFIG_DIR", "credential_markers": ["hosts.yml"], "login_command": ["copilot", "/login"] }'
 Assert-True ($retiredCopilot.credential_env -ceq 'COPILOT_HOME') 'the exact retired Copilot environment variable must migrate'
@@ -254,6 +379,10 @@ if (Test-Path -LiteralPath $copyStage) { Remove-Item -LiteralPath $copyStage -Re
 foreach ($runtimeName in @('.bridge.pid', '.bridge.8787.pid', 'mcp-config.json', '.build-info.1.test.tmp', 'bridge.start.out.log')) {
   [IO.File]::WriteAllText((Join-Path $copySource $runtimeName), "runtime-only`n", [Text.UTF8Encoding]::new($false))
 }
+New-Item -ItemType Directory -Path (Join-Path $copySource 'config') -Force | Out-Null
+$legacySourceBytes = "{`"repos`": [{`"name`": `"machine/private`", `"path`": `"C:\\private\\checkout`"}]}`n"
+[IO.File]::WriteAllText((Join-Path $copySource 'config\github-repos.json'), $legacySourceBytes, [Text.UTF8Encoding]::new($false))
+[IO.File]::WriteAllText((Join-Path $copySource 'config\github-repos.example.json'), "{`"repos`": []}`n", [Text.UTF8Encoding]::new($false))
 New-Item -ItemType Directory -Path (Join-Path $copySource '.mcp-install.lock') -Force | Out-Null
 [IO.File]::WriteAllText((Join-Path $copySource '.mcp-install.lock\owner'), "runtime-lock-owner`n", [Text.UTF8Encoding]::new($false))
 Copy-ReleaseSource $copySource $copyStage
@@ -262,8 +391,12 @@ foreach ($runtimeName in @('.bridge.pid', '.bridge.8787.pid', 'mcp-config.json',
   Assert-True (-not (Test-Path -LiteralPath (Join-Path $copyStage $runtimeName))) "runtime artifact must be excluded from staging: $runtimeName"
 }
 Assert-True (-not (Test-Path -LiteralPath (Join-Path $copyStage '.mcp-install.lock'))) 'MCP registration lock directory must be excluded from release staging'
-$identityNames = @(Get-ReleaseIdentityFiles $copyStage | ForEach-Object { $_.Name })
-Assert-True ($identityNames.Count -eq 1 -and $identityNames[0] -eq 'keep.txt') 'release identity enumeration must share staging runtime exclusions'
+Assert-True (-not (Test-Path -LiteralPath (Join-Path $copyStage 'config\github-repos.json'))) 'source staging must omit exact legacy machine enrollment before reading or copying its bytes'
+Assert-True (Test-Path -LiteralPath (Join-Path $copyStage 'config\github-repos.example.json') -PathType Leaf) 'the exact exclusion must retain the similarly named tracked example'
+$identityPaths = @(Get-ReleaseIdentityFiles $copyStage | ForEach-Object {
+  $_.FullName.Substring($copyStage.Length).TrimStart('\', '/').Replace('\', '/')
+})
+Assert-True ($identityPaths.Count -eq 2 -and $identityPaths -contains 'keep.txt' -and $identityPaths -contains 'config/github-repos.example.json') 'release identity enumeration must share the exact staging exclusions'
 
 [IO.File]::WriteAllText((Join-Path $copySource '.npmrc'), "//registry.example.invalid/:_authToken=must-not-be-read`n", [Text.UTF8Encoding]::new($false))
 $secretRejected = $false
@@ -400,6 +533,165 @@ Assert-True $raceListenerCleaned 'same-build port-winner regression must clean t
 Assert-True $racePidArtifactsCleaned 'same-build port-winner regression must clean its PID artifacts'
 Write-Host '[RelayBridge] Windows exact candidate-PID rejection passed.' -ForegroundColor DarkGray
 
+# Stop-BridgeForCutover's WaitForExit-timeout and port-exhaustion branches, and
+# its authenticated-shutdown-request failure, cannot be reached deterministically
+# through a live process. Mock only the handle acquisition, health probe, port
+# probe, shutdown request, and sleep - all in child scope - so the real function
+# body still runs.
+& {
+  $counter = @{ order = @(); waitForExitCalls = 0; waitForExitMilliseconds = @(); disposeCalls = 0 }
+  $health = [pscustomobject]@{ pid = 4242; capabilityAuth = $true }
+  function Get-BridgeHealth([int]$BridgePort, [int]$TimeoutSec = 2) { $counter.order += 'health'; return $health }
+  function Test-Path { return $true }
+  function Get-Content { return ('a' * 64) }
+  function Get-BridgeShutdownProcessHandle([int]$ProcessId) {
+    $counter.order += 'capture'
+    $process = [pscustomobject]@{ Counter = $counter }
+    $process | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {
+      param($Milliseconds)
+      $this.Counter.order += 'wait'
+      $this.Counter.waitForExitCalls++
+      $this.Counter.waitForExitMilliseconds += $Milliseconds
+      return $false
+    }
+    $process | Add-Member -MemberType ScriptMethod -Name Dispose -Value {
+      $this.Counter.order += 'dispose'
+      $this.Counter.disposeCalls++
+    }
+    return $process
+  }
+  function Invoke-RestMethod { $counter.order += 'shutdown'; return '{"ok":true}' }
+  function Test-LocalPortInUse([int]$BridgePort) { $counter.order += 'portcheck'; return $false }
+  function Start-Sleep([int]$Milliseconds) { throw 'must not sleep once the listener port has closed' }
+
+  $stoppedHealth = $null
+  $threw = $false
+  $errorMessage = ''
+  try { Stop-BridgeForCutover 'C:\fake-runtime-root' 8787 ([ref]$stoppedHealth) }
+  catch { $threw = $true; $errorMessage = $_.Exception.Message }
+  Assert-True $threw 'a WaitForExit timeout after authenticated shutdown must fail cutover'
+  Assert-True ($errorMessage -match 'did not exit after authenticated shutdown') 'the WaitForExit-timeout failure must name the process that did not exit'
+  Assert-True ($null -ne $stoppedHealth -and $stoppedHealth.pid -eq 4242) 'restart evidence must be preserved even when the exit wait times out'
+  Assert-True ($counter.waitForExitCalls -eq 1 -and $counter.waitForExitMilliseconds[0] -eq 10000) 'WaitForExit must be called with the exact production timeout'
+  Assert-True ($counter.disposeCalls -eq 1) 'the captured process handle must be disposed exactly once'
+  $captureIndex = [Array]::IndexOf($counter.order, 'capture')
+  $shutdownIndex = [Array]::IndexOf($counter.order, 'shutdown')
+  $portIndex = [Array]::IndexOf($counter.order, 'portcheck')
+  $waitIndex = [Array]::IndexOf($counter.order, 'wait')
+  Assert-True ($captureIndex -ge 0 -and $captureIndex -lt $shutdownIndex) 'the process handle must be captured before authenticated shutdown is requested'
+  Assert-True ($portIndex -ge 0 -and $portIndex -lt $waitIndex) 'the process exit wait must happen only after the listener port has closed'
+}
+Write-Host '[RelayBridge] Stop-BridgeForCutover WaitForExit-timeout case passed.' -ForegroundColor DarkGray
+
+& {
+  $counter = @{ portChecks = 0; sleeps = 0; sleepMilliseconds = @(); waitForExitCalls = 0; disposeCalls = 0 }
+  $health = [pscustomobject]@{ pid = 4242; capabilityAuth = $true }
+  function Get-BridgeHealth([int]$BridgePort, [int]$TimeoutSec = 2) { return $health }
+  function Test-Path { return $true }
+  function Get-Content { return ('a' * 64) }
+  function Get-BridgeShutdownProcessHandle([int]$ProcessId) {
+    $process = [pscustomobject]@{ Counter = $counter }
+    $process | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {
+      param($Milliseconds)
+      $this.Counter.waitForExitCalls++
+      return $true
+    }
+    $process | Add-Member -MemberType ScriptMethod -Name Dispose -Value {
+      $this.Counter.disposeCalls++
+    }
+    return $process
+  }
+  function Invoke-RestMethod { return '{"ok":true}' }
+  function Test-LocalPortInUse([int]$BridgePort) { $counter.portChecks++; return $true }
+  function Start-Sleep([int]$Milliseconds) { $counter.sleeps++; $counter.sleepMilliseconds += $Milliseconds }
+
+  $stoppedHealth = $null
+  $threw = $false
+  $errorMessage = ''
+  try { Stop-BridgeForCutover 'C:\fake-runtime-root' 8787 ([ref]$stoppedHealth) }
+  catch { $threw = $true; $errorMessage = $_.Exception.Message }
+  Assert-True $threw 'exhausting every port-close attempt must fail cutover'
+  Assert-True ($errorMessage -match 'did not stop before cutover') 'the port-exhaustion failure must name the stalled bridge'
+  Assert-True ($null -ne $stoppedHealth -and $stoppedHealth.pid -eq 4242) 'restart evidence must be preserved even when the port never closes'
+  Assert-True ($counter.portChecks -eq 50 -and $counter.sleeps -eq 50) 'port-close polling must stop at exactly the bounded attempt count'
+  Assert-True (($counter.sleepMilliseconds | Where-Object { $_ -ne 100 }).Count -eq 0) 'every port-close poll must wait the exact production interval'
+  Assert-True ($counter.waitForExitCalls -eq 0) 'the process exit wait must never run once port-close polling is exhausted'
+  Assert-True ($counter.disposeCalls -eq 1) 'the captured process handle must be disposed exactly once'
+}
+Write-Host '[RelayBridge] Stop-BridgeForCutover port-exhaustion case passed.' -ForegroundColor DarkGray
+
+& {
+  $counter = @{ captured = $false; disposeCalls = 0; shutdownAttempted = $false; portChecked = $false; waitForExitCalls = 0 }
+  $health = [pscustomobject]@{ pid = 4242; capabilityAuth = $true }
+  function Get-BridgeHealth([int]$BridgePort, [int]$TimeoutSec = 2) { return $health }
+  function Test-Path { return $true }
+  function Get-Content { return ('a' * 64) }
+  function Get-BridgeShutdownProcessHandle([int]$ProcessId) {
+    $counter.captured = $true
+    $process = [pscustomobject]@{ Counter = $counter }
+    $process | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {
+      param($Milliseconds)
+      $this.Counter.waitForExitCalls++
+      return $true
+    }
+    $process | Add-Member -MemberType ScriptMethod -Name Dispose -Value {
+      $this.Counter.disposeCalls++
+    }
+    return $process
+  }
+  function Invoke-RestMethod { $counter.shutdownAttempted = $true; throw 'connection refused' }
+  function Test-LocalPortInUse([int]$BridgePort) { $counter.portChecked = $true; return $false }
+  function Start-Sleep([int]$Milliseconds) { throw 'a failed shutdown request must never wait or poll the port' }
+
+  $stoppedHealth = $null
+  $threw = $false
+  $errorMessage = ''
+  try { Stop-BridgeForCutover 'C:\fake-runtime-root' 8787 ([ref]$stoppedHealth) }
+  catch { $threw = $true; $errorMessage = $_.Exception.Message }
+  Assert-True $threw 'a failed authenticated shutdown request must fail cutover'
+  Assert-True ($errorMessage -match 'Could not stop the RelayBridge') 'the shutdown-request failure must name the token/root mismatch cause'
+  Assert-True ($counter.captured) 'the process handle must still be captured before the shutdown request is attempted'
+  Assert-True ($counter.shutdownAttempted) 'the authenticated shutdown request must be attempted'
+  Assert-True ($null -eq $stoppedHealth) 'no restart evidence may be recorded when the shutdown request itself fails'
+  Assert-True (-not $counter.portChecked) 'a failed shutdown request must never poll the port'
+  Assert-True ($counter.waitForExitCalls -eq 0) 'a failed shutdown request must never wait on the process'
+  Assert-True ($counter.disposeCalls -eq 1) 'the captured process handle must be disposed exactly once'
+}
+Write-Host '[RelayBridge] Stop-BridgeForCutover authenticated-shutdown-failure case passed.' -ForegroundColor DarkGray
+
+& {
+  $counter = @{ waitForExitCalls = 0; waitForExitMilliseconds = @(); disposeCalls = 0; portChecks = 0 }
+  $health = [pscustomobject]@{ pid = 4242; capabilityAuth = $true; buildId = '2.0.1+cccccccccccccccc' }
+  function Get-BridgeHealth([int]$BridgePort, [int]$TimeoutSec = 2) { return $health }
+  function Test-Path { return $true }
+  function Get-Content { return ('a' * 64) }
+  function Get-BridgeShutdownProcessHandle([int]$ProcessId) {
+    $process = [pscustomobject]@{ Counter = $counter }
+    $process | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {
+      param($Milliseconds)
+      $this.Counter.waitForExitCalls++
+      $this.Counter.waitForExitMilliseconds += $Milliseconds
+      return $true
+    }
+    $process | Add-Member -MemberType ScriptMethod -Name Dispose -Value {
+      $this.Counter.disposeCalls++
+    }
+    return $process
+  }
+  function Invoke-RestMethod { return '{"ok":true}' }
+  function Test-LocalPortInUse([int]$BridgePort) { $counter.portChecks++; return $false }
+  function Start-Sleep([int]$Milliseconds) { throw 'must not sleep once the listener port has closed' }
+
+  $stoppedHealth = $null
+  $result = Stop-BridgeForCutover 'C:\fake-runtime-root' 8787 ([ref]$stoppedHealth)
+  Assert-True ($null -ne $result -and $result.pid -eq 4242 -and $result.buildId -eq '2.0.1+cccccccccccccccc') 'a clean shutdown must return the pre-cutover health snapshot'
+  Assert-True ($null -ne $stoppedHealth -and $stoppedHealth.pid -eq $result.pid -and $stoppedHealth.buildId -eq $result.buildId) 'StoppedHealth must record the identical snapshot returned to the caller'
+  Assert-True ($counter.waitForExitCalls -eq 1 -and $counter.waitForExitMilliseconds[0] -eq 10000) 'WaitForExit must be called with the exact production timeout'
+  Assert-True ($counter.disposeCalls -eq 1) 'the captured process handle must be disposed exactly once'
+  Assert-True ($counter.portChecks -ge 1) 'a clean shutdown must still confirm the listener port has closed'
+}
+Write-Host '[RelayBridge] Stop-BridgeForCutover clean-exit success case passed.' -ForegroundColor DarkGray
+
 if ($SafetyOnly) {
   if (Test-Path -LiteralPath $testRoot) { Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue }
   Write-Host '[RelayBridge] Windows install safety-only tests passed.' -ForegroundColor Green
@@ -408,6 +700,27 @@ if ($SafetyOnly) {
 
 New-Item -ItemType Directory -Path (Join-Path $installRoot 'data\receipts'), (Join-Path $installRoot 'config') -Force | Out-Null
 try {
+  # The new no-start migration cases need the real migration implementation but
+  # not a second copy of the release's five-minute native suite. This canonical
+  # source fixture still traverses the complete installer/stage/cutover path;
+  # its locked test script is intentionally minimal.
+  $migrationFixtureSource = Join-Path $testRoot 'migration-source-fixture'
+  New-Item -ItemType Directory -Path (Join-Path $migrationFixtureSource 'lib'), (Join-Path $migrationFixtureSource 'tools') -Force | Out-Null
+  Copy-Item -LiteralPath (Join-Path $repoRoot 'lib\github-tracker.js') -Destination (Join-Path $migrationFixtureSource 'lib\github-tracker.js')
+  Copy-Item -LiteralPath (Join-Path $repoRoot 'lib\platform.js') -Destination (Join-Path $migrationFixtureSource 'lib\platform.js')
+  Copy-Item -LiteralPath (Join-Path $repoRoot 'tools\migrate-github-registry.cjs') -Destination (Join-Path $migrationFixtureSource 'tools\migrate-github-registry.cjs')
+  New-Item -ItemType Directory -Path (Join-Path $migrationFixtureSource 'config') -Force | Out-Null
+  Copy-Item -LiteralPath (Join-Path $repoRoot 'cli-config.json') -Destination (Join-Path $migrationFixtureSource 'cli-config.json')
+  Copy-Item -LiteralPath (Join-Path $repoRoot 'config\routing-policy.json') -Destination (Join-Path $migrationFixtureSource 'config\routing-policy.json')
+  $migrationFixturePackage = @'
+{"name":"relaybridge-migration-fixture","version":"2.0.1","private":true,"scripts":{"test":"node -e \"process.exit(0)\""}}
+'@
+  $migrationFixtureLock = @'
+{"name":"relaybridge-migration-fixture","version":"2.0.1","lockfileVersion":3,"requires":true,"packages":{"":{"name":"relaybridge-migration-fixture","version":"2.0.1"}}}
+'@
+  [IO.File]::WriteAllText((Join-Path $migrationFixtureSource 'package.json'), ($migrationFixturePackage.Trim() + "`n"), [Text.UTF8Encoding]::new($false))
+  [IO.File]::WriteAllText((Join-Path $migrationFixtureSource 'package-lock.json'), ($migrationFixtureLock.Trim() + "`n"), [Text.UTF8Encoding]::new($false))
+
   $legacyServer = @'
 'use strict';
 const fs = require('fs');
@@ -417,7 +730,7 @@ const port = Number(process.env.PORT);
 const server = http.createServer((req, res) => {
   if (req.method === 'GET' && req.url === '/api/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ version: '2.0.0', capabilityAuth: true }));
+    return res.end(JSON.stringify({ version: '2.0.0', capabilityAuth: true, pid: process.pid }));
   }
   if (req.method === 'POST' && req.url === '/api/admin/shutdown' && req.headers['x-relaybridge-token'] === token) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -493,10 +806,35 @@ server.listen(port, '127.0.0.1');
   [IO.File]::WriteAllText((Join-Path $installRoot 'cli-config.json'), (($operatorConfig | ConvertTo-Json -Depth 20) + "`n"), [Text.UTF8Encoding]::new($false))
   $operatorRouting = [ordered]@{ taskPriorities = [ordered]@{ general = @('custom_provider') }; operatorNote = 'preserve me' }
   [IO.File]::WriteAllText((Join-Path $installRoot 'config\routing-policy.json'), (($operatorRouting | ConvertTo-Json -Depth 20) + "`n"), [Text.UTF8Encoding]::new($false))
+  $legacyGitHubRegistry = [ordered]@{
+    repos = @([ordered]@{
+      name = 'owner/repository'
+      path = $installRoot
+      autoCommit = $true
+      autoPush = $false
+      dryRun = $true
+      trackingMode = 'checkpoint-on-branch'
+    })
+  }
+  $legacyGitHubRegistryBytes = ($legacyGitHubRegistry | ConvertTo-Json -Depth 10) + "`n"
+  $legacyGitHubRegistryPath = Join-Path $installRoot 'config\github-repos.json'
+  [IO.File]::WriteAllText($legacyGitHubRegistryPath, $legacyGitHubRegistryBytes, [Text.UTF8Encoding]::new($false))
+
+  # A helper rejection occurs after the old tree has been renamed and the new
+  # release promoted. It must still restore every old byte and must never leave
+  # a partially-created runtime registry behind.
+  [IO.File]::WriteAllText($legacyGitHubRegistryPath, "{ definitely not JSON`n", [Text.UTF8Encoding]::new($false))
+  $beforeMigrationFailure = Get-TreeFingerprint $installRoot
+  $migrationFailed = Invoke-TestInstall -InstallSource $migrationFixtureSource
+  Assert-True ($migrationFailed.ExitCode -ne 0) 'invalid legacy enrollment must fail the promoted installation'
+  Assert-True ((Get-TreeFingerprint $installRoot) -eq $beforeMigrationFailure) 'migration rejection must roll the promoted tree back byte-for-byte'
+  Assert-True (-not (Test-Path -LiteralPath (Join-Path $installRoot 'data\github-repos.json'))) 'migration rejection must not leave runtime enrollment behind'
+  [IO.File]::WriteAllText($legacyGitHubRegistryPath, $legacyGitHubRegistryBytes, [Text.UTF8Encoding]::new($false))
 
   $before = Get-TreeFingerprint $installRoot
-  $renameFailed = Invoke-TestInstall 'after-old-rename'
+  $renameFailed = Invoke-TestInstall 'after-old-rename' -InstallSource $migrationFixtureSource
   Assert-True ($renameFailed.ExitCode -ne 0) 'the injected post-rename failure must fail the installer'
+  Assert-True ($renameFailed.Diagnostic -match [Regex]::Escape('Injected installer failure at after-old-rename')) 'post-rename rollback regression must prove staging succeeded and reached its injected checkpoint'
   Assert-True ((Get-TreeFingerprint $installRoot) -eq $before) 'rollback must restore the old root when candidate promotion never completes'
 
   $legacyPort = Get-FreePort
@@ -513,8 +851,9 @@ server.listen(port, '127.0.0.1');
   }
   Assert-True ($legacyHealth.version -eq '2.0.0') 'legacy fixture must be healthy before cutover'
 
-  $failed = Invoke-TestInstall 'after-promote' -Port $legacyPort
+  $failed = Invoke-TestInstall 'after-promote' -Port $legacyPort -InstallSource $migrationFixtureSource
   Assert-True ($failed.ExitCode -ne 0) 'the injected post-promotion failure must fail the installer'
+  Assert-True ($failed.Diagnostic -match [Regex]::Escape('Injected installer failure at after-promote')) 'post-promotion rollback regression must prove staging and promotion reached the injected checkpoint'
   Assert-True ((Get-TreeFingerprint $installRoot) -eq $before) 'automatic rollback must restore retained release/runtime files byte-for-byte'
   $restoredHealth = Invoke-RestMethod -Uri "http://127.0.0.1:$legacyPort/api/health" -TimeoutSec 3 -UseBasicParsing
   Assert-True ($restoredHealth.version -eq '2.0.0') 'rollback must restart a pre-buildId RelayBridge by its legacy version'
@@ -531,8 +870,14 @@ server.listen(port, '127.0.0.1');
   $startedPort = $success.Port
   Assert-True (Test-Path -LiteralPath (Join-Path $installRoot 'server.js') -PathType Leaf) 'new server.js must be promoted'
   Assert-True (Test-Path -LiteralPath (Join-Path $installRoot 'relaybridge.cmd') -PathType Leaf) 'Windows CLI shim must be promoted'
-  $cliHelp = & (Join-Path $installRoot 'relaybridge.cmd') --help 2>&1 | Out-String
-  Assert-True ($LASTEXITCODE -eq 0) 'promoted Windows CLI shim must execute successfully'
+  # WSL may launch this harness from a UNC checkout. cmd.exe cannot use that
+  # cwd, while the promoted application intentionally lives on native Windows.
+  Push-Location -LiteralPath $installRoot
+  try {
+    $cliHelp = & (Join-Path $installRoot 'relaybridge.cmd') --help 2>&1 | Out-String
+    $cliHelpExitCode = $LASTEXITCODE
+  } finally { Pop-Location }
+  Assert-True ($cliHelpExitCode -eq 0) 'promoted Windows CLI shim must execute successfully'
   Assert-True ($cliHelp -match 'relaybridge status') 'promoted Windows CLI shim must invoke bin/relaybridge.js'
 
   $pathHelper = Join-Path $installRoot 'tools\register-cli-path.ps1'
@@ -545,6 +890,12 @@ server.listen(port, '127.0.0.1');
   Assert-True (-not (Test-Path -LiteralPath (Join-Path $installRoot 'stale-code.js'))) 'stale release files must not survive promotion'
   Assert-True ((Get-Content -LiteralPath (Join-Path $installRoot '.bridge-token') -Raw).Trim() -eq ('a' * 64)) 'capability token bytes must be preserved'
   Assert-True (Test-Path -LiteralPath (Join-Path $installRoot 'data\receipts\preserved.jsonl')) 'retained data must be preserved'
+  Assert-True (-not (Test-Path -LiteralPath (Join-Path $installRoot 'config\github-repos.json'))) 'legacy machine-specific enrollment must not be copied back into release config'
+  $migratedGitHubRegistryPath = Join-Path $installRoot 'data\github-repos.json'
+  Assert-True (Test-Path -LiteralPath $migratedGitHubRegistryPath -PathType Leaf) 'legacy enrollment must migrate into preserved runtime data'
+  $migratedGitHubRegistry = [IO.File]::ReadAllText($migratedGitHubRegistryPath, [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
+  Assert-True ($migratedGitHubRegistry.repos[0].name -eq 'owner/repository') 'migration must read the old enrollment from backupRoot after InstallDir was renamed'
+  Assert-True ($migratedGitHubRegistry.repos[0].path -eq $installRoot) 'migration must preserve the native checkout path'
 
   $merged = [IO.File]::ReadAllText((Join-Path $installRoot 'cli-config.json'), [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
   Assert-True ($merged._comment -eq "operator-owned config $emDash UTF-8 survives every merge") 'operator UTF-8 text must survive config merge byte-exactly'
@@ -556,12 +907,34 @@ server.listen(port, '127.0.0.1');
   Assert-True ($null -eq $merged.cursor.PSObject.Properties['model_tiers_locked']) 'the draft-added lock must not survive as a fake operator override'
   Assert-True ($merged.cursor.model_tiers_mode -eq 'account_default') 'the release must record why Cursor has no named-model tiers'
   Assert-True ($merged.claude.model_tiers.standard.model -eq 'operator-custom-model') 'a genuinely custom locked operator tier must still be preserved'
-  foreach ($providerName in @('claude', 'claude_fable')) {
-    foreach ($slotName in @('safe', 'dangerous', 'oneshot_safe', 'oneshot_dangerous')) {
-      $slotArgs = @($merged.$providerName.$slotName)
-      $effortIndex = [Array]::IndexOf($slotArgs, '--effort')
-      Assert-True ($effortIndex -ge 0 -and $slotArgs[$effortIndex + 1] -eq 'high') "$providerName.$slotName must migrate legacy maximum effort to the shipped safe baseline"
+  $shippedConfig = [IO.File]::ReadAllText((Join-Path $repoRoot 'cli-config.json'), [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
+  $managedProviderArgs = $shippedConfig._config_merge.managed_provider_args
+  Assert-True ($managedProviderArgs.PSObject.Properties.Name.Count -gt 0) 'shipped managed_provider_args must declare at least one managed provider so this assertion cannot vacuously pass'
+  $managedMappingCount = 0
+  foreach ($providerSpec in $managedProviderArgs.PSObject.Properties) {
+    $providerName = $providerSpec.Name
+    foreach ($slotName in @($providerSpec.Value.slots)) {
+      foreach ($argSpec in @($providerSpec.Value.args)) {
+        $flag = [string]$argSpec.flag
+        $valueCount = [int]$argSpec.value_count
+        $shippedSlotArgs = @($shippedConfig.$providerName.$slotName)
+        $shippedFlagIndex = [Array]::IndexOf($shippedSlotArgs, $flag)
+        Assert-True ($shippedFlagIndex -ge 0) "shipped $providerName.$slotName must declare managed flag $flag"
+        $expectedValues = @($shippedSlotArgs[($shippedFlagIndex + 1)..($shippedFlagIndex + $valueCount)])
+        $mergedSlotArgs = @($merged.$providerName.$slotName)
+        $mergedFlagIndex = [Array]::IndexOf($mergedSlotArgs, $flag)
+        Assert-True ($mergedFlagIndex -ge 0) "$providerName.$slotName must retain managed flag $flag after migration"
+        $actualValues = @($mergedSlotArgs[($mergedFlagIndex + 1)..($mergedFlagIndex + $valueCount)])
+        Assert-True ((($actualValues -join ',') -ceq ($expectedValues -join ','))) "$providerName.$slotName must migrate managed flag $flag to this release's exact shipped value"
+        $managedMappingCount++
+      }
     }
+  }
+  Assert-True ($managedMappingCount -ge 6) 'derived managed provider-argument mappings must cover every declared managed slot, not vacuously pass on an empty fixture'
+  foreach ($unmanagedSlotName in @('dangerous', 'oneshot_dangerous')) {
+    $unmanagedSlotArgs = @($merged.claude_fable.$unmanagedSlotName)
+    $unmanagedEffortIndex = [Array]::IndexOf($unmanagedSlotArgs, '--effort')
+    Assert-True ($unmanagedEffortIndex -ge 0 -and $unmanagedSlotArgs[$unmanagedEffortIndex + 1] -eq 'max') "claude_fable.$unmanagedSlotName is unmanaged and must retain the installed fixture effort value"
   }
   Assert-True ($merged.claude.safe[[Array]::IndexOf(@($merged.claude.safe), '--model') + 1] -eq 'operator-claude-model') 'managed-argument migration must preserve an operator model choice'
   Assert-True (@($merged.claude.safe) -contains '--operator-flag') 'managed-argument migration must preserve unrelated operator flags'
@@ -572,7 +945,6 @@ server.listen(port, '127.0.0.1');
   Assert-True ((Test-ExactJsonStringArray $merged.copilot.credential_markers @('config.json'))) 'the installed retired Copilot marker must migrate end-to-end'
   Assert-True ((Test-ExactJsonStringArray $merged.copilot.login_command @('copilot', 'login'))) 'the installed retired Copilot login command must migrate end-to-end'
   Assert-True ($merged.copilot.linked_accounts_supported -eq $false) 'upgrades must disable unsafe profile-only Copilot account pooling'
-  $shippedConfig = [IO.File]::ReadAllText((Join-Path $repoRoot 'cli-config.json'), [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
   foreach ($providerName in @('claude', 'claude_fable', 'codex', 'copilot')) {
     foreach ($requiredName in @($shippedConfig.$providerName.strip_env)) {
       Assert-True (@($merged.$providerName.strip_env) -contains $requiredName) "$providerName must gain required identity exclusion $requiredName on upgrade"
@@ -598,6 +970,42 @@ server.listen(port, '127.0.0.1');
     Start-Sleep -Milliseconds 100
   }
   $startedPort = 0
+
+  # Exercise the distinct-root migration contract end to end. Runtime files
+  # move into the new install, while the legacy config remains at the unchanged
+  # MigrateFrom path long enough for the post-promotion helper to read it.
+  $migrateFromRoot = Join-Path $testRoot 'LegacySource'
+  $migrateTargetRoot = Join-Path $testRoot 'MigratedRelayBridge'
+  New-Item -ItemType Directory -Path (Join-Path $migrateFromRoot 'config'), (Join-Path $migrateFromRoot 'data\receipts') -Force | Out-Null
+  [IO.File]::WriteAllText((Join-Path $migrateFromRoot 'old-code.txt'), "old source remains`n", [Text.UTF8Encoding]::new($false))
+  [IO.File]::WriteAllText((Join-Path $migrateFromRoot '.bridge-token'), (('b' * 64) + "`n"), [Text.UTF8Encoding]::new($false))
+  [IO.File]::WriteAllText((Join-Path $migrateFromRoot 'data\receipts\from-old.jsonl'), "{`"receiptId`":`"migrated`"}`n", [Text.UTF8Encoding]::new($false))
+  $migrateFromRegistry = [ordered]@{
+    repos = @([ordered]@{
+      name = 'owner/migrate-from'
+      path = $migrateFromRoot
+      autoPush = $false
+      trackingMode = 'checkpoint-on-branch'
+    })
+  }
+  $migrateFromRegistryBytes = ($migrateFromRegistry | ConvertTo-Json -Depth 10) + "`n"
+  $migrateFromRegistryPath = Join-Path $migrateFromRoot 'config\github-repos.json'
+  [IO.File]::WriteAllText($migrateFromRegistryPath, $migrateFromRegistryBytes, [Text.UTF8Encoding]::new($false))
+
+  $migrateFromResult = Invoke-TestInstall -TargetInstallDir $migrateTargetRoot -MigrationSource $migrateFromRoot -InstallSource $migrationFixtureSource
+  if ($migrateFromResult.ExitCode -ne 0) {
+    throw "MigrateFrom installer case failed with exit code $($migrateFromResult.ExitCode). $($migrateFromResult.Diagnostic)"
+  }
+  Assert-True (Test-Path -LiteralPath (Join-Path $migrateFromRoot 'old-code.txt') -PathType Leaf) 'MigrateFrom must leave the old code tree in place'
+  Assert-True ([IO.File]::ReadAllText($migrateFromRegistryPath, [Text.UTF8Encoding]::new($false)) -eq $migrateFromRegistryBytes) 'MigrateFrom must read legacy enrollment from its unchanged source path without modifying it'
+  Assert-True (-not (Test-Path -LiteralPath (Join-Path $migrateFromRoot '.bridge-token'))) 'MigrateFrom must move the capability token out of the old root'
+  Assert-True (-not (Test-Path -LiteralPath (Join-Path $migrateFromRoot 'data'))) 'MigrateFrom must move runtime data out of the old root'
+  Assert-True ((Get-Content -LiteralPath (Join-Path $migrateTargetRoot '.bridge-token') -Raw).Trim() -eq ('b' * 64)) 'MigrateFrom must preserve capability-token bytes in the new root'
+  Assert-True (Test-Path -LiteralPath (Join-Path $migrateTargetRoot 'data\receipts\from-old.jsonl') -PathType Leaf) 'MigrateFrom must preserve receipt data in the new root'
+  Assert-True (-not (Test-Path -LiteralPath (Join-Path $migrateTargetRoot 'config\github-repos.json'))) 'MigrateFrom must not copy machine enrollment back into release config'
+  $migrateFromRuntimeRegistry = [IO.File]::ReadAllText((Join-Path $migrateTargetRoot 'data\github-repos.json'), [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
+  Assert-True ($migrateFromRuntimeRegistry.repos[0].name -eq 'owner/migrate-from') 'MigrateFrom must migrate unchanged-source enrollment into target runtime state'
+
   Assert-True (Test-Path -LiteralPath (Join-Path $installRoot 'node_modules\express') -PathType Container) 'locked dependencies must be staged before promotion'
   Assert-True ((Get-ChildItem -LiteralPath $testRoot -Directory | Where-Object { $_.Name -match '\.(stage|rollback|failed)\.' }).Count -eq 0) 'temporary release directories must be cleaned'
 

@@ -1,0 +1,4 @@
+{
+  "_comment": "Live enrollment is machine-specific runtime state. Add repositories with the dashboard or MCP onboarding tool; RelayBridge stores them in data/github-repos.json by default.",
+  "repos": []
+}

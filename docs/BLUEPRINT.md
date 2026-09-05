@@ -14,7 +14,7 @@ prompt** at peak token efficiency. One principle drives everything:
 | **Skill** | Full on-demand playbook (SKILL.md + reference.md) | `skills/relaybridge/`, installed to `~/.claude/skills/relaybridge/` | Only when a task touches delegation — costs zero tokens otherwise |
 | **MCP** | 35+ typed tools + `psbridge://` resources over stdio | `mcp/server.mjs`, registered by `install-mcp.ps1` into Codex + Claude | When the host lists tools; call `get_context_bundle` first |
 | **Plugin surface** | Dashboard panels (terminals, 📡 Broadcast, 🧩 Agents, 🐙 GitHub) + REST | `public/index.html`, `http://127.0.0.1:8787` | Human-driven |
-| **Connectors** | Provider seats (Claude, Codex, Copilot, Cursor, Gemini, Grok, Perplexity, Ollama) + the GitHub integration (`gh`-backed) | `cli-config.json`, `config/github-repos.json` | Per delegated call |
+| **Connectors** | Provider seats (Claude, Codex, Copilot, Cursor, Gemini, Grok, Perplexity, Ollama) + the GitHub integration (`gh`-backed) | `cli-config.json`, ignored `data/github-repos.json` | Per delegated call |
 
 **Install order (one time per machine):**
 
@@ -75,7 +75,7 @@ committee-review principle.
 
 ## GitHub layer (work is tracked as a side effect)
 
-Enrolled repos (`config/github-repos.json`) get automatic per-run checkpoint
+Enrolled repos (`data/github-repos.json`, or `RELAYBRIDGE_GITHUB_REPOS`) get automatic per-run checkpoint
 commits, DEVLOG entries, draft PRs, and bump labels; the repo-side Actions own
 assignment, duplicate-work warnings, and real `vX.Y.Z` tags on merge. Tag
 prompts with `#issue` and `bump:level`. New repos: `github_onboard_repo` — one
