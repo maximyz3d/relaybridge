@@ -120,6 +120,12 @@ test('completed persisted committee emits before bounded cleanup and cannot stra
   assert.deepEqual(terminated, [4242]);
   assert.equal(outcome.cleanup.clientClose.settled, false);
   assert.equal(outcome.cleanup.transportClose.settled, false);
+  const { routeTask } = await import('../mcp/router.mjs');
+  const committeeRequest = harness.calls.find((call) => call.name === 'run_committee').arguments;
+  const route = routeTask({ task: committeeRequest.task, preferredProviders: committeeRequest.providers,
+    diagnostics: { ollama_fast: { found: true, ready: true }, ollama_coder: { found: true, ready: true } } });
+  assert.equal(route.classification.tier, 'utility', 'default smoke respects the fast seat ceiling');
+  for (const kind of committeeRequest.providers) assert.equal(route.candidates.find((candidate) => candidate.kind === kind).eligible, true);
 });
 
 test('requested failed committee exits nonzero even when top-level tool ok is true', async () => {

@@ -319,7 +319,7 @@ export async function runSmoke({
     if (includeCommittee) {
       phase = 'run_committee';
       results.committee = await call('run_committee', {
-        task: 'Review the JavaScript expression a == null and state one benefit and one limitation.',
+        task: 'State one benefit and one limitation of bounded delegation.',
         providers: [...expectedCommitteeProviders],
         maxProviders: expectedCommitteeProviders.length,
         localOnly: true,
