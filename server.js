@@ -5294,7 +5294,6 @@ async function executeOneShot(body, res) {
         cleaned_output_unavailable_reason: !cleanedStdout
           ? (parsedOutput.parseError ? 'incomplete_or_malformed_terminal_result' : 'terminal_result_had_no_clean_text')
           : null,
-        graceful_finalization: { ...gracefulFinalization },
         writer_diff_summary: collectWriterDiffSummary(),
       } : {}),
       graceful_finalization: tokenBudgetExceeded || gracefulFinalization.requested

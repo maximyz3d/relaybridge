@@ -86,6 +86,24 @@ test('redaction is bounded before credential regexes scan large model text', () 
   assert.doesNotMatch(checkpoint.text, /tail-secret/);
 });
 
+test('a bounded tail that starts inside a private-key block fails closed', () => {
+  const syntheticKeyBody = 'SYNTHETICKEYMATERIAL'.repeat(4000);
+  const checkpoint = extractClaudeAssistantCheckpoint([{
+    type: 'assistant',
+    message: { id: 'bounded-key', content: [{ type: 'text', text: [
+      'safe prefix',
+      '-----BEGIN TEST PRIVATE KEY-----',
+      syntheticKeyBody,
+      '-----END TEST PRIVATE KEY-----',
+      'safe suffix',
+    ].join('\n') }] },
+  }], 1024);
+
+  assert.equal(checkpoint.truncated, true);
+  assert.match(checkpoint.text, /^\[REDACTED_PRIVATE_KEY\]\nsafe suffix$/);
+  assert.doesNotMatch(checkpoint.text, /SYNTHETICKEYMATERIAL|BEGIN TEST PRIVATE KEY|END TEST PRIVATE KEY/);
+});
+
 test('no assistant text yields explicit unavailable metadata', () => {
   const checkpoint = extractClaudeAssistantCheckpoint([
     { type: 'assistant', message: { id: 'm1', content: [{ type: 'tool_use', input: { secret: 'nope' } }] } },

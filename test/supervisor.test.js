@@ -260,6 +260,45 @@ test('provider token reserve requests finalization once without weakening the ha
   assert.equal(s.snapshot(T0 + 4000).finalizationRequested.threshold, 9000);
 });
 
+test('hard stop guards take precedence over a finalization reserve on the same tick', async (t) => {
+  const reserveOptions = {
+    providerBudget: {
+      maxOutputTokens: null, maxTotalTokens: 10000, maxCacheReadTokens: null,
+      maxCacheCreationTokens: null, maxTurns: null,
+    },
+    providerBudgetFinalizationReserve: {
+      maxOutputTokens: 0, maxTotalTokens: 2000,
+      maxCacheReadTokens: 0, maxCacheCreationTokens: 0,
+    },
+  };
+  const atReserve = (supervisor) => {
+    supervisor.recordProviderUsage({ total_tokens: 9000 }, { phase: 'incremental' });
+    return supervisor;
+  };
+
+  await t.test('output cap', () => {
+    const s = atReserve(make({ ...reserveOptions, maxOutputBytes: 32 }));
+    s.recordOutput('unique output beyond the configured byte ceiling', T0 + 1000);
+    assert.equal(s.evaluate(T0 + 1000).reason, 'output_cap');
+  });
+
+  await t.test('hard cap', () => {
+    const s = atReserve(make({ ...reserveOptions, idleMs: 1000, hardCapMs: 1000 }));
+    assert.equal(s.evaluate(T0 + 1000).reason, 'hard_cap');
+  });
+
+  await t.test('repeat loop', () => {
+    const s = atReserve(make({ ...reserveOptions, loopRepeatThreshold: 2 }));
+    s.recordOutput('same synthetic repeated line\nsame synthetic repeated line\n', T0 + 1000);
+    assert.equal(s.evaluate(T0 + 1000).reason, 'loop_detected');
+  });
+
+  await t.test('idle stall', () => {
+    const s = atReserve(make({ ...reserveOptions, idleMs: 1000 }));
+    assert.equal(s.evaluate(T0 + 1000).reason, 'idle_stall');
+  });
+});
+
 test('terminal usage never requests a pointless finalization turn', () => {
   const s = make({ providerBudget: {
     maxOutputTokens: null, maxTotalTokens: 10000, maxCacheReadTokens: null,

@@ -80,3 +80,19 @@ test('non-repository writer summary fails closed', () => {
   assert.equal(summary.available, false);
   assert.equal(summary.changedFileCount, 0);
 });
+
+test('writer snapshot treats control-shaped workspace text as one git path argument', (t) => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-writer-path-'));
+  t.after(() => fs.rmSync(parent, { recursive: true, force: true }));
+  const cwd = path.join(parent, 'repo\n--help');
+  fs.mkdirSync(cwd);
+  git(cwd, 'init', '-q');
+  git(cwd, 'config', 'user.email', 'test@example.invalid');
+  git(cwd, 'config', 'user.name', 'Relay Test');
+  fs.writeFileSync(path.join(cwd, 'local.txt'), 'synthetic\n');
+
+  const snapshot = captureWriterWorkspaceSnapshot(cwd);
+  assert.equal(snapshot.available, true);
+  assert.equal(snapshot.entries.get('local.txt'), '??');
+  assert.equal(snapshot.fingerprintFileCount, 1);
+});
