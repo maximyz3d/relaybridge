@@ -165,7 +165,10 @@ if (startupIdentityBarrier) {
     if (child.exitCode !== null) throw new Error(`bridge exited before module barrier (${child.exitCode})\n${output}`);
     return fs.existsSync(barrierReady);
   });
-  fs.appendFileSync(path.join(root, 'lib', 'task-queue.js'), '\n// changed after initial identity\n');
+  // Add covered source that no module loader can concurrently read. Mutating
+  // task-queue.js here raced the parallel ESM graph and could instead trip the
+  // earlier per-file stability guard, obscuring this final-gate regression.
+  write(path.join(root, 'startup-identity-mutation.txt'), 'changed after initial identity\n');
   write(barrierRelease, 'release');
 
   const exitCode = await new Promise((resolve, reject) => {
