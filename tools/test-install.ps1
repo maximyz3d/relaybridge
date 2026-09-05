@@ -56,13 +56,15 @@ function Test-ProcessRunning([int]$ProcessId) {
   } catch { return $false }
 }
 
-function Invoke-TestInstall([string]$FailAt = '', [switch]$Start, [int]$Port = 0) {
+function Invoke-TestInstall([string]$FailAt = '', [switch]$Start, [int]$Port = 0, [switch]$FailRollbackCleanup) {
   if (-not $Port) { $Port = Get-FreePort }
   $previousFailAt = $env:RELAYBRIDGE_INSTALL_TEST_FAIL_AT
+  $previousFailRollbackCleanup = $env:RELAYBRIDGE_INSTALL_TEST_FAIL_ROLLBACK_CLEANUP
   $previousErrorFile = $env:RELAYBRIDGE_INSTALL_TEST_ERROR_FILE
   $errorFile = Join-Path $testRoot ('install-error-' + [Guid]::NewGuid().ToString('N') + '.txt')
   try {
     $env:RELAYBRIDGE_INSTALL_TEST_FAIL_AT = $FailAt
+    $env:RELAYBRIDGE_INSTALL_TEST_FAIL_ROLLBACK_CLEANUP = if ($FailRollbackCleanup) { '1' } else { $null }
     $env:RELAYBRIDGE_INSTALL_TEST_ERROR_FILE = $errorFile
     $arguments = @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $installer,
       '-SourceDir', $repoRoot, '-InstallDir', $installRoot, '-SkipProviderSetup', '-SkipCliPathRegistration', '-NoBrowser', '-Port', [string]$Port)
@@ -81,6 +83,7 @@ function Invoke-TestInstall([string]$FailAt = '', [switch]$Start, [int]$Port = 0
     return [pscustomobject]@{ ExitCode = $exitCode; Port = $Port; Diagnostic = $diagnostic }
   } finally {
     $env:RELAYBRIDGE_INSTALL_TEST_FAIL_AT = $previousFailAt
+    $env:RELAYBRIDGE_INSTALL_TEST_FAIL_ROLLBACK_CLEANUP = $previousFailRollbackCleanup
     $env:RELAYBRIDGE_INSTALL_TEST_ERROR_FILE = $previousErrorFile
   }
 }
@@ -516,11 +519,20 @@ server.listen(port, '127.0.0.1');
   }
   Assert-True ($legacyHealth.version -eq '2.0.0') 'legacy fixture must be healthy before cutover'
 
-  $failed = Invoke-TestInstall 'after-promote' -Port $legacyPort
+  $failed = Invoke-TestInstall 'after-promote' -Port $legacyPort -FailRollbackCleanup
   Assert-True ($failed.ExitCode -ne 0) 'the injected post-promotion failure must fail the installer'
+  Assert-True ($failed.Diagnostic -match 'Injected installer failure at after-promote') 'post-promotion failure diagnostics must prove the injected failure stage'
+  Assert-True ($failed.Diagnostic -match 'failed release cleanup deferred: Injected rollback cleanup failure') 'rollback diagnostics must retain a non-fatal failed-release cleanup warning'
   Assert-True ((Get-TreeFingerprint $installRoot) -eq $before) 'automatic rollback must restore retained release/runtime files byte-for-byte'
-  $restoredHealth = Invoke-RestMethod -Uri "http://127.0.0.1:$legacyPort/api/health" -TimeoutSec 3 -UseBasicParsing
+  try {
+    $restoredHealth = Invoke-RestMethod -Uri "http://127.0.0.1:$legacyPort/api/health" -TimeoutSec 3 -UseBasicParsing
+  } catch {
+    throw "rollback did not restore the legacy health endpoint. Installer diagnostics:`n$($failed.Diagnostic)"
+  }
   Assert-True ($restoredHealth.version -eq '2.0.0') 'rollback must restart a pre-buildId RelayBridge by its legacy version'
+  $failedRecoveryRoots = @(Get-ChildItem -LiteralPath $testRoot -Directory | Where-Object { $_.Name -like 'RelayBridge.failed.*' })
+  Assert-True ($failedRecoveryRoots.Count -eq 1) 'a failed-release cleanup warning must preserve exactly one quarantined recovery tree'
+  Remove-Item -LiteralPath $failedRecoveryRoots[0].FullName -Recurse -Force
   $legacyToken = (Get-Content -LiteralPath (Join-Path $installRoot '.bridge-token') -Raw).Trim()
   Invoke-RestMethod -Uri "http://127.0.0.1:$legacyPort/api/admin/shutdown" -Method Post -Headers @{ 'X-RelayBridge-Token' = $legacyToken } -ContentType 'application/json' -Body '{}' -TimeoutSec 3 -UseBasicParsing | Out-Null
   for ($attempt = 0; $attempt -lt 50 -and (Get-NetTCPConnection -State Listen -LocalPort $legacyPort -ErrorAction SilentlyContinue); $attempt++) { Start-Sleep -Milliseconds 100 }

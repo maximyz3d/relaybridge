@@ -1170,6 +1170,8 @@ try {
 } catch {
   $installError = $_
   $rollbackErrors = @()
+  $rollbackWarnings = @()
+  $restoreSucceeded = $false
   if ($env:RELAYBRIDGE_INSTALL_TEST_ERROR_FILE) {
     try {
       $diagnostic = @(
@@ -1193,24 +1195,48 @@ try {
       if ($runtimeSource -and $movedRuntime.Count -gt 0) {
         Restore-PreservedRuntime $failedRoot $runtimeSource $movedRuntime
       }
-      if (Test-Path -LiteralPath $failedRoot) { Remove-Item -LiteralPath $failedRoot -Recurse -Force -ErrorAction Stop }
     } elseif (-not $promoted) {
       if ($oldRenamed -and (Test-Path -LiteralPath $backupRoot)) { Move-Item -LiteralPath $backupRoot -Destination $InstallDir }
       if ($runtimeSource -and $movedRuntime.Count -gt 0 -and (Test-Path -LiteralPath $stageRoot)) {
         Restore-PreservedRuntime $stageRoot $runtimeSource $movedRuntime
       }
     }
-  } catch { $rollbackErrors += $_.Exception.Message }
-  if ($rollbackErrors.Count -eq 0 -and $oldHealth -and $runtimeSource -and (Test-Path -LiteralPath (Join-Path $runtimeSource 'server.js'))) {
+    $restoreSucceeded = $true
+  } catch { $rollbackErrors += "tree restore failed: $($_.Exception.Message)" }
+  if ($restoreSucceeded -and $oldHealth -and $runtimeSource -and (Test-Path -LiteralPath (Join-Path $runtimeSource 'server.js'))) {
     try {
       $oldBuild = if ($oldHealth.buildId) { [string]$oldHealth.buildId } else { [string]$oldHealth.version }
       Start-StagedBridge $runtimeSource $Port $oldBuild -AllowLegacyVersion | Out-Null
       Write-Warning "Previous RelayBridge build $oldBuild was restored and restarted."
     } catch { $rollbackErrors += "automatic restart failed: $($_.Exception.Message)" }
   }
+  # The restored release and its exact-process restart are the recovery
+  # boundary. A scanner or stale handle may transiently retain the failed new
+  # tree on Windows; deleting that quarantined tree must not prevent recovery.
+  if ($restoreSucceeded -and $rollbackErrors.Count -eq 0 -and (Test-Path -LiteralPath $failedRoot)) {
+    try {
+      if ($env:RELAYBRIDGE_INSTALL_TEST_ERROR_FILE -and $env:RELAYBRIDGE_INSTALL_TEST_FAIL_ROLLBACK_CLEANUP -eq '1') {
+        throw 'Injected rollback cleanup failure'
+      }
+      Remove-Item -LiteralPath $failedRoot -Recurse -Force -ErrorAction Stop
+    }
+    catch { $rollbackWarnings += "failed release cleanup deferred: $($_.Exception.Message)" }
+  }
+  if ($env:RELAYBRIDGE_INSTALL_TEST_ERROR_FILE -and ($rollbackErrors.Count -or $rollbackWarnings.Count)) {
+    try {
+      $rollbackDiagnostic = @($rollbackErrors + $rollbackWarnings) -join "`r`n"
+      [IO.File]::AppendAllText($env:RELAYBRIDGE_INSTALL_TEST_ERROR_FILE,
+        ("Rollback diagnostics:`r`n" + $rollbackDiagnostic + "`r`n"), [Text.UTF8Encoding]::new($false))
+    } catch {
+      # Test-only diagnostics must never interfere with production rollback.
+    }
+  }
   if ($rollbackErrors.Count) {
     $preserveRecoveryArtifacts = $true
     Write-Warning ("Automatic rollback was incomplete; recovery directories were preserved beside the install root: " + ($rollbackErrors -join '; '))
+  } elseif ($rollbackWarnings.Count) {
+    $preserveRecoveryArtifacts = $true
+    Write-Warning ("Previous RelayBridge was restored, but recovery cleanup was deferred: " + ($rollbackWarnings -join '; '))
   } else {
     $preserveRecoveryArtifacts = $false
   }

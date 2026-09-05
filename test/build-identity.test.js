@@ -1238,6 +1238,10 @@ test('lifecycle scripts guard credentials, preserve generated identity, and requ
   assert.match(releaseInstall, /FileAttributes\]::ReparsePoint/);
   assert.match(releaseInstall, /buildIdentityReady -ne \$true/);
   assert.match(releaseInstall, /\$reportedPid -ne \[int64\]\$proc\.Id/);
+  const rollbackRestart = releaseInstall.indexOf('if ($restoreSucceeded -and $oldHealth');
+  const failedReleaseCleanup = releaseInstall.indexOf('if ($restoreSucceeded -and $rollbackErrors.Count -eq 0 -and (Test-Path -LiteralPath $failedRoot))');
+  assert.ok(rollbackRestart >= 0 && failedReleaseCleanup > rollbackRestart,
+    'Windows rollback must restart the restored release before attempting non-critical failed-release cleanup');
   assert.match(windowsStart, /prepare-build-info\.cjs/);
   assert.match(windowsStart, /buildIdentityReady -ne \$true/);
   assert.match(windowsStart, /\$reportedPid -ne \[int64\]\$process\.Id/);
