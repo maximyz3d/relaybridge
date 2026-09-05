@@ -441,6 +441,34 @@ test('atomic manifest failure preserves the prior complete file and removes its 
   assert.doesNotThrow(() => JSON.parse(fs.readFileSync(target, 'utf8')));
 });
 
+test('atomic manifest publication retries transient Windows destination contention', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relaybridge-build-retry-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const target = path.join(root, 'build-info.json');
+  const prior = '{"version":"2.0.0","buildId":"prior"}\n';
+  write(target, prior);
+  const fsApi = Object.create(fs);
+  let attempts = 0;
+  fsApi.renameSync = (from, to) => {
+    attempts += 1;
+    if (attempts === 1) {
+      assert.equal(fs.readFileSync(target, 'utf8'), prior,
+        'the prior complete manifest must remain visible while replacement is contended');
+      throw Object.assign(new Error('injected Windows contention'), { code: 'EPERM' });
+    }
+    return fs.renameSync(from, to);
+  };
+  writeBuildInfoAtomic(root, { version: '2.0.1', buildId: 'current' }, {
+    fsApi,
+    platform: 'win32',
+    randomUUID: () => 'fixed',
+  });
+  assert.equal(attempts, 2);
+  assert.deepEqual(JSON.parse(fs.readFileSync(target, 'utf8')), {
+    version: '2.0.1', buildId: 'current',
+  });
+});
+
 test('concurrent source preparations publish one complete deterministic manifest', async (t) => {
   const root = makeSourceRepo(t);
   const tool = path.join(ROOT, 'tools', 'prepare-build-info.cjs');
@@ -1165,7 +1193,7 @@ posixOnly('start.sh signal cleanup terminates its exact detached session', async
 });
 
 test('lifecycle scripts guard credentials, preserve generated identity, and require exact ready health', () => {
-  const install = fs.readFileSync(path.join(ROOT, 'install-mcp.sh'), 'utf8');
+  const install = fs.readFileSync(path.join(ROOT, 'install-mcp.sh'), 'utf8').replace(/\r\n/g, '\n');
   const releaseInstall = fs.readFileSync(path.join(ROOT, 'install.ps1'), 'utf8');
   const start = fs.readFileSync(path.join(ROOT, 'start.sh'), 'utf8');
   const windowsStart = fs.readFileSync(path.join(ROOT, 'start.ps1'), 'utf8');
