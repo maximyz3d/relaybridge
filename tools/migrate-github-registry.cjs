@@ -3,7 +3,6 @@
 
 // Small installer/startup-compatible entrypoint around the same migration code
 // used by the live tracker. Paths are argv elements, never shell fragments.
-const path = require('path');
 const tracker = require('../lib/github-tracker');
 
 function fail(message) {
@@ -26,7 +25,7 @@ for (let i = 0; i < args.length; i += 1) {
       return;
     }
     const value = args[++i];
-    if (arg === '--root') options.root = path.resolve(value);
+    if (arg === '--root') options.root = value;
     if (arg === '--legacy-file') options.legacyFile = value;
     if (arg === '--runtime-file') options.runtimeFile = value;
     continue;

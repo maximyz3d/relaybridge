@@ -88,6 +88,7 @@ test('loadRegistry validates names and tracking modes', () => {
 
 test('registry location precedence keeps machine state in ignored data', () => {
   const root = path.join(os.tmpdir(), 'rb-registry-root');
+  const posixRoot = '/home/relaybridge/test-root';
   const relayData = path.join(os.tmpdir(), 'rb-relay-data');
   const psData = path.join(os.tmpdir(), 'rb-ps-data');
   const explicit = path.join(os.tmpdir(), 'rb-explicit', 'repos.json');
@@ -106,7 +107,7 @@ test('registry location precedence keeps machine state in ignored data', () => {
     RELAYBRIDGE_GITHUB_REPOS: explicit,
   } }).runtimeFile, explicit);
   assert.throws(() => tracker.registryPaths({
-    root,
+    root: posixRoot,
     env: { RELAYBRIDGE_GITHUB_REPOS: '/mnt/c/relay/github-repos.json' },
     platform: { isWindows: false, isWSL: true, label: 'WSL' },
   }), /GitHub registry must use the WSL Linux filesystem/);
@@ -119,7 +120,7 @@ test('registry location precedence keeps machine state in ignored data', () => {
       { isWindows: false, isWSL: true, label: 'WSL' },
     ]) {
       assert.throws(() => tracker.registryPaths({
-        root,
+        root: posixRoot,
         env: { RELAYBRIDGE_GITHUB_REPOS: foreignPath },
         platform: detected,
       }), /GitHub registry file must be an absolute path/,
@@ -127,34 +128,57 @@ test('registry location precedence keeps machine state in ignored data', () => {
     }
   }
   assert.throws(() => tracker.registryPaths({
-    root,
+    root: posixRoot,
     env: { RELAYBRIDGE_DATA_DIR: 'C:\\Users\\person\\RelayBridge\\data' },
     platform: { isWindows: false, isWSL: true, label: 'WSL' },
   }), /GitHub registry data directory must be an absolute path/);
   assert.throws(() => tracker.registryPaths({
-    root,
+    root: posixRoot,
     env: {},
     runtimeFile: 'C:\\Users\\person\\RelayBridge\\github-repos.json',
     platform: { isWindows: false, isWSL: true, label: 'WSL' },
   }), /GitHub registry file must be an absolute path/);
   assert.throws(() => tracker.registryPaths({
-    root,
+    root: posixRoot,
     env: {},
     legacyFile: '\\\\fileserver\\relaybridge\\legacy.json',
     platform: { isWindows: false, isWSL: false, label: 'POSIX' },
   }), /legacy GitHub registry file must be an absolute path/);
+  for (const foreignRoot of [
+    'C:\\Users\\person\\RelayBridge',
+    '\\\\fileserver\\relaybridge\\RelayBridge',
+  ]) {
+    assert.throws(() => tracker.registryPaths({
+      root: foreignRoot,
+      env: {},
+      platform: { isWindows: false, isWSL: true, label: 'WSL' },
+    }), /RelayBridge root must be an absolute path/,
+    'options.root must be validated before native path resolution');
+  }
 });
 
-posixOnly('migration CLI rejects raw Windows runtime paths before host normalization', (t) => {
+posixOnly('migration CLI rejects raw Windows runtime and root paths before host normalization', (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rbgh-cli-foreign-path-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  const result = spawnSync(process.execPath, [
-    path.join(__dirname, '..', 'tools', 'migrate-github-registry.cjs'),
-    '--root', root,
-    '--runtime-file', 'C:\\Users\\person\\RelayBridge\\github-repos.json',
-  ], { encoding: 'utf8' });
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /GitHub registry file must be an absolute path/);
+  const tool = path.join(__dirname, '..', 'tools', 'migrate-github-registry.cjs');
+  for (const fixture of [
+    {
+      args: ['--root', root, '--runtime-file', 'C:\\Users\\person\\RelayBridge\\github-repos.json'],
+      expected: /GitHub registry file must be an absolute path/,
+    },
+    {
+      args: ['--root', 'C:\\Users\\person\\RelayBridge'],
+      expected: /RelayBridge root must be an absolute path/,
+    },
+    {
+      args: ['--root', '\\\\fileserver\\relaybridge\\RelayBridge'],
+      expected: /RelayBridge root must be an absolute path/,
+    },
+  ]) {
+    const result = spawnSync(process.execPath, [tool, ...fixture.args], { encoding: 'utf8' });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, fixture.expected);
+  }
   assert.equal(fs.readdirSync(root).length, 0,
     'a foreign path must be rejected before it can become a cwd-relative state path');
 });
@@ -178,6 +202,207 @@ test('a valid legacy registry is atomically migrated only when runtime is absent
   if (process.platform !== 'win32') {
     assert.equal(fs.statSync(migrated.runtimeFile).mode & 0o777, 0o600);
   }
+});
+
+posixOnly('migration never follows a publication-time target replacement for metadata writes', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rbgh-migrate-publish-swap-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const legacy = path.join(root, 'config', 'github-repos.json');
+  const runtime = path.join(root, 'data', 'github-repos.json');
+  const victim = path.join(root, 'outside-victim.txt');
+  const victimBytes = 'external bytes must remain untouched\n';
+  fs.mkdirSync(path.dirname(legacy), { recursive: true });
+  fs.writeFileSync(legacy, JSON.stringify({ repos: [] }));
+  fs.writeFileSync(victim, victimBytes);
+  fs.chmodSync(victim, 0o644);
+
+  const originalLinkSync = fs.linkSync;
+  const originalChmodSync = fs.chmodSync;
+  let swapped = false;
+  let targetChmods = 0;
+  t.after(() => {
+    fs.linkSync = originalLinkSync;
+    fs.chmodSync = originalChmodSync;
+  });
+  fs.linkSync = (source, target) => {
+    originalLinkSync.call(fs, source, target);
+    fs.unlinkSync(target);
+    fs.symlinkSync(victim, target);
+    swapped = true;
+  };
+  fs.chmodSync = (file, ...args) => {
+    if (path.resolve(String(file)) === runtime) targetChmods += 1;
+    return originalChmodSync.call(fs, file, ...args);
+  };
+
+  const result = tracker.migrateLegacyRegistry({ root, env: {}, platform: HOST_PLATFORM });
+  assert.equal(result.status, 'migrated');
+  assert.equal(swapped, true, 'the adversary must replace the published directory entry');
+  assert.equal(targetChmods, 0, 'migration must perform no path-based chmod after publication');
+  assert.equal(fs.lstatSync(runtime).isSymbolicLink(), true);
+  assert.equal(fs.readFileSync(victim, 'utf8'), victimBytes);
+  assert.equal(fs.statSync(victim).mode & 0o777, 0o644, 'victim permissions must remain unchanged');
+});
+
+posixOnly('legacy registry symlinks and dangling symlinks fail closed without reading target bytes', (t) => {
+  for (const linkedTargetExists of [true, false]) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rbgh-legacy-symlink-'));
+    const externalRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'rbgh-legacy-external-'));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    t.after(() => fs.rmSync(externalRoot, { recursive: true, force: true }));
+    const legacy = path.join(root, 'config', 'github-repos.json');
+    const runtime = path.join(root, 'data', 'github-repos.json');
+    const external = path.join(externalRoot, 'outside-registry.json');
+    const externalBytes = JSON.stringify({
+      repos: [{ name: 'external/bytes', path: path.join(externalRoot, 'repo') }],
+    });
+    fs.mkdirSync(path.dirname(legacy), { recursive: true });
+    if (linkedTargetExists) fs.writeFileSync(external, externalBytes);
+    fs.symlinkSync(external, legacy);
+
+    const fsApi = Object.create(fs);
+    let byteReads = 0;
+    fsApi.readFileSync = (...args) => {
+      byteReads += 1;
+      throw new Error(`unexpected legacy byte read: ${String(args[0])}`);
+    };
+
+    assert.throws(() => tracker.migrateLegacyRegistry({
+      root, env: {}, platform: HOST_PLATFORM, fsApi,
+    }), /legacy GitHub registry.*must be a regular file; symbolic links are not allowed/);
+    assert.equal(byteReads, 0, 'neither a live nor dangling legacy symlink may be followed');
+    assert.equal(fs.existsSync(runtime), false, 'an unsafe legacy entry must not create runtime authority state');
+    assert.equal(fs.lstatSync(legacy).isSymbolicLink(), true);
+    if (linkedTargetExists) assert.equal(fs.readFileSync(external, 'utf8'), externalBytes);
+  }
+});
+
+test('a legacy regular-file replacement after lstat is rejected before reading replacement bytes', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rbgh-legacy-regular-swap-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const legacy = path.join(root, 'config', 'github-repos.json');
+  const runtime = path.join(root, 'data', 'github-repos.json');
+  const replacement = path.join(root, 'replacement-registry.json');
+  const replacementBytes = JSON.stringify({
+    repos: [{ name: 'replacement/bytes', path: path.join(root, 'replacement') }],
+  });
+  fs.mkdirSync(path.dirname(legacy), { recursive: true });
+  fs.writeFileSync(legacy, JSON.stringify({ repos: [] }));
+  fs.writeFileSync(replacement, replacementBytes);
+
+  const fsApi = Object.create(fs);
+  let swapped = false;
+  let byteReads = 0;
+  fsApi.lstatSync = (file, ...args) => {
+    const stat = fs.lstatSync(file, ...args);
+    if (!swapped && path.resolve(String(file)) === legacy) {
+      fs.renameSync(replacement, legacy);
+      swapped = true;
+    }
+    return stat;
+  };
+  fsApi.readFileSync = (...args) => {
+    byteReads += 1;
+    throw new Error(`unexpected legacy byte read: ${String(args[0])}`);
+  };
+
+  assert.throws(() => tracker.migrateLegacyRegistry({
+    root, env: {}, platform: HOST_PLATFORM, fsApi,
+  }), /cannot securely read legacy GitHub registry.*target changed before it could be opened/);
+  assert.equal(swapped, true);
+  assert.equal(byteReads, 0, 'replacement legacy bytes must not be read after inode identity changes');
+  assert.equal(fs.readFileSync(legacy, 'utf8'), replacementBytes);
+  assert.equal(fs.existsSync(runtime), false);
+});
+
+test('a legacy disappearance after initial lstat is an error, not a missing registry', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rbgh-legacy-disappear-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const legacy = path.join(root, 'config', 'github-repos.json');
+  fs.mkdirSync(path.dirname(legacy), { recursive: true });
+  fs.writeFileSync(legacy, JSON.stringify({ repos: [] }));
+
+  const fsApi = Object.create(fs);
+  let removed = false;
+  let byteReads = 0;
+  fsApi.lstatSync = (file, ...args) => {
+    const stat = fs.lstatSync(file, ...args);
+    if (!removed && path.resolve(String(file)) === legacy) {
+      fs.unlinkSync(legacy);
+      removed = true;
+    }
+    return stat;
+  };
+  fsApi.readFileSync = (...args) => {
+    byteReads += 1;
+    throw new Error(`unexpected legacy byte read: ${String(args[0])}`);
+  };
+
+  assert.throws(() => tracker.migrateLegacyRegistry({
+    root, env: {}, platform: HOST_PLATFORM, fsApi,
+  }), /cannot securely read legacy GitHub registry.*ENOENT/);
+  assert.equal(removed, true);
+  assert.equal(byteReads, 0);
+});
+
+posixOnly('a legacy regular-file-to-FIFO replacement is rejected without reading or blocking', (t) => {
+  if (spawnSync('sh', ['-c', 'command -v mkfifo'], { encoding: 'utf8' }).status !== 0) {
+    t.skip('mkfifo is unavailable');
+    return;
+  }
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rbgh-legacy-fifo-swap-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const legacy = path.join(root, 'config', 'github-repos.json');
+  fs.mkdirSync(path.dirname(legacy), { recursive: true });
+  fs.writeFileSync(legacy, JSON.stringify({ repos: [] }));
+  const script = `
+    const fs = require('fs');
+    const path = require('path');
+    const { spawnSync } = require('child_process');
+    const tracker = require(${JSON.stringify(path.join(__dirname, '..', 'lib', 'github-tracker.js'))});
+    const root = ${JSON.stringify(root)};
+    const target = ${JSON.stringify(legacy)};
+    const originalLstatSync = fs.lstatSync;
+    const originalReadFileSync = fs.readFileSync;
+    let swapped = false;
+    let byteReads = 0;
+    fs.lstatSync = (file, ...args) => {
+      const stat = originalLstatSync.call(fs, file, ...args);
+      if (!swapped && path.resolve(String(file)) === target) {
+        fs.unlinkSync(target);
+        const made = spawnSync('mkfifo', [target]);
+        if (made.status !== 0) process.exit(3);
+        swapped = true;
+      }
+      return stat;
+    };
+    fs.readFileSync = (...args) => {
+      byteReads += 1;
+      throw new Error('unexpected legacy byte read');
+    };
+    try {
+      tracker.migrateLegacyRegistry({
+        root, env: {}, platform: { isWindows: false, isWSL: false, label: 'POSIX' },
+      });
+      process.exit(4);
+    } catch (error) {
+      process.stdout.write(JSON.stringify({
+        rejected: /opened target is not a regular file/.test(error.message),
+        swapped,
+        byteReads,
+      }));
+    } finally {
+      fs.readFileSync = originalReadFileSync;
+    }
+  `;
+  const result = spawnSync(process.execPath, ['-e', script], {
+    encoding: 'utf8',
+    timeout: 2000,
+  });
+  assert.notEqual(result.error && result.error.code, 'ETIMEDOUT',
+    'O_NONBLOCK must prevent a swapped legacy FIFO from hanging migration');
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), { rejected: true, swapped: true, byteReads: 0 });
 });
 
 test('an existing runtime registry always wins and legacy is never read or overwritten', () => {
@@ -254,6 +479,142 @@ posixOnly('runtime registry symlinks fail closed without suppressing valid legac
     assert.equal(fs.lstatSync(runtime).isSymbolicLink(), true);
     assert.equal(fs.readFileSync(legacy, 'utf8'), legacyBytes);
   }
+});
+
+posixOnly('a symlink replacement after lstat is rejected without reading external bytes', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rbgh-lstat-swap-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  for (const stripNoFollow of [false, true]) {
+    const suffix = stripNoFollow ? 'fallback' : 'nofollow';
+    const runtime = path.join(root, `${suffix}-github-repos.json`);
+    const external = path.join(root, `${suffix}-external-registry.json`);
+    const externalBytes = JSON.stringify({
+      repos: [{ name: 'external/bytes', path: path.join(root, 'external') }],
+    });
+    fs.writeFileSync(runtime, JSON.stringify({ repos: [] }));
+    fs.writeFileSync(external, externalBytes);
+
+    const fsApi = Object.create(fs);
+    let swapped = false;
+    let observedFlags = null;
+    let readCalls = 0;
+    let closeCalls = 0;
+    fsApi.lstatSync = (file, ...args) => {
+      const stat = fs.lstatSync(file, ...args);
+      if (!swapped && path.resolve(String(file)) === runtime) {
+        fs.unlinkSync(runtime);
+        fs.symlinkSync(external, runtime);
+        swapped = true;
+      }
+      return stat;
+    };
+    fsApi.openSync = (file, flags, ...args) => {
+      observedFlags = flags;
+      const forwardedFlags = stripNoFollow
+        ? flags & ~fs.constants.O_NOFOLLOW
+        : flags;
+      return fs.openSync(file, forwardedFlags, ...args);
+    };
+    fsApi.readFileSync = (...args) => {
+      readCalls += 1;
+      throw new Error(`unexpected registry byte read: ${String(args[0])}`);
+    };
+    fsApi.closeSync = (fd) => {
+      closeCalls += 1;
+      fs.closeSync(fd);
+    };
+
+    assert.throws(() => tracker.loadRegistry(runtime, { platform: HOST_PLATFORM, fsApi }),
+      /cannot securely read GitHub registry/);
+    assert.equal(swapped, true);
+    assert.equal(observedFlags & fs.constants.O_NOFOLLOW, fs.constants.O_NOFOLLOW);
+    assert.equal(observedFlags & fs.constants.O_NONBLOCK, fs.constants.O_NONBLOCK);
+    assert.equal(readCalls, 0, 'neither no-follow nor identity fallback may read external bytes');
+    assert.equal(closeCalls, stripNoFollow ? 1 : 0,
+      'a fallback-opened descriptor must be closed after identity rejection');
+    assert.equal(fs.lstatSync(runtime).isSymbolicLink(), true);
+    assert.equal(fs.readFileSync(external, 'utf8'), externalBytes);
+  }
+});
+
+test('a regular-file replacement after lstat fails inode validation before reading bytes', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rbgh-regular-swap-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const runtime = path.join(root, 'github-repos.json');
+  const replacement = path.join(root, 'replacement-registry.json');
+  fs.writeFileSync(runtime, JSON.stringify({ repos: [] }));
+  fs.writeFileSync(replacement, JSON.stringify({
+    repos: [{ name: 'replacement/bytes', path: path.join(root, 'replacement') }],
+  }));
+
+  const originalLstatSync = fs.lstatSync;
+  const originalReadFileSync = fs.readFileSync;
+  let swapped = false;
+  let descriptorReads = 0;
+  t.after(() => {
+    fs.lstatSync = originalLstatSync;
+    fs.readFileSync = originalReadFileSync;
+  });
+  fs.lstatSync = (file, ...args) => {
+    const stat = originalLstatSync.call(fs, file, ...args);
+    if (!swapped && path.resolve(String(file)) === runtime) {
+      fs.renameSync(replacement, runtime);
+      swapped = true;
+    }
+    return stat;
+  };
+  fs.readFileSync = (file, ...args) => {
+    if (typeof file === 'number') descriptorReads += 1;
+    return originalReadFileSync.call(fs, file, ...args);
+  };
+
+  assert.throws(() => tracker.loadRegistry(runtime, { platform: HOST_PLATFORM }),
+    /registry target changed before it could be opened/);
+  assert.equal(swapped, true);
+  assert.equal(descriptorReads, 0, 'replacement bytes must not be read after inode identity changes');
+});
+
+posixOnly('a regular-file-to-FIFO replacement is rejected without blocking', (t) => {
+  if (spawnSync('sh', ['-c', 'command -v mkfifo'], { encoding: 'utf8' }).status !== 0) {
+    t.skip('mkfifo is unavailable');
+    return;
+  }
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rbgh-fifo-swap-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const runtime = path.join(root, 'github-repos.json');
+  fs.writeFileSync(runtime, JSON.stringify({ repos: [] }));
+  const script = `
+    const fs = require('fs');
+    const { spawnSync } = require('child_process');
+    const tracker = require(${JSON.stringify(path.join(__dirname, '..', 'lib', 'github-tracker.js'))});
+    const target = ${JSON.stringify(runtime)};
+    const originalLstatSync = fs.lstatSync;
+    let swapped = false;
+    fs.lstatSync = (file, ...args) => {
+      const stat = originalLstatSync.call(fs, file, ...args);
+      if (!swapped && require('path').resolve(String(file)) === target) {
+        fs.unlinkSync(target);
+        const made = spawnSync('mkfifo', [target]);
+        if (made.status !== 0) process.exit(3);
+        swapped = true;
+      }
+      return stat;
+    };
+    try {
+      tracker.loadRegistry(target, { platform: { isWindows: false, isWSL: false, label: 'POSIX' } });
+      process.exit(4);
+    } catch {
+      process.stdout.write('rejected');
+    }
+  `;
+  const result = spawnSync(process.execPath, ['-e', script], {
+    encoding: 'utf8',
+    timeout: 2000,
+  });
+  assert.notEqual(result.error && result.error.code, 'ETIMEDOUT',
+    'O_NONBLOCK must prevent a swapped FIFO from hanging registry startup');
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, 'rejected');
 });
 
 test('a nonregular runtime target fails closed before legacy migration', (t) => {
@@ -368,9 +729,12 @@ test('load fails closed if an accepted migration race winner disappears', (t) =>
   });
 
   const originalLinkSync = fs.linkSync;
+  const originalOpenSync = fs.openSync;
   const originalReadFileSync = fs.readFileSync;
+  const runtimeFds = new Set();
   t.after(() => {
     fs.linkSync = originalLinkSync;
+    fs.openSync = originalOpenSync;
     fs.readFileSync = originalReadFileSync;
   });
   fs.linkSync = (_source, target) => {
@@ -379,9 +743,14 @@ test('load fails closed if an accepted migration race winner disappears', (t) =>
     error.code = 'EEXIST';
     throw error;
   };
+  fs.openSync = (file, ...args) => {
+    const fd = originalOpenSync.call(fs, file, ...args);
+    if (path.resolve(String(file)) === runtime) runtimeFds.add(fd);
+    return fd;
+  };
   fs.readFileSync = (file, ...args) => {
     const bytes = originalReadFileSync.call(fs, file, ...args);
-    if (path.resolve(String(file)) === runtime) fs.unlinkSync(runtime);
+    if (typeof file === 'number' && runtimeFds.has(file)) fs.unlinkSync(runtime);
     return bytes;
   };
 
@@ -495,6 +864,44 @@ test('saveRegistry writes through the same data-dir precedence', () => {
   tracker.saveRegistry({ repos: [{ name: 'o/r', path: path.join(root, 'repo') }] }, undefined, options);
   assert.equal(fs.existsSync(path.join(dataDir, 'github-repos.json')), true);
   assert.equal(tracker.loadRegistry(undefined, options).repos[0].name, 'o/r');
+});
+
+posixOnly('save never follows a publication-time target replacement for metadata writes', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rbgh-save-publish-swap-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const runtime = path.join(root, 'data', 'github-repos.json');
+  const victim = path.join(root, 'outside-victim.txt');
+  const victimBytes = 'save must not alter external bytes\n';
+  fs.writeFileSync(victim, victimBytes);
+  fs.chmodSync(victim, 0o644);
+
+  const originalRenameSync = fs.renameSync;
+  const originalChmodSync = fs.chmodSync;
+  let swapped = false;
+  let targetChmods = 0;
+  t.after(() => {
+    fs.renameSync = originalRenameSync;
+    fs.chmodSync = originalChmodSync;
+  });
+  fs.renameSync = (source, target) => {
+    originalRenameSync.call(fs, source, target);
+    if (path.resolve(String(target)) === runtime) {
+      fs.unlinkSync(target);
+      fs.symlinkSync(victim, target);
+      swapped = true;
+    }
+  };
+  fs.chmodSync = (file, ...args) => {
+    if (path.resolve(String(file)) === runtime) targetChmods += 1;
+    return originalChmodSync.call(fs, file, ...args);
+  };
+
+  tracker.saveRegistry({ repos: [] }, undefined, { root, env: {}, platform: HOST_PLATFORM });
+  assert.equal(swapped, true, 'the adversary must replace the renamed directory entry');
+  assert.equal(targetChmods, 0, 'save must perform no path-based chmod after publication');
+  assert.equal(fs.lstatSync(runtime).isSymbolicLink(), true);
+  assert.equal(fs.readFileSync(victim, 'utf8'), victimBytes);
+  assert.equal(fs.statSync(victim).mode & 0o777, 0o644, 'victim permissions must remain unchanged');
 });
 
 test('directory fsync is attempted after registry publication where supported', (t) => {
@@ -633,7 +1040,7 @@ test('claim workflow warns on duplicates and uses least required immutable actio
 });
 
 test('RelayBridge CI uses Node 24, immutable actions, least permissions, and stale-run cancellation', () => {
-  const ci = fs.readFileSync(path.resolve(__dirname, '..', '.github', 'workflows', 'ci.yml'), 'utf8');
+  const ci = fs.readFileSync(path.resolve(__dirname, '..', '.github', 'workflows', 'ci.yml'), 'utf8').replace(/\r\n/g, '\n');
   assert.match(ci, /^permissions:\n  contents: read$/m);
   assert.match(ci, /actions\/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6\.0\.2/);
   assert.match(ci, /actions\/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7\.0\.0/);

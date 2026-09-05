@@ -1756,7 +1756,9 @@ function normalizeClaudeJsonUsage(document) {
 // complete model census. Other providers remain explicitly terminal-only or
 // unavailable rather than being policed with character-count guesses.
 function createProviderUsageObserver(parserName, supervisor) {
-  if (parserName !== 'claude_json') return { record() {}, flush() {} };
+  if (parserName !== 'claude_json') {
+    return { record(chunk) { return String(chunk || '').length; }, flush() {} };
+  }
   let partial = '';
   const seen = new Set();
   const cumulative = {
@@ -1764,42 +1766,57 @@ function createProviderUsageObserver(parserName, supervisor) {
     cache_creation_input_tokens: 0, total_tokens: 0, turns: 0,
   };
   const consume = (line) => {
+    if (supervisor.evaluate().action === 'kill') return false;
     let event;
-    try { event = JSON.parse(line); } catch { return; }
+    try { event = JSON.parse(line); } catch { return true; }
     if (event?.type === 'result') {
       const usage = normalizeClaudeJsonUsage(event);
       const turns = nonnegativeUsageNumber(event.num_turns);
       if (usage) supervisor.recordProviderUsage({ ...usage, turns }, { phase: 'terminal' });
       else if (turns !== null) supervisor.recordProviderUsage({ turns }, { phase: 'terminal' });
-      return;
+      return supervisor.evaluate().action !== 'kill';
     }
-    if (event?.type !== 'assistant' || !event.message || typeof event.message !== 'object') return;
+    if (event?.type !== 'assistant' || !event.message || typeof event.message !== 'object') return true;
     const id = typeof event.message.id === 'string' ? event.message.id.trim() : '';
-    if (!id || seen.has(id)) return;
+    if (!id || seen.has(id)) return true;
     const usage = event.message.usage;
-    if (!usage || typeof usage !== 'object' || Array.isArray(usage)) return;
+    if (!usage || typeof usage !== 'object' || Array.isArray(usage)) return true;
     const values = {
       input_tokens: nonnegativeUsageNumber(usage.input_tokens),
       output_tokens: nonnegativeUsageNumber(usage.output_tokens),
       cache_read_input_tokens: nonnegativeUsageNumber(usage.cache_read_input_tokens ?? 0),
       cache_creation_input_tokens: nonnegativeUsageNumber(usage.cache_creation_input_tokens ?? 0),
     };
-    if (Object.values(values).some((value) => value === null)) return;
+    if (Object.values(values).some((value) => value === null)) return true;
     const total = safeTokenSum(Object.values(values));
-    if (total === null) return;
+    if (total === null) return true;
     seen.add(id);
     for (const [key, value] of Object.entries(values)) cumulative[key] += value;
     cumulative.total_tokens += total;
     cumulative.turns += 1;
     supervisor.recordProviderUsage(cumulative, { phase: 'incremental' });
+    return supervisor.evaluate().action !== 'kill';
   };
   return {
     record(chunk) {
-      const lines = (partial + String(chunk || '')).split(/\r?\n/);
-      partial = lines.pop() || '';
-      for (const line of lines) consume(line);
+      const text = String(chunk || '');
+      const priorPartialLength = partial.length;
+      const combined = partial + text;
+      const separator = /\r?\n/g;
+      let lineStart = 0;
+      let match;
+      while ((match = separator.exec(combined)) !== null) {
+        const line = combined.slice(lineStart, match.index);
+        lineStart = separator.lastIndex;
+        if (consume(line) === false) {
+          partial = '';
+          return Math.max(0, Math.min(text.length, lineStart - priorPartialLength));
+        }
+      }
+      partial = combined.slice(lineStart);
+      return text.length;
     },
-    flush() { if (partial.trim()) consume(partial); partial = ''; },
+    flush() { if (partial.trim() && supervisor.evaluate().action !== 'kill') consume(partial); partial = ''; },
   };
 }
 
@@ -2063,7 +2080,7 @@ function hasProviderInternalTimeoutDiagnostic(value) {
   return PROVIDER_INTERNAL_TIMEOUT_PATTERNS.some((pattern) => pattern.test(diagnostic));
 }
 
-function parseConfiguredOneShotOutput(entry, rawOutput) {
+function parseConfiguredOneShotOutput(entry, rawOutput, { ignoreTerminalResult = false } = {}) {
   const parser = String(entry?.oneshot_output_parser || 'text');
   if (parser === 'text') {
     return {
@@ -2106,6 +2123,12 @@ function parseConfiguredOneShotOutput(entry, rawOutput) {
         }).filter((value) => value && typeof value === 'object' && !Array.isArray(value));
       document = [...events].reverse().find((value) => value.type === 'result') || null;
     }
+    // A provider may flush a success document after the supervisor has made a
+    // sticky terminal decision but before process-tree termination completes.
+    // Keep those bytes available to transport diagnostics, while parsing the
+    // pre-stop assistant stream as a partial result instead of accepting the
+    // late success as the outcome.
+    if (ignoreTerminalResult) document = null;
     if (!document || typeof document !== 'object' || Array.isArray(document)) throw new Error('result is not an object');
     if (document.type !== 'result') throw new Error('document type is not result');
     const subtype = (normalizeClaudeResultString(document.subtype) || '').toLowerCase();
@@ -4829,11 +4852,21 @@ async function executeOneShot(body, res) {
   }
   let stdout = '';
   let stderr = '';
+  let supervisorStdout = null;
+  let lateStdout = '';
+  const retainLateStdout = (chunk) => {
+    const remaining = Math.max(0, 65536 - lateStdout.length);
+    if (remaining) lateStdout += String(chunk || '').slice(0, remaining);
+  };
   let timedOut = false;
   let clientGone = false;
   let settled = false;
   res._relayCancellationPayload = () => {
-    const parsedOutput = parseConfiguredOneShotOutput(entry, stdout);
+    const semanticStdout = supervisorStdout ?? stdout;
+    const transportStdout = stdout + lateStdout;
+    const parsedOutput = parseConfiguredOneShotOutput(entry, semanticStdout, {
+      ignoreTerminalResult: stopReason === 'token_budget',
+    });
     const retainedPartial = stopReason === 'token_budget' && !!parsedOutput.parseError
       && !!parsedOutput.partialDiagnostic;
     const cancellationState = resolveCancellationTerminalState({
@@ -4874,8 +4907,8 @@ async function executeOneShot(body, res) {
       } : {}),
       ...(stopReason === 'token_budget'
         ? { cleaned_output_unavailable: !parsedOutput.output } : {}),
-      transport_output_chars: String(stdout).length,
-      transport_output_hash: crypto.createHash('sha256').update(String(stdout)).digest('hex'),
+      transport_output_chars: String(transportStdout).length,
+      transport_output_hash: crypto.createHash('sha256').update(String(transportStdout)).digest('hex'),
       stop_reason: cancellationState.stopReason,
       supervisor_stop_reason: cancellationState.supervisorStopReason,
       stop_detail: stopReason ? stopDetail : 'the caller disconnected before the provider returned a usable result',
@@ -4905,6 +4938,17 @@ async function executeOneShot(body, res) {
   let stopBudgetEnforcement = null;
   let sampling = false;
   const usageObserver = createProviderUsageObserver(entry.oneshot_output_parser, supervisor);
+  const latchSupervisorVerdict = (verdict) => {
+    if (verdict.action !== 'kill' || stopReason) return false;
+    stopReason = verdict.reason;
+    stopDetail = verdict.detail;
+    supervisorStdout = stdout;
+    if (verdict.reason === 'token_budget') {
+      stopBudgetEnforcement = supervisor.snapshot().providerUsagePhase;
+    }
+    timedOut = verdict.reason !== 'token_budget';
+    return true;
+  };
 
   const finishSupervision = () => {
     clearInterval(tick);
@@ -4914,12 +4958,7 @@ async function executeOneShot(body, res) {
     if (settled) return finishSupervision();
     const applyVerdict = () => {
       const verdict = supervisor.evaluate();
-      if (verdict.action !== 'kill') return;
-      stopReason = verdict.reason;
-      stopDetail = verdict.detail;
-      if (verdict.reason === 'token_budget') stopBudgetEnforcement = supervisor.snapshot().providerUsagePhase;
-      timedOut = verdict.reason !== 'token_budget';
-      killProcessTree(proc);
+      if (latchSupervisorVerdict(verdict)) killProcessTree(proc);
     };
     // CPU is only sampled once a run has gone quiet, so healthy runs never pay
     // for the probe. It is what distinguishes a model thinking in silence from
@@ -4950,18 +4989,26 @@ async function executeOneShot(body, res) {
   // recordOutput returns false once the output cap is reached, which stops the
   // buffer growing before the kill lands â€” a runaway CLI cannot OOM the bridge.
   proc.stdout.on('data', (d) => {
-    usageObserver.record(d);
-    if (supervisor.recordOutput(d)) stdout += d;
+    if (stopReason) {
+      // Retain a bounded tail solely for transport byte/hash evidence. It is
+      // never re-fed into parsing, usage, failure, cooldown, or receipt status.
+      retainLateStdout(d);
+      return;
+    }
+    const chunk = String(d);
+    const semanticChars = usageObserver.record(chunk);
+    const semanticChunk = chunk.slice(0, semanticChars);
+    const lateChunk = chunk.slice(semanticChars);
+    if (semanticChunk && supervisor.recordOutput(semanticChunk)) stdout += semanticChunk;
     const verdict = supervisor.evaluate();
-    if (verdict.action === 'kill' && !stopReason) {
-      stopReason = verdict.reason;
-      stopDetail = verdict.detail;
-      if (verdict.reason === 'token_budget') stopBudgetEnforcement = supervisor.snapshot().providerUsagePhase;
-      timedOut = verdict.reason !== 'token_budget';
+    if (latchSupervisorVerdict(verdict)) {
+      retainLateStdout(lateChunk);
       killProcessTree(proc);
     }
   });
-  proc.stderr.on('data', (d) => { if (supervisor.recordOutput(d)) stderr += d; });
+  proc.stderr.on('data', (d) => {
+    if (!stopReason && supervisor.recordOutput(d)) stderr += d;
+  });
   proc.on('error', (err) => {
     if (settled) return;
     settled = true;
@@ -4988,7 +5035,11 @@ async function executeOneShot(body, res) {
       return;
     }
     usageObserver.flush();
-    const parsedOutput = parseConfiguredOneShotOutput(entry, stdout);
+    const semanticStdout = supervisorStdout ?? stdout;
+    const transportStdout = stdout + lateStdout;
+    let parsedOutput = parseConfiguredOneShotOutput(entry, semanticStdout, {
+      ignoreTerminalResult: stopReason === 'token_budget',
+    });
     if (parsedOutput.usage || parsedOutput.numTurns !== null) {
       supervisor.recordProviderUsage({ ...(parsedOutput.usage || {}), turns: parsedOutput.numTurns }, { phase: 'terminal' });
       const terminalVerdict = supervisor.evaluate();
@@ -4996,6 +5047,13 @@ async function executeOneShot(body, res) {
         stopReason = terminalVerdict.reason;
         stopDetail = terminalVerdict.detail;
         if (terminalVerdict.reason === 'token_budget') stopBudgetEnforcement = 'terminal';
+        // The kill was only discoverable from the terminal result itself, so it
+        // was parsed as authoritative content above. Re-parse with the same
+        // suppression the mid-stream same-chunk cutoff applies, so that result
+        // can never surface as output, rate-limit prose, or a completed answer.
+        if (stopReason === 'token_budget') {
+          parsedOutput = parseConfiguredOneShotOutput(entry, semanticStdout, { ignoreTerminalResult: true });
+        }
       }
     }
     const supervisedUsage = supervisor.snapshot().providerUsage;
@@ -5028,7 +5086,7 @@ async function executeOneShot(body, res) {
     // This prevents an audit discussing "rate limit" or HTTP 429 handling from
     // being misclassified as a provider failure.
     const failureBlob = (stderr + ((code !== 0 || !cleanedStdout || parsedOutput.isError || parsedOutput.parseError)
-      ? ('\n' + stdout) : '') + ('\n' + (parsedOutput.diagnostic || ''))).toLowerCase();
+      ? ('\n' + semanticStdout) : '') + ('\n' + (parsedOutput.diagnostic || ''))).toLowerCase();
     const rate_signals = [
       'rate limit', 'rate-limit', 'too many requests', 'quota exceeded', 'usage limit reached',
       'hit your usage limit', 'hit your limit', "you've hit your session limit",
@@ -5056,10 +5114,16 @@ async function executeOneShot(body, res) {
     });
     const cursorActionRequired = runClassification.actionRequired || null;
     const cursorUsageQuotaExhausted = cursorActionRequired?.kind === 'usage_quota_exhausted';
+    const tokenBudgetExceeded = stopReason === 'token_budget';
+    // A token-budget kill must never be recolored as a rate limit by ordinary
+    // prose (stderr or model text discussing limits) once the budget has
+    // already tripped. An authoritative provider API 429 status still counts,
+    // since it reflects evidence that preceded/caused the cutoff rather than
+    // free text caught in the failure blob.
     const rate_limited = parsedOutput.resultSubtype !== 'error_max_budget_usd'
       && !cursorUsageQuotaExhausted
-      && (authoritativeApiFailure === 'rate_limit' || !!copilotQuotaEvidence
-        || rate_signals.some(s => failureBlob.includes(s)));
+      && (authoritativeApiFailure === 'rate_limit'
+        || (!tokenBudgetExceeded && (!!copilotQuotaEvidence || rate_signals.some(s => failureBlob.includes(s)))));
     const budget_exceeded = parsedOutput.resultSubtype === 'error_max_budget_usd'
       || authoritativeApiFailure === 'budget'
       || cursorUsageQuotaExhausted
@@ -5080,7 +5144,6 @@ async function executeOneShot(body, res) {
     const providerInternalTimedOut = (code !== 0 || !cleanedStdout || parsedOutput.isError)
       && hasProviderInternalTimeoutDiagnostic(failureBlob);
     const providerTimedOut = timedOut || authoritativeApiFailure === 'timeout' || providerInternalTimedOut;
-    const tokenBudgetExceeded = stopReason === 'token_budget';
     const retainedPartial = tokenBudgetExceeded && !!parsedOutput.parseError
       && !!parsedOutput.partialDiagnostic;
     const finalFailureClass = !isolationCleanup.ok ? 'isolation_cleanup'
@@ -5128,8 +5191,8 @@ async function executeOneShot(body, res) {
       ...(tokenBudgetExceeded ? { cleaned_output_unavailable: !cleanedStdout } : {}),
       quota_evidence: copilotQuotaEvidence,
       provider_action_required: cursorActionRequired,
-      transport_output_chars: String(stdout).length,
-      transport_output_hash: crypto.createHash('sha256').update(String(stdout)).digest('hex'),
+      transport_output_chars: String(transportStdout).length,
+      transport_output_hash: crypto.createHash('sha256').update(String(transportStdout)).digest('hex'),
       rate_limited,
       budget_exceeded,
       auth_failed,
@@ -5152,7 +5215,7 @@ async function executeOneShot(body, res) {
       dropped_out,
       model_invocation: true,
     }, {
-      kind, prompt, route, startedAt, cwd: resolvedCwd, transportStdout: stdout,
+      kind, prompt, route, startedAt, cwd: resolvedCwd, transportStdout: semanticStdout,
       accountId: dispatchAccount.account?.id || null,
     });
     // GitHub middleware: only successful runs checkpoint — a dropped-out run

@@ -454,6 +454,58 @@ test('atomic manifest failure preserves the prior complete file and removes its 
   assert.doesNotThrow(() => JSON.parse(fs.readFileSync(target, 'utf8')));
 });
 
+test('Windows atomic manifest publication retries transient sharing errors without removing the prior file', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relaybridge-build-sharing-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const target = path.join(root, 'build-info.json');
+  const prior = '{"preserved":true}\n';
+  write(target, prior);
+  const fsApi = Object.create(fs);
+  let attempts = 0;
+  const pauses = [];
+  fsApi.renameSync = (from, to) => {
+    assert.equal(fs.readFileSync(target, 'utf8'), prior);
+    attempts += 1;
+    if (attempts <= 3) throw Object.assign(new Error('sharing violation'), {
+      code: ['EPERM', 'EACCES', 'EBUSY'][attempts - 1],
+    });
+    fs.renameSync(from, to);
+  };
+  writeBuildInfoAtomic(root, { complete: true }, {
+    fsApi, platform: 'win32', renameRetryPause: (ms) => pauses.push(ms),
+  });
+  assert.equal(attempts, 4);
+  assert.deepEqual(pauses, [50, 50, 50]);
+  assert.deepEqual(JSON.parse(fs.readFileSync(target, 'utf8')), { complete: true });
+  assert.deepEqual(fs.readdirSync(root), ['build-info.json']);
+});
+
+test('atomic manifest sharing retries are bounded and Windows-only', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relaybridge-build-locked-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const target = path.join(root, 'build-info.json');
+  const prior = '{"preserved":true}\n';
+  write(target, prior);
+  for (const [platform, code, expectedAttempts] of [
+    ['win32', 'EPERM', 21], ['linux', 'EPERM', 1], ['win32', 'EIO', 1],
+  ]) {
+    let attempts = 0;
+    let pauses = 0;
+    const fsApi = Object.create(fs);
+    fsApi.renameSync = () => {
+      attempts += 1;
+      throw Object.assign(new Error('persistent publication failure'), { code });
+    };
+    assert.throws(() => writeBuildInfoAtomic(root, { complete: true }, {
+      fsApi, platform, renameRetryPause: () => { pauses += 1; },
+    }), /persistent publication failure/);
+    assert.equal(attempts, expectedAttempts);
+    assert.equal(pauses, expectedAttempts - 1);
+    assert.equal(fs.readFileSync(target, 'utf8'), prior);
+    assert.deepEqual(fs.readdirSync(root), ['build-info.json']);
+  }
+});
+
 test('concurrent source preparations publish one complete deterministic manifest', async (t) => {
   const root = makeSourceRepo(t);
   const tool = path.join(ROOT, 'tools', 'prepare-build-info.cjs');
@@ -1177,14 +1229,17 @@ posixOnly('start.sh signal cleanup terminates its exact detached session', async
   await assert.rejects(fetch(`http://127.0.0.1:${port}/api/health`));
 });
 
+posixOnly('POSIX lifecycle scripts pass their native shell syntax checks', () => {
+  assert.equal(spawnSync('sh', ['-n', path.join(ROOT, 'install-mcp.sh')]).status, 0);
+  assert.equal(spawnSync('bash', ['-n', path.join(ROOT, 'start.sh')]).status, 0);
+});
+
 test('lifecycle scripts guard credentials, preserve generated identity, and require exact ready health', () => {
-  const install = fs.readFileSync(path.join(ROOT, 'install-mcp.sh'), 'utf8');
+  const install = fs.readFileSync(path.join(ROOT, 'install-mcp.sh'), 'utf8').replace(/\r\n/g, '\n');
   const releaseInstall = fs.readFileSync(path.join(ROOT, 'install.ps1'), 'utf8');
   const start = fs.readFileSync(path.join(ROOT, 'start.sh'), 'utf8');
   const windowsStart = fs.readFileSync(path.join(ROOT, 'start.ps1'), 'utf8');
   const windowsMcp = fs.readFileSync(path.join(ROOT, 'install-mcp.ps1'), 'utf8');
-  assert.equal(spawnSync('sh', ['-n', path.join(ROOT, 'install-mcp.sh')]).status, 0);
-  assert.equal(spawnSync('bash', ['-n', path.join(ROOT, 'start.sh')]).status, 0);
   assert.doesNotMatch(install, /snapshot "\$build_info" build-info/);
   assert.doesNotMatch(install, /restore "\$build_info" build-info/);
   assert.match(install, /"\$node_path" "\$build_info_tool" "\$script_dir"/);

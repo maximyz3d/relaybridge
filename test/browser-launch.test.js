@@ -25,6 +25,7 @@ const installScript = path.join(repoRoot, 'install-chrome-mcp.sh');
 const relayInstallScript = path.join(repoRoot, 'install-mcp.sh');
 const startScript = path.join(repoRoot, 'start-chrome-debug.sh');
 const windowsProxyScript = path.join(repoRoot, 'tools', 'chrome-wsl-tcp-proxy.cjs');
+const posixOnly = process.platform === 'win32' ? test.skip : test;
 
 test('browser URLs are bounded HTTP(S) values without embedded credentials', () => {
   assert.equal(validateBrowserUrl('https://example.com/a?q=1'), 'https://example.com/a?q=1');
@@ -62,7 +63,7 @@ test('unknown browser choices fail closed', () => {
   assert.throws(() => browserOpeners('mystery', { isLinux: true }, 'https://example.com/'), /default or chrome/);
 });
 
-test('Chrome setup scripts pass their native shell syntax checks', () => {
+posixOnly('Chrome setup scripts pass their native shell syntax checks', () => {
   const installCheck = spawnSync('sh', ['-n', installScript], { encoding: 'utf8' });
   assert.equal(installCheck.status, 0, installCheck.stderr);
   const relayInstallCheck = spawnSync('sh', ['-n', relayInstallScript], { encoding: 'utf8' });
@@ -148,7 +149,7 @@ test('RelayBridge MCP installer converts signals to failures before transactiona
   assert.doesNotMatch(source, /trap on_exit EXIT HUP INT TERM/);
 });
 
-test('Chrome MCP installer fails closed when both clients are skipped', () => {
+posixOnly('Chrome MCP installer fails closed when both clients are skipped', () => {
   const result = spawnSync('sh', [installScript, '--skip-codex', '--skip-claude'], { encoding: 'utf8' });
   assert.equal(result.status, 1);
   assert.match(result.stderr, /both clients were skipped/);
@@ -183,7 +184,7 @@ test('WSL NAT fallback is exact-bound, source-restricted, and validates process 
   assert.doesNotMatch(source, /(?:0\.0\.0\.0|IPAddress\.Any|netsh|portproxy|New-NetFirewallRule)/i);
 });
 
-test('WSL launcher passes an injection-safe literal port and verifies Chrome JSON', (t) => {
+posixOnly('WSL launcher passes an injection-safe literal port and verifies Chrome JSON', (t) => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'relaybridge-browser-test-'));
   t.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
   const binDir = path.join(tempDir, 'bin');
@@ -227,7 +228,7 @@ test('WSL launcher passes an injection-safe literal port and verifies Chrome JSO
   assert.equal(fs.existsSync(natAttempted), false, 'a directly reachable endpoint must bypass NAT setup');
 });
 
-test('Chrome launcher rejects invalid ports before invoking an opener', () => {
+posixOnly('Chrome launcher rejects invalid ports before invoking an opener', () => {
   const result = spawnSync('bash', [startScript], {
     encoding: 'utf8',
     env: { ...process.env, RELAYBRIDGE_CHROME_PORT: '9222;whoami', WSL_DISTRO_NAME: 'RelayBridgeTest' },
@@ -236,7 +237,7 @@ test('Chrome launcher rejects invalid ports before invoking an opener', () => {
   assert.match(result.stderr, /must be 1-65535/);
 });
 
-test('Chrome launcher rejects a colliding or malformed WSL bridge port', () => {
+posixOnly('Chrome launcher rejects a colliding or malformed WSL bridge port', () => {
   for (const bridgePort of ['9222', '49222;whoami']) {
     const result = spawnSync('bash', [startScript], {
       encoding: 'utf8',

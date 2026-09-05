@@ -6,7 +6,7 @@ const fs = require('fs');
 const http = require('http');
 const os = require('os');
 const path = require('path');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 
 const ROOT = path.resolve(__dirname, '..');
 const TEST_BUILD_ID = 'relaybridge-windows-path-test';
@@ -93,7 +93,12 @@ test('Windows child PATH discovers the official Cursor install directory and kee
   for (const key of Object.keys(serverEnv)) {
     if (key.toUpperCase() === 'PATH') delete serverEnv[key];
   }
-  serverEnv.Path = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32');
+  // Source build identity still needs git. Preserve only its exact directory,
+  // not the host provider PATH: Cursor discovery remains the behavior under test.
+  const gitLookup = spawnSync('where.exe', ['git.exe'], { encoding: 'utf8', windowsHide: true });
+  assert.equal(gitLookup.status, 0, gitLookup.stderr || 'git is required by source build verification');
+  const gitDirectory = path.dirname(gitLookup.stdout.trim().split(/\r?\n/)[0]);
+  serverEnv.Path = [path.join(process.env.SystemRoot || 'C:\\Windows', 'System32'), gitDirectory].join(';');
 
   const proc = spawn(process.execPath, [path.join(ROOT, 'server.js')], {
     cwd: ROOT,
