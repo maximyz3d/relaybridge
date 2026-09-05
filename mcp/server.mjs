@@ -10,6 +10,8 @@ import { z } from 'zod';
 import TIMEOUT_POLICY from '../timeout-policy.cjs';
 import { normalizeGenericValidation } from '../lib/validation-contract.js';
 import { promptTransportLimits, preparePrompt } from '../lib/prompt-transport.js';
+import { CONTRACT_FIELDS } from '../lib/execution-contract.js';
+import { SUPPORTED_EFFORTS as EFFORT_LEVELS } from '../lib/effort-controls.js';
 import {
   BASE_URL,
   BRIDGE_ROOT,
@@ -50,7 +52,7 @@ function envFirst(...names) {
 const CLI_CONFIG_PATH = path.resolve(envFirst('RELAYBRIDGE_CONFIG_FILE', 'PS_BRIDGE_CONFIG_FILE') || path.join(BRIDGE_ROOT, 'cli-config.json'));
 const TASK_TIERS = ['utility', 'standard', 'complex', 'critical'];
 const MODEL_TIERS = ['light', 'standard', 'heavy'];
-const EFFORT_LEVELS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+const EXECUTION_SCHEMA = z.record(z.string(), z.unknown()).describe('Versioned provider model/effort intent returned by plan_task; all fields are validated by live REST before execution or cache lookup. This grants no permissions.');
 
 export function workflowPermissionDefaults(input = {}, env = process.env) {
   const setting = (current, legacy) => {
@@ -181,6 +183,14 @@ function toolError(error) {
     payload.route = error.route;
     payload.status = error.status;
     payload.detail = error.detail;
+    const validation = normalizeValidationDiagnostic(error.detail?.validation);
+    if (validation) {
+      payload.validation = validation;
+      payload.errorCode = validation.code;
+      payload.modelInvocation = error.detail?.model_invocation === false ? false : null;
+      payload.physicalAttemptCount = payload.modelInvocation === false ? 0 : null;
+      payload.tokenUsageSource = payload.modelInvocation === false ? 'not_invoked' : 'unknown';
+    }
   }
   return result(payload, { isError: true });
 }
@@ -393,6 +403,7 @@ async function getAccountAwareRoute(args, signal, timeoutMs = ACCOUNT_AWARE_ROUT
         dangerous: args.dangerous === true,
         acknowledgeFilesystemWrites: args.acknowledgeFilesystemWrites === true,
         diagnostics,
+        effort: args.effort, model: args.model, modelTier: args.modelTier,
         ...(args.providerBudget ? { providerBudget: args.providerBudget } : {}),
       },
       timeoutMs: routeTimeoutMs,
@@ -870,7 +881,12 @@ function normalizeWorkspaceAdmission(value) {
   const bridgeBuildId = strictBoundedString(value.bridgeBuildId, 180);
   const receiptStoreId = strictSha256(value.receiptStoreId);
   if (!cwdIdentityHash || !cwdPolicyId || !bridgeBuildId || !receiptStoreId) return null;
-  return { cwdIdentityHash, cwdPolicyId, bridgeBuildId, receiptStoreId };
+  const execution = value.execution;
+  if (!execution || typeof execution !== 'object' || Array.isArray(execution)
+    || execution.version !== 1 || !strictSha256(execution.configFingerprint)
+    || CONTRACT_FIELDS.some((field) => !Object.prototype.hasOwnProperty.call(execution, field))
+    || Object.keys(execution).some((field) => !CONTRACT_FIELDS.includes(field))) return null;
+  return { cwdIdentityHash, cwdPolicyId, bridgeBuildId, receiptStoreId, execution };
 }
 
 function strictCountMap(value, allowedKey) {
@@ -1333,6 +1349,8 @@ async function callProvider({
   providerBudget,
   taskTier,
   modelTier,
+  model,
+  execution,
   effort,
   maxEffortOverride = false,
 }) {
@@ -1341,9 +1359,8 @@ async function callProvider({
   const attemptId = `${requestId}:attempt:1`;
   const outerReceiptId = `rcpt_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 8)}`;
   const classification = classifyTask(prompt);
-  const effectiveTaskTier = TASK_TIERS.includes(taskTier) ? taskTier : classification.tier;
-  const effectiveModelTier = MODEL_TIERS.includes(modelTier)
-    ? modelTier : modelTierForTaskTier(effectiveTaskTier);
+  const effectiveTaskTier = taskTier !== undefined ? taskTier : execution ? undefined : classification.tier;
+  const effectiveModelTier = modelTier !== undefined ? modelTier : execution ? undefined : modelTierForTaskTier(effectiveTaskTier);
   const ttl = cacheTtlFor(classification, cacheTtlMs);
   const configFingerprint = stableHash({
     config: fs.readFileSync(CLI_CONFIG_PATH, 'utf8'),
@@ -1368,7 +1385,9 @@ async function callProvider({
     }
     const response = await bridgeRequest('/api/workspace/validate', {
       method: 'POST',
-      body: { kind, prompt, cwd, requestId },
+      body: { kind, prompt, cwd, requestId, model, execution,
+        taskTier: effectiveTaskTier, modelTier: effectiveModelTier,
+        effort, maxEffortOverride, providerBudget, dangerous: false },
       timeoutMs: TIMEOUT_POLICY.transportTimeoutMs(timeoutMs),
       signal,
       actionIdentity: true,
@@ -1387,9 +1406,7 @@ async function callProvider({
     configFingerprint,
     purpose,
     providerBudget: providerBudget || null,
-    taskTier: effectiveTaskTier,
-    modelTier: effectiveModelTier,
-    effort: effort || null,
+    execution: workspaceAdmission?.execution || execution || null,
     maxEffortOverride: maxEffortOverride === true,
     cwdIdentityHash: workspaceAdmission?.cwdIdentityHash || null,
     cwdPolicyId: workspaceAdmission?.cwdPolicyId || null,
@@ -1486,6 +1503,8 @@ async function callProvider({
         budgetTaskTier: effectiveTaskTier,
         taskTier: effectiveTaskTier,
         modelTier: effectiveModelTier,
+        model,
+        execution: workspaceAdmission.execution,
         effort,
         maxEffortOverride,
         dangerous: false,
@@ -1632,7 +1651,8 @@ function eligibleOneShotKinds(route, config, { selectedOnly = false, allowedKind
     seen.add(candidate.kind);
     if (allowed.size && !allowed.has(candidate.kind)) return false;
     const entry = config[candidate.kind];
-    return candidate.policyScore >= 0 && entry && Array.isArray(entry.oneshot_safe) && entry.oneshot_safe.length;
+    return candidate.policyScore >= 0 && !candidate.validation && !candidate.blocked
+      && candidate.ready !== false && entry && Array.isArray(entry.oneshot_safe) && entry.oneshot_safe.length;
   });
 }
 
@@ -1826,14 +1846,17 @@ export function buildServer() {
       task: z.string().min(1).describe('what needs doing, in a sentence or two'),
       effort: z.enum(EFFORT_LEVELS).optional().describe('override the effort the tier would pick; xhigh/max require an explicit maxEffortOverride when executed'),
       kind: z.string().optional().describe('force a specific provider and plan around it'),
+      model: z.string().min(1).max(160).optional().describe('exact configured or available model; never silently substituted'),
+      modelTier: z.enum(MODEL_TIERS).optional(),
+      providerBudget: PROVIDER_BUDGET_SCHEMA.nullish(),
       dangerous: z.boolean().default(false).describe('plan an explicit writer-capable provider invocation'),
       acknowledgeFilesystemWrites: z.boolean().default(false).describe('required with dangerous=true; confirms persistent writes are authorized'),
     }),
     annotations: READ_ONLY,
-  }, safeHandler(async ({ task, effort, kind, dangerous, acknowledgeFilesystemWrites }, context) => {
+  }, safeHandler(async ({ task, effort, kind, model, modelTier, providerBudget, dangerous, acknowledgeFilesystemWrites }, context) => {
     const plan = await bridgeRequest('/api/plan', {
       method: 'POST',
-      body: { task, effort: effort ?? null, kind: kind ?? null, dangerous, acknowledgeFilesystemWrites },
+      body: { task, effort, kind, model, modelTier, providerBudget, dangerous, acknowledgeFilesystemWrites },
       timeoutMs: 20000,
       signal: context?.mcpReq?.signal,
     });
@@ -2143,6 +2166,8 @@ export function buildServer() {
       providerBudget: PROVIDER_BUDGET_SCHEMA.nullish(),
       taskTier: z.enum(TASK_TIERS).optional(),
       modelTier: z.enum(MODEL_TIERS).optional(),
+      model: z.string().min(1).max(160).optional(),
+      execution: EXECUTION_SCHEMA.optional(),
       effort: z.enum(EFFORT_LEVELS).optional(),
       maxEffortOverride: z.boolean().default(false),
       acknowledgeHumanGate: z.boolean().default(false),
@@ -2267,10 +2292,12 @@ export function buildServer() {
         useCache: args.useCache,
         parentReceiptId: rootReceipt.receiptId,
         purpose: 'route_and_ask',
+        model: candidate.model ?? undefined,
+        execution: candidate.execution ?? undefined,
         signal,
         providerBudget: args.providerBudget,
-        taskTier: route.classification.tier,
-        modelTier: modelTierForTaskTier(route.classification.tier),
+        taskTier: candidate.execution ? undefined : route.classification.tier,
+        modelTier: candidate.execution ? undefined : modelTierForTaskTier(route.classification.tier),
         effort: args.effort,
         maxEffortOverride: args.maxEffortOverride,
       });
@@ -2348,6 +2375,7 @@ export function buildServer() {
       maxProviders: args.maxProviders,
       committeeMode: args.mode,
       providerBudget: args.providerBudget,
+      effort: args.effort,
     }, signal, remainingTime(requestedDeadlineAt, 1));
     if (route.humanGateRequired && !args.acknowledgeHumanGate) {
       return result({ ok: false, blocked: true, route, error: 'High-stakes committee requires acknowledgeHumanGate=true and remains advisory.' }, { isError: true });
@@ -2387,13 +2415,29 @@ export function buildServer() {
         preparePrompt(seatPrompts[index], { ...limits,
           maxChars: limits.maxChars === null ? tierPolicy.maxInputChars : Math.min(limits.maxChars, tierPolicy.maxInputChars),
           policyPrefix: typeof entry.oneshot_safe_prompt_prefix === 'string' ? entry.oneshot_safe_prompt_prefix.trim() : '' });
+        const candidate = eligible[index];
+        const admission = await bridgeRequest('/api/workspace/validate', { method: 'POST', signal,
+          timeoutMs: remainingTime(requestedDeadlineAt), actionIdentity: true,
+          body: { kind: candidate.kind, prompt: seatPrompts[index], cwd: args.cwd,
+            requestId: `mcp:${crypto.randomUUID()}`, dangerous: false,
+            execution: candidate.execution ?? undefined, model: candidate.model ?? undefined,
+            taskTier: candidate.execution ? undefined : route.classification.tier,
+            modelTier: candidate.execution ? undefined : modelTierForTaskTier(route.classification.tier),
+            effort: args.effort, maxEffortOverride: args.maxEffortOverride, providerBudget: args.providerBudget } });
+        const normalized = normalizeWorkspaceAdmission(admission);
+        if (!normalized) throw new Error('Malformed live execution admission; committee blocked before dispatch.');
+        candidate.execution = normalized.execution;
       }
     } catch (error) {
-      const validation = normalizeGenericValidation(error.validation);
+      const validation = normalizeValidationDiagnostic(error.validation || error.detail?.validation);
+      const failure = bridgeFailureResult(error, { kind: null, signal }).sanitized;
       const receipt = appendReceipt({ event: 'committee', routeId: route.routeId,
-        taskHash: route.classification.taskHash, status: 'input_budget_gate',
-        modelInvocation: false, physicalAttemptCount: 0, validation });
-      return result({ ok: false, blocked: true, route, receiptId: receipt.receiptId,
+        taskHash: route.classification.taskHash, status: 'preflight_gate',
+        modelInvocation: false, physicalAttemptCount: 0, validation, errorCode: validation?.code || null,
+        transportReceiptId: failure.transportReceiptId, tokenUsageSource: 'not_invoked',
+        providerRetryCount: 0, transportRetryCount: 0 });
+      return result({ ...failure, ok: false, blocked: true, status: 'blocked', members: [], cacheHit: false,
+        route, receiptId: receipt.receiptId, errorCode: validation?.code || null,
         error: error.message, validation, inputTruncated: false, modelInvocation: false,
         physicalAttemptCount: 0, tokenUsageSource: 'not_invoked' }, { isError: true });
     }
@@ -2432,10 +2476,12 @@ export function buildServer() {
           useCache: args.useCache,
           parentReceiptId: rootReceipt.receiptId,
           purpose: `committee:${role}`,
+          model: candidate.model ?? undefined,
+          execution: candidate.execution ?? undefined,
           signal,
           providerBudget: args.providerBudget,
-          taskTier: route.classification.tier,
-          modelTier: modelTierForTaskTier(route.classification.tier),
+          taskTier: candidate.execution ? undefined : route.classification.tier,
+          modelTier: candidate.execution ? undefined : modelTierForTaskTier(route.classification.tier),
           effort: args.effort,
           maxEffortOverride: args.maxEffortOverride,
         });
@@ -2499,10 +2545,12 @@ export function buildServer() {
           useCache: args.useCache,
           parentReceiptId: rootReceipt.receiptId,
           purpose: 'committee:chair',
+          model: eligible.find((candidate) => candidate.kind === chairKind)?.model ?? undefined,
+          execution: eligible.find((candidate) => candidate.kind === chairKind)?.execution ?? undefined,
           signal,
           providerBudget: args.providerBudget,
-          taskTier: route.classification.tier,
-          modelTier: modelTierForTaskTier(route.classification.tier),
+          taskTier: eligible.find((candidate) => candidate.kind === chairKind)?.execution ? undefined : route.classification.tier,
+          modelTier: eligible.find((candidate) => candidate.kind === chairKind)?.execution ? undefined : modelTierForTaskTier(route.classification.tier),
           effort: args.effort,
           maxEffortOverride: args.maxEffortOverride,
         });
@@ -2625,16 +2673,20 @@ export function buildServer() {
       cwd: z.string().max(1000).optional(),
       timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).max(TIMEOUT_POLICY.oneShotMaxMs).default(TIMEOUT_POLICY.oneShotDefaultMs),
       providerBudget: PROVIDER_BUDGET_SCHEMA.nullish(),
+      taskTier: z.enum(TASK_TIERS).optional(),
+      modelTier: z.enum(MODEL_TIERS).optional(),
+      model: z.string().min(1).max(160).optional(),
+      execution: EXECUTION_SCHEMA.optional(),
       effort: z.enum(EFFORT_LEVELS).optional(),
       maxEffortOverride: z.boolean().default(false),
     }),
     annotations: { ...ACTION, openWorldHint: true },
-  }, safeHandler(async ({ prompt, tag, providers, all, cwd, timeoutMs, providerBudget, effort, maxEffortOverride }, context) => {
+  }, safeHandler(async ({ prompt, tag, providers, all, cwd, timeoutMs, providerBudget, effort, maxEffortOverride, taskTier, modelTier, model, execution }, context) => {
     const response = await bridgeRequest('/api/broadcast', {
       method: 'POST',
       body: {
         prompt, tag, providers, all, cwd, timeoutMs, providerBudget, effort,
-        maxEffortOverride, dangerous: false,
+        maxEffortOverride, taskTier, modelTier, model, execution, dangerous: false,
       },
       timeoutMs: TIMEOUT_POLICY.transportTimeoutMs(timeoutMs),
       signal: context?.mcpReq?.signal,
@@ -2977,6 +3029,8 @@ export function buildServer() {
       providerBudget: PROVIDER_BUDGET_SCHEMA.nullish(),
       taskTier: z.enum(['utility', 'standard', 'complex', 'critical']).optional(),
       modelTier: z.enum(['light', 'standard', 'heavy']).optional(),
+      model: z.string().min(1).max(160).optional(),
+      execution: EXECUTION_SCHEMA.optional(),
       effort: z.enum(EFFORT_LEVELS).optional(),
       maxEffortOverride: z.boolean().default(false),
       groundingOverride: z.boolean().default(false),

@@ -190,17 +190,19 @@ test('the CLI ask payload preserves the caller working directory', () => {
   assert.equal(body.requestId, 'cli:test-request-0001');
 });
 
-test('the CLI ask payload propagates the planned model tier and effort', () => {
+test('the CLI ask payload propagates the planned exact intent without promoting inferred effort to explicit', () => {
   const { buildAskBody } = require('../bin/relaybridge.js');
   const plan = {
-    primary: { kind: 'codex', modelTier: 'heavy' },
+    primary: { kind: 'codex', modelTier: 'heavy', model: 'planned-model', execution: { provider: 'codex', model: 'planned-model' } },
     tier: 'complex',
     effort: 'high',
   };
   const body = buildAskBody(plan, 'debug the architecture', '/repo', 'cli:test-controls-1');
   assert.equal(body.taskTier, 'complex');
   assert.equal(body.modelTier, 'heavy');
-  assert.equal(body.effort, 'high');
+  assert.equal(body.effort, undefined);
+  assert.equal(body.model, 'planned-model');
+  assert.deepEqual(body.execution, plan.primary.execution);
   assert.equal(body.maxEffortOverride, undefined);
 });
 
@@ -212,7 +214,7 @@ test('the CLI extreme-effort gate reflects explicit user intent, not a returned 
     effort: 'max',
   };
   const inferred = buildAskBody(plan, 'hard task', '/repo', 'cli:test-controls-2');
-  assert.equal(inferred.effort, 'max');
+  assert.equal(inferred.effort, undefined);
   assert.equal(inferred.maxEffortOverride, undefined, 'a plan cannot silently authorize maximum effort');
 
   for (const effort of ['xhigh', 'max']) {

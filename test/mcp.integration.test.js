@@ -1164,11 +1164,11 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
       useCache: false,
     },
   });
-  assert.equal(cwdCommittee.structuredContent.status, 'failed');
-  assert.equal(cwdCommittee.structuredContent.members.length, 2);
-  cwdCommittee.structuredContent.members.forEach(assertCwdDiagnostic);
+  assert.equal(cwdCommittee.structuredContent.status, 'blocked');
+  assert.equal(cwdCommittee.structuredContent.members.length, 0);
+  assertCwdDiagnostic(cwdCommittee.structuredContent);
 
-  for (const rejectedMember of [cwdRoute.structuredContent.attempts[0], ...cwdCommittee.structuredContent.members]) {
+  for (const rejectedMember of [cwdRoute.structuredContent.attempts[0], cwdCommittee.structuredContent]) {
     assert.match(rejectedMember.transportReceiptId, /^rcpt_/);
     assert.equal(rejectedMember.transportReceiptPersisted, true);
     const outer = await client.callTool({
@@ -1192,11 +1192,7 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
     assert.equal(containsPath(transportReceipt.structuredContent.receipt, outsideRoot), false);
   }
 
-  const cwdCommitteeRun = await client.callTool({
-    name: 'get_run', arguments: { runId: cwdCommittee.structuredContent.runId },
-  });
-  assert.equal(cwdCommitteeRun.structuredContent.members.length, 2);
-  cwdCommitteeRun.structuredContent.members.forEach(assertCwdDiagnostic);
+  assert.equal(cwdCommittee.structuredContent.runId, undefined, 'all-member rejection precedes creation of a running committee');
 
   const routedProvider = await client.callTool({
     name: 'route_and_ask',
@@ -1216,7 +1212,7 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   const routedEffort = routedTier === 'utility' ? 'low'
     : ['complex', 'critical'].includes(routedTier) ? 'high' : 'medium';
   assert.equal(routedProvider.structuredContent.winner.route.task_tier, routedTier);
-  assert.equal(routedProvider.structuredContent.winner.route.requested_model_tier, routedModelTier);
+  assert.equal(routedProvider.structuredContent.winner.route.requested_model_tier, null, 'routing weight is inferred, not a caller model-tier request');
   assert.equal(routedProvider.structuredContent.winner.route.model_tier, routedModelTier);
   assert.equal(routedProvider.structuredContent.winner.route.requested_effort, null);
   assert.equal(routedProvider.structuredContent.winner.route.applied_effort, routedEffort);
@@ -1262,7 +1258,8 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   assert.deepEqual(strictCommittee.structuredContent.members.map((member) => member.kind), ['codex']);
   assert.equal(strictCommittee.structuredContent.members[0].route.task_tier,
     strictCommittee.structuredContent.route.classification.tier);
-  assert.equal(strictCommittee.structuredContent.members[0].route.requested_model_tier,
+  assert.equal(strictCommittee.structuredContent.members[0].route.requested_model_tier, null);
+  assert.equal(strictCommittee.structuredContent.members[0].route.model_tier,
     strictCommittee.structuredContent.route.classification.tier === 'utility' ? 'light'
       : ['complex', 'critical'].includes(strictCommittee.structuredContent.route.classification.tier)
         ? 'heavy' : 'standard');

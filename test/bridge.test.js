@@ -1873,9 +1873,10 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   });
   assert.equal(unsupportedEffortResponse.status, 400);
   const unsupportedEffort = await unsupportedEffortResponse.json();
-  assert.match(unsupportedEffort.error, /cannot express requested effort=minimal/);
+  assert.equal(unsupportedEffort.validation.code, 'unsupported_effort');
+  assert.equal(unsupportedEffort.validation.field, 'effort');
   assert.equal(unsupportedEffort.model_invocation, false);
-  assert.equal(unsupportedEffort.route.effort_method, 'unsupported');
+  assert.equal(unsupportedEffort.physical_attempt_count, 0);
 
   const malformedModelsResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST',

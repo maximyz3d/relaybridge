@@ -231,6 +231,9 @@ function buildAskBody(
   providerBudget = null,
   explicitlyRequestedEffort = null,
 ) {
+  if (plan.primary?.validation || plan.primary?.blocked || plan.primary?.ready === false) {
+    throw new InputError(plan.primary.validation?.reason || 'The planned provider is blocked; obtain a ready plan before execution.');
+  }
   const body = {
     kind: plan.primary.kind,
     prompt: task,
@@ -240,9 +243,11 @@ function buildAskBody(
     requestId,
   };
   if (plan.primary.modelTier) body.modelTier = plan.primary.modelTier;
-  if (plan.effort) body.effort = plan.effort;
+  if (plan.primary.model) body.model = plan.primary.model;
+  if (plan.primary.execution) body.execution = plan.primary.execution;
   const explicitEffort = typeof explicitlyRequestedEffort === 'string'
     ? explicitlyRequestedEffort.trim().toLowerCase() : null;
+  if (explicitEffort) body.effort = explicitEffort;
   if (explicitEffort === 'max' || explicitEffort === 'xhigh') {
     body.maxEffortOverride = true;
   }
@@ -307,7 +312,7 @@ async function main() {
       case 'plan': {
         const providerBudget = parseProviderBudgetFlag(flags['provider-budget'] ?? flags.providerBudget);
         const task = resolveTaskInput(flags, rest);
-        const plan = await call('/api/plan', { method: 'POST', body: { task, effort: flags.effort || null, kind: flags.kind || null, providerBudget } });
+        const plan = await call('/api/plan', { method: 'POST', body: { task, effort: flags.effort, kind: flags.kind, model: flags.model, modelTier: flags['model-tier'] ?? flags.modelTier, providerBudget } });
         printPlan(plan, { json });
         return 0;
       }
@@ -315,7 +320,7 @@ async function main() {
       case 'ask': {
         const providerBudget = parseProviderBudgetFlag(flags['provider-budget'] ?? flags.providerBudget);
         const task = resolveTaskInput(flags, rest);
-        const plan = await call('/api/plan', { method: 'POST', body: { task, effort: flags.effort || null, kind: flags.kind || null, providerBudget } });
+        const plan = await call('/api/plan', { method: 'POST', body: { task, effort: flags.effort, kind: flags.kind, model: flags.model, modelTier: flags['model-tier'] ?? flags.modelTier, providerBudget } });
         if (!plan.primary) { console.error('no ready provider for this task; run: relaybridge status'); return 1; }
         if (plan.humanGate && !flags.force) {
           printPlan(plan, { json: false });

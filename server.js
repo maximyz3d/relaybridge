@@ -11,11 +11,11 @@ const crypto = require('crypto');
 const { RunSupervisor, resolveSupervisorOptions, normalizeProviderBudget } = require('./lib/run-supervisor');
 const { validateProviderBudget } = require('./lib/provider-budget');
 const { promptTransportLimits, preparePrompt, renderPromptSlot } = require('./lib/prompt-transport');
-const { SUPPORTED_EFFORTS, EXTREME_EFFORTS, EFFORT_BY_TASK_TIER,
-  normalizeEffort, findEffortControl, stripEffortControls, configuredEffortArgs,
-  configuredReasoningEffortFamily, modelImpliedEffort, applyProviderEffort } = require('./lib/effort-controls');
-const { resolveModelArgs, applyModelArgs, modelConfigStaleness, modelTierForTaskTier } = require('./lib/model-tiers');
-const { buildRegistry, parseModelList, pinIsRetired } = require('./lib/model-registry');
+const { resolveProviderControls, validateControlRequest, modelControls } = require('./lib/execution-contract');
+const { validationError } = require('./lib/validation-contract');
+const { normalizeEffort } = require('./lib/effort-controls');
+const { modelConfigStaleness, modelTierForTaskTier } = require('./lib/model-tiers');
+const { buildRegistry, parseModelList } = require('./lib/model-registry');
 const { buildTaskPlan, costClassFor } = require('./lib/task-plan');
 const { createWorkflowPipeline } = require('./lib/workflow-pipeline');
 const { createWorkflowController } = require('./lib/workflow-controller');
@@ -1207,50 +1207,6 @@ function resolveSlot(slot) {
   });
 }
 
-function annotateRequestedPlanEffort(plan, config, requestedEffort) {
-  plan.effort = requestedEffort;
-  const candidates = new Set([
-    plan.primary,
-    ...(Array.isArray(plan.alternates) ? plan.alternates : []),
-    plan.cheapestCapable,
-  ].filter(Boolean));
-  for (const candidate of candidates) {
-    candidate.effort = requestedEffort;
-    const entry = config?.[candidate.kind] || {};
-    let effortArgs = configuredEffortArgs(entry, requestedEffort);
-    const family = configuredReasoningEffortFamily(entry);
-    if (!effortArgs && requestedEffort === 'xhigh' && family) {
-      effortArgs = [family.flag, `${family.key}=xhigh`];
-    }
-    const baseSlot = Array.isArray(entry.oneshot_safe) ? entry.oneshot_safe : [];
-    const baseControl = findEffortControl(baseSlot);
-    if (!effortArgs && baseControl?.method === 'flag') {
-      effortArgs = [baseControl.flag, requestedEffort];
-    }
-    if (!effortArgs && baseControl?.method === 'config' && requestedEffort !== 'max') {
-      effortArgs = [baseControl.flag, `${baseControl.configKey}=${requestedEffort}`];
-    }
-    const actual = findEffortControl(effortArgs || []);
-    if (actual) {
-      candidate.args = stripEffortControls(Array.isArray(candidate.args) ? candidate.args : []).args
-        .concat(effortArgs);
-      candidate.effortMethod = actual.method === 'config' ? 'effort_flags' : 'flag';
-      candidate.appliedEffort = actual.effort;
-      candidate.effortSupported = true;
-      continue;
-    }
-    const implied = modelImpliedEffort({ model: candidate.model, modelTier: candidate.modelTier }, entry);
-    candidate.appliedEffort = implied;
-    candidate.effortSupported = implied === requestedEffort;
-    if (candidate.effortSupported) candidate.effortMethod = 'model_choice';
-  }
-  if (plan.primary?.effortSupported === false) {
-    plan.guidance = [
-      ...(Array.isArray(plan.guidance) ? plan.guidance : []),
-      `${plan.primary.label || plan.primary.kind} cannot express effort=${requestedEffort} with its selected model/control; execution will reject before spending provider quota.`,
-    ];
-  }
-}
 
 function buildEnv(extras = {}, stripNames = []) {
   const env = { ...process.env, ...extras };
@@ -2199,6 +2155,7 @@ async function runOpenAIChatOneShot({ entry, prompt, effectivePrompt, timeoutMs,
     const existingIdentity = typeof route.resolved_model_identity === 'string'
       ? route.resolved_model_identity.trim().slice(0, 160) : '';
     route.resolved_model = providerModel || configuredModel || null;
+    route.observed_model = providerModel || null;
     route.resolved_model_identity = providerModel || existingIdentity || configuredModel || null;
     route.resolved_model_source = providerModel ? 'provider_response'
       : existingIdentity ? route.resolved_model_source : configuredModel ? 'configured_model' : null;
@@ -2337,6 +2294,7 @@ async function runOllamaApiOneShot({ entry, prompt, effectivePrompt, timeoutMs, 
     const providerModel = typeof payload.model === 'string' ? payload.model.trim().slice(0, 160) : '';
     const configuredModel = typeof entry.model === 'string' ? entry.model.trim().slice(0, 160) : '';
     route.resolved_model = providerModel || configuredModel || null;
+    route.observed_model = providerModel || null;
     const inputTokens = nonnegativeUsageNumber(payload.prompt_eval_count);
     const outputTokens = nonnegativeUsageNumber(payload.eval_count);
     const usage = {
@@ -3029,6 +2987,31 @@ app.get('/api/workspace', (req, res) => {
 // cached provider result.  This endpoint performs the same startup-pinned cwd
 // validation as /api/oneshot without invoking a provider or exposing a host
 // path.  Rejections receive the normal durable zero-invocation receipt.
+function validateProviderIntent(body, cfg = loadConfig()) {
+  if (!providerAccounts.validProviderKey(body.kind) || !Object.prototype.hasOwnProperty.call(cfg, body.kind)) {
+    throw validationError('unknown_provider', 'kind', 'Provider is not configured.');
+  }
+  const entry = cfg[body.kind];
+  validateProviderBudget(body.providerBudget);
+  const useDanger = body.dangerous === true;
+  const controls = resolveProviderControls({ kind: body.kind, entry, registry: modelRegistry,
+    slot: useDanger ? entry.oneshot_dangerous : entry.oneshot_safe,
+    taskTier: body.taskTier, modelTier: body.modelTier, model: body.model,
+    effort: body.effort, maxEffortOverride: body.maxEffortOverride,
+    execution: body.execution, dangerous: useDanger });
+  if (body.prompt !== undefined) preparePrompt(body.prompt, {
+    ...promptTransportLimits(entry, controls.slot),
+    policyPrefix: !useDanger && typeof entry.oneshot_safe_prompt_prefix === 'string' ? entry.oneshot_safe_prompt_prefix.trim() : '',
+  });
+  return controls;
+}
+function rejectInvalidIntent(res, body, error) {
+  return sendOneShotPreAdmissionRejection(res, { statusCode: 400,
+    payload: { error: error.validation?.reason || error.message, errorCode: error.code || null, validation: error.validation || null },
+    kind: typeof body.kind === 'string' ? body.kind : null,
+    prompt: typeof body.prompt === 'string' ? body.prompt : '',
+    requestId: normalizeOneShotRequestId(body), failureClass: 'validation', startedAt: Date.now() });
+}
 app.post('/api/workspace/validate', (req, res) => {
   const startedAt = Date.now();
   const body = req.body || {};
@@ -3036,8 +3019,13 @@ app.post('/api/workspace/validate', (req, res) => {
   try {
     const snapshot = captureAllowedCwdIdentity(body.cwd);
     revalidateAllowedCwdIdentity(snapshot);
+    let execution = null;
+    if (body.kind !== undefined) {
+      execution = validateProviderIntent(body).execution;
+    }
     return res.json({
       ok: true,
+      execution,
       cwdIdentityHash: snapshot.cwdIdentityHash,
       cwdPolicyId: CWD_POLICY_IDENTITY,
       model_invocation: false,
@@ -3563,19 +3551,18 @@ app.post('/api/models/refresh', async (req, res) => {
 app.post('/api/plan', planningRequestLimit, async (req, res) => {
   const controller = new AbortController();
   res.once('close', () => { if (!res.writableEnded) controller.abort(); });
-  const { task, effort, kind, providerBudget: rawBudget } = req.body || {};
+  const { task, effort, kind, model, modelTier, providerBudget: rawBudget } = req.body || {};
   if (!task || typeof task !== 'string' || !task.trim()) {
     return res.status(400).json({ error: 'task (non-empty string) required' });
   }
-  const requestedEffort = effort ? normalizeEffort(String(effort)) : null;
-  if (effort && !requestedEffort) {
-    return res.status(400).json({ error: `effort must be one of: ${SUPPORTED_EFFORTS.join(', ')}` });
-  }
+  try { validateControlRequest(req.body || {}); }
+  catch (err) { return rejectInvalidIntent(res, { ...req.body, prompt: task }, err); }
+  const requestedEffort = effort == null ? null : normalizeEffort(effort);
   let requestedProviderBudget;
   try {
     requestedProviderBudget = validateProviderBudget(rawBudget);
   } catch (err) {
-    return res.status(400).json({ error: err.message });
+    return rejectInvalidIntent(res, { ...req.body, prompt: task }, err);
   }
   let filesystemAuthority;
   try { filesystemAuthority = planningFilesystemAuthority(req.body || {}); }
@@ -3621,15 +3608,17 @@ app.post('/api/plan', planningRequestLimit, async (req, res) => {
       route,
       config: cfg,
       registry: modelRegistry,
-      resolveModelArgs,
-      // lib/task-plan predates xhigh.  Use its conservative high mechanics to
-      // choose the same provider/model, then restore the caller's explicit
-      // xhigh intent below; execution performs the provider capability check.
-      requestedEffort: requestedEffort === 'xhigh' ? 'high' : requestedEffort,
+      requestedEffort,
       requestedKind: kind || null,
       requestedProviderBudget,
+      requestedModel: model,
+      requestedModelTier: modelTier,
+      dangerous: filesystemAuthority.dangerous,
     });
-    if (requestedEffort) annotateRequestedPlanEffort(plan, cfg, requestedEffort);
+    if (kind && plan.primary?.validation) return res.status(400).json({ ok: false,
+      error: plan.primary.validation.reason, errorCode: plan.primary.validation.code,
+      validation: plan.primary.validation, model_invocation: false, physical_attempt_count: 0,
+      token_usage_source: 'not_invoked' });
     res.json({ ok: true, task: task.slice(0, 400), ...plan, fleetState: route.fleetState });
   } catch (err) {
     if (!res.destroyed && !res.writableEnded) res.status(500).json({ ok: false, error: err.message });
@@ -3655,11 +3644,13 @@ app.post('/api/route', planningRequestLimit, async (req, res) => {
   if (!['advisory', 'consensus'].includes(committeeMode)) {
     return res.status(400).json({ error: 'committeeMode must be advisory or consensus' });
   }
+  try { validateControlRequest(req.body || {}); }
+  catch (err) { return rejectInvalidIntent(res, { ...req.body, prompt: task }, err); }
   let requestedProviderBudget;
   try {
     requestedProviderBudget = validateProviderBudget(rawBudget);
   } catch (err) {
-    return res.status(400).json({ error: err.message });
+    return rejectInvalidIntent(res, { ...req.body, prompt: task }, err);
   }
   let filesystemAuthority;
   try { filesystemAuthority = planningFilesystemAuthority(req.body || {}); }
@@ -3711,27 +3702,25 @@ app.post('/api/route', planningRequestLimit, async (req, res) => {
       filesystemAuthority,
     };
     const taskTier = route.classification?.tier;
-    const selected = (route.selected || []).map((pick) => {
-      const entry = cfg[pick.kind] || {};
-      const resolved = resolveModelArgs({ entry, taskTier });
-      const retired = resolved.model ? pinIsRetired(modelRegistry, pick.kind, resolved.model) : false;
-      const budget = resolveSupervisorOptions({
-        entry,
-        globals: cfg._supervisor || {},
-        providerBudget: requestedProviderBudget,
-        taskTier,
-      }).providerBudget;
+    const planCandidate = (pick) => {
+      const planned = buildTaskPlan({ route: { ...route, selected: [pick] }, config: cfg,
+        registry: modelRegistry, requestedProviderBudget, requestedEffort: req.body?.effort,
+        requestedModel: req.body?.model, requestedModelTier: req.body?.modelTier,
+        dangerous: filesystemAuthority.dangerous }).primary;
       return {
         ...pick,
-        modelTier: resolved.modelTier,
-        model: retired ? null : resolved.model,
-        modelArgs: retired ? [] : resolved.args,
-        modelSource: retired ? 'account_default_retired_pin' : resolved.source,
-        modelNote: retired ? `configured model "${resolved.model}" is no longer offered by this account` : resolved.note,
-        providerBudget: budget,
+        modelTier: planned.modelTier, model: planned.model, modelArgs: planned.args,
+        modelSource: planned.execution ? 'execution_contract' : null,
+        modelNote: planned.validation?.reason || null, execution: planned.execution,
+        effort: planned.effort, appliedEffort: planned.appliedEffort,
+        effortMethod: planned.effortMethod, effortFallbackReason: planned.effortFallbackReason,
+        validation: planned.validation, blocked: planned.blocked, ready: planned.ready,
+        providerBudget: planned.providerBudget,
       };
-    });
-    res.json({ ok: true, ...route, selected, modelTier: modelTierForTaskTier(taskTier), modelConfig: modelConfigStaleness(cfg._models || {}) });
+    };
+    const selected = (route.selected || []).map(planCandidate);
+    const candidates = (route.candidates || []).map(planCandidate);
+    res.json({ ok: true, ...route, selected, candidates, modelTier: modelTierForTaskTier(taskTier), modelConfig: modelConfigStaleness(cfg._models || {}) });
   } catch (err) {
     if (!res.destroyed && !res.writableEnded) res.status(500).json({ ok: false, error: err.message });
   }
@@ -4229,28 +4218,8 @@ async function executeOneShot(body, res) {
   try {
     requestedProviderBudget = validateProviderBudget(body?.providerBudget);
   } catch (err) {
-    return rejectBeforeAdmission(400, 'validation', { error: err.message });
+    return rejectBeforeAdmission(400, 'validation', { error: err.message, errorCode: err.code, validation: err.validation });
   }
-  const requestedEffort = typeof body?.effort === 'string' ? body.effort.trim().toLowerCase() : null;
-  if (requestedEffort && !SUPPORTED_EFFORTS.includes(requestedEffort)) {
-    return rejectBeforeAdmission(400, 'validation', {
-      error: `effort must be one of: ${SUPPORTED_EFFORTS.join(', ')}`,
-    });
-  }
-  if (EXTREME_EFFORTS.has(requestedEffort) && body?.maxEffortOverride !== true) {
-    return rejectBeforeAdmission(400, 'validation', {
-      error: `effort=${requestedEffort} requires maxEffortOverride=true; RelayBridge never infers xhigh/max effort`,
-    });
-  }
-  if (body?.maxEffortOverride === true && !EXTREME_EFFORTS.has(requestedEffort)) {
-    return rejectBeforeAdmission(400, 'validation', {
-      error: 'maxEffortOverride is valid only with effort=xhigh or effort=max',
-    });
-  }
-  const tierEffort = !requestedEffort && typeof body?.taskTier === 'string'
-    ? EFFORT_BY_TASK_TIER[body.taskTier.trim().toLowerCase()] || null
-    : null;
-  const effectiveEffort = requestedEffort || tierEffort;
   // A provider-wide readiness probe describes the operator's implicit/default
   // login. Linked credential directories are separate authority domains, so a
   // positive signed-out result excludes only that implicit account; account
@@ -4302,58 +4271,22 @@ async function executeOneShot(body, res) {
   if (!slotRaw || !slotRaw.length) {
     return rejectBeforeAdmission(400, 'configuration', { error: 'no oneshot config for ' + kind });
   }
-  // Model selection inside the provider: taskTier/modelTier picks the weight
-  // class. A pin discovery proved is retired is dropped rather than sent â€” a
-  // missing flag runs on the account default, a dead id fails every call.
-  let modelChoice = resolveModelArgs({
-    entry,
-    taskTier: typeof body?.taskTier === 'string' ? body.taskTier : undefined,
-    modelTier: typeof body?.modelTier === 'string' ? body.modelTier : undefined,
-  });
-  if (modelChoice.model && pinIsRetired(modelRegistry, kind, modelChoice.model)) {
-    console.warn(`[RelayBridge] ${kind}: pinned model "${modelChoice.model}" is not in this account's model list â€” falling back to the account default`);
-    modelChoice = { ...modelChoice, args: [], model: null, source: 'account_default_retired_pin' };
+  let controls;
+  try {
+    controls = resolveProviderControls({ kind, entry, registry: modelRegistry, slot: slotRaw,
+      taskTier: body?.taskTier, modelTier: body?.modelTier, model: body?.model,
+      effort: body?.effort, maxEffortOverride: body?.maxEffortOverride,
+      execution: body?.execution, dangerous: useDanger });
+  } catch (error) {
+    return rejectBeforeAdmission(400, 'validation', { error: error.message,
+      errorCode: error.code || null, validation: error.validation || null });
   }
-  let slot = applyModelArgs(
-    resolveSlot(slotRaw),
-    modelChoice.args,
-    entry,
-    modelChoice.suppressArgs,
-  );
-  let effortResolution = applyProviderEffort({
-    slot, entry, modelChoice, requestedEffort: effectiveEffort,
-  });
-  let effortFallbackReason = null;
-  // A task tier is a routing preference, not an assertion that every custom
-  // provider exposes an effort knob. Apply the inferred value when the
-  // provider can express it; otherwise run on its honest account default.
-  // An explicit caller request remains strict and still fails before launch.
-  if (effortResolution.error && !requestedEffort && tierEffort) {
-    effortFallbackReason = effortResolution.error;
-    effortResolution = applyProviderEffort({
-      slot, entry, modelChoice, requestedEffort: null,
-    });
-  }
-  if (effortResolution.error) {
-    return rejectBeforeAdmission(400, 'validation', {
-      error: `${kind} ${effortResolution.error}`,
-      requestedEffort: effectiveEffort,
-      appliedEffort: null,
-    }, {
-      provider: kind,
-      task_tier: typeof body?.taskTier === 'string' ? body.taskTier : null,
-      model_tier: modelChoice.modelTier,
-      requested_effort: requestedEffort,
-      target_effort: effectiveEffort,
-      applied_effort: null,
-      effort_explicit: !!requestedEffort,
-      effort_source: requestedEffort ? 'request' : (tierEffort ? 'task_tier' : 'provider_default'),
-      max_effort_override: EXTREME_EFFORTS.has(requestedEffort) && body?.maxEffortOverride === true,
-      effort_method: 'unsupported',
-      request_id: requestId,
-    });
-  }
-  slot = effortResolution.slot;
+  const { modelChoice, effortResolution, execution } = controls;
+  const requestedEffort = execution.requestedEffort;
+  const tierEffort = execution.effortSource === 'task_tier' ? execution.targetEffort : null;
+  const effectiveEffort = execution.targetEffort;
+  const effortFallbackReason = execution.effortFallbackReason;
+  let slot = resolveSlot(controls.slot);
   const safePromptPrefix = !useDanger && typeof entry.oneshot_safe_prompt_prefix === 'string'
     ? entry.oneshot_safe_prompt_prefix.trim() : '';
   let preparedPrompt;
@@ -4364,7 +4297,6 @@ async function executeOneShot(body, res) {
       error: err.message, errorCode: err.code, validation: err.validation,
     });
   }
-  const hasInlinePrompt = preparedPrompt.evidence.transport === 'argument';
   const hasPromptFile = preparedPrompt.evidence.transport === 'file';
   let resolvedCwd;
   let resolvedCwdIdentity;
@@ -4539,12 +4471,7 @@ async function executeOneShot(body, res) {
   // strippable.
   Object.assign(childEnv, dispatchAccount.env);
   const resolvedBin = resolveExecutable(bin, childEnv);
-  const flagValue = (name) => {
-    const index = args.indexOf(name);
-    return index >= 0 && index + 1 < args.length ? args[index + 1] : null;
-  };
-  const modelFlagSent = ['--model', '-m', '--model-id', '--llm', '--model-name']
-    .find((flag) => args.includes(flag)) || null;
+  const modelFlagSent = modelControls(slot, entry)[0]?.flag || null;
   // Return non-secret route metadata with every one-shot response.  This lets
   // committee callers prove which model/effort was requested instead of
   // guessing from a generic "Claude" label.
@@ -4559,20 +4486,24 @@ async function executeOneShot(body, res) {
     transport: entry.transport || 'cli',
     configured_binary: bin,
     resolved_binary: resolvedBin,
-    task_tier: typeof body?.taskTier === 'string' ? body.taskTier : null,
-    requested_model_tier: typeof body?.modelTier === 'string' ? body.modelTier : null,
+    task_tier: execution.requestedTaskTier,
+    requested_model_tier: execution.requestedModelTier,
     model_tier: modelChoice.modelTier,
-    requested_model: (modelFlagSent ? flagValue(modelFlagSent) : null) || entry.model || null,
+    caller_requested_model: typeof body?.model === 'string' ? body.model : null,
+    planned_model: body?.execution?.model ?? null,
+    requested_model: execution.model,
+    execution,
+    resolved_outgoing_model: execution.model,
+    model_identity_source: modelChoice.source,
+    observed_model: null,
     model_flag_sent: modelFlagSent,
-    resolved_model_identity: entry.model
-      ? `${entry.model}${ollamaManifestIdentity(entry) ? `@${ollamaManifestIdentity(entry)}` : ''}`
-      : null,
+    resolved_model_identity: execution.model,
     requested_effort: requestedEffort,
     target_effort: effectiveEffort,
     applied_effort: effortResolution.appliedEffort,
     effort_explicit: !!requestedEffort,
     effort_source: requestedEffort ? 'request' : (tierEffort ? 'task_tier' : 'provider_default'),
-    max_effort_override: EXTREME_EFFORTS.has(requestedEffort) && body?.maxEffortOverride === true,
+    max_effort_override: body?.maxEffortOverride === true,
     effort_method: effortResolution.method,
     effort_control: effortResolution.control,
     effort_fallback_reason: effortFallbackReason,
@@ -4687,7 +4618,7 @@ async function executeOneShot(body, res) {
   if (entry.oneshot_adapter === 'ollama_api') {
     cleanupPromptFile();
     return runOllamaApiOneShot({
-      entry, prompt, effectivePrompt, timeoutMs: adapterTimeoutMs, res, route, startedAt,
+      entry: { ...entry, model: execution.model }, prompt, effectivePrompt, timeoutMs: adapterTimeoutMs, res, route, startedAt,
       providerBudget: resolvedProviderBudget,
       accountId: dispatchAccount.account?.id || null,
     });
@@ -4695,7 +4626,7 @@ async function executeOneShot(body, res) {
   if (entry.oneshot_adapter === 'openai_chat_api') {
     cleanupPromptFile();
     return runOpenAIChatOneShot({
-      entry, prompt, effectivePrompt, timeoutMs: adapterTimeoutMs, res, route, startedAt,
+      entry: { ...entry, model: execution.model }, prompt, effectivePrompt, timeoutMs: adapterTimeoutMs, res, route, startedAt,
       providerBudget: resolvedProviderBudget,
       accountId: dispatchAccount.account?.id || null,
     });
@@ -4973,6 +4904,7 @@ async function executeOneShot(body, res) {
             + Number(left.cache_read_input_tokens || 0) + Number(left.cache_creation_input_tokens || 0))
       )[0];
       if (dominant?.model) {
+        route.observed_model = dominant.model;
         route.resolved_model_identity = dominant.model;
         route.resolved_model_source = 'provider_reported_model_usage';
       }
@@ -5167,15 +5099,17 @@ app.post('/api/tasks', async (req, res) => {
     const { classifyTask } = await ROUTER_MODULE_PROMISE;
     const classifiedTaskTier = typeof input.prompt === 'string'
       ? classifyTask(input.prompt).tier : undefined;
-    const taskTier = typeof input.taskTier === 'string' ? input.taskTier : classifiedTaskTier;
-    const modelTier = typeof input.modelTier === 'string'
-      ? input.modelTier : modelTierForTaskTier(taskTier);
+    const taskTier = input.taskTier !== undefined ? input.taskTier : input.execution != null ? undefined : classifiedTaskTier;
+    const modelTier = input.modelTier !== undefined
+      ? input.modelTier : input.execution != null ? undefined : modelTierForTaskTier(taskTier);
     const budgetTaskTier = typeof input.budgetTaskTier === 'string'
       ? input.budgetTaskTier
-      : taskTier;
-    res.json(taskQueue.submit({ ...input, providerBudget, budgetTaskTier, taskTier, modelTier }));
+      : input.execution?.resolvedTaskTier || taskTier || classifiedTaskTier;
+    const prepared = { ...input, dangerous: input.dangerous === true, providerBudget, budgetTaskTier, taskTier, modelTier };
+    const controls = validateProviderIntent({ ...prepared, dangerous: input.dangerous === true });
+    res.json(taskQueue.submit({ ...prepared, execution: controls.execution }));
   }
-  catch (err) { res.status(400).json({ error: err.message }); }
+  catch (err) { return rejectInvalidIntent(res, req.body || {}, err); }
 });
 app.get('/api/tasks', (req, res) => {
   try { res.json({ tasks: taskQueue.list({ collab: req.query.collab, status: req.query.status, limit: req.query.limit }), stats: taskQueue.stats() }); }
@@ -6350,7 +6284,7 @@ app.post('/api/agents/:id/tags', (req, res) => {
 app.post('/api/broadcast', async (req, res) => {
   const {
     prompt, tag, providers, all, dangerous, timeoutMs = TIMEOUT_POLICY.oneShotDefaultMs, cwd,
-    providerBudget, effort, maxEffortOverride,
+    providerBudget, effort, maxEffortOverride, model, execution, taskTier, modelTier,
   } = req.body || {};
   const effectiveTimeoutMs = TIMEOUT_POLICY.normalizeOneShotTimeoutMs(timeoutMs);
   if (typeof prompt !== 'string' || !prompt.trim()) {
@@ -6360,7 +6294,7 @@ app.post('/api/broadcast', async (req, res) => {
   try {
     validatedProviderBudget = validateProviderBudget(providerBudget);
   } catch (err) {
-    return res.status(400).json({ error: err.message });
+    return rejectInvalidIntent(res, req.body || {}, err);
   }
   const { classifyTask } = await ROUTER_MODULE_PROMISE;
   const cfg = loadConfig();
@@ -6376,6 +6310,18 @@ app.post('/api/broadcast', async (req, res) => {
       tag: typeof tag === 'string' ? tag : null,
     });
   }
+  const resolvedTaskTier = taskTier !== undefined ? taskTier : execution != null ? undefined : classifyTask(prompt).tier;
+  const resolvedModelTier = modelTier !== undefined ? modelTier : execution != null ? undefined : modelTierForTaskTier(resolvedTaskTier);
+  const intents = new Map();
+  try {
+    // Validate every member before the first provider can consume quota. A
+    // planned tuple is provider-bound and cannot be broadcast to other seats.
+    for (const kind of targets) intents.set(kind, validateProviderIntent({
+      kind, prompt, providerBudget: validatedProviderBudget, model, execution,
+      taskTier: resolvedTaskTier, modelTier: resolvedModelTier, effort, maxEffortOverride,
+      dangerous: dangerous === true,
+    }, cfg).execution);
+  } catch (err) { return rejectInvalidIntent(res, req.body || {}, err); }
   const startedAt = Date.now();
   const budgetTaskTier = classifyTask(prompt).tier;
   const deadlineAt = startedAt + effectiveTimeoutMs;
@@ -6409,9 +6355,9 @@ app.post('/api/broadcast', async (req, res) => {
     const captured = new CapturedOneShotResponse();
     activeCaptured.add(captured);
     executeOneShot({
-      kind, prompt, timeoutMs: remainingMs, cwd, dangerous,
+      kind, prompt, timeoutMs: remainingMs, cwd, dangerous: dangerous === true,
       providerBudget: validatedProviderBudget, budgetTaskTier,
-      taskTier: budgetTaskTier, modelTier: modelTierForTaskTier(budgetTaskTier),
+      taskTier: resolvedTaskTier, modelTier: resolvedModelTier, model, execution: intents.get(kind),
       effort, maxEffortOverride,
     }, captured)
       .catch((err) => captured.status(500).json({ error: err.message, dropped_out: true }));

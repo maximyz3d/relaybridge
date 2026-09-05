@@ -233,9 +233,9 @@ test('live cwd admission invalidates stale route and committee cache across rest
   const blockedCommittee = await second.client.callTool({
     name: 'run_committee', arguments: committeeArgs(committeeTaskB, allowedB),
   });
-  assert.equal(blockedCommittee.structuredContent.status, 'failed');
-  assert.equal(blockedCommittee.structuredContent.members.length, 1);
-  assertCwdBlocked(blockedCommittee.structuredContent.members[0]);
+  assert.equal(blockedCommittee.structuredContent.status, 'blocked');
+  assert.equal(blockedCommittee.structuredContent.members.length, 0);
+  assertCwdBlocked(blockedCommittee.structuredContent);
 
   const blockedLink = await second.client.callTool({
     name: 'route_and_ask', arguments: routeArgs(routeTaskLink, link),

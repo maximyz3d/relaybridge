@@ -348,10 +348,24 @@ are carried with the capability so a future CLI upgrade can be re-evaluated.
 Standard Claude planning defaults to Sonnet/medium; complex plans route to
 Opus/high and the hardest plans can use Fable's explicit heavy tier. Fable has
 no dangerous slot. Bounded Claude revisions use the `claude` provider's
-Sonnet/medium writer slot. Maximum effort is never inferred: a caller must send
-both `effort: "max"` and `maxEffortOverride: true`. Claude accepts max directly;
+Sonnet/medium writer slot. Extreme effort requires explicit intent and
+`maxEffortOverride: true`, including an exact xhigh/max model variant. Claude accepts max directly;
 Codex maps that cross-provider request to `xhigh`, its highest supported normal
 CLI configuration value, rather than silently reducing it to high.
+
+Planning returns a versioned `primary.execution` intent tuple. Pass it unchanged
+to REST `/api/oneshot`, `/api/tasks`, or MCP `ask_provider`/`submit_task` with the
+same provider. The CLI and routed/committee tools forward it automatically.
+The tuple binds the exact model, requested and applied effort, and provider
+configuration fingerprint; it grants no permissions and contains no executable
+arguments. Replays rebuild controls from live configuration and reject model,
+effort, authority, or catalog mismatches before invocation—even on cache hits.
+A broadcast may use one tuple only when targeting its single bound provider.
+Unsupported explicit effort is rejected; inferred effort may fall back with an
+explanation. HTTP adapters currently expose no reasoning-effort control.
+`resolved_outgoing_model` records requested transport identity, while
+`observed_model` is populated only when the provider reports one. Unknown final
+model revisions remain unknown.
 
 Provider prompts default to a 20-minute deadline and accept an explicit
 `timeoutMs` up to 45 minutes. The liveness supervisor also grants buffered
