@@ -1,3 +1,6 @@
+## v2.1.4 - 2026-09-05
+- #115 chore(actions): bump actions/checkout from 6.0.2 to 7.0.1
+
 ## v2.1.3 - 2026-09-05
 - #116 chore(deps): bump zod from 4.4.3 to 4.5.4 in the npm-minor-and-patch group
 
