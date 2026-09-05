@@ -200,8 +200,8 @@ test('claim workflow warns on duplicates and uses least required immutable actio
   const claim = fs.readFileSync(path.join(onboard.TEMPLATE_DIR, 'claim-on-start.yml'), 'utf8');
   assert.match(claim, /opened, edited, ready_for_review, reopened, closed/);
   assert.match(claim, /contents: read/);
-  assert.match(claim, /pull-requests: read/);
-  assert.doesNotMatch(claim, /pull-requests: write/);
+  assert.match(claim, /pull-requests: write/, 'claim reconciliation persists its ownership marker on the PR');
+  assert.doesNotMatch(claim, /contents: write/, 'claim reconciliation never needs repository contents write access');
   assert.match(claim, /head\.repo\.full_name == github\.repository/);
   assert.match(claim, /pull_request\.user\.login != 'dependabot\[bot\]'/);
   assert.match(claim, /pull_request_target:/);
