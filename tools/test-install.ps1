@@ -417,7 +417,10 @@ const port = Number(process.env.PORT);
 const server = http.createServer((req, res) => {
   if (req.method === 'GET' && req.url === '/api/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ version: '2.0.0', capabilityAuth: true }));
+    // Legacy identity shape: version but no buildId/buildIdentityReady. It
+    // must still identify its exact process so rollback cannot accept an
+    // unrelated listener that wins the port race.
+    return res.end(JSON.stringify({ version: '2.0.0', capabilityAuth: true, pid: process.pid }));
   }
   if (req.method === 'POST' && req.url === '/api/admin/shutdown' && req.headers['x-relaybridge-token'] === token) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
