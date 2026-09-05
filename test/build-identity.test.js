@@ -1238,6 +1238,20 @@ test('lifecycle scripts guard credentials, preserve generated identity, and requ
   assert.match(releaseInstall, /FileAttributes\]::ReparsePoint/);
   assert.match(releaseInstall, /buildIdentityReady -ne \$true/);
   assert.match(releaseInstall, /\$reportedPid -ne \[int64\]\$proc\.Id/);
+  const cutoverStopBlock = releaseInstall.slice(
+    releaseInstall.indexOf('function Stop-BridgeForCutover'),
+    releaseInstall.indexOf('function Start-StagedBridge'),
+  );
+  assert.match(cutoverStopBlock, /Get-Process -Id \$reportedPid -ErrorAction Stop/,
+    'Windows cutover must pin the process identity reported by authenticated health');
+  assert.match(cutoverStopBlock, /\$null = \$oldProcess\.Handle/,
+    'Windows cutover must open the exact process handle before requesting shutdown');
+  assert.doesNotMatch(cutoverStopBlock, /Stop-Process/,
+    'Windows cutover must fail closed instead of signaling a health-reported PID');
+  const cutoverExitBarrier = releaseInstall.indexOf('$oldProcess.HasExited -and -not (Test-LocalPortInUse $BridgePort)');
+  const cutoverReturn = releaseInstall.indexOf('return $health', cutoverExitBarrier);
+  assert.ok(cutoverExitBarrier >= 0 && cutoverReturn > cutoverExitBarrier,
+    'Windows cutover must wait for the health-reported process and its listener to terminate');
   const rollbackRestart = releaseInstall.indexOf('if ($restoreSucceeded -and $oldHealth');
   const failedReleaseCleanup = releaseInstall.indexOf('if ($restoreSucceeded -and $rollbackErrors.Count -eq 0 -and (Test-Path -LiteralPath $failedRoot))');
   assert.ok(rollbackRestart >= 0 && failedReleaseCleanup > rollbackRestart,

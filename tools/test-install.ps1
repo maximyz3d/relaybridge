@@ -431,7 +431,9 @@ const server = http.createServer((req, res) => {
   }
   if (req.method === 'POST' && req.url === '/api/admin/shutdown' && req.headers['x-relaybridge-token'] === token) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end('{"ok":true}', () => server.close(() => process.exit(0)));
+    // Close the listener first but deliberately retain the process/cwd briefly.
+    // Windows cutover must wait for full process exit before renaming this tree.
+    return res.end('{"ok":true}', () => server.close(() => setTimeout(() => process.exit(0), 750)));
   }
   res.writeHead(404);
   res.end();

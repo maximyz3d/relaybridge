@@ -928,22 +928,36 @@ function Stop-BridgeForCutover([string]$RuntimeRoot, [int]$BridgePort) {
     return $null
   }
   if (-not $health.capabilityAuth) { throw "Port $BridgePort is serving an unrecognized RelayBridge-compatible process; cutover was not attempted." }
+  $reportedPid = try { [int64]$health.pid } catch { 0 }
+  if ($reportedPid -le 0) {
+    throw "RelayBridge on port $BridgePort did not report a valid process identity; cutover was not attempted."
+  }
   $tokenPath = Join-Path $RuntimeRoot '.bridge-token'
   if (-not (Test-Path -LiteralPath $tokenPath -PathType Leaf)) {
     throw "A RelayBridge is already running on port $BridgePort, but $RuntimeRoot has no capability token. Stop it explicitly or select the matching -MigrateFrom root."
   }
   $token = (Get-Content -LiteralPath $tokenPath -Raw).Trim()
   if ($token -notmatch '^[A-Fa-f0-9]{64}$') { throw "The capability token in $tokenPath is invalid; cutover was not attempted." }
+  try { $oldProcess = Get-Process -Id $reportedPid -ErrorAction Stop }
+  catch { throw "RelayBridge on port $BridgePort reported PID '$reportedPid', but that process could not be pinned; cutover was not attempted." }
   try {
-    Invoke-RestMethod -Uri "http://127.0.0.1:$BridgePort/api/admin/shutdown" -Method Post -Headers @{ 'X-RelayBridge-Token' = $token } -ContentType 'application/json' -Body '{}' -TimeoutSec 5 -UseBasicParsing | Out-Null
-  } catch {
-    throw "Could not stop the RelayBridge on port $BridgePort with the token from $RuntimeRoot. This usually means another install root owns the live bridge. Cutover was not attempted."
+    try { $null = $oldProcess.Handle }
+    catch { throw "RelayBridge on port $BridgePort reported PID '$reportedPid', but its process handle could not be opened; cutover was not attempted." }
+    try {
+      Invoke-RestMethod -Uri "http://127.0.0.1:$BridgePort/api/admin/shutdown" -Method Post -Headers @{ 'X-RelayBridge-Token' = $token } -ContentType 'application/json' -Body '{}' -TimeoutSec 5 -UseBasicParsing | Out-Null
+    } catch {
+      throw "Could not stop the RelayBridge on port $BridgePort with the token from $RuntimeRoot. This usually means another install root owns the live bridge. Cutover was not attempted."
+    }
+    # server.js permits a five-second graceful drain before its forced-exit
+    # backstop. Keep the cutover barrier beyond that window.
+    for ($attempt = 0; $attempt -lt 100; $attempt++) {
+      if ($oldProcess.HasExited -and -not (Test-LocalPortInUse $BridgePort)) { return $health }
+      Start-Sleep -Milliseconds 100
+    }
+    throw "RelayBridge PID $reportedPid on port $BridgePort did not fully exit before cutover."
+  } finally {
+    $oldProcess.Dispose()
   }
-  for ($attempt = 0; $attempt -lt 50; $attempt++) {
-    if (-not (Test-LocalPortInUse $BridgePort)) { return $health }
-    Start-Sleep -Milliseconds 100
-  }
-  throw "RelayBridge on port $BridgePort did not stop before cutover."
 }
 
 function Start-StagedBridge([string]$BridgeRoot, [int]$BridgePort, [string]$ExpectedBuildId, [switch]$AllowLegacyVersion) {
