@@ -90,10 +90,16 @@ test('Windows child PATH discovers the official Cursor install directory and kee
     RELAYBRIDGE_DATA_DIR: path.join(tempRoot, 'data'),
     RELAYBRIDGE_ALLOWED_ROOTS: allowedRoot,
   };
+  const inheritedPath = Object.entries(process.env)
+    .find(([key]) => key.toUpperCase() === 'PATH')?.[1];
+  assert.ok(inheritedPath, 'Windows test runner must provide PATH');
   for (const key of Object.keys(serverEnv)) {
     if (key.toUpperCase() === 'PATH') delete serverEnv[key];
   }
-  serverEnv.Path = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32');
+  // Preserve required runner tools (notably Git, used to revalidate the
+  // source identity) while proving RelayBridge itself appends Cursor's
+  // LOCALAPPDATA install directory.
+  serverEnv.Path = inheritedPath;
 
   const proc = spawn(process.execPath, [path.join(ROOT, 'server.js')], {
     cwd: ROOT,

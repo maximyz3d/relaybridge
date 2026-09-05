@@ -330,12 +330,12 @@ require('./fake-mcp-client.js');
     Assert-True ($null -ne $raceClaudeAfter.mcpServers.unrelated) 'the cross-checkout race must preserve unrelated Claude configuration'
 
     $foreignCheckoutTokenBytes = [Convert]::ToBase64String([IO.File]::ReadAllBytes($tokenFileB))
-    $foreignCheckoutTokenOwner = (Get-Acl -LiteralPath $tokenFileB).Owner
+    $foreignCheckoutTokenOwner = ([IO.File]::GetAccessControl($tokenFileB)).GetOwner([Security.Principal.SecurityIdentifier]).Value
     Push-Location -LiteralPath $testRoot
     try { & $installerPath }
     finally { Pop-Location }
     Assert-True ([Convert]::ToBase64String([IO.File]::ReadAllBytes($tokenFileB)) -eq $foreignCheckoutTokenBytes) 'a later checkout A registration must preserve checkout B token bytes it does not own'
-    Assert-True ((Get-Acl -LiteralPath $tokenFileB).Owner -eq $foreignCheckoutTokenOwner) 'a later checkout A registration must preserve checkout B token ownership'
+    Assert-True (([IO.File]::GetAccessControl($tokenFileB)).GetOwner([Security.Principal.SecurityIdentifier]).Value -eq $foreignCheckoutTokenOwner) 'a later checkout A registration must preserve checkout B token ownership'
 
     $preparedBuild = [IO.File]::ReadAllText((Join-Path $bridgeRoot 'build-info.json'), [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
     Assert-True ([string]$preparedBuild.buildId -match '^2\.0\.1\+[a-f0-9]{16}$') 'Windows MCP registration must prepare an exact source build identity'

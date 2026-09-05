@@ -25,6 +25,7 @@ const installScript = path.join(repoRoot, 'install-chrome-mcp.sh');
 const relayInstallScript = path.join(repoRoot, 'install-mcp.sh');
 const startScript = path.join(repoRoot, 'start-chrome-debug.sh');
 const windowsProxyScript = path.join(repoRoot, 'tools', 'chrome-wsl-tcp-proxy.cjs');
+const posixOnly = process.platform === 'win32' ? test.skip : test;
 
 test('browser URLs are bounded HTTP(S) values without embedded credentials', () => {
   assert.equal(validateBrowserUrl('https://example.com/a?q=1'), 'https://example.com/a?q=1');
@@ -183,7 +184,7 @@ test('WSL NAT fallback is exact-bound, source-restricted, and validates process 
   assert.doesNotMatch(source, /(?:0\.0\.0\.0|IPAddress\.Any|netsh|portproxy|New-NetFirewallRule)/i);
 });
 
-test('WSL launcher passes an injection-safe literal port and verifies Chrome JSON', (t) => {
+posixOnly('WSL launcher passes an injection-safe literal port and verifies Chrome JSON', (t) => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'relaybridge-browser-test-'));
   t.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
   const binDir = path.join(tempDir, 'bin');

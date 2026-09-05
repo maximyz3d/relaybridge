@@ -928,22 +928,36 @@ function Stop-BridgeForCutover([string]$RuntimeRoot, [int]$BridgePort) {
     return $null
   }
   if (-not $health.capabilityAuth) { throw "Port $BridgePort is serving an unrecognized RelayBridge-compatible process; cutover was not attempted." }
+  $reportedPid = try { [int64]$health.pid } catch { 0 }
+  if ($reportedPid -le 0) {
+    throw "RelayBridge on port $BridgePort did not report a valid process identity; cutover was not attempted."
+  }
   $tokenPath = Join-Path $RuntimeRoot '.bridge-token'
   if (-not (Test-Path -LiteralPath $tokenPath -PathType Leaf)) {
     throw "A RelayBridge is already running on port $BridgePort, but $RuntimeRoot has no capability token. Stop it explicitly or select the matching -MigrateFrom root."
   }
   $token = (Get-Content -LiteralPath $tokenPath -Raw).Trim()
   if ($token -notmatch '^[A-Fa-f0-9]{64}$') { throw "The capability token in $tokenPath is invalid; cutover was not attempted." }
+  try { $oldProcess = Get-Process -Id $reportedPid -ErrorAction Stop }
+  catch { throw "RelayBridge on port $BridgePort reported PID '$reportedPid', but that process could not be pinned; cutover was not attempted." }
   try {
-    Invoke-RestMethod -Uri "http://127.0.0.1:$BridgePort/api/admin/shutdown" -Method Post -Headers @{ 'X-RelayBridge-Token' = $token } -ContentType 'application/json' -Body '{}' -TimeoutSec 5 -UseBasicParsing | Out-Null
-  } catch {
-    throw "Could not stop the RelayBridge on port $BridgePort with the token from $RuntimeRoot. This usually means another install root owns the live bridge. Cutover was not attempted."
+    try { $null = $oldProcess.Handle }
+    catch { throw "RelayBridge on port $BridgePort reported PID '$reportedPid', but its process handle could not be opened; cutover was not attempted." }
+    try {
+      Invoke-RestMethod -Uri "http://127.0.0.1:$BridgePort/api/admin/shutdown" -Method Post -Headers @{ 'X-RelayBridge-Token' = $token } -ContentType 'application/json' -Body '{}' -TimeoutSec 5 -UseBasicParsing | Out-Null
+    } catch {
+      throw "Could not stop the RelayBridge on port $BridgePort with the token from $RuntimeRoot. This usually means another install root owns the live bridge. Cutover was not attempted."
+    }
+    # server.js permits a five-second graceful drain before its forced-exit
+    # backstop. Keep the cutover barrier beyond that window.
+    for ($attempt = 0; $attempt -lt 100; $attempt++) {
+      if ($oldProcess.HasExited -and -not (Test-LocalPortInUse $BridgePort)) { return $health }
+      Start-Sleep -Milliseconds 100
+    }
+    throw "RelayBridge PID $reportedPid on port $BridgePort did not fully exit before cutover."
+  } finally {
+    $oldProcess.Dispose()
   }
-  for ($attempt = 0; $attempt -lt 50; $attempt++) {
-    if (-not (Test-LocalPortInUse $BridgePort)) { return $health }
-    Start-Sleep -Milliseconds 100
-  }
-  throw "RelayBridge on port $BridgePort did not stop before cutover."
 }
 
 function Start-StagedBridge([string]$BridgeRoot, [int]$BridgePort, [string]$ExpectedBuildId, [switch]$AllowLegacyVersion) {
@@ -1170,6 +1184,8 @@ try {
 } catch {
   $installError = $_
   $rollbackErrors = @()
+  $rollbackWarnings = @()
+  $restoreSucceeded = $false
   if ($env:RELAYBRIDGE_INSTALL_TEST_ERROR_FILE) {
     try {
       $diagnostic = @(
@@ -1193,24 +1209,48 @@ try {
       if ($runtimeSource -and $movedRuntime.Count -gt 0) {
         Restore-PreservedRuntime $failedRoot $runtimeSource $movedRuntime
       }
-      if (Test-Path -LiteralPath $failedRoot) { Remove-Item -LiteralPath $failedRoot -Recurse -Force -ErrorAction Stop }
     } elseif (-not $promoted) {
       if ($oldRenamed -and (Test-Path -LiteralPath $backupRoot)) { Move-Item -LiteralPath $backupRoot -Destination $InstallDir }
       if ($runtimeSource -and $movedRuntime.Count -gt 0 -and (Test-Path -LiteralPath $stageRoot)) {
         Restore-PreservedRuntime $stageRoot $runtimeSource $movedRuntime
       }
     }
-  } catch { $rollbackErrors += $_.Exception.Message }
-  if ($rollbackErrors.Count -eq 0 -and $oldHealth -and $runtimeSource -and (Test-Path -LiteralPath (Join-Path $runtimeSource 'server.js'))) {
+    $restoreSucceeded = $true
+  } catch { $rollbackErrors += "tree restore failed: $($_.Exception.Message)" }
+  if ($restoreSucceeded -and $oldHealth -and $runtimeSource -and (Test-Path -LiteralPath (Join-Path $runtimeSource 'server.js'))) {
     try {
       $oldBuild = if ($oldHealth.buildId) { [string]$oldHealth.buildId } else { [string]$oldHealth.version }
       Start-StagedBridge $runtimeSource $Port $oldBuild -AllowLegacyVersion | Out-Null
       Write-Warning "Previous RelayBridge build $oldBuild was restored and restarted."
     } catch { $rollbackErrors += "automatic restart failed: $($_.Exception.Message)" }
   }
+  # The restored release and its exact-process restart are the recovery
+  # boundary. A scanner or stale handle may transiently retain the failed new
+  # tree on Windows; deleting that quarantined tree must not prevent recovery.
+  if ($restoreSucceeded -and $rollbackErrors.Count -eq 0 -and (Test-Path -LiteralPath $failedRoot)) {
+    try {
+      if ($env:RELAYBRIDGE_INSTALL_TEST_ERROR_FILE -and $env:RELAYBRIDGE_INSTALL_TEST_FAIL_ROLLBACK_CLEANUP -eq '1') {
+        throw 'Injected rollback cleanup failure'
+      }
+      Remove-Item -LiteralPath $failedRoot -Recurse -Force -ErrorAction Stop
+    }
+    catch { $rollbackWarnings += "failed release cleanup deferred: $($_.Exception.Message)" }
+  }
+  if ($env:RELAYBRIDGE_INSTALL_TEST_ERROR_FILE -and ($rollbackErrors.Count -or $rollbackWarnings.Count)) {
+    try {
+      $rollbackDiagnostic = @($rollbackErrors + $rollbackWarnings) -join "`r`n"
+      [IO.File]::AppendAllText($env:RELAYBRIDGE_INSTALL_TEST_ERROR_FILE,
+        ("Rollback diagnostics:`r`n" + $rollbackDiagnostic + "`r`n"), [Text.UTF8Encoding]::new($false))
+    } catch {
+      # Test-only diagnostics must never interfere with production rollback.
+    }
+  }
   if ($rollbackErrors.Count) {
     $preserveRecoveryArtifacts = $true
     Write-Warning ("Automatic rollback was incomplete; recovery directories were preserved beside the install root: " + ($rollbackErrors -join '; '))
+  } elseif ($rollbackWarnings.Count) {
+    $preserveRecoveryArtifacts = $true
+    Write-Warning ("Previous RelayBridge was restored, but recovery cleanup was deferred: " + ($rollbackWarnings -join '; '))
   } else {
     $preserveRecoveryArtifacts = $false
   }

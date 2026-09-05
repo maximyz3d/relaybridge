@@ -56,13 +56,15 @@ function Test-ProcessRunning([int]$ProcessId) {
   } catch { return $false }
 }
 
-function Invoke-TestInstall([string]$FailAt = '', [switch]$Start, [int]$Port = 0) {
+function Invoke-TestInstall([string]$FailAt = '', [switch]$Start, [int]$Port = 0, [switch]$FailRollbackCleanup) {
   if (-not $Port) { $Port = Get-FreePort }
   $previousFailAt = $env:RELAYBRIDGE_INSTALL_TEST_FAIL_AT
+  $previousFailRollbackCleanup = $env:RELAYBRIDGE_INSTALL_TEST_FAIL_ROLLBACK_CLEANUP
   $previousErrorFile = $env:RELAYBRIDGE_INSTALL_TEST_ERROR_FILE
   $errorFile = Join-Path $testRoot ('install-error-' + [Guid]::NewGuid().ToString('N') + '.txt')
   try {
     $env:RELAYBRIDGE_INSTALL_TEST_FAIL_AT = $FailAt
+    $env:RELAYBRIDGE_INSTALL_TEST_FAIL_ROLLBACK_CLEANUP = if ($FailRollbackCleanup) { '1' } else { $null }
     $env:RELAYBRIDGE_INSTALL_TEST_ERROR_FILE = $errorFile
     $arguments = @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $installer,
       '-SourceDir', $repoRoot, '-InstallDir', $installRoot, '-SkipProviderSetup', '-SkipCliPathRegistration', '-NoBrowser', '-Port', [string]$Port)
@@ -78,9 +80,14 @@ function Invoke-TestInstall([string]$FailAt = '', [switch]$Start, [int]$Port = 0
     $diagnostic = if (Test-Path -LiteralPath $errorFile -PathType Leaf) {
       [IO.File]::ReadAllText($errorFile, [Text.UTF8Encoding]::new($false)).Trim()
     } else { '' }
+    if ($exitCode -ne 0) {
+      $boundedDiagnostic = if ($diagnostic) { $diagnostic.Substring(0, [Math]::Min(12000, $diagnostic.Length)) } else { '(child installer produced no diagnostic file)' }
+      Write-Host "[RelayBridge test] installer exit=$exitCode failpoint=$FailAt port=$Port`n$boundedDiagnostic"
+    }
     return [pscustomobject]@{ ExitCode = $exitCode; Port = $Port; Diagnostic = $diagnostic }
   } finally {
     $env:RELAYBRIDGE_INSTALL_TEST_FAIL_AT = $previousFailAt
+    $env:RELAYBRIDGE_INSTALL_TEST_FAIL_ROLLBACK_CLEANUP = $previousFailRollbackCleanup
     $env:RELAYBRIDGE_INSTALL_TEST_ERROR_FILE = $previousErrorFile
   }
 }
@@ -417,11 +424,16 @@ const port = Number(process.env.PORT);
 const server = http.createServer((req, res) => {
   if (req.method === 'GET' && req.url === '/api/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ version: '2.0.0', capabilityAuth: true }));
+    // Legacy identity shape: version but no buildId/buildIdentityReady. It
+    // must still identify its exact process so rollback cannot accept an
+    // unrelated listener that wins the port race.
+    return res.end(JSON.stringify({ version: '2.0.0', capabilityAuth: true, pid: process.pid }));
   }
   if (req.method === 'POST' && req.url === '/api/admin/shutdown' && req.headers['x-relaybridge-token'] === token) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end('{"ok":true}', () => server.close(() => process.exit(0)));
+    // Close the listener first but deliberately retain the process/cwd briefly.
+    // Windows cutover must wait for full process exit before renaming this tree.
+    return res.end('{"ok":true}', () => server.close(() => setTimeout(() => process.exit(0), 750)));
   }
   res.writeHead(404);
   res.end();
@@ -513,11 +525,20 @@ server.listen(port, '127.0.0.1');
   }
   Assert-True ($legacyHealth.version -eq '2.0.0') 'legacy fixture must be healthy before cutover'
 
-  $failed = Invoke-TestInstall 'after-promote' -Port $legacyPort
+  $failed = Invoke-TestInstall 'after-promote' -Port $legacyPort -FailRollbackCleanup
   Assert-True ($failed.ExitCode -ne 0) 'the injected post-promotion failure must fail the installer'
+  Assert-True ($failed.Diagnostic -match 'Injected installer failure at after-promote') 'post-promotion failure diagnostics must prove the injected failure stage'
+  Assert-True ($failed.Diagnostic -match 'failed release cleanup deferred: Injected rollback cleanup failure') 'rollback diagnostics must retain a non-fatal failed-release cleanup warning'
   Assert-True ((Get-TreeFingerprint $installRoot) -eq $before) 'automatic rollback must restore retained release/runtime files byte-for-byte'
-  $restoredHealth = Invoke-RestMethod -Uri "http://127.0.0.1:$legacyPort/api/health" -TimeoutSec 3 -UseBasicParsing
+  try {
+    $restoredHealth = Invoke-RestMethod -Uri "http://127.0.0.1:$legacyPort/api/health" -TimeoutSec 3 -UseBasicParsing
+  } catch {
+    throw "rollback did not restore the legacy health endpoint. Installer diagnostics:`n$($failed.Diagnostic)"
+  }
   Assert-True ($restoredHealth.version -eq '2.0.0') 'rollback must restart a pre-buildId RelayBridge by its legacy version'
+  $failedRecoveryRoots = @(Get-ChildItem -LiteralPath $testRoot -Directory | Where-Object { $_.Name -like 'RelayBridge.failed.*' })
+  Assert-True ($failedRecoveryRoots.Count -eq 1) 'a failed-release cleanup warning must preserve exactly one quarantined recovery tree'
+  Remove-Item -LiteralPath $failedRecoveryRoots[0].FullName -Recurse -Force
   $legacyToken = (Get-Content -LiteralPath (Join-Path $installRoot '.bridge-token') -Raw).Trim()
   Invoke-RestMethod -Uri "http://127.0.0.1:$legacyPort/api/admin/shutdown" -Method Post -Headers @{ 'X-RelayBridge-Token' = $legacyToken } -ContentType 'application/json' -Body '{}' -TimeoutSec 3 -UseBasicParsing | Out-Null
   for ($attempt = 0; $attempt -lt 50 -and (Get-NetTCPConnection -State Listen -LocalPort $legacyPort -ErrorAction SilentlyContinue); $attempt++) { Start-Sleep -Milliseconds 100 }
@@ -556,12 +577,26 @@ server.listen(port, '127.0.0.1');
   Assert-True ($null -eq $merged.cursor.PSObject.Properties['model_tiers_locked']) 'the draft-added lock must not survive as a fake operator override'
   Assert-True ($merged.cursor.model_tiers_mode -eq 'account_default') 'the release must record why Cursor has no named-model tiers'
   Assert-True ($merged.claude.model_tiers.standard.model -eq 'operator-custom-model') 'a genuinely custom locked operator tier must still be preserved'
-  foreach ($providerName in @('claude', 'claude_fable')) {
-    foreach ($slotName in @('safe', 'dangerous', 'oneshot_safe', 'oneshot_dangerous')) {
-      $slotArgs = @($merged.$providerName.$slotName)
-      $effortIndex = [Array]::IndexOf($slotArgs, '--effort')
-      Assert-True ($effortIndex -ge 0 -and $slotArgs[$effortIndex + 1] -eq 'high') "$providerName.$slotName must migrate legacy maximum effort to the shipped safe baseline"
+  $shippedConfig = [IO.File]::ReadAllText((Join-Path $repoRoot 'cli-config.json'), [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
+  foreach ($providerSpec in $shippedConfig._config_merge.managed_provider_args.PSObject.Properties) {
+    $providerName = $providerSpec.Name
+    foreach ($slotName in @($providerSpec.Value.slots)) {
+      $mergedArgs = @($merged.$providerName.$slotName)
+      $shippedArgs = @($shippedConfig.$providerName.$slotName)
+      foreach ($argSpec in @($providerSpec.Value.args)) {
+        $flag = [string]$argSpec.flag
+        $valueCount = [int]$argSpec.value_count
+        $mergedIndex = [Array]::IndexOf($mergedArgs, $flag)
+        $shippedIndex = [Array]::IndexOf($shippedArgs, $flag)
+        Assert-True ($mergedIndex -ge 0 -and $shippedIndex -ge 0) "$providerName.$slotName must retain managed flag $flag"
+        for ($offset = 1; $offset -le $valueCount; $offset++) {
+          Assert-True ([string]$mergedArgs[$mergedIndex + $offset] -ceq [string]$shippedArgs[$shippedIndex + $offset]) "$providerName.$slotName $flag must follow the shipped managed baseline"
+        }
+      }
     }
+  }
+  foreach ($slotName in @('dangerous', 'oneshot_dangerous')) {
+    Assert-True (Test-ExactJsonStringArray @($merged.claude_fable.$slotName) @($operatorConfig.claude_fable.$slotName)) "undeclared claude_fable.$slotName operator arguments must remain byte-exact"
   }
   Assert-True ($merged.claude.safe[[Array]::IndexOf(@($merged.claude.safe), '--model') + 1] -eq 'operator-claude-model') 'managed-argument migration must preserve an operator model choice'
   Assert-True (@($merged.claude.safe) -contains '--operator-flag') 'managed-argument migration must preserve unrelated operator flags'
@@ -572,7 +607,6 @@ server.listen(port, '127.0.0.1');
   Assert-True ((Test-ExactJsonStringArray $merged.copilot.credential_markers @('config.json'))) 'the installed retired Copilot marker must migrate end-to-end'
   Assert-True ((Test-ExactJsonStringArray $merged.copilot.login_command @('copilot', 'login'))) 'the installed retired Copilot login command must migrate end-to-end'
   Assert-True ($merged.copilot.linked_accounts_supported -eq $false) 'upgrades must disable unsafe profile-only Copilot account pooling'
-  $shippedConfig = [IO.File]::ReadAllText((Join-Path $repoRoot 'cli-config.json'), [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
   foreach ($providerName in @('claude', 'claude_fable', 'codex', 'copilot')) {
     foreach ($requiredName in @($shippedConfig.$providerName.strip_env)) {
       Assert-True (@($merged.$providerName.strip_env) -contains $requiredName) "$providerName must gain required identity exclusion $requiredName on upgrade"

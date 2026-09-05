@@ -126,8 +126,10 @@ test('issue #99: explicit per-call lower providerBudget override wins over provi
   assert.equal(opts.providerBudget.maxCacheReadTokens, 100000, 'explicit per-call budget overrides Claude null default');
 
   const supervisor = new RunSupervisor(opts);
+  supervisor.recordProviderUsage({ cache_read_input_tokens: 89999 }, { phase: 'incremental' });
+  assert.equal(supervisor.evaluate().action, 'continue', 'below the finalization reserve runs safely');
   supervisor.recordProviderUsage({ cache_read_input_tokens: 100000 }, { phase: 'incremental' });
-  assert.equal(supervisor.evaluate().action, 'continue', 'within per-call budget runs safely');
+  assert.equal(supervisor.evaluate().action, 'finalize', 'the checkpoint reserve finalizes without increasing the per-call ceiling');
 
   supervisor.recordProviderUsage({ cache_read_input_tokens: 100001 }, { phase: 'incremental' });
   const verdict = supervisor.evaluate();

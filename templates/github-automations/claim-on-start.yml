@@ -27,7 +27,8 @@ on:
 permissions:
   contents: read
   issues: write
-  pull-requests: read
+  # Claim state is stored in a bot-authored PR comment as well as issue comments.
+  pull-requests: write
 
 # Claims share issue assignments across PRs, so serialize repository-wide.
 # Keeping the full FIFO queue avoids a close/edit event overtaking an open.
@@ -51,7 +52,7 @@ jobs:
       # workflow commit. A PR that first introduces the helper cleanly skips
       # reconciliation; it becomes active after merge. Never execute PR/base/
       # head code in this issues:write job.
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
