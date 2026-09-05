@@ -157,6 +157,23 @@ test('registry location precedence keeps machine state in ignored data', () => {
   }
 });
 
+test('onboarding preflight can read legacy registry authority without migration or writes', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rb-registry-peek-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const options = { root, env: {}, migrate: false };
+  const paths = tracker.registryPaths(options);
+  fs.mkdirSync(path.dirname(paths.legacyFile), { recursive: true });
+  const original = JSON.stringify({ repos: [{ name: 'acme/project', path: root }] });
+  fs.writeFileSync(paths.legacyFile, original);
+  assert.equal(tracker.loadRegistry(undefined, options).repos[0].name, 'acme/project');
+  assert.equal(fs.existsSync(paths.runtimeFile), false);
+  assert.equal(fs.readFileSync(paths.legacyFile, 'utf8'), original);
+  fs.mkdirSync(path.dirname(paths.runtimeFile), { recursive: true });
+  fs.writeFileSync(paths.runtimeFile, '{bad json');
+  assert.throws(() => tracker.loadRegistry(undefined, options));
+  assert.equal(fs.readFileSync(paths.runtimeFile, 'utf8'), '{bad json');
+});
+
 posixOnly('migration CLI rejects raw Windows runtime and root paths before host normalization', (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rbgh-cli-foreign-path-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));

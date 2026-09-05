@@ -48,17 +48,15 @@ test('Windows child PATH discovers the official Cursor install directory and kee
   const tokenPath = path.join(tempRoot, 'capability.token');
   fs.mkdirSync(cursorDir, { recursive: true });
   fs.mkdirSync(allowedRoot, { recursive: true });
-  fs.writeFileSync(cursorShim, [
-    '@echo off',
-    'if /I "%1"=="mixed" (',
-    '  echo Logged in as cached-user',
-    '  echo Not logged in 1>&2',
-    '  exit /b 0',
-    ')',
-    'echo Not logged in',
-    'exit /b 0',
-    '',
-  ].join('\r\n'), 'utf8');
+  fs.copyFileSync(path.join(__dirname, 'fixtures', 'windows-shims', 'cursor-agent.cmd'), cursorShim);
+  fs.copyFileSync(path.join(__dirname, 'fixtures', 'windows-shims', 'cursor-agent.ps1'), path.join(cursorDir, 'cursor-agent.ps1'));
+  fs.copyFileSync(process.execPath, path.join(cursorDir, 'node.exe'));
+  fs.writeFileSync(path.join(cursorDir, 'index.js'), [
+    "if (process.argv[2] === 'mixed') {",
+    "  process.stdout.write('Logged in as cached-user\\n');",
+    "  process.stderr.write('Not logged in\\n');",
+    "} else process.stdout.write('Not logged in\\n');",
+  ].join('\n'), 'utf8');
   const cursorSeat = {
     label: 'Cursor Agent',
     diagnostic_binary: 'agent',

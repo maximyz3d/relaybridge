@@ -78,8 +78,11 @@ test('only authentication-authoritative probes may clear a default-account quara
   assert.match(serverSource, /entry\.probe_auth_authoritative !== true/);
 });
 
-test('probe timeouts always resolve so readiness cannot wedge', () => {
-  // Killing the tree is not a guarantee of an exit event; a pending probe would
-  // hang readiness checks and model discovery forever.
-  assert.match(serverSource, /probe timed out and did not exit/);
+test('probe callers have a bounded deadline while physical admission waits for actual close', () => {
+  const caller = serverSource.slice(serverSource.indexOf('async function runProbe('), serverSource.indexOf('function runPhysicalProbe('));
+  const physical = serverSource.slice(serverSource.indexOf('function runPhysicalProbe('), serverSource.indexOf('let lastDiagnostics = null;'));
+  assert.ok(caller.includes('setTimeout(() => deadline.abort(), timeoutMs + 2000)'), 'caller deadline must not depend on close');
+  assert.ok(caller.includes('probePool.run(') && caller.includes('signal: callerSignal'), 'deadline must cancel only this subscriber');
+  assert.ok(physical.includes("proc.on('close', (code) => finish(code))"), 'physical work must retain admission until close');
+  assert.doesNotMatch(physical, /setTimeout\([^;]*finish\(/, 'a timer cannot release physical admission');
 });

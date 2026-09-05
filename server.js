@@ -19,6 +19,8 @@ const { buildQuotaSeatGroups } = require('./lib/quota-seat');
 const providerAccounts = require('./lib/provider-accounts');
 const { providerUsageCapability, providerUsageCapabilities } = require('./lib/provider-usage-capability');
 const platform = require('./lib/platform');
+const { resolveWindowsLaunch } = require('./lib/win-shim-launch');
+const { createRequestLimiter, createOperationSlots, createReadOperationPool } = require('./lib/operation-admission');
 const { validateBrowserUrl, browserOpeners } = require('./lib/browser-launch');
 const { receiptStoreIdentity } = require('./lib/receipt-store-identity.cjs');
 const { loadBuildIdentity } = require('./lib/build-identity.cjs');
@@ -968,6 +970,7 @@ function sendOneShotPreAdmissionRejection(res, {
 }) {
   const accounting = {
     model_invocation: false,
+    physical_attempt_count: 0,
     token_usage_source: 'not_invoked',
     transportReceiptId: null,
     transport_retry_count: 0,
@@ -1591,9 +1594,15 @@ function resolveExecutableWin32(command, env, pathKey) {
   return command;
 }
 
-function quoteCmdArg(value) {
-  const s = String(value);
-  return /[\s"&|<>^()%!]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+function qualifiedProviderLaunch(file, args, env) {
+  const launch = resolveWindowsLaunch({ file, args, env });
+  if (launch.mode === 'unsupported') {
+    throw Object.assign(new Error(launch.reason), {
+      code: launch.code,
+      validation: { code: launch.code, field: 'provider', reason: launch.reason },
+    });
+  }
+  return { ...launch, env: { ...env, ...launch.envPatch } };
 }
 
 function capPrompt(prompt, maxChars) {
@@ -2674,7 +2683,7 @@ async function discoverModels() {
           const models = parseModelList(result.stdout, entry);
           probeResults[kind] = models.length ? { models } : { error: 'probe returned no recognizable model ids' };
         } else {
-          probeResults[kind] = { error: (result.stderr || 'probe failed').split('\n')[0].slice(0, 200) };
+          probeResults[kind] = { error: [result.code, (result.stderr || 'probe failed').split('\n')[0]].filter(Boolean).join(': ').slice(0, 200) };
         }
       } catch (err) {
         probeResults[kind] = { error: err.message };
@@ -2725,24 +2734,17 @@ class Session {
   _spawn() {
     const env = buildEnv({ TERM: 'xterm-256color' });
     const resolvedCommand = resolveExecutable(this.command, env);
+    // Qualification is outside the PTY fallback: unsupported shims cannot
+    // escape rejection by retrying through another transport.
+    const launch = qualifiedProviderLaunch(resolvedCommand, this.args, env);
     if (pty) {
       try {
-        // On Windows, ConPTY (used by node-pty) can't resolve .cmd / .bat / .ps1
-        // shims directly â€” pty.spawn('claude', ...) fails because the shim isn't
-        // a real .exe. Wrap any non-.exe command with `cmd.exe /c` so the shim
-        // resolves through cmd.exe's path search. PowerShell.exe etc. skip this.
-        let spawnCmd = resolvedCommand;
-        let spawnArgs = this.args;
-        if (process.platform === 'win32' && !/\.exe$/i.test(resolvedCommand)) {
-          spawnCmd = process.env.ComSpec || 'cmd.exe';
-          spawnArgs = ['/d', '/s', '/c', [resolvedCommand, ...this.args].map(quoteCmdArg).join(' ')];
-        }
-        this.proc = pty.spawn(spawnCmd, spawnArgs, {
+        this.proc = pty.spawn(launch.file, launch.args, {
           name: 'xterm-256color',
           cols: 120,
           rows: 30,
           cwd: this.cwd,
-          env,
+          env: launch.env,
         });
         this._mode = 'pty';
         this.proc.onData((data) => this._onData(data));
@@ -2752,20 +2754,10 @@ class Session {
         console.warn(`[session ${this.id}] PTY spawn failed: ${err.message}, falling back to pipe`);
       }
     }
-    // pipe fallback
-    // On Windows, npm-installed CLIs are usually .cmd shims (claude.cmd,
-    // codex.cmd, gemini.cmd). spawn('claude', ...) with shell:false won't
-    // resolve those â€” you get ENOENT. Setting shell:true lets cmd.exe
-    // look up the command and find the shim. (Localhost-only server with
-    // user-controlled cli-config.json, so no injection surface.)
-    const isWindowsShim = process.platform === 'win32' && !/\.exe$/i.test(resolvedCommand);
-    const pipeCommand = isWindowsShim ? (process.env.ComSpec || 'cmd.exe') : resolvedCommand;
-    const pipeArgs = isWindowsShim
-      ? ['/d', '/s', '/c', [resolvedCommand, ...this.args].map(quoteCmdArg).join(' ')]
-      : this.args;
-    this.proc = spawn(pipeCommand, pipeArgs, {
+    // Pipe fallback uses the exact same qualified native executable and argv.
+    this.proc = spawn(launch.file, launch.args, {
       cwd: this.cwd,
-      env,
+      env: launch.env,
       windowsHide: true,
       // Same reason as the one-shot spawn: killProcessTree can only take out
       // the whole tree with a single signal when the child leads its own
@@ -2951,6 +2943,27 @@ function createSessionFromKind(kind, opts = {}) {
 
 // ---- HTTP / WS server ----
 const app = express();
+const diagnosticRequestLimit = createRequestLimiter({ family: 'diagnostics', limit: 120 });
+const execRequestLimit = createRequestLimiter({ family: 'host_exec', limit: 60 });
+const accountMutationLimit = createRequestLimiter({ family: 'account_mutation', limit: 60 });
+const usageAdviceLimit = createRequestLimiter({ family: 'usage_advice', limit: 120 });
+const installRequestLimit = createRequestLimiter({ family: 'provider_install', limit: 12 });
+const hostExecSlots = createOperationSlots({ limit: 4 });
+const installSlots = createOperationSlots({ limit: 1 });
+const probePool = createReadOperationPool({ maxActive: 4, maxQueued: 64, maxSubscribers: 64 });
+let authGeneration = 0;
+
+function rejectOperationAdmission(res, error) {
+  res.set('Retry-After', '1');
+  return res.status(429).json({ ok: false, success: false, failureClass: 'admission_limit',
+    error: error.message, errorCode: error.code, retryable: true,
+    validation: { code: error.code, field: 'request', reason: error.message },
+    model_invocation: false, physical_attempt_count: 0, token_usage_source: 'not_invoked' });
+}
+
+function diagnosticGeneration(cfg) {
+  return `${authGeneration}:${crypto.createHash('sha256').update(JSON.stringify(cfg)).digest('hex')}`;
+}
 app.disable('x-powered-by');
 app.use(express.json({ limit: '1mb' }));
 
@@ -3255,26 +3268,43 @@ app.post('/api/workspace/validate', (req, res) => {
   }
 });
 
-function runProbe(slotRaw, timeoutMs = 15000, stripEnv = [], signal) {
+async function runProbe(slotRaw, timeoutMs = 15000, stripEnv = [], signal) {
+  const notRun = (error, extra = {}) => ({ exitCode: -1, stdout: '', stderr: error.message,
+    code: error.code || null, validation: error.validation || null, timedOut: false,
+    model_invocation: false, ...extra });
+  if (signal?.aborted) return notRun(new Error('diagnostic cancelled'), { aborted: true });
+  const env = buildEnv({}, stripEnv);
+  const [configuredBinary, ...args] = resolveSlot(slotRaw);
+  let launch;
+  try { launch = qualifiedProviderLaunch(resolveExecutable(configuredBinary, env), args, env); }
+  catch (error) { return notRun(error); }
+  const key = crypto.createHash('sha256').update(JSON.stringify({ file: launch.file, args: launch.args,
+    env: launch.env, adapter: launch.adapter, template: launch.templateHash, cwd: ROOT, timeoutMs, authGeneration })).digest('hex');
+  const deadline = new AbortController();
+  const callerSignal = signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal;
+  const deadlineTimer = setTimeout(() => deadline.abort(), timeoutMs + 2000);
+  deadlineTimer.unref?.();
+  try {
+    return await probePool.run(key, (workerSignal) => runPhysicalProbe(launch, timeoutMs, workerSignal), { signal: callerSignal });
+  } catch (error) {
+    return notRun(error, { timedOut: deadline.signal.aborted && !signal?.aborted,
+      aborted: !!signal?.aborted, admissionRejected: error.code === 'operation_admission_limit' });
+  } finally { clearTimeout(deadlineTimer); }
+}
+
+// This promise represents PHYSICAL lifetime, not the HTTP caller's patience.
+// Only actual close or a confirmed no-child startup failure frees admission.
+function runPhysicalProbe(launch, timeoutMs, signal) {
   return new Promise((resolve) => {
-    if (signal?.aborted) return resolve({ exitCode: -1, stdout: '', stderr: 'diagnostic cancelled', timedOut: false, aborted: true });
-    const slot = resolveSlot(slotRaw);
-    const env = buildEnv({}, stripEnv);
-    const [configuredBinary, ...args] = slot;
-    const resolvedBinary = resolveExecutable(configuredBinary, env);
-    const isWindowsShim = process.platform === 'win32' && !/\.exe$/i.test(resolvedBinary);
-    const spawnBinary = isWindowsShim ? (process.env.ComSpec || 'cmd.exe') : resolvedBinary;
-    const spawnArgs = isWindowsShim
-      ? ['/d', '/s', '/c', [resolvedBinary, ...args].map(quoteCmdArg).join(' ')]
-      : args;
+    if (signal.aborted) return resolve({ exitCode: -1, stdout: '', stderr: 'diagnostic cancelled', timedOut: false, aborted: true, model_invocation: false });
     let proc;
     try {
       // detached on POSIX so the timeout kill signals the probe's whole group
       // instead of orphaning whatever it spawned — see the one-shot spawnOpts
       // for why killTree's ps-walk fallback is not equivalent.
-      proc = trackChild(spawn(spawnBinary, spawnArgs, { cwd: ROOT, env, windowsHide: true, detached: process.platform !== 'win32' }));
+      proc = trackChild(spawn(launch.file, launch.args, { cwd: ROOT, env: launch.env, windowsHide: true, detached: process.platform !== 'win32' }));
     } catch (err) {
-      return resolve({ exitCode: -1, stdout: '', stderr: err.message, timedOut: false });
+      return resolve({ exitCode: -1, stdout: '', stderr: err.message, timedOut: false, model_invocation: false });
     }
     let stdout = '';
     let stderr = '';
@@ -3292,27 +3322,24 @@ function runProbe(slotRaw, timeoutMs = 15000, stripEnv = [], signal) {
       // /api/auth/status). The most common failure on a fresh box, "that CLI is
       // not installed under this name", was therefore recorded as no error at
       // all: model-registry rows landed with error:null and no warning.
-      resolve({ exitCode, stdout, stderr: [stderr, error && error.message].filter(Boolean).join('\n'), timedOut, aborted: !!signal?.aborted });
+      resolve({ exitCode, stdout, stderr: [stderr, error && error.message].filter(Boolean).join('\n'), timedOut, aborted: !!signal?.aborted, model_invocation: !!proc.pid });
     };
     const timer = setTimeout(() => {
       timedOut = true;
       killProcessTree(proc);
-      // Resolve on a grace delay even if the child never emits close: killing
-      // the tree is not a guarantee of an exit event, and a pending probe would
-      // otherwise wedge readiness checks and model discovery forever.
-      const graceful = setTimeout(() => finish(-1, new Error('probe timed out and did not exit')), 2000);
-      if (typeof graceful.unref === 'function') graceful.unref();
+      // The subscriber deadline can stop waiting; physical capacity remains
+      // occupied while process termination/pipe cleanup is still in progress.
     }, timeoutMs);
     abortHandler = () => {
       killProcessTree(proc);
-      finish(-1, new Error('diagnostic cancelled'));
     };
     signal?.addEventListener('abort', abortHandler, { once: true });
+    if (signal.aborted) abortHandler();
     proc.stdout.setEncoding('utf8');
     proc.stderr.setEncoding('utf8');
-    proc.stdout.on('data', (d) => { if (stdout.length < 32768) stdout += d; });
-    proc.stderr.on('data', (d) => { if (stderr.length < 32768) stderr += d; });
-    proc.on('error', (err) => finish(-1, err));
+    proc.stdout.on('data', (d) => { stdout = (stdout + d).slice(0, 32768); });
+    proc.stderr.on('data', (d) => { stderr = (stderr + d).slice(0, 32768); });
+    proc.on('error', (err) => { if (!proc.pid) finish(-1, err); else killProcessTree(proc); });
     proc.on('close', (code) => finish(code));
     try { proc.stdin.end(); } catch {}
   });
@@ -3323,6 +3350,7 @@ function runProbe(slotRaw, timeoutMs = 15000, stripEnv = [], signal) {
 let lastDiagnostics = null;
 
 function updateDefaultAccountRuntimeAuth(kind, authenticated) {
+  authGeneration += 1;
   if (!kind) return;
   const priorResults = lastDiagnostics?.results && typeof lastDiagnostics.results === 'object'
     ? lastDiagnostics.results : {};
@@ -3334,6 +3362,8 @@ function updateDefaultAccountRuntimeAuth(kind, authenticated) {
       ...priorResults,
       [kind]: {
         ...prior,
+        transientProbeFailure: false,
+        qualificationFailure: null,
         found: true,
         ready: authenticated,
         authFailed: !authenticated,
@@ -3347,6 +3377,7 @@ function updateDefaultAccountRuntimeAuth(kind, authenticated) {
 }
 
 function armDefaultAccountRuntimeAuthRetry(kind) {
+  authGeneration += 1;
   const priorResults = lastDiagnostics?.results && typeof lastDiagnostics.results === 'object'
     ? lastDiagnostics.results : {};
   const prior = priorResults[kind] && typeof priorResults[kind] === 'object'
@@ -3359,6 +3390,8 @@ function armDefaultAccountRuntimeAuthRetry(kind) {
       ...priorResults,
       [kind]: {
         ...prior,
+        transientProbeFailure: false,
+        qualificationFailure: null,
         ready: null,
         authFailed: false,
         authAuthoritative: false,
@@ -3376,7 +3409,7 @@ function reconcileManagedDefaultAuth(cfg, results) {
   for (const [kind, result] of Object.entries(results || {})) {
     const entry = cfg?.[kind];
     if (!entry || !providerAccounts.credentialEnvFor(entry) || !result?.found
-      || entry.probe_auth_authoritative !== true) continue;
+      || entry.probe_auth_authoritative !== true || result.authAuthoritative !== true || result.transientProbeFailure) continue;
     try {
       const mutation = result.ready === true
         ? providerAccounts.clearAccountAuthFailure(
@@ -3873,7 +3906,7 @@ function signedOutProviders(diagnostics, cfg) {
   const results = diagnostics?.results || diagnostics || {};
   const out = [];
   for (const [kind, info] of Object.entries(results)) {
-    if (!info || !info.found || info.ready || info.authFailed !== true) continue;
+    if (!info || !info.found || info.ready || info.authFailed !== true || info.transientProbeFailure) continue;
     const entry = cfg[kind];
     if (!entry) continue;
     out.push({
@@ -3892,8 +3925,11 @@ function probeIndicatesAuthFailure(text) {
   return AUTH_FAILURE_RE.test(String(text || ''));
 }
 
-app.get('/api/auth/status', async (req, res) => {
+app.get('/api/auth/status', diagnosticRequestLimit, async (req, res) => {
   const cfg = loadConfig();
+  const generation = diagnosticGeneration(cfg);
+  const controller = new AbortController();
+  res.once('close', () => { if (!res.writableEnded) controller.abort(); });
   let diagnostics = lastDiagnostics;
   // Only probe when asked or when nothing has been checked yet: a readiness
   // sweep spawns one process per provider and should not run on every poll.
@@ -3919,18 +3955,31 @@ app.get('/api/auth/status', async (req, res) => {
           found = !!probeBin && (resolvedProbe !== probeBin || path.isAbsolute(resolvedProbe));
         } catch { found = false; }
         if (!found) return [kind, { found: false, ready: false, detail: 'not installed' }];
-        const result = await runProbe(entry.probe, Number(entry.probe_timeout_ms || 30000), entry.strip_env || []);
+        const result = await runProbe(entry.probe, Number(entry.probe_timeout_ms || 30000), entry.strip_env || [], controller.signal);
         const probeText = cleanOutput([result.stdout, result.stderr].filter(Boolean).join('\n'));
+        const completed = result.model_invocation !== false && !result.timedOut && !result.aborted && !result.admissionRejected;
         return [kind, {
           found: true,
-          ready: result.exitCode === 0,
-          authFailed: result.exitCode !== 0 && probeIndicatesAuthFailure(probeText),
-          authAuthoritative: entry.probe_auth_authoritative === true,
+          ready: completed && result.exitCode === 0,
+          authFailed: completed && result.exitCode !== 0 && probeIndicatesAuthFailure(probeText),
+          authAuthoritative: completed && entry.probe_auth_authoritative === true,
+          qualificationFailure: result.validation || null,
+          transientProbeFailure: result.admissionRejected || result.aborted || result.timedOut || result.model_invocation === false,
           detail: result.exitCode === 0 ? 'authenticated' : probeText.split('\n')[0].slice(0, 160),
         }];
       }));
       const refreshedResults = Object.fromEntries(pairs.filter(([, v]) => v));
-      reconcileManagedDefaultAuth(cfg, refreshedResults);
+      if (controller.signal.aborted) return;
+      if (generation !== diagnosticGeneration(loadConfig())) {
+        return res.status(409).json({ error: 'diagnostic authority changed; refresh again', errorCode: 'diagnostic_stale' });
+      }
+      const authoritativeRefresh = Object.fromEntries(Object.entries(refreshedResults).filter(([, value]) => !value.transientProbeFailure));
+      for (const [kind, value] of Object.entries(refreshedResults)) {
+        if (value.transientProbeFailure && lastDiagnostics?.results?.[kind]) {
+          refreshedResults[kind] = lastDiagnostics.results[kind];
+        }
+      }
+      reconcileManagedDefaultAuth(cfg, authoritativeRefresh);
       diagnostics = { at: Date.now(), results: refreshedResults };
       lastDiagnostics = diagnostics;
     } catch (err) {
@@ -3971,7 +4020,7 @@ app.get('/api/auth/status', async (req, res) => {
   });
 });
 
-app.get('/api/diag', async (req, res) => {
+app.get('/api/diag', diagnosticRequestLimit, async (req, res) => {
   const controller = new AbortController();
   let clientGone = false;
   res.on('close', () => {
@@ -3981,6 +4030,7 @@ app.get('/api/diag', async (req, res) => {
     }
   });
   const cfg = loadConfig();
+  const generation = diagnosticGeneration(cfg);
   const env = buildEnv();
   const kinds = Object.keys(cfg).filter((k) => !k.startsWith('_'));
   const pairs = await Promise.all(kinds.map(async (kind) => {
@@ -4049,17 +4099,19 @@ app.get('/api/diag', async (req, res) => {
     ]);
     if (probe) {
       probeExitCode = probe.exitCode;
-      ready = !probe.timedOut && probe.exitCode === 0;
+      ready = !probe.timedOut && !probe.aborted && probe.exitCode === 0;
       const probeText = cleanOutput([probe.stdout, probe.stderr].filter(Boolean).join('\n'));
       if (entry.probe_expect && !probeText.toLowerCase().includes(String(entry.probe_expect).toLowerCase())) ready = false;
       const probeReject = Array.isArray(entry.probe_reject) ? entry.probe_reject : [];
       if (probeReject.some((value) => probeText.toLowerCase().includes(String(value).toLowerCase()))) ready = false;
-      authFailed = !ready && probeIndicatesAuthFailure(probeText);
+      authFailed = probe.model_invocation !== false && !probe.timedOut && !probe.aborted && !probe.admissionRejected
+        && !ready && probeIndicatesAuthFailure(probeText);
       detail = ready && entry.probe_success_detail
         ? String(entry.probe_success_detail).slice(0, 300)
         : (entry.probe_redact ? (ready ? 'readiness check passed' : 'readiness check failed') : probeText.split('\n')[0].slice(0, 300));
       if (probe.timedOut) detail = 'readiness check timed out';
       if (probe.aborted) detail = 'readiness check cancelled';
+      if (probe.validation) detail = `${probe.code}: ${probe.validation.reason}`;
     }
     let runtimeVersion = '';
     if (versionProbe) {
@@ -4076,16 +4128,23 @@ app.get('/api/diag', async (req, res) => {
       detail,
       probeExitCode,
       authFailed,
-      authAuthoritative: entry.probe_auth_authoritative === true,
+      authAuthoritative: !!probe && probe.model_invocation !== false && !probe.timedOut && !probe.aborted && !probe.admissionRejected
+        && entry.probe_auth_authoritative === true,
+      qualificationFailure: probe?.validation || versionProbe?.validation || null,
+      transientProbeFailure: probe?.admissionRejected || probe?.aborted || probe?.timedOut || probe?.model_invocation === false,
       runtimeVersion,
       usageCapability: providerUsageCapability(entry, { runtimeVersion }),
     }];
   }));
   const rawResults = Object.fromEntries(pairs);
   const results = applyFilesystemEligibilityToDiagnostics(rawResults, cfg).diagnostics;
-  if (!controller.signal.aborted) {
+  if (!clientGone && generation !== diagnosticGeneration(loadConfig())) {
+    return res.status(409).json({ error: 'diagnostic authority changed; refresh again', errorCode: 'diagnostic_stale' });
+  }
+  if (!controller.signal.aborted && generation === diagnosticGeneration(loadConfig())) {
     reconcileManagedDefaultAuth(cfg, results);
-    lastDiagnostics = { at: Date.now(), results };
+    lastDiagnostics = { at: Date.now(), results: Object.fromEntries(Object.entries(results).map(([kind, value]) => [kind,
+      value.transientProbeFailure && lastDiagnostics?.results?.[kind] ? lastDiagnostics.results[kind] : value])) };
   }
   if (!clientGone && !res.writableEnded) {
     let routing = null;
@@ -4138,7 +4197,8 @@ app.post('/api/sessions', (req, res) => {
     const s = createSessionFromKind(kind, { label, cwd, dangerous, mode });
     res.json(s.meta());
   } catch (err) {
-    res.status(400).json({ error: err.message });
+    res.status(400).json({ error: err.message, errorCode: err.code || null, validation: err.validation || null,
+      model_invocation: false, physical_attempt_count: 0, token_usage_source: 'not_invoked' });
   }
 });
 
@@ -4169,7 +4229,7 @@ app.get('/api/sessions/:id/buffer', (req, res) => {
 
 // One-shot exec â€” for Cowork to run a PowerShell command and get output back.
 const EXEC_OUTPUT_MAX = 1048576;
-app.post('/api/exec', (req, res) => {
+app.post('/api/exec', execRequestLimit, (req, res) => {
   if (!isDirectLoopbackRequest(req)) {
     return res.status(403).json({ error: 'command execution is loopback-only' });
   }
@@ -4190,7 +4250,18 @@ app.post('/api/exec', (req, res) => {
     cwd: execCwd,
     env: buildEnv(),
   });
-  const proc = trackChild(spawn(built.exe, built.args, built.options));
+  let release;
+  try { release = hostExecSlots.acquire(); }
+  catch (error) { return rejectOperationAdmission(res, error); }
+  let proc;
+  try { proc = trackChild(spawn(built.exe, built.args, built.options)); }
+  catch (error) {
+    release();
+    return res.status(500).json({ error: 'command spawn failed', model_invocation: false,
+      physical_attempt_count: 0, token_usage_source: 'not_invoked' });
+  }
+  proc.once('close', release);
+  proc.once('error', () => { if (!proc.pid) release(); });
   let stdout = '';
   let stderr = '';
   // 'error' and 'close' can both fire for one spawn (ENOENT emits error, then
@@ -4209,17 +4280,17 @@ app.post('/api/exec', (req, res) => {
   // ceiling; this route had neither. `truncated` tells the caller the output
   // is short rather than the command being quiet.
   let truncated = false;
-  proc.stdout.on('data', (d) => { if (stdout.length < EXEC_OUTPUT_MAX) stdout += d; else truncated = true; });
-  proc.stderr.on('data', (d) => { if (stderr.length < EXEC_OUTPUT_MAX) stderr += d; else truncated = true; });
+  proc.stdout.on('data', (d) => { if (stdout.length + d.length > EXEC_OUTPUT_MAX) truncated = true; stdout = (stdout + d).slice(0, EXEC_OUTPUT_MAX); });
+  proc.stderr.on('data', (d) => { if (stderr.length + d.length > EXEC_OUTPUT_MAX) truncated = true; stderr = (stderr + d).slice(0, EXEC_OUTPUT_MAX); });
   proc.on('close', (code) => {
     clearTimeout(t);
-    if (settled) return;
+    if (settled || res.destroyed) return;
     settled = true;
     res.json({ stdout, stderr, exitCode: code, truncated: truncated || undefined, shell: built.shellKind, shellNote: built.fallbackNote || undefined });
   });
   proc.on('error', (err) => {
     clearTimeout(t);
-    if (settled) return;
+    if (settled || res.destroyed) return;
     settled = true;
     res.status(500).json({ error: err.message, stdout, stderr });
   });
@@ -4347,6 +4418,7 @@ async function executeOneShot(body, res) {
   // selection below may still choose a provisioned linked login.
   const readiness = lastDiagnostics?.results?.[kind];
   const defaultAccountSignedOut = !!(readiness && readiness.found
+    && !readiness.transientProbeFailure
     && readiness.ready === false && readiness.authFailed === true
     && readiness.authAuthoritative === true
     && Array.isArray(entry.login_command));
@@ -4724,6 +4796,20 @@ async function executeOneShot(body, res) {
     isolatedProviderHome = null;
     return result;
   };
+  // HTTP adapters have no executable. Every CLI path qualifies BEFORE
+  // cancellation receipts/listeners or child admission can record an attempt.
+  let launch = null;
+  if (!['ollama_api', 'openai_chat_api'].includes(entry.oneshot_adapter)) {
+    try { launch = qualifiedProviderLaunch(resolvedBin, args, childEnv); }
+    catch (err) {
+      cleanupPromptFile();
+      const cleanup = cleanupProviderHome();
+      return rejectBeforeAdmission(400, cleanup.ok ? 'validation' : 'isolation_cleanup', {
+        error: err.message, errorCode: err.code || null, validation: err.validation || null,
+      }, route);
+    }
+    route.launch_adapter = launch.adapter;
+  }
   const persistCancellationReceipt = () => {
     if (res._relayReceiptPersisted) return;
     const payload = typeof res._relayCancellationPayload === 'function'
@@ -4791,7 +4877,6 @@ async function executeOneShot(body, res) {
       accountId: dispatchAccount.account?.id || null,
     });
   }
-  const isWindows = process.platform === 'win32';
   let proc;
   try {
     // Re-check both the startup-pinned allowed-root identity and the selected
@@ -4806,15 +4891,9 @@ async function executeOneShot(body, res) {
       );
     }
     resolvedCwd = spawnCwdIdentity.resolved;
-    // Build the actual spawn target. On Windows, wrap non-.exe (npm shims like
-    // claude.cmd) with cmd.exe /c so the shim resolves. Use single-string form
-    // for cmd.exe so arg quoting is preserved (shell:true would split prompts
-    // containing spaces into separate args, breaking gemini -p "my prompt").
-    let spawnBin = resolvedBin;
-    let spawnArgs = args;
-    let spawnOpts = {
+    const spawnOpts = {
       cwd: resolvedCwd,
-      env: childEnv,
+      env: launch.env,
       windowsHide: true,
       // NOTE: this spawn deliberately does NOT set `detached`, even though
       // killProcessTree's fast path (process.kill(-pid)) needs a process group
@@ -4825,12 +4904,7 @@ async function executeOneShot(body, res) {
       // exitCode null (signal death) — the kill paths around a normal run have
       // to be audited before the group can be created. Tracked separately.
     };
-    if (isWindows && !/\.exe$/i.test(resolvedBin)) {
-      spawnBin = process.env.ComSpec || 'cmd.exe';
-      spawnArgs = ['/d', '/s', '/c', [resolvedBin, ...args].map(quoteCmdArg).join(' ')];
-      spawnOpts.windowsVerbatimArguments = true;
-    }
-    proc = trackChild(spawn(spawnBin, spawnArgs, spawnOpts));
+    proc = trackChild(spawn(launch.file, launch.args, spawnOpts));
     // executeOneShot returns after wiring the child events; the response is
     // delivered by proc.on('close'). Background-task capture must distinguish
     // that intentional deferred response from a handler that forgot to reply.
@@ -5646,6 +5720,7 @@ function accountRegistry() {
 }
 
 function invalidateAccountRegistry() {
+  authGeneration += 1;
   _accountRegistryCache = { at: 0, value: { providers: {} } };
 }
 
@@ -5803,6 +5878,7 @@ function accountAwareRoutingInputs(config, diagnostics, gauges, coolingStates) {
     }
     const readiness = adjustedDiagnostics[kind];
     const defaultSignedOut = !!(readiness && readiness.found && readiness.ready === false
+      && !readiness.transientProbeFailure
       && readiness.authFailed === true && readiness.authAuthoritative === true
       && Array.isArray(entry.login_command));
     const unavailableAccountIds = defaultSignedOut
@@ -6006,6 +6082,7 @@ app.get('/api/accounts', (req, res) => {
     catch { supportsMultipleAccounts = false; }
     const accounts = providerAccounts.accountsFor(kind, entry, registry).map((a) => {
       const runtimeAuthUnavailable = a.implicit
+        && !lastDiagnostics?.results?.[kind]?.transientProbeFailure
         && lastDiagnostics?.results?.[kind]?.ready === false
         && lastDiagnostics?.results?.[kind]?.authFailed === true
         && lastDiagnostics?.results?.[kind]?.authAuthoritative === true;
@@ -6048,7 +6125,7 @@ app.get('/api/accounts', (req, res) => {
   res.json({ providers: out, dataDir: path.join(DATA_DIR, 'accounts') });
 });
 
-app.post('/api/accounts/:kind', (req, res) => {
+app.post('/api/accounts/:kind', accountMutationLimit, (req, res) => {
   const kind = String(req.params.kind);
   const entry = loadConfig()[kind];
   if (!entry || kind.startsWith('_')) return res.status(404).json({ error: `unknown provider '${kind}'` });
@@ -6110,7 +6187,7 @@ app.post('/api/accounts/:kind/:id/enabled', (req, res) => {
 // version-only probe. Give the operator one explicit, typed way to arm a single
 // retry. If the credentials are still bad, normal dispatch accounting writes
 // the quarantine marker straight back.
-app.post('/api/accounts/:kind/:id/auth/retry', (req, res) => {
+app.post('/api/accounts/:kind/:id/auth/retry', accountMutationLimit, (req, res) => {
   const kind = String(req.params.kind);
   const id = String(req.params.id);
   const entry = loadConfig()[kind];
@@ -6258,10 +6335,17 @@ app.get('/api/usage/totals', (req, res) => {
   try { res.json(usageLedger.totals(Number(req.query.windowMs) || 86400000)); }
   catch (err) { res.status(500).json({ error: err.message }); }
 });
-app.post('/api/usage/advise', (req, res) => {
+app.post('/api/usage/advise', usageAdviceLimit, (req, res) => {
   try {
     const filesystemAuthority = planningFilesystemAuthority(req.body || {});
     const { tier = 'standard', candidates = [], highStakes = false, explicitProvider = false } = req.body || {};
+    if (!Array.isArray(candidates) || candidates.length > 64 || candidates.some((item) => {
+      const seat = typeof item === 'string' ? item : item?.seat;
+      return !providerAccounts.validProviderKey(seat);
+    })) {
+      return res.status(400).json({ error: 'candidates must contain at most 64 valid provider entries',
+        validation: { code: 'invalid_candidates', field: 'candidates', reason: 'expected at most 64 valid provider entries' } });
+    }
     const gauges = usageLedger.gaugeAll(seatCostClasses());
     const cfg = loadConfig();
     const filesystemUsable = [];
@@ -6395,7 +6479,7 @@ app.post('/api/github/track', async (req, res) => {
 // Provision the full automation stack into a repo in one action (draft PR).
 app.post('/api/github/onboard', async (req, res) => {
   try { res.json(await githubOnboard.onboardRepo({ name: req.body?.name, path: req.body?.path })); }
-  catch (err) { res.status(400).json({ error: err.message }); }
+  catch (err) { res.status(400).json({ error: err.message, errorCode: err.code || null, cleanupFailure: err.cleanupFailure || null }); }
 });
 
 app.post('/api/github/upgrade-repos', async (req, res) => {
@@ -6563,7 +6647,7 @@ app.post('/api/broadcast', async (req, res) => {
 // Install one CLI by its kind. Providers may use npm, Python/pip, or an exact
 // vendor-supplied command (Antigravity). Nothing runs until the user confirms
 // the Install dialog in the local UI.
-app.post('/api/install', (req, res) => {
+app.post('/api/install', installRequestLimit, (req, res) => {
   const { kind } = req.body || {};
   if (!kind) return res.status(400).json({ error: 'kind required' });
   const cfg = loadConfig();
@@ -6585,46 +6669,58 @@ app.post('/api/install', (req, res) => {
   const env = buildEnv();
   const [configuredBinary, ...configuredArgs] = slot;
   const resolvedBinary = resolveExecutable(configuredBinary, env);
-  const isWindowsShim = process.platform === 'win32' && !/\.exe$/i.test(resolvedBinary);
-  const spawnBinary = isWindowsShim ? (process.env.ComSpec || 'cmd.exe') : resolvedBinary;
-  const spawnArgs = isWindowsShim
-    ? ['/d', '/s', '/c', [resolvedBinary, ...configuredArgs].map(quoteCmdArg).join(' ')]
-    : configuredArgs;
+  let launch;
+  try { launch = qualifiedProviderLaunch(resolvedBinary, configuredArgs, env); }
+  catch (err) {
+    return res.status(400).json({ kind, success: false, error: err.message,
+      errorCode: err.code || null, validation: err.validation || null,
+      model_invocation: false, physical_attempt_count: 0, token_usage_source: 'not_invoked' });
+  }
   let installCwd;
   try { installCwd = defaultAllowedCwd(); }
   catch (err) { return res.status(400).json({ error: err.message }); }
-  const proc = trackChild(spawn(spawnBinary, spawnArgs, {
-    cwd: installCwd,
-    env,
-    windowsHide: true,
-    // npm/pip fan out into their own children; group-kill them when the
-    // 5-minute cap fires instead of leaving a half-finished install running.
-    detached: process.platform !== 'win32',
-  }));
+  let release;
+  try { release = installSlots.acquire(); }
+  catch (error) { return rejectOperationAdmission(res, error); }
+  let proc;
+  try {
+    proc = trackChild(spawn(launch.file, launch.args, {
+      cwd: installCwd, env: launch.env, windowsHide: true,
+      // Installers fan out; cancellation targets the owned process group.
+      detached: process.platform !== 'win32',
+    }));
+  } catch (err) {
+    release();
+    return res.status(400).json({ kind, success: false, error: 'installer spawn failed',
+      model_invocation: false, physical_attempt_count: 0, token_usage_source: 'not_invoked' });
+  }
+  proc.once('close', release);
+  proc.once('error', () => { if (!proc.pid) release(); });
   let stdout = '';
   let stderr = '';
+  let truncated = false;
   let settled = false;
   const t = setTimeout(() => killProcessTree(proc), 300000); // 5 min cap
   res.on('close', () => { if (!res.writableEnded) killProcessTree(proc); });
   proc.stdout.setEncoding('utf8');
   proc.stderr.setEncoding('utf8');
-  proc.stdout.on('data', (d) => { stdout += d; });
-  proc.stderr.on('data', (d) => { stderr += d; });
+  proc.stdout.on('data', (d) => { if (stdout.length + d.length > EXEC_OUTPUT_MAX) truncated = true; stdout = (stdout + d).slice(0, EXEC_OUTPUT_MAX); });
+  proc.stderr.on('data', (d) => { if (stderr.length + d.length > EXEC_OUTPUT_MAX) truncated = true; stderr = (stderr + d).slice(0, EXEC_OUTPUT_MAX); });
   proc.on('error', (err) => {
-    if (settled) return;
+    if (settled || res.destroyed) return;
     settled = true;
     clearTimeout(t);
-    res.json({ kind, package: pkg, installer: entry.install_display, success: false, exitCode: -1, stdout, stderr: stderr + '\n' + err.message });
+    res.json({ kind, package: pkg, installer: entry.install_display, success: false, exitCode: -1, stdout, stderr: stderr + '\n' + err.message, truncated });
   });
   proc.on('close', (code) => {
-    if (settled) return;
-    settled = true;
     clearTimeout(t);
     // An install is the one event that makes a PATH lookup stale on purpose:
     // the seat the caller just installed must not stay "not installed" for the
     // rest of the memo's TTL.
     executableCache.clear();
-    res.json({ kind, package: pkg, installer: entry.install_display, success: code === 0, exitCode: code, stdout, stderr });
+    if (settled || res.destroyed) return;
+    settled = true;
+    res.json({ kind, package: pkg, installer: entry.install_display, success: code === 0, exitCode: code, stdout, stderr, truncated });
   });
 });
 

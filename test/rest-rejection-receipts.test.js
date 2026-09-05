@@ -216,6 +216,7 @@ test('direct REST pre-admission failures persist deduplicated zero-invocation re
     assert.equal(payload.failureClass, failureClass);
     assert.equal(payload.model_invocation, false);
     assert.equal(payload.token_usage_source, 'not_invoked');
+    assert.equal(payload.physical_attempt_count, 0);
     assert.equal(payload.transportReceiptId, null);
     assert.equal(payload.transport_retry_count, 0);
     assert.equal(payload.provider_retries.count, 0);
