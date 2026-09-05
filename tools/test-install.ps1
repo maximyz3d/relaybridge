@@ -80,6 +80,10 @@ function Invoke-TestInstall([string]$FailAt = '', [switch]$Start, [int]$Port = 0
     $diagnostic = if (Test-Path -LiteralPath $errorFile -PathType Leaf) {
       [IO.File]::ReadAllText($errorFile, [Text.UTF8Encoding]::new($false)).Trim()
     } else { '' }
+    if ($exitCode -ne 0) {
+      $boundedDiagnostic = if ($diagnostic) { $diagnostic.Substring(0, [Math]::Min(12000, $diagnostic.Length)) } else { '(child installer produced no diagnostic file)' }
+      Write-Host "[RelayBridge test] installer exit=$exitCode failpoint=$FailAt port=$Port`n$boundedDiagnostic"
+    }
     return [pscustomobject]@{ ExitCode = $exitCode; Port = $Port; Diagnostic = $diagnostic }
   } finally {
     $env:RELAYBRIDGE_INSTALL_TEST_FAIL_AT = $previousFailAt
