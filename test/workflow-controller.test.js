@@ -170,6 +170,22 @@ test('controller drives the complete Codex-Claude handoff without overlapping wr
   assert.deepEqual(completed.nextActions, []);
 });
 
+test('a local token-budget stop never retries even with independent accepted 429 evidence', (t) => {
+  const f = fixture(t);
+  const created = reachReviewReady(f, createInput(f.cwd), 'APPROVE');
+  const first = f.controller.startFinalReview(created.runId);
+  f.finish(first.task, 'local cache-read budget crossed; provider also returned 429', 'failed', {
+    failureClass: 'token_budget', flags: { rate_limited: true, timed_out: true },
+    retryAt: f.clock.value + 300000,
+  });
+  const failed = f.controller.reconcile(created.runId);
+  assert.equal(failed.workflow.phase, 'failed');
+  assert.equal(failed.workflow.providerRetry, null);
+  assert.equal(failed.workflow.providerTask, null);
+  assert.equal(failed.workflow.providerTaskHistory.filter((item) => item.purpose === 'final-review').length, 1);
+  assert.equal(failed.nextActions.includes('retry_failed_pipeline_provider'), false);
+});
+
 test('typed transient review failures retry after backoff and stop at the bounded attempt limit', (t) => {
   const f = fixture(t);
   const created = reachReviewReady(f, createInput(f.cwd), 'APPROVE');

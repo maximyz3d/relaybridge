@@ -11,6 +11,18 @@ const config = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'cli-config
 
 const route = (tier, kinds) => ({ classification: { tier }, selected: kinds.map((kind) => ({ kind })) });
 
+test('explicit-kind planning and cheapest guidance cannot resurrect a semantically incapable shell or undersized model', () => {
+  const classification = { tier: 'complex', tags: ['coding'], signals: { whollyDeterministic: false } };
+  for (const kind of ['powershell', 'ollama_fast', 'copilot']) {
+    const plan = buildTaskPlan({ route: { classification, selected: [{ kind: 'claude' }] }, config, requestedKind: kind, requestedModelTier: 'heavy' });
+    assert.equal(plan.primary.kind, kind); assert.equal(plan.primary.blocked, true); assert.equal(plan.primary.ready, false);
+    assert.equal(plan.primary.validation.code, 'ineligible_provider'); assert.equal(plan.cheapestCapable, null);
+  }
+  const plan = buildTaskPlan({ route: { classification, selected: [{ kind: 'claude' }, { kind: 'powershell' }, { kind: 'ollama_coder' }] }, config });
+  assert.equal(plan.primary.kind, 'claude'); assert.equal(plan.cheapestCapable.kind, 'claude');
+  assert.equal(plan.alternates.every((row) => row.blocked), true);
+});
+
 test('plan preserves classifier tags for CLI and MCP consumers', () => {
   const classifiedRoute = route('standard', ['perplexity']);
   classifiedRoute.classification.tags = ['research', 'hardware'];

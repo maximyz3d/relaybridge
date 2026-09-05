@@ -142,6 +142,7 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   const helper = path.join(ROOT, 'test', 'prompt-file-cli.js');
   const echoProvider = {
       label: 'Echo',
+      oneshot_capabilities: { safe: ['model_invocation', 'workspace_read', 'tool_use'], dangerous: ['model_invocation', 'workspace_read', 'workspace_write', 'tool_use'] },
       safe: [process.execPath, helper, '--version'],
       dangerous: [process.execPath, helper, '--version'],
       oneshot_safe: [
@@ -956,7 +957,9 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   assert.equal(narrationOnly.structuredContent.droppedOut, true);
   assert.equal(narrationOnly.structuredContent.failureClass, 'incomplete_response');
   assert.equal(narrationOnly.structuredContent.stopReason, 'provider_incomplete_response');
-  assert.match(narrationOnly.structuredContent.stdout, /^I will inspect/);
+  assert.equal(narrationOnly.structuredContent.stdout, '');
+  assert.match(narrationOnly.structuredContent.partialDiagnostic, /^I will inspect/);
+  assert.equal(narrationOnly.structuredContent.outputDetector.id, 'future_narration_only');
 
   const perplexityPartial = await client.callTool({
     name: 'ask_provider',
@@ -1148,10 +1151,9 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
       useCache: false,
     },
   });
-  assert.equal(cwdRoute.structuredContent.status, 'failed');
-  assert.ok(cwdRoute.structuredContent.route.candidates.length > 1, 'the route had alternatives but must not replay a deterministic cwd rejection');
-  assert.equal(cwdRoute.structuredContent.attempts.length, 1);
-  assertCwdDiagnostic(cwdRoute.structuredContent.attempts[0]);
+  assert.equal(cwdRoute.structuredContent.blocked, true);
+  assert.equal(cwdRoute.structuredContent.attempts.length, 0, 'cwd is rejected before any routing attempt');
+  assertCwdDiagnostic(cwdRoute.structuredContent);
 
   const cwdCommittee = await client.callTool({
     name: 'run_committee',
@@ -1164,11 +1166,11 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
       useCache: false,
     },
   });
-  assert.equal(cwdCommittee.structuredContent.status, 'blocked');
+  assert.equal(cwdCommittee.structuredContent.blocked, true);
   assert.equal(cwdCommittee.structuredContent.members.length, 0);
   assertCwdDiagnostic(cwdCommittee.structuredContent);
 
-  for (const rejectedMember of [cwdRoute.structuredContent.attempts[0], cwdCommittee.structuredContent]) {
+  for (const rejectedMember of [cwdRoute.structuredContent, cwdCommittee.structuredContent]) {
     assert.match(rejectedMember.transportReceiptId, /^rcpt_/);
     assert.equal(rejectedMember.transportReceiptPersisted, true);
     const outer = await client.callTool({
@@ -1270,7 +1272,7 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   const localConsensus = await client.callTool({
     name: 'run_committee',
     arguments: {
-      task: 'Review this JavaScript function and propose a test.',
+      task: 'Explain this bounded scenario and outline assumptions and give a short recommendation.',
       providers: ['ollama', 'ollama_coder'],
       maxProviders: 2,
       localOnly: true,
@@ -1288,7 +1290,7 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   const unprovenConsensus = await client.callTool({
     name: 'run_committee',
     arguments: {
-      task: 'Review this JavaScript function and state whether the reviewers actually agree.',
+      task: 'Explain this bounded scenario and outline assumptions and state whether the reviewers actually agree.',
       providers: ['ollama', 'ollama_coder'],
       maxProviders: 2,
       localOnly: true,
@@ -1333,7 +1335,7 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   const cancelledCommittee = client.callTool({
     name: 'run_committee',
     arguments: {
-      task: 'Review this JavaScript function for cancellation behavior.',
+      task: 'Explain this bounded scenario and outline assumptions and describe cancellation behavior.',
       providers: ['ollama', 'ollama_coder'],
       maxProviders: 2,
       localOnly: true,

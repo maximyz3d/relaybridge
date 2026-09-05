@@ -444,6 +444,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
     },
     claude: {
       label: 'Unverified Claude Routing Fixture',
+      oneshot_capabilities: { safe: ['model_invocation'], dangerous: ['model_invocation'] },
       oneshot_safe_filesystem_policy: 'unverified_provider_policy',
       safe: [process.execPath, helper, '--version'],
       dangerous: [process.execPath, helper, '--version'],
@@ -474,6 +475,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
       oneshot_dangerous: [...baseSlot, '--stderr', 'Error: timeout waiting for response', '--exit', '1'],
     },
     headless_permission_denial: {
+      oneshot_capabilities: { safe: ['model_invocation', 'workspace_read', 'tool_use'] },
       label: 'Antigravity Headless Permission Fixture',
       safe: [process.execPath, helper, '--version'],
       dangerous: [process.execPath, helper, '--version'],
@@ -484,6 +486,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
       prompt_max_chars: 80,
     },
     headless_readonly_success: {
+      oneshot_capabilities: { safe: ['model_invocation', 'workspace_read', 'tool_use'] },
       label: 'Antigravity Command-Free Review Fixture',
       safe: [process.execPath, helper, '--version'],
       dangerous: [process.execPath, helper, '--version'],
@@ -494,6 +497,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
     },
     narration_only: {
       label: 'Narration-Only Grok Fixture',
+      oneshot_capabilities: { safe: ['model_invocation', 'workspace_read', 'tool_use'] },
       usage_capability: {
         tokens: 'unavailable', turns: 'unavailable', verified_runtime_version: '1.1.19',
         evidence: 'fixture CLI exposes no authoritative usage',
@@ -513,6 +517,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
     },
     grok: {
       label: 'Grok Quota Fixture',
+      oneshot_capabilities: { safe: ['model_invocation'], dangerous: ['model_invocation'] },
       safe: [process.execPath, helper, '--version'],
       dangerous: [process.execPath, helper, '--version'],
       oneshot_safe: [...baseSlot, '--stderr', "API error (status 429 Too Many Requests): subscription:free-usage-exhausted: You've used all the included free usage for model grok-4.6 for now. Usage resets over a rolling 24-hour window — tokens (actual/limit): 552,305/500,000. Upgrade to a Grok subscription. model_id=grok-4.6", '--exit', '1'],
@@ -522,6 +527,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
     },
     copilot: {
       label: 'Copilot Monthly Quota Fixture',
+      oneshot_capabilities: { safe: ['model_invocation'], dangerous: ['model_invocation'] },
       safe: [process.execPath, helper, '--version'],
       dangerous: [process.execPath, helper, '--version'],
       oneshot_safe: [...baseSlot, '--stderr', "You have exceeded your monthly quota (Request ID: 393F:279076:21CF7B:277870:6A7E5965)\n\nChanges    +0 -0\nAI Credits 0 (3s)\nResume     copilot --resume=fixture", '--exit', '1'],
@@ -543,6 +549,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
     },
     usage_json: {
       label: 'Structured Claude Usage',
+      oneshot_capabilities: { safe: ['model_invocation'] },
       transport: 'subscription:anthropic',
       quota_seat: 'subscription:anthropic:default',
       safe: [process.execPath, helper, '--version'],
@@ -553,6 +560,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
     },
     codex_effort: {
       label: 'Codex Reasoning Effort Fixture',
+      oneshot_capabilities: { safe: ['model_invocation'], dangerous: ['model_invocation'] },
       safe: [process.execPath, helper, '--version'],
       dangerous: [process.execPath, helper, '--version'],
       oneshot_safe: baseSlot,
@@ -962,7 +970,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.ok(datasheetRoute.selected.every((candidate) => candidate.capabilities.includes('research')));
 
   const datasheetCli = spawnSync(process.execPath, [path.join(ROOT, 'bin', 'relaybridge.js'), 'plan', datasheetTask, '--json'], {
-    cwd: ROOT,
+    cwd: tempRoot,
     env: {
       ...process.env,
       RELAYBRIDGE_URL: baseUrl,
@@ -1178,7 +1186,9 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(narrationResult.failureClass, 'incomplete_response');
   assert.equal(narrationResult.stop_reason, 'provider_incomplete_response');
   assert.match(narrationResult.stop_detail, /switch providers/);
-  assert.match(narrationResult.stdout, /^I will inspect/);
+  assert.equal(narrationResult.stdout, '');
+  assert.match(narrationResult.partial_diagnostic, /^I will inspect/);
+  assert.equal(narrationResult.output_detector.id, 'future_narration_only');
   const narrationReceipt = fs.readFileSync(
     path.join(tempRoot, 'data', 'receipts', new Date().toISOString().slice(0, 10) + '.jsonl'), 'utf8',
   ).trim().split(/\r?\n/).map(JSON.parse).find((row) => row.receiptId === narrationResult.receiptId);
@@ -1693,7 +1703,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
 
   const groupedPlan = await (await fetch(baseUrl + '/api/plan', {
     method: 'POST', headers: jsonAuth,
-    body: JSON.stringify({ task: 'review this architecture', kind: 'usage_json' }),
+    body: JSON.stringify({ task: 'Explain this bounded scenario.', kind: 'usage_json' }),
   })).json();
   assert.deepEqual(groupedPlan.fleetState.quotaSeats['subscription:anthropic:default'].providers,
     sharedUsageAliases);
@@ -1741,7 +1751,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
 
   const observedPlan = await (await fetch(baseUrl + '/api/plan', {
     method: 'POST', headers: jsonAuth,
-    body: JSON.stringify({ task: 'review this architecture', kind: 'usage_json' }),
+    body: JSON.stringify({ task: 'Explain this bounded scenario.', kind: 'usage_json' }),
   })).json();
   assert.equal(observedPlan.fleetState.operatorQuota['subscription:anthropic:default'].percentRemaining, 4);
   assert.equal(observedPlan.fleetState.balance.quotaSeats
@@ -1787,7 +1797,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
 
   const xhighPlanResponse = await fetch(baseUrl + '/api/plan', {
     method: 'POST', headers: jsonAuth,
-    body: JSON.stringify({ task: 'review a difficult architecture', kind: 'codex_effort', effort: 'xhigh' }),
+    body: JSON.stringify({ task: 'Explain a bounded scenario', kind: 'codex_effort', effort: 'xhigh' }),
   });
   assert.equal(xhighPlanResponse.status, 200);
   const xhighPlan = await xhighPlanResponse.json();
@@ -2600,6 +2610,7 @@ test('linked provider accounts fail closed, isolate cooldowns, and refresh mutat
   ];
   const provider = (label, quotaSeat, slotExtra) => ({
     label,
+    oneshot_capabilities: { safe: ['model_invocation'], dangerous: ['model_invocation'] },
     quota_seat: quotaSeat,
     credential_env: 'TEST_ACCOUNT_HOME',
     credential_markers: ['.credentials.json'],
@@ -3653,6 +3664,7 @@ test('local Ollama adapter uses loopback HTTP, returns final-only text, and reco
   fs.writeFileSync(configPath, JSON.stringify({
     ollama_fast: {
       label: 'Fake local model',
+      oneshot_capabilities: { safe: ['model_invocation', 'prompt_only'], dangerous: ['model_invocation', 'prompt_only'] },
       transport: 'local:ollama',
       oneshot_adapter: 'ollama_api',
       model: 'fake-local:1b',

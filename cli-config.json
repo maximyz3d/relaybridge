@@ -97,6 +97,10 @@
     }
   },
   "powershell": {
+    "oneshot_capabilities": {
+      "safe": ["workspace_read", "tool_use"],
+      "dangerous": ["workspace_read", "workspace_write", "tool_use"]
+    },
     "label": "PowerShell",
     "tags": [],
     "company": "Microsoft",
@@ -113,6 +117,19 @@
     ]
   },
   "claude": {
+    "oneshot_capabilities": {
+      "safe": [
+        "model_invocation",
+        "workspace_read",
+        "tool_use"
+      ],
+      "dangerous": [
+        "model_invocation",
+        "workspace_read",
+        "workspace_write",
+        "tool_use"
+      ]
+    },
     "credential_env": "CLAUDE_CONFIG_DIR",
     "credential_markers": [
       ".credentials.json"
@@ -285,6 +302,19 @@
     "npm_package": "@anthropic-ai/claude-code"
   },
   "claude_fable": {
+    "oneshot_capabilities": {
+      "safe": [
+        "model_invocation",
+        "workspace_read",
+        "tool_use"
+      ],
+      "dangerous": [
+        "model_invocation",
+        "workspace_read",
+        "workspace_write",
+        "tool_use"
+      ]
+    },
     "credential_env": "CLAUDE_CONFIG_DIR",
     "credential_markers": [
       ".credentials.json"
@@ -405,6 +435,19 @@
     "_note": "Fable 5 is an explicit heavy planning/review tier on the same Claude subscription. It has no writer slot; revisions use the Claude Sonnet writer so route metadata matches the invoked model. Readiness proves the installed CLI and login; an actual receipt is required before claiming end-to-end model availability."
   },
   "codex": {
+    "oneshot_capabilities": {
+      "safe": [
+        "model_invocation",
+        "workspace_read",
+        "tool_use"
+      ],
+      "dangerous": [
+        "model_invocation",
+        "workspace_read",
+        "workspace_write",
+        "tool_use"
+      ]
+    },
     "credential_env": "CODEX_HOME",
     "credential_markers": [
       "auth.json"
@@ -525,6 +568,19 @@
     "npm_package": "@openai/codex"
   },
   "copilot": {
+    "oneshot_capabilities": {
+      "safe": [
+        "model_invocation",
+        "workspace_read",
+        "tool_use"
+      ],
+      "dangerous": [
+        "model_invocation",
+        "workspace_read",
+        "workspace_write",
+        "tool_use"
+      ]
+    },
     "credential_env": "COPILOT_HOME",
     "credential_markers": [
       "config.json"
@@ -609,6 +665,19 @@
     "_note": "The official CLI supports copilot --prompt for direct prompts and Copilot CLI custom agents. RelayBridge runs it in bounded one-shot mode; mutating tool approval remains governed by Copilot CLI."
   },
   "cursor": {
+    "oneshot_capabilities": {
+      "safe": [
+        "model_invocation",
+        "workspace_read",
+        "tool_use"
+      ],
+      "dangerous": [
+        "model_invocation",
+        "workspace_read",
+        "workspace_write",
+        "tool_use"
+      ]
+    },
     "label": "Cursor Agent",
     "oneshot_safe_filesystem_policy": "unverified_provider_policy",
     "login_command": [
@@ -695,6 +764,19 @@
     "model_note": "This plan only allows Auto: named models return \"Named models unavailable\". No model flag is sent so the Cursor seat picks its own. The installer removes the retired shipped pins while preserving explicitly locked custom operator pins."
   },
   "gemini": {
+    "oneshot_capabilities": {
+      "safe": [
+        "model_invocation",
+        "workspace_read",
+        "tool_use"
+      ],
+      "dangerous": [
+        "model_invocation",
+        "workspace_read",
+        "workspace_write",
+        "tool_use"
+      ]
+    },
     "label": "Gemini (Antigravity)",
     "oneshot_safe_filesystem_policy": "unverified_provider_policy",
     "oneshot_safe_prompt_policy": "antigravity_headless_builtin_read_only_tools",
@@ -846,6 +928,19 @@
     "_permission_note": "Antigravity CLI 1.1.19 has no per-invocation command allow-rule flag. Persistent command(prefix) rules permit trailing arguments and RelayBridge cannot prove broad git, PowerShell, or rg rules read-only. Safe headless calls therefore use a visible command-free prompt policy and surface any auto-denial without retrying. The dangerous slot remains explicit and is never selected as fallback."
   },
   "grok": {
+    "oneshot_capabilities": {
+      "safe": [
+        "model_invocation",
+        "workspace_read",
+        "tool_use"
+      ],
+      "dangerous": [
+        "model_invocation",
+        "workspace_read",
+        "workspace_write",
+        "tool_use"
+      ]
+    },
     "label": "Grok Build",
     "oneshot_safe_filesystem_policy": "unverified_provider_policy",
     "login_command": [
@@ -936,6 +1031,16 @@
     "post_install": "Run grok login once to sign in."
   },
   "perplexity": {
+    "oneshot_capabilities": {
+      "safe": [
+        "model_invocation",
+        "prompt_only"
+      ],
+      "dangerous": [
+        "model_invocation",
+        "prompt_only"
+      ]
+    },
     "label": "Perplexity",
     "oneshot_safe_filesystem_policy": "unverified_provider_policy",
     "tags": [
@@ -994,6 +1099,16 @@
     "_note": "Uses your Perplexity web subscription via the community pwm CLI. The RelayBridge subscription seat strips paid-API fallback variables and consumes normal Perplexity web/search quotas. Optional PPLX_MODEL defaults to auto; validate explicit names with pwm ask --help."
   },
   "ollama_fast": {
+    "oneshot_capabilities": {
+      "safe": [
+        "model_invocation",
+        "prompt_only"
+      ],
+      "dangerous": [
+        "model_invocation",
+        "prompt_only"
+      ]
+    },
     "label": "Local Qwen 2.5 1.5B (Fast)",
     "oneshot_safe_filesystem_policy": "read_only_enforced",
     "models_probe": [
@@ -1049,6 +1164,16 @@
     "_note": "Apache-2.0 model, no-API-fee, non-thinking local utility seat. Uses local compute, memory, storage, and electricity; escalate failed validations."
   },
   "ollama_llama": {
+    "oneshot_capabilities": {
+      "safe": [
+        "model_invocation",
+        "prompt_only"
+      ],
+      "dangerous": [
+        "model_invocation",
+        "prompt_only"
+      ]
+    },
     "label": "Local Meta Llama 3.2 3B",
     "oneshot_safe_filesystem_policy": "read_only_enforced",
     "models_probe": [
@@ -1104,6 +1229,16 @@
     "_note": "Local Meta Llama utility/general seat. No China-hosted API path; uses local compute and must earn higher routing tiers through receipts."
   },
   "ollama": {
+    "oneshot_capabilities": {
+      "safe": [
+        "model_invocation",
+        "prompt_only"
+      ],
+      "dangerous": [
+        "model_invocation",
+        "prompt_only"
+      ]
+    },
     "label": "Local Qwen3 4B",
     "oneshot_safe_filesystem_policy": "read_only_enforced",
     "models_probe": [
@@ -1160,6 +1295,16 @@
     "_note": "Zero API fee, but uses local compute, memory, storage, and electricity. This installed model is eligible for utility/standard work only until local task benchmarks qualify it."
   },
   "ollama_coder": {
+    "oneshot_capabilities": {
+      "safe": [
+        "model_invocation",
+        "prompt_only"
+      ],
+      "dangerous": [
+        "model_invocation",
+        "prompt_only"
+      ]
+    },
     "label": "Local Qwen Coder 7B",
     "oneshot_safe_filesystem_policy": "read_only_enforced",
     "models_probe": [
@@ -1215,6 +1360,16 @@
     "_note": "Zero API fee local coding seat. Escalate validator or test failures; model-card claims are not a reproduced RelayBridge benchmark."
   },
   "groq_llama_fast": {
+    "oneshot_capabilities": {
+      "safe": [
+        "model_invocation",
+        "prompt_only"
+      ],
+      "dangerous": [
+        "model_invocation",
+        "prompt_only"
+      ]
+    },
     "label": "Groq Llama 3.1 8B",
     "oneshot_safe_filesystem_policy": "read_only_enforced",
     "tags": [

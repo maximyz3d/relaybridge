@@ -3,6 +3,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const { startTestBridge } = require('./helpers/temporary-bridge');
 const ROOT = path.resolve(__dirname, '..');
 
@@ -18,6 +19,7 @@ test('MCP preserves typed prompt gates, null budgets, all-member admission and u
       "process.stdout.write(Array.from({length:600},(_,i)=>'Finding '+i+': consider deterministic tests.').join('\\n'));",
     ].join('\n'));
     const seat = (kind, max) => ({ label: kind, company: kind, transport: 'subscription:fixture',
+      oneshot_capabilities: { safe: ['model_invocation'] },
       safe: [process.execPath], probe: [process.execPath, script, '--version'],
       oneshot_safe: [process.execPath, script, marker, kind, '{prompt_file}'],
       oneshot_safe_filesystem_policy: 'read_only_enforced', ...(max ? { prompt_input_max_chars: max } : {}) });
@@ -77,4 +79,17 @@ test('MCP preserves typed prompt gates, null budgets, all-member admission and u
   const invoked = fs.readFileSync(marker, 'utf8').trim().split('\n').map(JSON.parse);
   assert.equal(invoked.length, 2, 'only independent members execute; oversized chair does not');
   assert.ok(invoked.every((entry) => entry.prompt.endsWith(task)));
+
+  const cwdIdentityHash = (await bridge.request('/api/workspace/validate', { cwd: bridge.root })).body.cwdIdentityHash;
+  const content = 'Supplied bounded design material. ' + 'x'.repeat(2000);
+  const inlineEvidence = { content, sha256: crypto.createHash('sha256').update(content).digest('hex'), cwdIdentityHash };
+  const groundedCommittee = await call('run_committee', { task, cwd: bridge.root, providers: ['claude', 'codex'],
+    requiresWorkspaceAccess: true, inlineEvidence, maxProviders: 2, mode: 'consensus',
+    acknowledgeHumanGate: true, useCache: false });
+  assert.equal(groundedCommittee.members.length, 2, JSON.stringify(groundedCommittee));
+  assert.equal(groundedCommittee.synthesis.validation.code, 'prompt_too_large');
+  assert.equal(groundedCommittee.synthesis.modelInvocation, false);
+  const groundedInvocations = fs.readFileSync(marker, 'utf8').trim().split('\n').map(JSON.parse).slice(invoked.length);
+  assert.equal(groundedInvocations.length, 2, 'inline grounding cannot bypass the composed chair cap');
+  assert.ok(groundedInvocations.every((entry) => entry.prompt.split(content).length === 2));
 });

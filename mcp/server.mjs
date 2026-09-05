@@ -10,8 +10,17 @@ import { z } from 'zod';
 import TIMEOUT_POLICY from '../timeout-policy.cjs';
 import { normalizeGenericValidation } from '../lib/validation-contract.js';
 import { promptTransportLimits, preparePrompt } from '../lib/prompt-transport.js';
+import { normalizeGrounding, prepareGroundedPrompt } from '../lib/workspace-grounding.js';
+
+const GROUNDING_FIELDS = {
+  requiresWorkspaceAccess: z.boolean().optional().describe('Require actual workspace access or a complete validated read-only inline evidence bundle.'),
+  inlineEvidence: z.object({ content: z.string().min(1).max(100000), sha256: z.string().regex(/^[0-9a-f]{64}$/),
+    cwdIdentityHash: z.string().regex(/^[0-9a-f]{64}$/) }).strict().optional(),
+};
 import { CONTRACT_FIELDS } from '../lib/execution-contract.js';
 import { SUPPORTED_EFFORTS as EFFORT_LEVELS } from '../lib/effort-controls.js';
+import { validQuotaSeat } from '../lib/quota-seat.js';
+import { validProviderKey } from '../lib/provider-accounts.js';
 import {
   BASE_URL,
   BRIDGE_ROOT,
@@ -180,6 +189,15 @@ function toolError(error) {
     error: error?.message || String(error),
   };
   if (error instanceof BridgeError) {
+    if (error.detail?.model_invocation === false && error.detail?.validation) {
+      const failure = bridgeFailureResult(error, { kind: null }).sanitized;
+      const receipt = appendReceipt({ event: 'planning_preflight', status: 'blocked',
+        modelInvocation: false, physicalAttemptCount: 0, tokenUsageSource: 'not_invoked',
+        validation: failure.validation, errorCode: failure.errorCode, failureClass: failure.failureClass,
+        transportReceiptId: failure.transportReceiptId, providerRetryCount: 0, transportRetryCount: 0 });
+      Object.assign(payload, failure, { receiptId: receipt.receiptId },
+        { ok: false, blocked: true, attempts: [], members: [], cacheHit: false });
+    }
     payload.route = error.route;
     payload.status = error.status;
     payload.detail = error.detail;
@@ -395,6 +413,7 @@ async function getAccountAwareRoute(args, signal, timeoutMs = ACCOUNT_AWARE_ROUT
       method: 'POST',
       body: {
         task: args.task,
+        cwd: args.cwd, requiresWorkspaceAccess: args.requiresWorkspaceAccess, inlineEvidence: args.inlineEvidence,
         preferKinds: Array.isArray(args.preferredProviders) ? args.preferredProviders : [],
         excludeKinds: Array.isArray(args.excludedProviders) ? args.excludedProviders : [],
         localOnly: args.localOnly === true,
@@ -776,7 +795,7 @@ const PROVIDER_FAILURE_CLASSES = new Set([
   'tool_deferred', 'aborted_streaming', 'aborted_tools', 'hook_stopped',
   'stop_hook_prevented', 'blocking_limit', 'prompt_too_long',
   'provider_error', 'admission_limit', 'bridge_identity_mismatch',
-  'incomplete_response', 'token_budget', 'plan_restriction',
+  'incomplete_response', 'provider_refusal', 'token_budget', 'plan_restriction',
   'client_cancelled', 'mcp_deadline_cancelled',
   'validation', 'configuration', 'safe_filesystem_unverified',
   'safe_isolation_setup', 'isolation_cleanup', 'workspace_grounding',
@@ -886,7 +905,9 @@ function normalizeWorkspaceAdmission(value) {
     || execution.version !== 1 || !strictSha256(execution.configFingerprint)
     || CONTRACT_FIELDS.some((field) => !Object.prototype.hasOwnProperty.call(execution, field))
     || Object.keys(execution).some((field) => !CONTRACT_FIELDS.includes(field))) return null;
-  return { cwdIdentityHash, cwdPolicyId, bridgeBuildId, receiptStoreId, execution };
+  const grounding = normalizeGrounding(value.grounding);
+  if (!grounding || grounding.allowed !== true || grounding.cwdIdentityHash !== cwdIdentityHash) return null;
+  return { cwdIdentityHash, cwdPolicyId, bridgeBuildId, receiptStoreId, execution, grounding };
 }
 
 function strictCountMap(value, allowedKey) {
@@ -1067,6 +1088,14 @@ export function normalizeVendorQuota(value) {
 
 export function normalizeQuotaEvidence(value) {
   if (!value || typeof value !== 'object') return null;
+  if (value.source === 'claude_terminal_api_status') {
+    if (!validProviderKey(value.provider)
+      || value.scope !== 'account' || value.kind !== 'rate_limit' || value.status !== 429
+      || strictTokenCount(value.errorCount) === null
+      || !/^[0-9a-f]{64}$/.test(String(value.errorDiagnosticHash || ''))) return null;
+    return { provider: value.provider, scope: 'account', kind: 'rate_limit', source: value.source,
+      status: 429, errorCount: value.errorCount, errorDiagnosticHash: value.errorDiagnosticHash };
+  }
   const stderrChars = strictTokenCount(value.stderrChars);
   const observedAt = strictBoundedString(value.observedAt, 40);
   if (value.provider !== 'copilot' || value.scope !== 'seat'
@@ -1080,6 +1109,26 @@ export function normalizeQuotaEvidence(value) {
     provider: 'copilot', scope: 'seat', kind: value.kind, source: value.source,
     diagnostic: value.diagnostic, observedAt, stderrChars, stderrHash: value.stderrHash,
   };
+}
+
+export function normalizeProviderCooldown(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || !validQuotaSeat(value.seat)
+    || !['account', 'model'].includes(value.scope)
+    || !['rate_limited', 'quota_exhausted', 'overloaded'].includes(value.reason)
+    || !['retry-after', 'retry-after-capped', 'backoff', 'overload-default'].includes(value.source)
+    || strictTokenCount(value.until) === null || strictTokenCount(value.offences) === null) return null;
+  return { seat: value.seat, scope: value.scope, reason: value.reason, source: value.source,
+    until: value.until, offences: value.offences };
+}
+
+export function normalizeOutputDetector(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || !['gemini_explicit_refusal', 'gemini_progress_only', 'future_narration_only'].includes(value.id)
+    || value.version !== 1 || value.source !== 'provider_terminal_text'
+    || strictTokenCount(value.outputChars) === null
+    || typeof value.outputHash !== 'string' || !/^[0-9a-f]{64}$/.test(value.outputHash)) return null;
+  return { id: value.id, version: 1, source: value.source, outputChars: value.outputChars, outputHash: value.outputHash };
 }
 
 export function normalizeProviderActionRequired(value) {
@@ -1138,6 +1187,7 @@ function sanitizeProviderResponse(response) {
     modelInvocation,
     failureClass: PROVIDER_FAILURE_CLASSES.has(rawFailureClass) ? rawFailureClass : null,
     resultSubtype: strictBoundedString(response.result_subtype),
+    outputDetector: normalizeOutputDetector(response.output_detector),
     resultSchemaDisagreement: response.result_schema_disagreement === true,
     providerStopReason: strictBoundedString(response.provider_stop_reason),
     providerTerminalReason: PROVIDER_TERMINAL_REASONS.has(terminalReason) ? terminalReason : null,
@@ -1174,6 +1224,10 @@ function sanitizeProviderResponse(response) {
     providerRetries: normalizeProviderRetries(response.provider_retries, modelInvocation),
     vendorQuota: normalizeVendorQuota(response.vendor_quota),
     quotaEvidence: normalizeQuotaEvidence(response.quota_evidence),
+    grounding: normalizeGrounding(response.grounding),
+    cooldown: normalizeProviderCooldown(response.cooldown),
+    retryAt: strictTokenCount(response.retry_at),
+    retryAfterSec: strictTokenCount(response.retry_after),
     providerActionRequired: normalizeProviderActionRequired(response.provider_action_required),
     stdout: stdout.text,
     stderr: stderr.text,
@@ -1307,6 +1361,10 @@ async function reconcileCancelledTransportAttempt({ requestId, outerReceiptId, k
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   if (!transportReceipt) return sanitized;
+  return reconcileTransportReceipt({ requestId, sanitized, transportReceipt });
+}
+
+export function reconcileTransportReceipt({ requestId, sanitized, transportReceipt }) {
   const supervisorWon = !!transportReceipt.supervisorStopReason;
   const failureClass = supervisorWon
     ? (transportReceipt.failureClass || 'timeout')
@@ -1324,6 +1382,16 @@ async function reconcileCancelledTransportAttempt({ requestId, outerReceiptId, k
     tokenUsageSource: transportReceipt.tokenUsageSource || 'unknown',
     usage: usageFromTransportReceipt(transportReceipt),
     providerRetries: providerRetriesFromReceipt(transportReceipt),
+    quotaEvidence: normalizeQuotaEvidence(transportReceipt.quotaEvidence),
+    cooldown: normalizeProviderCooldown(transportReceipt.cooldown),
+    retryAt: strictTokenCount(transportReceipt.retryAt),
+    retryAfterSec: strictTokenCount(transportReceipt.retryAfterSec),
+    providerApiErrorStatus: Number.isSafeInteger(transportReceipt.providerApiErrorStatus)
+      && transportReceipt.providerApiErrorStatus >= 100 && transportReceipt.providerApiErrorStatus <= 599
+      ? transportReceipt.providerApiErrorStatus : null,
+    rateLimited: normalizeQuotaEvidence(transportReceipt.quotaEvidence)?.kind === 'rate_limit'
+      || transportReceipt.failureClass === 'rate_limit',
+    budgetExceeded: transportReceipt.failureClass === 'token_budget' || transportReceipt.failureClass === 'budget',
     transportReceiptId: transportReceipt.receiptId,
     transportReceiptPersisted: true,
     transportOutputChars: transportReceipt.transportOutputChars ?? null,
@@ -1340,6 +1408,9 @@ async function callProvider({
   kind,
   prompt,
   cwd,
+  requiresWorkspaceAccess,
+  inlineEvidence,
+  semanticMaxChars,
   timeoutMs = TIMEOUT_POLICY.oneShotDefaultMs,
   useCache = true,
   cacheTtlMs,
@@ -1385,7 +1456,7 @@ async function callProvider({
     }
     const response = await bridgeRequest('/api/workspace/validate', {
       method: 'POST',
-      body: { kind, prompt, cwd, requestId, model, execution,
+      body: { kind, prompt, cwd, requestId, model, execution, requiresWorkspaceAccess, inlineEvidence,
         taskTier: effectiveTaskTier, modelTier: effectiveModelTier,
         effort, maxEffortOverride, providerBudget, dangerous: false },
       timeoutMs: TIMEOUT_POLICY.transportTimeoutMs(timeoutMs),
@@ -1396,6 +1467,8 @@ async function callProvider({
     if (!workspaceAdmission) {
       throw new Error('RelayBridge returned malformed cwd admission identity; provider execution is blocked.');
     }
+    validateGroundedInput({ kind, entry, prompt, cwd, requiresWorkspaceAccess, inlineEvidence,
+      cwdIdentityHash: workspaceAdmission.cwdIdentityHash, semanticMaxChars });
   } catch (error) {
     ({ sanitized, status } = bridgeFailureResult(error, { kind, signal }));
   }
@@ -1407,6 +1480,8 @@ async function callProvider({
     purpose,
     providerBudget: providerBudget || null,
     execution: workspaceAdmission?.execution || execution || null,
+    grounding: workspaceAdmission?.grounding || null,
+    semanticMaxChars: semanticMaxChars ?? null,
     maxEffortOverride: maxEffortOverride === true,
     cwdIdentityHash: workspaceAdmission?.cwdIdentityHash || null,
     cwdPolicyId: workspaceAdmission?.cwdPolicyId || null,
@@ -1494,6 +1569,8 @@ async function callProvider({
         kind,
         prompt,
         cwd,
+        requiresWorkspaceAccess,
+        inlineEvidence,
         requestId,
         outerReceiptId,
         expectedCwdIdentityHash: workspaceAdmission.cwdIdentityHash,
@@ -1547,6 +1624,11 @@ async function callProvider({
     modelUsage: sanitized.usage?.model_usage ?? [],
     vendorQuota: sanitized.vendorQuota ?? null,
     quotaEvidence: sanitized.quotaEvidence ?? null,
+    grounding: sanitized.grounding ?? null,
+    outputDetector: sanitized.outputDetector ?? null,
+    cooldown: sanitized.cooldown ?? null,
+    retryAt: sanitized.retryAt ?? null,
+    retryAfterSec: sanitized.retryAfterSec ?? null,
     providerActionRequired: sanitized.providerActionRequired ?? null,
     providerRetryCount: sanitized.providerRetries?.count ?? null,
     providerRetryDelayMs: sanitized.providerRetries?.total_delay_ms ?? null,
@@ -1651,9 +1733,22 @@ function eligibleOneShotKinds(route, config, { selectedOnly = false, allowedKind
     seen.add(candidate.kind);
     if (allowed.size && !allowed.has(candidate.kind)) return false;
     const entry = config[candidate.kind];
-    return candidate.policyScore >= 0 && !candidate.validation && !candidate.blocked
+    return candidate.eligible === true && candidate.policyScore >= 0 && !candidate.validation && !candidate.blocked
       && candidate.ready !== false && entry && Array.isArray(entry.oneshot_safe) && entry.oneshot_safe.length;
   });
+}
+
+function validateGroundedInput({ kind, entry, prompt, cwd, requiresWorkspaceAccess, inlineEvidence, cwdIdentityHash, semanticMaxChars }) {
+  try {
+    const composed = prepareGroundedPrompt({ prompt, cwd, requiresWorkspaceAccess, inlineEvidence, cwdIdentityHash, seat: kind, seatConfig: entry });
+    const limits = promptTransportLimits(entry, entry.oneshot_safe || []);
+    return preparePrompt(composed.prompt, { ...limits,
+      maxChars: semanticMaxChars == null ? limits.maxChars : limits.maxChars === null ? semanticMaxChars : Math.min(limits.maxChars, semanticMaxChars),
+      policyPrefix: typeof entry.oneshot_safe_prompt_prefix === 'string' ? entry.oneshot_safe_prompt_prefix.trim() : '' });
+  } catch (error) {
+    throw new BridgeError(error.message, { status: 400, detail: { failureClass: error.code === 'workspace_grounding' ? 'workspace_grounding' : 'validation',
+      validation: error.validation, errorCode: error.code, model_invocation: false, token_usage_source: 'not_invoked', physical_attempt_count: 0 } });
+  }
 }
 
 function rolePrompt(task, role, classification, policy) {
@@ -1666,7 +1761,7 @@ function rolePrompt(task, role, classification, policy) {
   };
   return [
     `You are the ${role} in a read-only RelayBridge advisory committee.`,
-    'Do not edit files, run tools, or claim that a proposal was implemented. Return concise analysis only.',
+    'Do not edit files, launch nested providers, or claim that a proposal was implemented. Use only permitted read-only inspection tools when available; otherwise limit findings to supplied material. Return concise analysis only.',
     roleInstructions[role] || roleInstructions.primary,
     `Task tier: ${classification.tier}. Tags: ${classification.tags.join(', ')}.`,
     '',
@@ -1811,6 +1906,8 @@ export function buildServer() {
     title: 'Preview deterministic task routing',
     description: 'Classify a task and preview an auditable local/cheap-first route without calling any model.',
     inputSchema: z.object({
+      ...GROUNDING_FIELDS,
+      cwd: z.string().max(1000).optional(),
       task: z.string().min(1).max(100000),
       preferredProviders: z.array(z.string()).max(8).default([]),
       excludedProviders: z.array(z.string()).max(8).default([]),
@@ -1843,6 +1940,8 @@ export function buildServer() {
     title: 'Plan a task: company, model, and effort',
     description: 'Given a task description, returns the cheapest capable execution plan: which company/provider, which model inside it, and how much reasoning effort — plus fallbacks and why. Call this BEFORE delegating anything you are unsure about. It exists to stop frontier seats being spent on mechanical edits and max-effort reasoning being spent on arithmetic.',
     inputSchema: z.object({
+      ...GROUNDING_FIELDS,
+      cwd: z.string().max(1000).optional(),
       task: z.string().min(1).describe('what needs doing, in a sentence or two'),
       effort: z.enum(EFFORT_LEVELS).optional().describe('override the effort the tier would pick; xhigh/max require an explicit maxEffortOverride when executed'),
       kind: z.string().optional().describe('force a specific provider and plan around it'),
@@ -1853,10 +1952,10 @@ export function buildServer() {
       acknowledgeFilesystemWrites: z.boolean().default(false).describe('required with dangerous=true; confirms persistent writes are authorized'),
     }),
     annotations: READ_ONLY,
-  }, safeHandler(async ({ task, effort, kind, model, modelTier, providerBudget, dangerous, acknowledgeFilesystemWrites }, context) => {
+  }, safeHandler(async ({ task, effort, kind, model, modelTier, providerBudget, dangerous, acknowledgeFilesystemWrites, cwd, requiresWorkspaceAccess, inlineEvidence }, context) => {
     const plan = await bridgeRequest('/api/plan', {
       method: 'POST',
-      body: { task, effort, kind, model, modelTier, providerBudget, dangerous, acknowledgeFilesystemWrites },
+      body: { task, effort, kind, model, modelTier, providerBudget, dangerous, acknowledgeFilesystemWrites, cwd, requiresWorkspaceAccess, inlineEvidence },
       timeoutMs: 20000,
       signal: context?.mcpReq?.signal,
     });
@@ -2157,6 +2256,7 @@ export function buildServer() {
     title: 'Ask one provider safely',
     description: 'Run one bounded, non-agentic provider turn with dangerous:false forced, available route metadata, cache controls, quota/failure signals, and an append-only receipt. The provider CLI runs in its own safe/headless mode, which is a vendor-side restriction rather than an OS sandbox. Hosted CLIs may not reveal final model revisions, usage, plan, or provider request IDs.',
     inputSchema: z.object({
+      ...GROUNDING_FIELDS,
       kind: z.string().min(1).max(64),
       prompt: z.string().min(1).max(100000),
       cwd: z.string().max(1000).optional(),
@@ -2193,6 +2293,7 @@ export function buildServer() {
     title: 'Route and ask with bounded escalation',
     description: 'Apply deterministic routing, call the first eligible safe provider, and escalate only on typed failure. High-stakes routes require explicit acknowledgement.',
     inputSchema: z.object({
+      ...GROUNDING_FIELDS,
       task: z.string().min(1).max(100000),
       cwd: z.string().max(1000).optional(),
       preferredProviders: z.array(z.string()).max(8).default([]),
@@ -2270,6 +2371,16 @@ export function buildServer() {
     const config = loadCliConfig();
     const tierEscalations = Number.isInteger(tierPolicy.maxEscalations) ? tierPolicy.maxEscalations : 1;
     const candidates = eligibleOneShotKinds(route, config).slice(0, Math.min(args.maxEscalations, tierEscalations) + 1);
+    if (!candidates.length) {
+      const validation = { code: 'no_eligible_provider', field: 'task', retryable: false,
+        reason: 'No ready provider satisfies the required invocation capabilities, task family, complexity, and admission policy.' };
+      const accounting = { modelInvocation: false, physicalAttemptCount: 0, tokenUsageSource: 'not_invoked' };
+      const receipt = appendReceipt({ event: 'route_execute', routeId: route.routeId,
+        taskHash: route.classification.taskHash, status: 'eligibility_gate', failureClass: 'validation', validation, ...accounting });
+      return result({ ok: false, blocked: true, status: 'eligibility_gate', error: validation.reason,
+        errorCode: validation.code, failureClass: 'validation', validation, route, winner: null, attempts: [],
+        ...accounting, receiptId: receipt.receiptId, receiptPersistenceError: receipt.receiptPersistenceError || null }, { isError: true });
+    }
     const deadlineAt = Math.min(requestedDeadlineAt, Date.now() + tierPolicy.defaultTimeoutMs);
     const rootReceipt = appendReceipt({ event: 'route_execute', routeId: route.routeId, taskHash: route.classification.taskHash, candidates: candidates.map((item) => item.kind), status: 'started' });
     let run = writeRun({
@@ -2288,6 +2399,8 @@ export function buildServer() {
         kind: candidate.kind,
         prompt: args.task,
         cwd: args.cwd,
+        requiresWorkspaceAccess: args.requiresWorkspaceAccess, inlineEvidence: args.inlineEvidence,
+        semanticMaxChars: tierPolicy.maxInputChars,
         timeoutMs: remainingTime(deadlineAt),
         useCache: args.useCache,
         parentReceiptId: rootReceipt.receiptId,
@@ -2347,6 +2460,7 @@ export function buildServer() {
     title: 'Run a bounded multi-provider committee',
     description: 'Fan out independent read-only roles to up to four diverse providers, checkpoint partial results, enforce one overall deadline, and optionally ask one safe chair for a structured agreement/mixed/disagreement assessment. Consensus is never inferred from successful text generation alone.',
     inputSchema: z.object({
+      ...GROUNDING_FIELDS,
       task: z.string().min(1).max(100000),
       cwd: z.string().max(1000).optional(),
       providers: z.array(z.string()).max(4).default([]),
@@ -2369,6 +2483,7 @@ export function buildServer() {
     const requestedDeadlineAt = Date.now() + args.timeoutMs;
     const route = await getAccountAwareRoute({
       task: args.task,
+      cwd: args.cwd, requiresWorkspaceAccess: args.requiresWorkspaceAccess, inlineEvidence: args.inlineEvidence,
       preferredProviders: args.providers,
       excludedProviders: [...args.excludedProviders, 'powershell'],
       localOnly: args.localOnly,
@@ -2386,6 +2501,10 @@ export function buildServer() {
     const config = loadCliConfig();
     const { policy } = loadRoutingData();
     const tierPolicy = policy.tiers[route.classification.tier];
+    const explicitInvalidMember = (route.fleetState?.groundingSkipped || []).find((row) => row.validation && args.providers.includes(row.kind));
+    if (explicitInvalidMember) throw new BridgeError(explicitInvalidMember.validation.reason, { status: 400,
+      detail: { failureClass: explicitInvalidMember.validation.code === 'workspace_grounding' ? 'workspace_grounding' : 'validation',
+        validation: explicitInvalidMember.validation, model_invocation: false, token_usage_source: 'not_invoked', physical_attempt_count: 0 } });
     const eligible = eligibleOneShotKinds(route, config, {
       selectedOnly: true,
       allowedKinds: args.providers,
@@ -2419,6 +2538,7 @@ export function buildServer() {
         const admission = await bridgeRequest('/api/workspace/validate', { method: 'POST', signal,
           timeoutMs: remainingTime(requestedDeadlineAt), actionIdentity: true,
           body: { kind: candidate.kind, prompt: seatPrompts[index], cwd: args.cwd,
+            requiresWorkspaceAccess: args.requiresWorkspaceAccess, inlineEvidence: args.inlineEvidence,
             requestId: `mcp:${crypto.randomUUID()}`, dangerous: false,
             execution: candidate.execution ?? undefined, model: candidate.model ?? undefined,
             taskTier: candidate.execution ? undefined : route.classification.tier,
@@ -2426,6 +2546,9 @@ export function buildServer() {
             effort: args.effort, maxEffortOverride: args.maxEffortOverride, providerBudget: args.providerBudget } });
         const normalized = normalizeWorkspaceAdmission(admission);
         if (!normalized) throw new Error('Malformed live execution admission; committee blocked before dispatch.');
+        validateGroundedInput({ kind: candidate.kind, entry, prompt: seatPrompts[index], cwd: args.cwd,
+          requiresWorkspaceAccess: args.requiresWorkspaceAccess, inlineEvidence: args.inlineEvidence,
+          cwdIdentityHash: normalized.cwdIdentityHash, semanticMaxChars: tierPolicy.maxInputChars });
         candidate.execution = normalized.execution;
       }
     } catch (error) {
@@ -2472,6 +2595,8 @@ export function buildServer() {
           kind: candidate.kind,
           prompt: seatPrompt,
           cwd: args.cwd,
+          requiresWorkspaceAccess: args.requiresWorkspaceAccess, inlineEvidence: args.inlineEvidence,
+          semanticMaxChars: tierPolicy.maxInputChars,
           timeoutMs: remainingTime(deadlineAt),
           useCache: args.useCache,
           parentReceiptId: rootReceipt.receiptId,
@@ -2541,6 +2666,8 @@ export function buildServer() {
           kind: chairKind,
           prompt: synthesisPrompt,
           cwd: args.cwd,
+          requiresWorkspaceAccess: args.requiresWorkspaceAccess, inlineEvidence: args.inlineEvidence,
+          semanticMaxChars: policy.committee.maxSynthesisChars,
           timeoutMs: remainingTime(deadlineAt),
           useCache: args.useCache,
           parentReceiptId: rootReceipt.receiptId,
@@ -2666,6 +2793,7 @@ export function buildServer() {
     title: 'Broadcast one prompt to many providers',
     description: 'Send the same prompt to every matching AI provider in one call. WARNING: this spends quota, credits, or local compute on MULTIPLE provider accounts at once — one broadcast can consume a seat of Claude, Codex, Gemini, Grok, and more simultaneously. Target by explicit providers, by a shared tag, or all:true; tag/all selection always skips opt-in autoRoute:false hosted seats unless they are named explicitly in providers. Calls run with dangerous:false through the same bounded one-shot path and receipts as ask_provider.',
     inputSchema: z.object({
+      ...GROUNDING_FIELDS,
       prompt: z.string().min(1).max(100000),
       tag: z.string().regex(/^[a-z][a-z0-9-]{0,23}$/).optional(),
       providers: z.array(z.string()).max(16).default([]),
@@ -2681,11 +2809,12 @@ export function buildServer() {
       maxEffortOverride: z.boolean().default(false),
     }),
     annotations: { ...ACTION, openWorldHint: true },
-  }, safeHandler(async ({ prompt, tag, providers, all, cwd, timeoutMs, providerBudget, effort, maxEffortOverride, taskTier, modelTier, model, execution }, context) => {
+  }, safeHandler(async ({ prompt, tag, providers, all, cwd, timeoutMs, providerBudget, effort, maxEffortOverride, taskTier, modelTier, model, execution, requiresWorkspaceAccess, inlineEvidence }, context) => {
     const response = await bridgeRequest('/api/broadcast', {
       method: 'POST',
       body: {
         prompt, tag, providers, all, cwd, timeoutMs, providerBudget, effort,
+        requiresWorkspaceAccess, inlineEvidence,
         maxEffortOverride, taskTier, modelTier, model, execution, dangerous: false,
       },
       timeoutMs: TIMEOUT_POLICY.transportTimeoutMs(timeoutMs),
@@ -3023,6 +3152,7 @@ export function buildServer() {
     title: 'Submit a background task',
     description: 'Queue a prompt to a provider and return a task id IMMEDIATELY without waiting for the run. Use for work longer than a chat turn, or when the result should be collectable later from a different surface. Link a collab id to append the result to that shared thread.',
     inputSchema: z.object({
+      ...GROUNDING_FIELDS,
       kind: z.string().min(1).max(64), prompt: z.string().min(1).max(100000),
       collab: z.string().max(64).optional(), title: z.string().max(120).optional(),
       cwd: z.string().max(1024).optional(), user: z.string().max(64).optional(),

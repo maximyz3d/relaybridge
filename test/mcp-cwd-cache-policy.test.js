@@ -138,6 +138,7 @@ test('live cwd admission invalidates stale route and committee cache across rest
   ].join(';');
   const provider = {
     label: 'Local coder fixture',
+    oneshot_capabilities: { safe: ['model_invocation'], dangerous: ['model_invocation'] },
     safe: [process.execPath, helper, '--version'],
     dangerous: [process.execPath, helper, '--version'],
     oneshot_safe: [process.execPath, '-e', providerScript],
@@ -226,26 +227,26 @@ test('live cwd admission invalidates stale route and committee cache across rest
   const blockedRoute = await second.client.callTool({
     name: 'route_and_ask', arguments: routeArgs(routeTaskB, allowedB),
   });
-  assert.equal(blockedRoute.structuredContent.status, 'failed');
-  assert.equal(blockedRoute.structuredContent.attempts.length, 1);
-  assertCwdBlocked(blockedRoute.structuredContent.attempts[0]);
+  assert.equal(blockedRoute.structuredContent.blocked, true);
+  assert.equal(blockedRoute.structuredContent.attempts.length, 0, 'planning rejects invalid cwd before any candidate attempt');
+  assertCwdBlocked(blockedRoute.structuredContent);
 
   const blockedCommittee = await second.client.callTool({
     name: 'run_committee', arguments: committeeArgs(committeeTaskB, allowedB),
   });
-  assert.equal(blockedCommittee.structuredContent.status, 'blocked');
+  assert.equal(blockedCommittee.structuredContent.blocked, true);
   assert.equal(blockedCommittee.structuredContent.members.length, 0);
   assertCwdBlocked(blockedCommittee.structuredContent);
 
   const blockedLink = await second.client.callTool({
     name: 'route_and_ask', arguments: routeArgs(routeTaskLink, link),
   });
-  assertCwdBlocked(blockedLink.structuredContent.attempts[0]);
+  assertCwdBlocked(blockedLink.structuredContent);
 
   const blockedLexical = await second.client.callTool({
     name: 'route_and_ask', arguments: routeArgs(routeTaskLexical, lexicalB),
   });
-  assertCwdBlocked(blockedLexical.structuredContent.attempts[0]);
+  assertCwdBlocked(blockedLexical.structuredContent);
 
   const allowedRoute = await second.client.callTool({
     name: 'route_and_ask', arguments: routeArgs(routeTaskA, allowedA),

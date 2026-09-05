@@ -718,6 +718,10 @@ function appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt }
     modelUsage: Array.isArray(usage?.model_usage) ? usage.model_usage : [],
     vendorQuota: payload.vendor_quota || null,
     quotaEvidence: payload.quota_evidence || null,
+    grounding: payload.grounding || null,
+    cooldown: payload.cooldown || null,
+    retryAt: nonnegativeUsageNumber(payload.retry_at),
+    retryAfterSec: nonnegativeUsageNumber(payload.retry_after),
     providerActionRequired: payload.provider_action_required || null,
     providerRetryCount: nonnegativeUsageNumber(payload.provider_retries?.count),
     providerRetryDelayMs: nonnegativeUsageNumber(payload.provider_retries?.total_delay_ms),
@@ -731,6 +735,7 @@ function appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt }
     providerRetryInvalidEvents: nonnegativeUsageNumber(payload.provider_retries?.invalid_events),
     providerRetryDuplicateEvents: nonnegativeUsageNumber(payload.provider_retries?.duplicate_events),
     resultSubtype: normalizeClaudeResultString(payload.result_subtype),
+    outputDetector: payload.output_detector || null,
     resultSchemaDisagreement: payload.result_schema_disagreement === true,
     providerStopReason: normalizeClaudeResultString(payload.provider_stop_reason),
     providerTerminalReason: normalizeClaudeResultString(payload.provider_terminal_reason),
@@ -1021,6 +1026,7 @@ function sendOneShotResult(res, payload, meta) {
   const requestId = meta?.route?.request_id || null;
   payload = {
     ...payload,
+    grounding: meta?.route?.grounding || null,
     requestId,
     invocationId: meta?.route?.invocation_id || requestId,
     attemptId: meta?.route?.attempt_id || (requestId ? `${requestId}:attempt:1` : null),
@@ -1052,14 +1058,17 @@ function sendOneShotResult(res, payload, meta) {
     payload = {
       ...payload,
       stdout: '',
-      failureClass: 'incomplete_response',
+      failureClass: payload.failureClass || classified.kind,
+      result_subtype: classified.resultSubtype || payload.result_subtype,
+      output_detector: classified.outputDetector || null,
       dropped_out: true,
       partial_result: true,
       failure_sentinel: classified.failureSentinel,
       failure_sentinel_source: classified.failureSentinelSource,
       partial_diagnostic: cleanOutput(classified.partialDiagnostic),
-      stop_reason: 'provider_incomplete_response',
-      stop_detail: classified.detail,
+      stop_reason: payload.failureClass ? payload.stop_reason
+        : classified.kind === 'provider_refusal' ? 'provider_refusal' : 'provider_incomplete_response',
+      stop_detail: payload.failureClass ? payload.stop_detail : classified.detail,
     };
   } else if (classified.kind === 'incomplete_response' && !payload.dropped_out) {
     payload = {
@@ -1078,11 +1087,16 @@ function sendOneShotResult(res, payload, meta) {
       const ok = payload.exitCode === 0 && !payload.dropped_out;
       // Classify once and use it for BOTH accounting and cooldown, so the two
       // can never disagree about why a run ended.
-      const failureKind = payload.provider_action_required?.kind === 'usage_quota_exhausted'
+      const localBudgetStop = payload.failureClass === 'token_budget' || payload.supervisor_stop_reason === 'token_budget';
+      const acceptedQuota = payload.provider_api_error_status === 429
+        && payload.quota_evidence?.source === 'claude_terminal_api_status';
+      const failureKind = localBudgetStop ? 'token_budget'
+        : payload.provider_action_required?.kind === 'usage_quota_exhausted'
         ? 'quota_exhausted'
         : payload.rate_limited ? 'rate_limited'
         : payload.auth_failed ? 'auth_failed'
         : payload.failureClass || (classified.kind !== 'ok' ? classified.kind : null);
+      const cooldownKind = localBudgetStop ? (acceptedQuota ? 'rate_limited' : null) : failureKind;
       const effectiveQuotaSeat = payload.route?.quota_seat || meta.route?.quota_seat
         || quotaSeatForProvider(meta.kind);
       if (failureKind === 'rate_limited') {
@@ -1114,7 +1128,7 @@ function sendOneShotResult(res, payload, meta) {
           const v = verifyReferencedPaths(payload.stdout, meta.cwd);
           if (v.checked && (v.confidence === 'likely-fabricated' || v.confidence === 'suspect')) {
             payload.grounding_warning = v.note;
-            payload.grounding = { confidence: v.confidence, missing: v.missing.slice(0, 10), present: v.present.slice(0, 10) };
+            payload.grounding_citations = { confidence: v.confidence, missing: v.missing.slice(0, 10), present: v.present.slice(0, 10), citations: v.citations.slice(0, 20) };
           }
         }
       } catch { /* verification is advisory; never fail a run over it */ }
@@ -1129,13 +1143,15 @@ function sendOneShotResult(res, payload, meta) {
           if (effectiveQuotaSeat !== meta.kind && providerCooldown.cooling
             && providerCooldown.scope === 'model') cooldowns.noteSuccess(meta.kind);
         }
-        else if (failureKind) {
+        else if (cooldownKind) {
           // An explicitly model-scoped vendor observation must not cool every
           // model on the account. Generic 429/overload evidence has no narrower
           // scope, so it conservatively applies to the shared quota seat.
           const cooldownSeat = payload.vendor_quota?.scope === 'model' ? meta.kind : effectiveQuotaSeat;
-          const cooldown = cooldowns.noteFailure(cooldownSeat, failureKind, {
-            retryAfterSec: parseRetryAfter(`${payload.stdout || ''}\n${payload.stderr || ''}`, payload.retry_after),
+          const cooldown = cooldowns.noteFailure(cooldownSeat, cooldownKind, {
+            retryAfterSec: acceptedQuota
+              ? parseRetryAfter(payload.provider_error_diagnostic || '')
+              : parseRetryAfter(`${payload.stdout || ''}\n${payload.stderr || ''}`, payload.retry_after),
             scope: payload.vendor_quota?.scope === 'model' ? 'model' : 'account',
           });
           if (cooldown?.until) {
@@ -1150,6 +1166,7 @@ function sendOneShotResult(res, payload, meta) {
               reason: cooldown.reason,
               source: cooldown.source,
               offences: cooldown.offences,
+              scope: cooldown.scope,
             };
           }
         }
@@ -1887,12 +1904,10 @@ function parseConfiguredOneShotOutput(entry, rawOutput, { ignoreTerminalResult =
         }).filter((value) => value && typeof value === 'object' && !Array.isArray(value));
       document = [...events].reverse().find((value) => value.type === 'result') || null;
     }
-    // A provider may flush a success document after the supervisor has made a
-    // sticky terminal decision but before process-tree termination completes.
-    // Keep those bytes available to transport diagnostics, while parsing the
-    // pre-stop assistant stream as a partial result instead of accepting the
-    // late success as the outcome.
-    if (ignoreTerminalResult) document = null;
+    // rawOutput is already the supervisor's accepted semantic prefix. A valid
+    // terminal document may itself trigger the budget stop; retain its usage
+    // and API status while suppressing its answer. Post-cutoff documents never
+    // enter this parser, even when they share a transport chunk with the stop.
     if (!document || typeof document !== 'object' || Array.isArray(document)) throw new Error('result is not an object');
     if (document.type !== 'result') throw new Error('document type is not result');
     const subtype = (normalizeClaudeResultString(document.subtype) || '').toLowerCase();
@@ -1919,8 +1934,9 @@ function parseConfiguredOneShotOutput(entry, rawOutput, { ignoreTerminalResult =
     const isError = subtypeIndicatesError || document.is_error === true;
     const errors = normalizeClaudeResultErrors(document.errors);
     const permissionDenials = normalizeClaudePermissionDenials(document.permission_denials);
+    const partial = ignoreTerminalResult ? extractClaudeAssistantDiagnostic(events) : null;
     return {
-      output: cleanOutput(!isError && typeof document.result === 'string' ? document.result : ''),
+      output: cleanOutput(!ignoreTerminalResult && !isError && typeof document.result === 'string' ? document.result : ''),
       usage: normalizeClaudeJsonUsage(document),
       isError,
       resultSubtype: subtype || null,
@@ -1944,7 +1960,7 @@ function parseConfiguredOneShotOutput(entry, rawOutput, { ignoreTerminalResult =
       providerDurationMs: nonnegativeUsageNumber(document.duration_ms),
       providerApiDurationMs: nonnegativeUsageNumber(document.duration_api_ms),
       resultSchemaDisagreement,
-      partialDiagnostic: '', partialDiagnosticTruncated: false,
+      partialDiagnostic: partial?.text || '', partialDiagnosticTruncated: partial?.truncated === true,
       parseError: null,
     };
   } catch (error) {
@@ -1964,6 +1980,13 @@ function parseConfiguredOneShotOutput(entry, rawOutput, { ignoreTerminalResult =
       parseError: `claude_json parse failed: ${error.message}`,
     };
   }
+}
+
+function acceptedTerminalQuotaEvidence(parsed, provider) {
+  if (parsed.apiErrorStatus !== 429 || parsed.parseError) return null;
+  return { provider, scope: 'account', kind: 'rate_limit', source: 'claude_terminal_api_status',
+    status: 429, errorCount: parsed.errorCount,
+    errorDiagnosticHash: crypto.createHash('sha256').update(parsed.diagnostic || '').digest('hex') };
 }
 
 function ollamaManifestIdentity(entry) {
@@ -2987,30 +3010,35 @@ app.get('/api/workspace', (req, res) => {
 // cached provider result.  This endpoint performs the same startup-pinned cwd
 // validation as /api/oneshot without invoking a provider or exposing a host
 // path.  Rejections receive the normal durable zero-invocation receipt.
-function validateProviderIntent(body, cfg = loadConfig()) {
+function validateProviderIntent(body, cfg = loadConfig(), snapshot = captureAllowedCwdIdentity(body.cwd), phase = 'execute') {
   if (!providerAccounts.validProviderKey(body.kind) || !Object.prototype.hasOwnProperty.call(cfg, body.kind)) {
     throw validationError('unknown_provider', 'kind', 'Provider is not configured.');
   }
   const entry = cfg[body.kind];
   validateProviderBudget(body.providerBudget);
   const useDanger = body.dangerous === true;
+  const filesystem = providerFilesystemEligibility(runtimeFilesystemPolicyEntry(entry), { dangerous: useDanger });
+  if (!filesystem.eligible) throw validationError('workspace_grounding', 'dangerous', filesystem.blockedReason || 'Provider filesystem policy does not admit this execution.');
   const controls = resolveProviderControls({ kind: body.kind, entry, registry: modelRegistry,
     slot: useDanger ? entry.oneshot_dangerous : entry.oneshot_safe,
     taskTier: body.taskTier, modelTier: body.modelTier, model: body.model,
     effort: body.effort, maxEffortOverride: body.maxEffortOverride,
-    execution: body.execution, dangerous: useDanger });
-  if (body.prompt !== undefined) preparePrompt(body.prompt, {
+    execution: body.execution, dangerous: useDanger, phase });
+  const grounded = prepareGroundedPrompt({ ...body, cwd: snapshot.resolved, cwdIdentityHash: snapshot.cwdIdentityHash,
+    seat: body.kind, seatConfig: entry, dangerous: useDanger });
+  if (body.prompt !== undefined) preparePrompt(grounded.prompt, {
     ...promptTransportLimits(entry, controls.slot),
     policyPrefix: !useDanger && typeof entry.oneshot_safe_prompt_prefix === 'string' ? entry.oneshot_safe_prompt_prefix.trim() : '',
   });
-  return controls;
+  revalidateAllowedCwdIdentity(snapshot);
+  return { ...controls, grounding: grounded.grounding };
 }
 function rejectInvalidIntent(res, body, error) {
   return sendOneShotPreAdmissionRejection(res, { statusCode: 400,
     payload: { error: error.validation?.reason || error.message, errorCode: error.code || null, validation: error.validation || null },
     kind: typeof body.kind === 'string' ? body.kind : null,
     prompt: typeof body.prompt === 'string' ? body.prompt : '',
-    requestId: normalizeOneShotRequestId(body), failureClass: 'validation', startedAt: Date.now() });
+    requestId: normalizeOneShotRequestId(body), failureClass: error.code === 'workspace_grounding' ? 'workspace_grounding' : 'validation', startedAt: Date.now() });
 }
 app.post('/api/workspace/validate', (req, res) => {
   const startedAt = Date.now();
@@ -3019,13 +3047,14 @@ app.post('/api/workspace/validate', (req, res) => {
   try {
     const snapshot = captureAllowedCwdIdentity(body.cwd);
     revalidateAllowedCwdIdentity(snapshot);
-    let execution = null;
+    let execution = null, grounding = null;
     if (body.kind !== undefined) {
-      execution = validateProviderIntent(body).execution;
+      ({ execution, grounding } = validateProviderIntent(body, loadConfig(), snapshot));
     }
     return res.json({
       ok: true,
       execution,
+      grounding,
       cwdIdentityHash: snapshot.cwdIdentityHash,
       cwdPolicyId: CWD_POLICY_IDENTITY,
       model_invocation: false,
@@ -3047,7 +3076,7 @@ app.post('/api/workspace/validate', (req, res) => {
       kind: typeof body.kind === 'string' ? body.kind : null,
       prompt: typeof body.prompt === 'string' ? body.prompt : '',
       requestId,
-      failureClass: 'validation',
+      failureClass: err.code === 'workspace_grounding' ? 'workspace_grounding' : 'validation',
       startedAt,
       route: { provider: typeof body.kind === 'string' ? body.kind : null, request_id: requestId },
     });
@@ -3268,6 +3297,32 @@ function applyFilesystemEligibilityToDiagnostics(diagnostics = {}, cfg = {}, { d
     }
   }
   return { diagnostics: out, skipped, dangerous };
+}
+
+function applyGroundingEligibilityToDiagnostics(diagnostics, cfg, body, snapshot) {
+  const out = {}, skipped = [];
+  for (const [kind, prior] of Object.entries(diagnostics)) {
+    const grounding = checkGrounding({ ...body, prompt: body.task, cwd: snapshot.resolved,
+      cwdIdentityHash: snapshot.cwdIdentityHash, seat: kind, seatConfig: cfg[kind] || {}, dangerous: body.dangerous === true });
+    out[kind] = grounding.allowed ? { ...prior, grounding }
+      : { ...prior, grounding, executionReady: false, executionDetail: grounding.reason, ready: false };
+    if (!grounding.allowed) skipped.push({ kind, reason: grounding.reason, remedy: grounding.remedy });
+    else if (prior.executionReady !== false && isAiProviderEntry(kind, cfg[kind])) {
+      try {
+        validateProviderIntent({ ...body, kind, prompt: body.task, dangerous: body.dangerous === true }, cfg, snapshot, 'plan');
+      } catch (error) {
+        const validation = error.validation || { code: 'invalid_provider_controls', field: 'provider', reason: error.message, retryable: false };
+        out[kind] = { ...out[kind], executionReady: false, ready: false, executionDetail: validation.reason, intentValidation: validation };
+        skipped.push({ kind, reason: validation.reason, validation });
+      }
+    }
+  }
+  return { diagnostics: out, skipped };
+}
+
+function invocationCapabilitiesFor(cfg, dangerous) {
+  return Object.fromEntries(Object.entries(cfg).filter(([kind]) => !kind.startsWith('_'))
+    .map(([kind, entry]) => [kind, entry?.oneshot_capabilities?.[dangerous ? 'dangerous' : 'safe'] || []]));
 }
 
 function agentSummary(kind, entry) {
@@ -3557,6 +3612,11 @@ app.post('/api/plan', planningRequestLimit, async (req, res) => {
   }
   try { validateControlRequest(req.body || {}); }
   catch (err) { return rejectInvalidIntent(res, { ...req.body, prompt: task }, err); }
+  let groundingSnapshot;
+  try {
+    groundingSnapshot = captureAllowedCwdIdentity(req.body?.cwd);
+    checkGrounding({ ...req.body, prompt: task, cwdIdentityHash: groundingSnapshot.cwdIdentityHash });
+  } catch (err) { return rejectInvalidIntent(res, { ...req.body, prompt: task }, err); }
   const requestedEffort = effort == null ? null : normalizeEffort(effort);
   let requestedProviderBudget;
   try {
@@ -3590,8 +3650,18 @@ app.post('/api/plan', planningRequestLimit, async (req, res) => {
       fleetInput.diagnostics, routingInputs.gauges,
     );
     const filesystemInput = applyFilesystemEligibilityToDiagnostics(vendorQuotaInput.diagnostics, cfg, filesystemAuthority);
-    diagnostics = filesystemInput.diagnostics;
-    let route = router.routeTask({ task, diagnostics, dangerous: filesystemAuthority.dangerous });
+    const groundingInput = applyGroundingEligibilityToDiagnostics(filesystemInput.diagnostics, cfg, { ...req.body, taskTier: router.classifyTask(task).tier }, groundingSnapshot);
+    diagnostics = groundingInput.diagnostics;
+    if (kind && diagnostics[kind]?.grounding?.allowed === false) {
+      return rejectInvalidIntent(res, { ...req.body, prompt: task }, validationError('workspace_grounding', 'kind', diagnostics[kind].grounding.reason + ' ' + diagnostics[kind].grounding.remedy));
+    }
+    if (kind && diagnostics[kind]?.intentValidation) {
+      const diagnostic = diagnostics[kind].intentValidation;
+      return rejectInvalidIntent(res, { ...req.body, prompt: task }, validationError(diagnostic.code, diagnostic.field, diagnostic.reason, diagnostic));
+    }
+    let route = router.routeTask({ task, diagnostics, dangerous: filesystemAuthority.dangerous,
+      invocationCapabilities: invocationCapabilitiesFor(cfg, filesystemAuthority.dangerous), modelTier,
+      preferredProviders: kind ? [kind] : [] });
     route = levelRouteSelection(route, routingInputs.gauges, seatCostClassMap());
     route.fleetState = {
       cooldownSkipped: fleetInput.skipped,
@@ -3602,6 +3672,7 @@ app.post('/api/plan', planningRequestLimit, async (req, res) => {
       quotaSeats: currentQuotaSeatGroups(),
       accountSelection: routingInputs.accountSelection,
       filesystemSkipped: filesystemInput.skipped,
+      groundingSkipped: groundingInput.skipped,
       filesystemAuthority,
     };
     const plan = buildTaskPlan({
@@ -3615,10 +3686,10 @@ app.post('/api/plan', planningRequestLimit, async (req, res) => {
       requestedModelTier: modelTier,
       dangerous: filesystemAuthority.dangerous,
     });
-    if (kind && plan.primary?.validation) return res.status(400).json({ ok: false,
-      error: plan.primary.validation.reason, errorCode: plan.primary.validation.code,
-      validation: plan.primary.validation, model_invocation: false, physical_attempt_count: 0,
-      token_usage_source: 'not_invoked' });
+    if (kind && plan.primary?.validation) {
+      const diagnostic = plan.primary.validation;
+      return rejectInvalidIntent(res, { ...req.body, prompt: task }, validationError(diagnostic.code, diagnostic.field, diagnostic.reason, diagnostic));
+    }
     res.json({ ok: true, task: task.slice(0, 400), ...plan, fleetState: route.fleetState });
   } catch (err) {
     if (!res.destroyed && !res.writableEnded) res.status(500).json({ ok: false, error: err.message });
@@ -3646,6 +3717,11 @@ app.post('/api/route', planningRequestLimit, async (req, res) => {
   }
   try { validateControlRequest(req.body || {}); }
   catch (err) { return rejectInvalidIntent(res, { ...req.body, prompt: task }, err); }
+  let groundingSnapshot;
+  try {
+    groundingSnapshot = captureAllowedCwdIdentity(req.body?.cwd);
+    checkGrounding({ ...req.body, prompt: task, cwdIdentityHash: groundingSnapshot.cwdIdentityHash });
+  } catch (err) { return rejectInvalidIntent(res, { ...req.body, prompt: task }, err); }
   let requestedProviderBudget;
   try {
     requestedProviderBudget = validateProviderBudget(rawBudget);
@@ -3679,9 +3755,11 @@ app.post('/api/route', planningRequestLimit, async (req, res) => {
       fleetInput.diagnostics, routingInputs.gauges,
     );
     const filesystemInput = applyFilesystemEligibilityToDiagnostics(vendorQuotaInput.diagnostics, cfg, filesystemAuthority);
-    diagnostics = filesystemInput.diagnostics;
+    const groundingInput = applyGroundingEligibilityToDiagnostics(filesystemInput.diagnostics, cfg, { ...req.body, taskTier: router.classifyTask(task).tier }, groundingSnapshot);
+    diagnostics = groundingInput.diagnostics;
     let route = router.routeTask({
       task, diagnostics,
+      invocationCapabilities: invocationCapabilitiesFor(cfg, filesystemAuthority.dangerous), modelTier: req.body?.modelTier,
       dangerous: filesystemAuthority.dangerous,
       preferredProviders: explicitKinds.length ? explicitKinds : undefined,
       excludedProviders: Array.isArray(excludeKinds) ? excludeKinds : undefined,
@@ -3699,6 +3777,7 @@ app.post('/api/route', planningRequestLimit, async (req, res) => {
       quotaSeats: currentQuotaSeatGroups(),
       accountSelection: routingInputs.accountSelection,
       filesystemSkipped: filesystemInput.skipped,
+      groundingSkipped: groundingInput.skipped,
       filesystemAuthority,
     };
     const taskTier = route.classification?.tier;
@@ -3715,6 +3794,7 @@ app.post('/api/route', planningRequestLimit, async (req, res) => {
         effort: planned.effort, appliedEffort: planned.appliedEffort,
         effortMethod: planned.effortMethod, effortFallbackReason: planned.effortFallbackReason,
         validation: planned.validation, blocked: planned.blocked, ready: planned.ready,
+        eligible: pick.eligible && planned.eligible, ineligibilityReasons: [...new Set([...(pick.ineligibilityReasons || []), ...planned.ineligibilityReasons])],
         providerBudget: planned.providerBudget,
       };
     };
@@ -4142,33 +4222,6 @@ async function executeOneShot(body, res) {
   const startedAt = Date.now();
   const { kind, prompt, timeoutMs, cwd, dangerous } = body || {};
 
-  // Issue #16: a workspace-inspection task sent to a seat with no filesystem
-  // access produces a confident, fabricated answer that records as a success.
-  // Refuse BEFORE dispatch — the tokens are wasted either way, but a refusal
-  // is visible and a fabricated audit is not. `groundingOverride` exists for
-  // the caller who genuinely wants an ungrounded opinion; it is flagged.
-  try {
-    const cfgAll = loadConfig();
-    const grounding = checkGrounding({
-      prompt, cwd, seat: kind, seatConfig: cfgAll?.[kind] || {},
-      override: body?.groundingOverride === true,
-    });
-    if (!grounding.allowed) {
-      return sendOneShotResult(res, {
-        ok: false, exitCode: null, stdout: '', stderr: grounding.reason,
-        error: grounding.reason, remedy: grounding.remedy,
-        failure_class: 'workspace_grounding',
-        model_invocation: false, dropped_out: true,
-        usage: { input_tokens: 0, output_tokens: 0 },
-      }, { kind, prompt, startedAt });
-    }
-    if (grounding.overridden) body = { ...body, _groundingOverridden: true, _groundingOverrideReason: grounding.reason };
-  } catch (err) {
-    // The gate is advisory when it cannot evaluate, but losing it must be
-    // visible rather than silently disabling a safety layer.
-    console.warn(`[RelayBridge] workspace grounding check unavailable: ${err.message}`);
-  }
-
   // Run association for the GitHub tracker: who did this, and any
   // explicit intent. Falls back to the OS account so checkpoint commits
   // are always attributed (maximyz3d / sover / 3DCPAI machines differ).
@@ -4289,15 +4342,7 @@ async function executeOneShot(body, res) {
   let slot = resolveSlot(controls.slot);
   const safePromptPrefix = !useDanger && typeof entry.oneshot_safe_prompt_prefix === 'string'
     ? entry.oneshot_safe_prompt_prefix.trim() : '';
-  let preparedPrompt;
-  try {
-    preparedPrompt = preparePrompt(prompt, { ...promptTransportLimits(entry, slot), policyPrefix: safePromptPrefix });
-  } catch (err) {
-    return rejectBeforeAdmission(400, 'validation', {
-      error: err.message, errorCode: err.code, validation: err.validation,
-    });
-  }
-  const hasPromptFile = preparedPrompt.evidence.transport === 'file';
+  let preparedPrompt, grounding;
   let resolvedCwd;
   let resolvedCwdIdentity;
   const expectedCwdIdentityHash = body?.expectedCwdIdentityHash;
@@ -4328,6 +4373,17 @@ async function executeOneShot(body, res) {
       validation: err.validation || null,
     });
   }
+  try {
+    const grounded = prepareGroundedPrompt({ ...body, cwd: resolvedCwd, cwdIdentityHash: resolvedCwdIdentity.cwdIdentityHash,
+      seat: kind, seatConfig: entry, dangerous: useDanger });
+    grounding = grounded.grounding;
+    preparedPrompt = preparePrompt(grounded.prompt, { ...promptTransportLimits(entry, slot), policyPrefix: safePromptPrefix });
+  } catch (err) {
+    return rejectBeforeAdmission(400, err.code === 'workspace_grounding' ? 'workspace_grounding' : 'validation', {
+      error: err.message, errorCode: err.code, validation: err.validation,
+    });
+  }
+  const hasPromptFile = preparedPrompt.evidence.transport === 'file';
   // Account selection is part of admission, not spawn setup. If every linked
   // account is disabled, unsigned, or cooling, an empty env would silently run
   // against the operator's default credentials and misattribute the receipt.
@@ -4537,8 +4593,7 @@ async function executeOneShot(body, res) {
       && body?._relayClientDeadlineAt !== ''
       && Number.isFinite(Number(body._relayClientDeadlineAt))
       ? Number(body._relayClientDeadlineAt) : null,
-    grounding_override: body?._groundingOverridden === true || null,
-    grounding_note: body?._groundingOverridden ? body._groundingOverrideReason : null,
+    grounding,
   };
   const cleanupProviderHome = () => {
     if (!isolatedProviderHome || route.isolated_home_cleanup !== 'pending') {
@@ -4613,7 +4668,7 @@ async function executeOneShot(body, res) {
     providerBudget: requestedProviderBudget,
     taskTier: typeof body?.budgetTaskTier === 'string'
       ? body.budgetTaskTier
-      : (typeof body?.taskTier === 'string' ? body.taskTier : null),
+      : execution.resolvedTaskTier,
   }).providerBudget;
   if (entry.oneshot_adapter === 'ollama_api') {
     cleanupPromptFile();
@@ -4695,8 +4750,7 @@ async function executeOneShot(body, res) {
     const parsedOutput = parseConfiguredOneShotOutput(entry, semanticStdout, {
       ignoreTerminalResult: stopReason === 'token_budget',
     });
-    const retainedPartial = stopReason === 'token_budget' && !!parsedOutput.parseError
-      && !!parsedOutput.partialDiagnostic;
+    const retainedPartial = stopReason === 'token_budget' && !!parsedOutput.partialDiagnostic;
     const cancellationState = resolveCancellationTerminalState({
       stopReason,
       timedOut,
@@ -4719,6 +4773,9 @@ async function executeOneShot(body, res) {
       provider_stop_reason: parsedOutput.providerStopReason,
       provider_terminal_reason: parsedOutput.terminalReason,
       provider_api_error_status: parsedOutput.apiErrorStatus,
+      quota_evidence: acceptedTerminalQuotaEvidence(parsedOutput, kind),
+      rate_limited: parsedOutput.apiErrorStatus === 429,
+      budget_exceeded: stopReason === 'token_budget',
       provider_permission_denials: parsedOutput.permissionDenials,
       provider_num_turns: parsedOutput.numTurns,
       provider_duration_ms: parsedOutput.providerDurationMs,
@@ -4870,6 +4927,11 @@ async function executeOneShot(body, res) {
     });
     if (parsedOutput.usage || parsedOutput.numTurns !== null) {
       supervisor.recordProviderUsage({ ...(parsedOutput.usage || {}), turns: parsedOutput.numTurns }, { phase: 'terminal' });
+    }
+    // flush() can accept usage from a final non-newline envelope whose other
+    // terminal fields fail parsing. The independently validated usage must
+    // still latch the local budget stop before any free-text classification.
+    if (supervisor.snapshot().providerUsage) {
       const terminalVerdict = supervisor.evaluate();
       if (terminalVerdict.action === 'kill' && !stopReason) {
         stopReason = terminalVerdict.reason;
@@ -4927,7 +4989,9 @@ async function executeOneShot(body, res) {
       parsedOutput.apiErrorStatus,
       cleanOutput([stderr, parsedOutput.diagnostic].filter(Boolean).join('\n')),
     );
-    const copilotQuotaEvidence = detectCopilotMonthlyQuota({
+    const tokenBudgetExceeded = stopReason === 'token_budget';
+    const terminalQuotaEvidence = acceptedTerminalQuotaEvidence(parsedOutput, kind);
+    const copilotQuotaEvidence = tokenBudgetExceeded ? null : detectCopilotMonthlyQuota({
       provider: kind,
       stdout: cleanedStdout,
       stderr,
@@ -4940,20 +5004,20 @@ async function executeOneShot(body, res) {
       stderr: cleanOutput([stderr, parsedOutput.diagnostic].filter(Boolean).join('\n')),
       exitCode: code,
       modelFlagSent: !!route.model_flag_sent,
+      stopReason,
     });
     const cursorActionRequired = runClassification.actionRequired || null;
     const cursorUsageQuotaExhausted = cursorActionRequired?.kind === 'usage_quota_exhausted';
-    const tokenBudgetExceeded = stopReason === 'token_budget';
     // A token-budget kill must never be recolored as a rate limit by ordinary
     // prose (stderr or model text discussing limits) once the budget has
     // already tripped. An authoritative provider API 429 status still counts,
     // since it reflects evidence that preceded/caused the cutoff rather than
     // free text caught in the failure blob.
-    const rate_limited = parsedOutput.resultSubtype !== 'error_max_budget_usd'
+    const rate_limited = !!terminalQuotaEvidence || (parsedOutput.resultSubtype !== 'error_max_budget_usd'
       && !cursorUsageQuotaExhausted
       && (authoritativeApiFailure === 'rate_limit'
-        || (!tokenBudgetExceeded && (!!copilotQuotaEvidence || rate_signals.some(s => failureBlob.includes(s)))));
-    const budget_exceeded = parsedOutput.resultSubtype === 'error_max_budget_usd'
+        || (!tokenBudgetExceeded && (!!copilotQuotaEvidence || rate_signals.some(s => failureBlob.includes(s))))));
+    const budget_exceeded = tokenBudgetExceeded || parsedOutput.resultSubtype === 'error_max_budget_usd'
       || authoritativeApiFailure === 'budget'
       || cursorUsageQuotaExhausted
       || budget_signals.some(s => failureBlob.includes(s));
@@ -4973,8 +5037,7 @@ async function executeOneShot(body, res) {
     const providerInternalTimedOut = (code !== 0 || !cleanedStdout || parsedOutput.isError)
       && hasProviderInternalTimeoutDiagnostic(failureBlob);
     const providerTimedOut = timedOut || authoritativeApiFailure === 'timeout' || providerInternalTimedOut;
-    const retainedPartial = tokenBudgetExceeded && !!parsedOutput.parseError
-      && !!parsedOutput.partialDiagnostic;
+    const retainedPartial = tokenBudgetExceeded && !!parsedOutput.partialDiagnostic;
     const finalFailureClass = !isolationCleanup.ok ? 'isolation_cleanup'
       : tokenBudgetExceeded ? 'token_budget'
       : parsedOutput.resultSubtype === 'error_max_budget_usd' ? 'budget'
@@ -5018,7 +5081,7 @@ async function executeOneShot(body, res) {
         partial_diagnostic_truncated: parsedOutput.partialDiagnosticTruncated === true,
       } : {}),
       ...(tokenBudgetExceeded ? { cleaned_output_unavailable: !cleanedStdout } : {}),
-      quota_evidence: copilotQuotaEvidence,
+      quota_evidence: terminalQuotaEvidence || copilotQuotaEvidence,
       provider_action_required: cursorActionRequired,
       transport_output_chars: String(transportStdout).length,
       transport_output_hash: crypto.createHash('sha256').update(String(transportStdout)).digest('hex'),
@@ -5262,7 +5325,7 @@ app.post('/api/workflows/:runId/cancel', (req, res) => {
 // evenly and "what would this cost on metered pricing" is answerable while on
 // subscription plans.
 const { createCooldownStore, parseRetryAfter } = require('./lib/provider-cooldown');
-const { checkGrounding, verifyReferencedPaths } = require('./lib/workspace-grounding');
+const { checkGrounding, prepareGroundedPrompt, verifyReferencedPaths } = require('./lib/workspace-grounding');
 const {
   classifyRunFailure,
   classifyProviderHttpFailure,
@@ -6285,6 +6348,7 @@ app.post('/api/broadcast', async (req, res) => {
   const {
     prompt, tag, providers, all, dangerous, timeoutMs = TIMEOUT_POLICY.oneShotDefaultMs, cwd,
     providerBudget, effort, maxEffortOverride, model, execution, taskTier, modelTier,
+    requiresWorkspaceAccess, inlineEvidence,
   } = req.body || {};
   const effectiveTimeoutMs = TIMEOUT_POLICY.normalizeOneShotTimeoutMs(timeoutMs);
   if (typeof prompt !== 'string' || !prompt.trim()) {
@@ -6317,7 +6381,7 @@ app.post('/api/broadcast', async (req, res) => {
     // Validate every member before the first provider can consume quota. A
     // planned tuple is provider-bound and cannot be broadcast to other seats.
     for (const kind of targets) intents.set(kind, validateProviderIntent({
-      kind, prompt, providerBudget: validatedProviderBudget, model, execution,
+      kind, prompt, cwd, requiresWorkspaceAccess, inlineEvidence, providerBudget: validatedProviderBudget, model, execution,
       taskTier: resolvedTaskTier, modelTier: resolvedModelTier, effort, maxEffortOverride,
       dangerous: dangerous === true,
     }, cfg).execution);
@@ -6356,6 +6420,7 @@ app.post('/api/broadcast', async (req, res) => {
     activeCaptured.add(captured);
     executeOneShot({
       kind, prompt, timeoutMs: remainingMs, cwd, dangerous: dangerous === true,
+      requiresWorkspaceAccess, inlineEvidence,
       providerBudget: validatedProviderBudget, budgetTaskTier,
       taskTier: resolvedTaskTier, modelTier: resolvedModelTier, model, execution: intents.get(kind),
       effort, maxEffortOverride,

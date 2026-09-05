@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { hardEligibility, primaryTaskFamily } from '../lib/routing-eligibility.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
@@ -42,6 +43,7 @@ export function classifyTask(task) {
   const looksLikeCode = hasAny(text, [
     /```/, /\b(implement|debug|refactor|compile|test failure|stack trace|function|class|typescript|javascript|python|rust|golang|repository|codebase|pull request|\bpr\b)\b/,
     /\.(?:js|mjs|cjs|ts|tsx|jsx|py|rs|go|java|cs|cpp|h|ps1|json|toml|ya?ml)\b/,
+    /\b(?:render calls?|binder calls?|placeholder scanner|(?:mutation|regression) tests?|schema validation|cli isolation|fail[- ]closed gates?|races?|architecture)\b/,
   ]);
   const looksLikeReview = hasAny(text, [
     /\b(review|audit|critique|verify|regression|security review|design review|drc|lint)\b/,
@@ -79,9 +81,15 @@ export function classifyTask(task) {
   const looksLikeReasoning = hasAny(text, [
     /\b(prove|proof|theorem|conjecture|formal reasoning|logic puzzle|mathematical reasoning|p\s*(?:=|equals?|vs\.?|versus)\s*np)\b/,
   ]);
-  const looksLikeVision = hasAny(text, [
-    /\b(image|screenshot|photo|diagram|render|visual|ocr|camera|pixel|layout)\b/,
+  const visualSubject = hasAny(text, [
+    /\b(image|screenshot|photo|diagram|visual inspection|ocr|camera|pixels?)\b/,
   ]);
+  const visualInspection = hasAny(text, [
+    /\b(?:inspect|examine|review|check|analy[sz]e|describe|identify|read|extract|recognize|look at)\b[^.\n]{0,100}\b(?:image|screenshot|photo|diagram|pixels?)\b/,
+    /\b(?:perform|do|run)\s+ocr\b|^\s*ocr\b/,
+    /\b(?:based on|shown in|visible in|from)\s+(?:the |this |supplied )?(?:image|screenshot|photo)\b/,
+  ]);
+  const looksLikeVision = visualSubject && (!looksLikeCode || visualInspection);
   const looksLikeHardware = hasAny(text, [
     /\b(pcb|kicad|schematic|gerber|motor|stator|rotor|rf|antenna|aircraft|avionics|obd|embedded|firmware|bom|fabrication)\b/,
   ]);
@@ -104,6 +112,22 @@ export function classifyTask(task) {
   const secrets = /\b(credentials?|api keys?|access tokens?|passwords?|secrets?|signing keys?|encryption keys?)\b/.test(text);
   const safetyCritical = /\b(airworthy|flight[- ]ready|life safety|safety[- ]critical|production release|fabrication release)\b/.test(text);
   const highStakes = medical || legal || financial || secrets || safetyCritical;
+  const semanticClause = /\b(?:explain|summari[sz]e|interpret|describe|recommend|compare|evaluate|improve|optimi[sz]e|write|create|build|compose|decide|plan|translate|reason|purpose|why|how)\b/.test(text);
+  const deterministicClauses = text.split(/[,;\r\n]+|\b(?:and|then|also|plus|followed by|as well as)\b/).map((clause) => clause.trim()).filter(Boolean);
+  const completeDeterministicRequest = deterministicClauses.length > 0 && deterministicClauses.length <= 12
+    && deterministicClauses.every((clause) => {
+      if (clause.length > 2048) return false;
+      const match = /^(?:please\s+)?(?:(?:(?:compute|calculate|show|print|get|return|check)\s+(?:the\s+)?)?(?:sha256(?:\s+hash)?|hash|git status|process list|health check|version|directory listing)\b|(?:show|list|find|count)\s+(?:the\s+)?(?:files?|processes|lines?|directories|folders|versions?)\b|which command\b|where is\b)/.exec(clause);
+      if (!match) return false;
+      const tail = clause.slice(match[0].length).trim().replace(/[.!]$/, '').trim();
+      // A recognized prefix is not proof that the whole request is mechanical.
+      // Admit only a bounded target (quoted paths may contain spaces); unmatched
+      // natural-language continuation requires a model instead of a shell.
+      return !tail || /^(?:(?:of|for|in|under|at)\s+(?:the\s+)?)?(?:"[^"\r\n]{1,1024}"|'[^'\r\n]{1,1024}'|`[^`\r\n]{1,1024}`|[\w./\\:*-]{1,1024})$/.test(tail);
+    });
+  const whollyDeterministic = looksLikeDeterministic && !looksLikeCode && !looksLikeReview
+    && !looksLikeResearch && !looksLikeReasoning && !looksLikeVision && !looksLikeHardware && !highStakes && !destructive
+    && !semanticClause && completeDeterministicRequest;
 
   if (looksLikeCode) tags.add('coding');
   if (looksLikeReview) tags.add(looksLikeCode ? 'code_review' : 'reasoning');
@@ -136,7 +160,7 @@ export function classifyTask(task) {
   ) {
     tier = 'complex';
     reasons.push('long, multi-part, or architectural task');
-  } else if (looksLikeCode || looksLikeResearch || looksLikeAuthoritativeDocumentResearch || looksLikeReasoning || looksLikeHardware || raw.length > 1000 || conjunctions >= 2) {
+  } else if (looksLikeCode || looksLikeReview || looksLikeResearch || looksLikeAuthoritativeDocumentResearch || looksLikeReasoning || looksLikeHardware || raw.length > 1000 || conjunctions >= 2) {
     tier = 'standard';
     reasons.push('specialized or multi-step task');
   } else {
@@ -164,6 +188,7 @@ export function classifyTask(task) {
       destructive,
       highStakes,
       authoritativeDocumentResearch: looksLikeAuthoritativeDocumentResearch,
+      whollyDeterministic,
     },
     routingConfidence: {
       level: confidence,
@@ -212,15 +237,18 @@ export function routeTask({
   maxProviders,
   committeeMode = 'advisory',
   dangerous = false,
+  invocationCapabilities,
+  modelTier,
+  routingData,
 } = {}) {
   const classification = classifyTask(task);
-  const { policy, evidence, fingerprints } = loadRoutingData();
+  const { policy, evidence, fingerprints } = routingData || loadRoutingData();
   const excluded = new Set(excludedProviders);
   const preferred = new Set(preferredProviders);
   const neverAuto = classification.tags.filter((tag) => policy.neverAutoExecuteTags.includes(tag));
-  const primaryTag = [
-    'deterministic', 'research', 'code_review', 'coding', 'vision', 'hardware', 'quick_lookup', 'reasoning', 'general',
-  ].find((tag) => classification.tags.includes(tag)) || 'general';
+  const primaryTag = primaryTaskFamily(classification);
+  const capabilityMap = invocationCapabilities || Object.fromEntries(Object.entries(readJson(path.join(ROOT, 'cli-config.json')))
+    .map(([kind, entry]) => [kind, entry?.oneshot_capabilities?.[dangerous ? 'dangerous' : 'safe'] || []]));
   const priority = policy.taskPriorities[primaryTag] || policy.taskPriorities.general;
 
   const candidates = Object.entries(evidence.providers).map(([kind, provider]) => {
@@ -229,6 +257,8 @@ export function routeTask({
     let policyScore = priorityIndex >= 0 ? 100 - priorityIndex * 8 : 10;
     const reasons = [];
     const limitations = [...(provider.limitations || [])];
+    const hard = hardEligibility({ kind, capabilities: capabilityMap[kind], aptitude: provider, classification, modelTier });
+    const ineligibilityReasons = [...hard.ineligibilityReasons];
     const capabilityMatch = (provider.capabilities || []).filter((tag) => classification.tags.includes(tag));
     const requiredCapability = ['vision', 'research'].includes(primaryTag) ? primaryTag : null;
 
@@ -239,6 +269,7 @@ export function routeTask({
     if (provider.autoRoute === false && !preferred.has(kind)) {
       policyScore -= 10000;
       reasons.push('opt-in provider; excluded unless explicitly preferred');
+      ineligibilityReasons.push('opt-in provider; excluded unless explicitly preferred');
     }
     if (capabilityMatch.length) {
       policyScore += 25 + capabilityMatch.length * 3;
@@ -271,6 +302,7 @@ export function routeTask({
     if (ready.ready === false) {
       policyScore -= 10000;
       reasons.push('live diagnostic is not ready');
+      ineligibilityReasons.push('live diagnostic is not ready');
     } else if (ready.ready === true) {
       policyScore += 20;
       reasons.push('live diagnostic ready');
@@ -278,14 +310,20 @@ export function routeTask({
     if (localOnly && !String(provider.privacyBoundary).startsWith('local')) {
       policyScore -= 10000;
       reasons.push('excluded by local-only policy');
+      ineligibilityReasons.push('excluded by local-only policy');
     }
     if (excluded.has(kind)) {
       policyScore -= 10000;
       reasons.push('explicitly excluded by caller');
+      ineligibilityReasons.push('explicitly excluded by caller');
     }
 
     return {
       kind,
+      eligible: ineligibilityReasons.length === 0,
+      ineligibilityReasons,
+      invocationCapabilities: Array.isArray(capabilityMap[kind]) ? capabilityMap[kind] : [],
+      maxRecommendedTier: provider.maxRecommendedTier || null,
       family: provider.family,
       modelIdentity: provider.modelIdentity,
       costClass: provider.costClass,
@@ -296,7 +334,7 @@ export function routeTask({
       limitations,
       readiness: ready,
       policyScore,
-      policyReasons: reasons,
+      policyReasons: [...reasons, ...hard.ineligibilityReasons],
     };
   }).sort((a, b) => b.policyScore - a.policyScore || a.kind.localeCompare(b.kind));
 
@@ -307,10 +345,10 @@ export function routeTask({
   const families = new Set();
 
   for (const candidate of candidates) {
-    if (candidate.policyScore < 0) continue;
+    if (!candidate.eligible || candidate.policyScore < 0) continue;
     if (selected.length >= limit) break;
     if (selected.length > 0 && families.has(candidate.family) && candidates.some((other) => (
-      other.policyScore >= 0 && !families.has(other.family) && !selected.includes(other)
+      other.eligible && other.policyScore >= 0 && !families.has(other.family) && !selected.includes(other)
     ))) continue;
     selected.push(candidate);
     families.add(candidate.family);

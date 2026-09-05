@@ -93,7 +93,7 @@ async function call(pathname, { method = 'GET', body = null } = {}) {
 function parseFlags(argv) {
   const flags = {};
   const rest = [];
-  const booleanFlags = new Set(['force', 'json', 'refresh', 'stdin']);
+  const booleanFlags = new Set(['force', 'json', 'refresh', 'stdin', 'requires-workspace-access']);
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg.startsWith('--')) {
@@ -113,6 +113,19 @@ function parseFlags(argv) {
 }
 
 class InputError extends Error {}
+
+function groundingFlags(flags) {
+  const value = flags['requires-workspace-access'];
+  if (value !== undefined && ![true, 'true', 'false'].includes(value)) throw new InputError('--requires-workspace-access accepts only true or false');
+  const rawEvidence = flags['inline-evidence'];
+  let inlineEvidence;
+  if (rawEvidence !== undefined) {
+    if (typeof rawEvidence !== 'string' || rawEvidence.length > 524288) throw new InputError('--inline-evidence requires bounded JSON containing content, sha256 and cwdIdentityHash');
+    try { inlineEvidence = JSON.parse(rawEvidence); } catch { throw new InputError('--inline-evidence must be valid JSON'); }
+  }
+  return { ...(value === undefined ? {} : { requiresWorkspaceAccess: value === true || value === 'true' }),
+    ...(rawEvidence === undefined ? {} : { inlineEvidence }) };
+}
 
 function decodePromptUtf8(value, source) {
   try {
@@ -230,6 +243,7 @@ function buildAskBody(
   requestId = newCliRequestId(),
   providerBudget = null,
   explicitlyRequestedEffort = null,
+  grounding = {},
 ) {
   if (plan.primary?.validation || plan.primary?.blocked || plan.primary?.ready === false) {
     throw new InputError(plan.primary.validation?.reason || 'The planned provider is blocked; obtain a ready plan before execution.');
@@ -241,6 +255,8 @@ function buildAskBody(
     dangerous: false,
     cwd,
     requestId,
+    requiresWorkspaceAccess: grounding.requiresWorkspaceAccess,
+    inlineEvidence: grounding.inlineEvidence,
   };
   if (plan.primary.modelTier) body.modelTier = plan.primary.modelTier;
   if (plan.primary.model) body.model = plan.primary.model;
@@ -289,6 +305,8 @@ const USAGE = `relaybridge — delegate work to AI CLIs on seats you already pay
 
 Prompt: positional text | --stdin | --prompt-file <path>  (choose exactly one)
 Flags: --effort minimal|low|medium|high|xhigh|max   --kind <provider>   --provider-budget '<json>'   --json
+Grounding: --requires-workspace-access [true|false]   --inline-evidence '<json>'
+Evidence JSON: {"content":"...","sha256":"<content hash>","cwdIdentityHash":"<admitted workspace hash>"}
 Correlation: ask prints its unique request ID, then the exact returned receipt tuple.
 
 Effort exists so a simple edit does not burn a frontier reasoning budget, and a
@@ -312,7 +330,7 @@ async function main() {
       case 'plan': {
         const providerBudget = parseProviderBudgetFlag(flags['provider-budget'] ?? flags.providerBudget);
         const task = resolveTaskInput(flags, rest);
-        const plan = await call('/api/plan', { method: 'POST', body: { task, effort: flags.effort, kind: flags.kind, model: flags.model, modelTier: flags['model-tier'] ?? flags.modelTier, providerBudget } });
+        const plan = await call('/api/plan', { method: 'POST', body: { task, effort: flags.effort, kind: flags.kind, model: flags.model, modelTier: flags['model-tier'] ?? flags.modelTier, providerBudget, cwd: process.cwd(), ...groundingFlags(flags) } });
         printPlan(plan, { json });
         return 0;
       }
@@ -320,7 +338,8 @@ async function main() {
       case 'ask': {
         const providerBudget = parseProviderBudgetFlag(flags['provider-budget'] ?? flags.providerBudget);
         const task = resolveTaskInput(flags, rest);
-        const plan = await call('/api/plan', { method: 'POST', body: { task, effort: flags.effort, kind: flags.kind, model: flags.model, modelTier: flags['model-tier'] ?? flags.modelTier, providerBudget } });
+        const grounding = groundingFlags(flags);
+        const plan = await call('/api/plan', { method: 'POST', body: { task, effort: flags.effort, kind: flags.kind, model: flags.model, modelTier: flags['model-tier'] ?? flags.modelTier, providerBudget, cwd: process.cwd(), ...grounding } });
         if (!plan.primary) { console.error('no ready provider for this task; run: relaybridge status'); return 1; }
         if (plan.humanGate && !flags.force) {
           printPlan(plan, { json: false });
@@ -328,7 +347,7 @@ async function main() {
           return 1;
         }
         const askBody = buildAskBody(
-          plan, task, process.cwd(), newCliRequestId(), providerBudget, flags.effort || null,
+          plan, task, process.cwd(), newCliRequestId(), providerBudget, flags.effort || null, grounding,
         );
         console.error(`# request ${askBody.requestId} · ${plan.primary.kind} · ${plan.primary.model || 'default'} · effort ${plan.effort}`);
         const result = await call('/api/oneshot', {

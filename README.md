@@ -317,6 +317,39 @@ Writer-capable route/plan previews require both `dangerous:true` and
 `acknowledgeFilesystemWrites:true`; neither field changes execution authority
 by itself.
 
+Workspace grounding is a separate pre-invocation requirement. Supplying a
+`cwd` does not give an HTTP or prompt-only provider access to local files.
+Each provider declares `oneshot_capabilities.safe` and, separately,
+`oneshot_capabilities.dangerous`; `model_invocation`, `workspace_read`,
+`workspace_write`, and `tool_use` describe the actual configured invocation.
+These declarations do not qualify an unverified filesystem boundary. Routing
+enforces task-family capabilities and approved complexity ceilings before
+applying cost, preference, or diversity scores. A deterministic shell cannot
+replace a model for architecture, reasoning, or mixed semantic work.
+
+REST and MCP planning/execution accept `requiresWorkspaceAccess:true` and an
+optional `inlineEvidence` object containing `content`, its UTF-8 `sha256`, and
+the admitted workspace's `cwdIdentityHash`. The CLI exposes these as
+`--requires-workspace-access` and `--inline-evidence '<json>'`. A validated
+bundle is appended exactly once and may support a prompt-only answer, but
+never authorizes writes. The digest proves transport integrity, not that the
+content is accurate or complete. Setting the requirement to `false` does not
+bypass detected file-dependent work. Unsupported grounding and oversized
+composed prompts fail before any invocation, including committee members;
+receipts identify zero attempts and the reason. Grounding admission is
+rechecked before cache lookup. File citations outside the workspace or on a
+foreign platform are reported as uncheckable, not fabricated merely because a
+local basename is absent.
+
+An exit-zero provider response is not necessarily completed work. Narrow,
+whole-response refusal and unfinished-progress detectors preserve diagnostic
+text but exclude it from successful answers and caches. Receipts record the
+detector version and output digest. A local token-budget stop remains a
+`token_budget` failure even when an accepted Claude terminal result also
+reports HTTP 429; that independent provider signal may establish its scoped
+cooldown. Assistant prose, discarded late output, and local budget stops alone
+cannot establish a provider quota reset.
+
 The global `_supervisor.providerBudget` sets provider-reported ceilings for
 output tokens, total tokens (including cache traffic), cache reads, cache
 creation, and turns. Provider entries may override them generally with

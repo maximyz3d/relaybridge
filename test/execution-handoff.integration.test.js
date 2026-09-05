@@ -21,6 +21,7 @@ test('exact plan intent survives CLI, REST, MCP cache, queue and broadcast; drif
       "process.stdout.write('A complete explanation with deterministic verification steps.');",
     ].join('\n'));
     const seat = () => ({ label: 'Gemini fixture', transport: 'subscription:fixture',
+      oneshot_capabilities: { safe: ['model_invocation'] },
       safe: [process.execPath], probe: [process.execPath, script, '--version'],
       models_probe: [process.execPath, script, '--catalog', census],
       oneshot_safe: [process.execPath, script, '--model', 'gemini-pro-high', '--effort', 'high', '--marker', marker, '--prompt-file', '{prompt_file}'],
