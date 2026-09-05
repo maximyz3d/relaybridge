@@ -1,3 +1,6 @@
+## v2.1.2 - 2026-09-05
+- #117 chore(deps): bump express from 4.22.2 to 5.2.1
+
 ## v2.1.1 - 2026-09-05
 - #95 fix: integrate Claude checkpoints and pending dependency updates
 
