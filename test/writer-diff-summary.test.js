@@ -84,7 +84,10 @@ test('non-repository writer summary fails closed', () => {
 test('writer snapshot treats control-shaped workspace text as one git path argument', (t) => {
   const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-writer-path-'));
   t.after(() => fs.rmSync(parent, { recursive: true, force: true }));
-  const cwd = path.join(parent, 'repo\n--help');
+  // Newlines are control characters that Win32 correctly rejects in path
+  // components. A leading option plus `&` remains legal on every supported
+  // filesystem while still detecting either argv splitting or shell parsing.
+  const cwd = path.join(parent, '--help & echo injected');
   fs.mkdirSync(cwd);
   git(cwd, 'init', '-q');
   git(cwd, 'config', 'user.email', 'test@example.invalid');
