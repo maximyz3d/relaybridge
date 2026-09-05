@@ -3646,7 +3646,7 @@ test('local Ollama adapter uses loopback HTTP, returns final-only text, and reco
     }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
-      model: { malformed: true },
+      model: requestPayload.prompt === 'malformed-model' ? { malformed: true } : 'fake-local:1b',
       response: '<think>private trace</think>\nFINAL_ONLY',
       done: true,
       done_reason: 'stop',
@@ -3738,9 +3738,17 @@ test('local Ollama adapter uses loopback HTTP, returns final-only text, and reco
   assert.equal(result.usage.output_tokens, 3);
   assert.equal(result.usage.total_tokens, 15);
   assert.equal(result.dropped_out, false);
-  assert.equal(requestPayload.stream, false);
+  assert.equal(requestPayload.stream, true);
   assert.equal(requestPayload.think, false);
   assert.equal(requestPayload.options.num_predict, 64);
+
+  const malformedModel = await (await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST', headers, body: JSON.stringify({ kind: 'ollama_fast', prompt: 'malformed-model', dangerous: false }),
+  })).json();
+  assert.equal(malformedModel.failureClass, 'provider_protocol_error');
+  assert.equal(malformedModel.errorCode, 'http_invalid_frame');
+  assert.equal(malformedModel.stdout, '');
+  assert.equal(malformedModel.model_invocation, true);
 
   const terminalBudgetResponse = await fetch(`${baseUrl}/api/oneshot`, {
     method: 'POST', headers,

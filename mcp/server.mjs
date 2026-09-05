@@ -11,6 +11,7 @@ import TIMEOUT_POLICY from '../timeout-policy.cjs';
 import { normalizeGenericValidation } from '../lib/validation-contract.js';
 import { promptTransportLimits, preparePrompt } from '../lib/prompt-transport.js';
 import { normalizeGrounding, prepareGroundedPrompt } from '../lib/workspace-grounding.js';
+import { normalizeTransportLifecycle } from '../lib/attempt-lifecycle.js';
 
 const GROUNDING_FIELDS = {
   requiresWorkspaceAccess: z.boolean().optional().describe('Require actual workspace access or a complete validated read-only inline evidence bundle.'),
@@ -721,6 +722,8 @@ export function normalizeProviderUsage(value, modelInvocation) {
   const cacheReadTokens = strictOptionalCount('cache_read_input_tokens', 0);
   const cacheCreationTokens = strictOptionalCount('cache_creation_input_tokens', 0);
   const reportedTotal = strictOptionalCount('total_tokens');
+  if (has('cache_input_included') && typeof value.cache_input_included !== 'boolean') return null;
+  const cacheInputIncluded = value.cache_input_included === true;
   if (
     (has('input_tokens') && inputTokens === null)
     || (has('output_tokens') && outputTokens === null)
@@ -729,7 +732,7 @@ export function normalizeProviderUsage(value, modelInvocation) {
     || (has('total_tokens') && reportedTotal === null)
   ) return null;
   const computedTotal = inputTokens !== null && outputTokens !== null
-    ? strictTokenSum([inputTokens, outputTokens, cacheReadTokens || 0, cacheCreationTokens || 0])
+    ? strictTokenSum([inputTokens, outputTokens, cacheInputIncluded ? 0 : cacheReadTokens || 0, cacheInputIncluded ? 0 : cacheCreationTokens || 0])
     : null;
   const totalTokens = computedTotal ?? reportedTotal;
   const thinkingCandidate = strictOptionalCount('thinking_tokens');
@@ -774,6 +777,7 @@ export function normalizeProviderUsage(value, modelInvocation) {
     output_tokens: outputTokens,
     cache_read_input_tokens: cacheReadTokens,
     cache_creation_input_tokens: cacheCreationTokens,
+    cache_input_included: cacheInputIncluded,
     total_tokens: totalTokens,
     thinking_tokens: thinkingTokens,
     cost_usd: cost,
@@ -794,8 +798,8 @@ const PROVIDER_FAILURE_CLASSES = new Set([
   'max_tokens', 'refusal', 'max_turns', 'structured_output_retry_exhausted',
   'tool_deferred', 'aborted_streaming', 'aborted_tools', 'hook_stopped',
   'stop_hook_prevented', 'blocking_limit', 'prompt_too_long',
-  'provider_error', 'admission_limit', 'bridge_identity_mismatch',
-  'incomplete_response', 'provider_refusal', 'token_budget', 'plan_restriction',
+  'provider_error', 'provider_protocol_error', 'output_cap', 'admission_limit', 'bridge_identity_mismatch',
+  'incomplete_response', 'provider_incomplete_response', 'provider_refusal', 'token_budget', 'plan_restriction',
   'client_cancelled', 'mcp_deadline_cancelled',
   'validation', 'configuration', 'safe_filesystem_unverified',
   'safe_isolation_setup', 'isolation_cleanup', 'workspace_grounding',
@@ -1176,6 +1180,10 @@ function sanitizeProviderResponse(response) {
     invocationId: strictBoundedString(response.invocationId),
     attemptId: strictBoundedString(response.attemptId),
     physicalAttemptCount: strictTokenCount(response.physical_attempt_count),
+    providerRunId: normalizeTransportLifecycle(response.transport_lifecycle)?.runId || null,
+    transportLifecycle: normalizeTransportLifecycle(response.transport_lifecycle),
+    transportDiagnosticCode: strictBoundedString(response.transport_diagnostic_code),
+    providerTerminalCompatibility: response.provider_terminal_compatibility === 'ollama_done_without_reason_v1' ? response.provider_terminal_compatibility : null,
     exitCode: response.exitCode,
     droppedOut: !!response.dropped_out,
     rateLimited: !!response.rate_limited,
@@ -1338,6 +1346,7 @@ function usageFromTransportReceipt(receipt) {
     output_tokens: receipt.actualOutputTokens ?? null,
     cache_read_input_tokens: receipt.actualCacheReadInputTokens ?? null,
     cache_creation_input_tokens: receipt.actualCacheCreationInputTokens ?? null,
+    cache_input_included: receipt.cacheInputIncluded === true,
     total_tokens: receipt.actualTotalTokens ?? null,
     thinking_tokens: receipt.actualThinkingTokens ?? null,
     cost_usd: receipt.provider_reported_cost_usd ?? null,
@@ -1401,6 +1410,10 @@ export function reconcileTransportReceipt({ requestId, sanitized, transportRecei
     invocationId: transportReceipt.invocationId || requestId,
     attemptId: transportReceipt.attemptId || `${requestId}:attempt:1`,
     physicalAttemptCount: transportReceipt.physicalAttemptCount ?? 1,
+    providerRunId: normalizeTransportLifecycle(transportReceipt.transportLifecycle)?.runId || null,
+    transportLifecycle: normalizeTransportLifecycle(transportReceipt.transportLifecycle),
+    transportDiagnosticCode: strictBoundedString(transportReceipt.transportDiagnosticCode),
+    providerTerminalCompatibility: transportReceipt.providerTerminalCompatibility === 'ollama_done_without_reason_v1' ? transportReceipt.providerTerminalCompatibility : null,
   };
 }
 
@@ -1617,6 +1630,7 @@ async function callProvider({
     actualInputTokens: sanitized.usage?.input_tokens ?? null,
     actualOutputTokens: sanitized.usage?.output_tokens ?? null,
     actualCacheReadInputTokens: sanitized.usage?.cache_read_input_tokens ?? null,
+    cacheInputIncluded: sanitized.usage?.cache_input_included === true,
     actualCacheCreationInputTokens: sanitized.usage?.cache_creation_input_tokens ?? null,
     actualTotalTokens: sanitized.usage?.total_tokens ?? null,
     actualThinkingTokens: sanitized.usage?.thinking_tokens ?? null,
@@ -1625,6 +1639,10 @@ async function callProvider({
     vendorQuota: sanitized.vendorQuota ?? null,
     quotaEvidence: sanitized.quotaEvidence ?? null,
     grounding: sanitized.grounding ?? null,
+    providerRunId: sanitized.providerRunId ?? null,
+    transportLifecycle: sanitized.transportLifecycle ?? null,
+    transportDiagnosticCode: sanitized.transportDiagnosticCode ?? null,
+    providerTerminalCompatibility: sanitized.providerTerminalCompatibility ?? null,
     outputDetector: sanitized.outputDetector ?? null,
     cooldown: sanitized.cooldown ?? null,
     retryAt: sanitized.retryAt ?? null,

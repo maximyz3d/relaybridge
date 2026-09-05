@@ -9,6 +9,9 @@ const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
 const { RunSupervisor, resolveSupervisorOptions, normalizeProviderBudget } = require('./lib/run-supervisor');
+const { createAttemptLifecycle } = require('./lib/attempt-lifecycle');
+const { readOllamaStream, readProviderBody, LIMITS: HTTP_PROVIDER_LIMITS } = require('./lib/http-provider-stream');
+const { parseHostedTerminal, classifyHttpTerminal } = require('./lib/http-provider-terminal');
 const { validateProviderBudget } = require('./lib/provider-budget');
 const { promptTransportLimits, preparePrompt, renderPromptSlot } = require('./lib/prompt-transport');
 const { resolveProviderControls, validateControlRequest, modelControls } = require('./lib/execution-contract');
@@ -670,8 +673,8 @@ function appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt }
     ? safeTokenSum([
         actualInputTokens,
         actualOutputTokens,
-        actualCacheReadTokens || 0,
-        actualCacheCreationTokens || 0,
+        usage?.cache_input_included === true ? 0 : actualCacheReadTokens || 0,
+        usage?.cache_input_included === true ? 0 : actualCacheCreationTokens || 0,
       ])
     : null;
   const actualTotalTokens = computedTotalTokens ?? reportedTotalTokens;
@@ -703,6 +706,7 @@ function appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt }
     actualOutputTokens,
     actualCacheReadInputTokens: actualCacheReadTokens,
     actualCacheCreationInputTokens: actualCacheCreationTokens,
+    cacheInputIncluded: usage?.cache_input_included === true,
     actualTotalTokens,
     actualThinkingTokens: nonnegativeUsageNumber(usage?.thinking_tokens),
     provider_reported_cost_usd: nonnegativeCostNumber(usage?.cost_usd),
@@ -713,7 +717,9 @@ function appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt }
     requestId,
     invocationId,
     attemptId,
-    physicalAttemptCount: modelInvocation === false ? 0 : 1,
+    physicalAttemptCount: Number.isSafeInteger(payload.physical_attempt_count) ? payload.physical_attempt_count : modelInvocation === false ? 0 : 1,
+    runId: payload.runId || route?.run_id || null,
+    transportLifecycle: payload.transport_lifecycle || null,
     outerReceiptId: route?.outer_receipt_id || null,
     modelUsage: Array.isArray(usage?.model_usage) ? usage.model_usage : [],
     vendorQuota: payload.vendor_quota || null,
@@ -738,6 +744,8 @@ function appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt }
     outputDetector: payload.output_detector || null,
     resultSchemaDisagreement: payload.result_schema_disagreement === true,
     providerStopReason: normalizeClaudeResultString(payload.provider_stop_reason),
+    providerTerminalCompatibility: payload.provider_terminal_compatibility === 'ollama_done_without_reason_v1' ? payload.provider_terminal_compatibility : null,
+    transportDiagnosticCode: normalizeClaudeResultString(payload.transport_diagnostic_code),
     providerTerminalReason: normalizeClaudeResultString(payload.provider_terminal_reason),
     providerApiErrorStatus: nonnegativeUsageNumber(payload.provider_api_error_status),
     providerNumTurns: nonnegativeUsageNumber(payload.provider_num_turns),
@@ -1022,7 +1030,8 @@ function sendOneShotPreAdmissionRejection(res, {
 }
 
 function sendOneShotResult(res, payload, meta) {
-  if (res.writableEnded || res.destroyed) return;
+  const canDeliver = !res.writableEnded && !res.destroyed;
+  if ((!canDeliver && meta?.persistAfterDisconnect !== true) || res._relayReceiptPersisted) return;
   const requestId = meta?.route?.request_id || null;
   payload = {
     ...payload,
@@ -1030,7 +1039,7 @@ function sendOneShotResult(res, payload, meta) {
     requestId,
     invocationId: meta?.route?.invocation_id || requestId,
     attemptId: meta?.route?.attempt_id || (requestId ? `${requestId}:attempt:1` : null),
-    physical_attempt_count: payload.model_invocation === false ? 0 : 1,
+    physical_attempt_count: Number.isSafeInteger(payload.physical_attempt_count) ? payload.physical_attempt_count : payload.model_invocation === false ? 0 : 1,
   };
   const classified = classifyRunFailure({
     provider: meta?.kind,
@@ -1193,10 +1202,10 @@ function sendOneShotResult(res, payload, meta) {
   try {
     const receipt = appendBridgeProviderReceipt({ ...meta, payload });
     res._relayReceiptPersisted = receipt.receiptId;
-    res.json({ ...payload, receiptId: receipt.receiptId, receiptPersisted: true });
+    if (canDeliver) res.json({ ...payload, receiptId: receipt.receiptId, receiptPersisted: true });
     return payload;
   } catch (error) {
-    res.json({ ...payload, receiptId: `rcpt_unpersisted_${Date.now().toString(36)}`, receiptPersisted: false, receiptPersistenceError: error.message });
+    if (canDeliver) res.json({ ...payload, receiptId: `rcpt_unpersisted_${Date.now().toString(36)}`, receiptPersisted: false, receiptPersistenceError: error.message });
     return payload;
   }
 }
@@ -2073,301 +2082,171 @@ function isUpstreamTimeoutStatus(status) {
   return Number(status) === 408 || Number(status) === 504;
 }
 
-function terminalProviderBudgetOutcome(usage, providerBudget, turns = null) {
-  const supervisor = new RunSupervisor({ providerBudget });
-  supervisor.recordProviderUsage({ ...(usage || {}), turns }, { phase: 'terminal' });
-  const verdict = supervisor.evaluate();
-  return verdict.action === 'kill' && verdict.reason === 'token_budget'
-    ? { exceeded: true, detail: verdict.detail, budget: supervisor.snapshot().providerBudget }
-    : { exceeded: false, detail: '', budget: supervisor.snapshot().providerBudget };
-}
-
-async function runOpenAIChatOneShot({ entry, prompt, effectivePrompt, timeoutMs, res, route, startedAt, providerBudget, accountId }) {
-  route.prompt_transport = 'hosted_openai_compatible';
-  route.prompt_truncated = false;
-  route.allow_paid_fallback = entry.allow_paid_fallback === true;
-  route.hosting_region = entry.hosting_region || null;
-  route.requires_explicit_preference = entry.autoRoute === false || null;
-
+async function runHttpProviderOneShot({ entry, prompt, effectivePrompt, res, route, startedAt,
+  supervisorOptions, accountId, releaseAdmission, cleanupResources, cwd }) {
+  const hosted = entry.oneshot_adapter === 'openai_chat_api';
+  const supervisor = new RunSupervisor(supervisorOptions);
+  const runId = `run_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 8)}`;
   const controller = new AbortController();
-  let timedOut = false;
-  let clientGone = false;
-  let requestStarted = false;
-  res._relayCancellationPayload = () => ({
-    kind: route.provider,
-    route,
-    exitCode: -1,
-    stdout: '',
-    stderr: '',
-    failureClass: timedOut ? 'timeout' : disconnectFailureClass({
-      client: route.client_surface, deadlineAt: route.client_deadline_at,
-    }),
-    stop_reason: timedOut ? 'hard_cap' : disconnectFailureClass({
-      client: route.client_surface, deadlineAt: route.client_deadline_at,
-    }),
-    cancelled: !timedOut,
-    timed_out: timedOut,
-    dropped_out: true,
-    model_invocation: requestStarted ? null : false,
-  });
-  const timer = setTimeout(() => {
-    timedOut = true;
-    controller.abort(new Error('hosted provider request timed out'));
-  }, TIMEOUT_POLICY.normalizeOneShotTimeoutMs(timeoutMs));
-  res.on('close', () => {
-    if (!res.writableEnded) {
-      clientGone = true;
-      controller.abort(new Error('bridge client disconnected'));
-    }
-  });
-
-  try {
-    const url = hostedChatUrl(entry);
-    const key = hostedApiKey(entry);
-    route.endpoint_host = url.hostname;
-    route.api_key_env = key.name;
-    requestStarted = true;
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${key.value}`,
-        ...(entry.http_referer ? { 'HTTP-Referer': String(entry.http_referer) } : {}),
-        ...(entry.x_title ? { 'X-Title': String(entry.x_title) } : {}),
-      },
-      body: JSON.stringify({
-        model: entry.model,
-        messages: [
-          ...(entry.system_prompt ? [{ role: 'system', content: String(entry.system_prompt) }] : []),
-          { role: 'user', content: effectivePrompt },
-        ],
-        temperature: Number.isFinite(Number(entry.temperature)) ? Number(entry.temperature) : 0.2,
-        max_tokens: Math.max(64, Math.min(Number(entry.max_output_tokens || 1024), 4096)),
-        stream: false,
-      }),
-      signal: controller.signal,
-    });
-    const responseText = await response.text();
-    let payload = {};
-    try { payload = responseText ? JSON.parse(responseText) : {}; } catch {}
-    if (!response.ok) {
-      const detail = cleanOutput(payload.error?.message || payload.error || responseText || `hosted provider HTTP ${response.status}`);
-      const httpFailure = classifyProviderHttpFailure(response.status, detail);
-      if (!clientGone && !res.writableEnded) {
-        sendOneShotResult(res, {
-          kind: route.provider,
-          route,
-          exitCode: response.status,
-          stdout: '',
-          stderr: detail,
-          failureClass: httpFailure,
-          rate_limited: httpFailure === 'rate_limit',
-          budget_exceeded: httpFailure === 'budget',
-          auth_failed: httpFailure === 'auth',
-          permission_denied: httpFailure === 'permission',
-          timed_out: isUpstreamTimeoutStatus(response.status),
-          dropped_out: true,
-          model_invocation: rejectedHttpModelInvocation(response.status),
-        }, { kind: route.provider, prompt, route, startedAt, accountId });
-      }
-      return;
-    }
-    const stdout = cleanOutput(payload.choices?.[0]?.message?.content || payload.output_text || '');
-    const providerModel = typeof payload.model === 'string' ? payload.model.trim().slice(0, 160) : '';
-    const configuredModel = typeof entry.model === 'string' ? entry.model.trim().slice(0, 160) : '';
-    const existingIdentity = typeof route.resolved_model_identity === 'string'
-      ? route.resolved_model_identity.trim().slice(0, 160) : '';
-    route.resolved_model = providerModel || configuredModel || null;
-    route.observed_model = providerModel || null;
-    route.resolved_model_identity = providerModel || existingIdentity || configuredModel || null;
-    route.resolved_model_source = providerModel ? 'provider_response'
-      : existingIdentity ? route.resolved_model_source : configuredModel ? 'configured_model' : null;
-    const usage = payload.usage ? (() => {
-      const inputTokens = nonnegativeUsageNumber(payload.usage.prompt_tokens);
-      const outputTokens = nonnegativeUsageNumber(payload.usage.completion_tokens);
-      const computedTotal = inputTokens !== null && outputTokens !== null
-        ? safeTokenSum([inputTokens, outputTokens]) : null;
-      return {
-        input_tokens: inputTokens,
-        output_tokens: outputTokens,
-        total_tokens: computedTotal ?? nonnegativeUsageNumber(payload.usage.total_tokens),
-      };
-    })() : null;
-    const budgetOutcome = terminalProviderBudgetOutcome(usage, providerBudget);
-    if (!clientGone && !res.writableEnded) {
-      sendOneShotResult(res, {
-        kind: route.provider,
-        route,
-        exitCode: 0,
-        stdout,
-        stderr: '',
-        usage,
-        failureClass: budgetOutcome.exceeded ? 'token_budget' : null,
-        stop_reason: budgetOutcome.exceeded ? 'token_budget' : null,
-        supervisor_stop_reason: budgetOutcome.exceeded ? 'token_budget' : null,
-        stop_detail: budgetOutcome.detail,
-        provider_budget: budgetOutcome.budget,
-        provider_budget_enforcement: usage ? 'terminal' : 'unavailable',
-        rate_limited: false,
-        budget_exceeded: false,
-        auth_failed: false,
-        permission_denied: false,
-        timed_out: false,
-        dropped_out: budgetOutcome.exceeded || !stdout,
-        model_invocation: true,
-      }, { kind: route.provider, prompt, route, startedAt, accountId });
-    }
-  } catch (error) {
-    if (!clientGone && !res.writableEnded) {
-      sendOneShotResult(res, {
-        kind: route.provider,
-        route,
-        exitCode: -1,
-        stdout: '',
-        stderr: cleanOutput(error?.message || String(error)),
-        auth_failed: isHostedApiKeyMissingError(error),
-        timed_out: timedOut,
-        dropped_out: true,
-        model_invocation: requestStarted ? null : false,
-      }, { kind: route.provider, prompt, route, startedAt, accountId });
-    }
-  } finally {
-    clearTimeout(timer);
+  route.run_id = runId;
+  route.prompt_transport = hosted ? 'hosted_openai_compatible' : 'local_http';
+  route.prompt_truncated = false;
+  route.effective_timeout_ms = supervisor.opts.hardCapMs;
+  route.transport_wire_bytes = 0;
+  if (hosted) {
+    route.allow_paid_fallback = entry.allow_paid_fallback === true;
+    route.hosting_region = entry.hosting_region || null;
+    route.requires_explicit_preference = entry.autoRoute === false || null;
   }
-}
-
-async function runOllamaApiOneShot({ entry, prompt, effectivePrompt, timeoutMs, res, route, startedAt, providerBudget, accountId }) {
-  route.prompt_transport = 'local_http';
-  route.prompt_truncated = false;
-  const controller = new AbortController();
-  let timedOut = false;
-  let clientGone = false;
-  let requestStarted = false;
-  res._relayCancellationPayload = () => ({
-    kind: route.provider,
-    route,
-    exitCode: -1,
-    stdout: '',
-    stderr: '',
-    failureClass: timedOut ? 'timeout' : disconnectFailureClass({
+  const lifecycle = createAttemptLifecycle({ runId, kind: route.provider, route, supervisor,
+    registry: activeRuns, releaseAdmission, tickMs: 1000 });
+  res._relayLifecycle = lifecycle;
+  lifecycle.bindTransport({ type: 'http', requestStop: () => controller.abort() });
+  const detach = () => {
+    if (!res.writableEnded) lifecycle.clientDetached({ reason: disconnectFailureClass({
       client: route.client_surface, deadlineAt: route.client_deadline_at,
-    }),
-    stop_reason: timedOut ? 'hard_cap' : disconnectFailureClass({
-      client: route.client_surface, deadlineAt: route.client_deadline_at,
-    }),
-    cancelled: !timedOut,
-    timed_out: timedOut,
-    dropped_out: true,
-    model_invocation: requestStarted ? null : false,
-  });
-  const timer = setTimeout(() => {
-    timedOut = true;
-    controller.abort(new Error('local Ollama request timed out'));
-  }, TIMEOUT_POLICY.normalizeOneShotTimeoutMs(timeoutMs));
-  res.on('close', () => {
-    if (!res.writableEnded) {
-      clientGone = true;
-      controller.abort(new Error('bridge client disconnected'));
+    }) });
+  };
+  res.once('close', detach);
+  if (res.destroyed) detach();
+  let requestStarted = false, responseStatus = null, semanticOutput = '', terminal = null, payload;
+  let acceptedUsage = null, sealedPayload = null, transportDiagnostic = null;
+  const wireProgress = (bytes) => { route.transport_wire_bytes += bytes; };
+  const meta = { kind: route.provider, prompt, route, startedAt, accountId, cwd, persistAfterDisconnect: true };
+  const usageFromTerminal = (value) => {
+    const input = nonnegativeUsageNumber(value.prompt_eval_count);
+    const output = nonnegativeUsageNumber(value.eval_count);
+    return { input_tokens: input, output_tokens: output,
+      total_tokens: input !== null && output !== null ? safeTokenSum([input, output]) : null,
+      cache_input_included: true,
+      ...(value.prompt_eval_cached_count !== null && value.prompt_eval_cached_count !== undefined
+        ? { cache_read_input_tokens: value.prompt_eval_cached_count } : {}) };
+  };
+  const acceptTerminal = (value, usage) => {
+    terminal = value;
+    if (value.model) {
+      route.observed_model = value.model; route.resolved_model = value.model;
+      route.resolved_model_identity = value.model; route.resolved_model_source = 'provider_response';
     }
-  });
-
+    if (usage) lifecycle.observeUsage(usage, 'terminal', (accepted) => { acceptedUsage = { ...accepted }; });
+    return !lifecycle.snapshot().stop;
+  };
+  const sealTerminal = () => {
+    if (lifecycle.snapshot().stop) return false;
+    const outcome = classifyHttpTerminal({ ...terminal, reason: hosted ? terminal.reason : terminal.done_reason });
+    let answer = semanticOutput;
+    if (entry.strip_thinking) {
+      const closeTag = answer.lastIndexOf('</think>');
+      if (closeTag >= 0) answer = answer.slice(closeTag + '</think>'.length);
+    }
+    answer = cleanOutput(answer);
+    const failureClass = outcome.failureClass || (!answer ? 'incomplete_response' : null);
+    sealedPayload = { exitCode: failureClass ? -1 : 0, stdout: failureClass ? '' : answer, stderr: '',
+      usage: acceptedUsage, failureClass, dropped_out: !!failureClass, model_invocation: true,
+      supervisor_stop_reason: null, stop_reason: outcome.stopReason,
+      provider_stop_reason: hosted ? terminal.reason : terminal.done_reason,
+      provider_terminal_compatibility: terminal.compatibility || null,
+      ...(failureClass && answer ? { partial_result: true, partial_diagnostic: answer.slice(0, 4000),
+        partial_diagnostic_truncated: answer.length > 4000 } : {}) };
+    lifecycle.sealOutcome(sealedPayload);
+    return !lifecycle.snapshot().stop;
+  };
   try {
-    const url = localOllamaUrl();
+    const url = hosted ? hostedChatUrl(entry) : localOllamaUrl();
+    const key = hosted ? hostedApiKey(entry) : null;
+    if (hosted) { route.endpoint_host = url.hostname; route.api_key_env = key.name; }
+    if (!lifecycle.markDispatched()) throw Object.assign(new Error('Request cancelled before dispatch.'), { name: 'AbortError' });
     requestStarted = true;
     const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+      method: 'POST', redirect: 'manual', signal: controller.signal,
+      headers: { 'Content-Type': 'application/json',
+        ...(hosted ? { Authorization: `Bearer ${key.value}`,
+          ...(entry.http_referer ? { 'HTTP-Referer': String(entry.http_referer) } : {}),
+          ...(entry.x_title ? { 'X-Title': String(entry.x_title) } : {}) } : {}) },
+      body: JSON.stringify(hosted ? {
         model: entry.model,
-        prompt: effectivePrompt,
-        stream: false,
-        think: false,
-        options: {
-          num_predict: Math.max(64, Math.min(Number(entry.max_output_tokens || 1024), 4096)),
-        },
-      }),
-      signal: controller.signal,
+        messages: [...(entry.system_prompt ? [{ role: 'system', content: String(entry.system_prompt) }] : []),
+          { role: 'user', content: effectivePrompt }],
+        temperature: Number.isFinite(Number(entry.temperature)) ? Number(entry.temperature) : 0.2,
+        max_tokens: Math.max(64, Math.min(Number(entry.max_output_tokens || 1024), 4096)), stream: false,
+      } : { model: entry.model, prompt: effectivePrompt, stream: true, think: false,
+        options: { num_predict: Math.max(64, Math.min(Number(entry.max_output_tokens || 1024), 4096)) } }),
     });
-    const responseText = await response.text();
-    let payload = {};
-    try { payload = responseText ? JSON.parse(responseText) : {}; } catch {}
+    responseStatus = response.status;
     if (!response.ok) {
-      const detail = cleanOutput(payload.error || responseText || `Ollama HTTP ${response.status}`);
-      if (!clientGone && !res.writableEnded) {
-        sendOneShotResult(res, {
-          kind: route.provider,
-          route,
-          exitCode: response.status,
-          stdout: '',
-          stderr: detail,
-          timed_out: isUpstreamTimeoutStatus(response.status),
-          dropped_out: true,
-          model_invocation: rejectedHttpModelInvocation(response.status),
-        }, { kind: route.provider, prompt, route, startedAt, accountId });
+      let text = '', diagnosticCode = null;
+      try { text = await readProviderBody(response, { signal: controller.signal, maxBytes: 65536, onWireBytes: wireProgress }); }
+      catch (error) { diagnosticCode = typeof error.code === 'string' ? error.code : (error.name === 'AbortError' ? 'http_body_aborted' : 'http_body_read_failed'); }
+      let errorBody; try { errorBody = JSON.parse(text); } catch {}
+      const detail = cleanOutput(typeof errorBody?.error?.message === 'string' ? errorBody.error.message
+        : typeof errorBody?.error === 'string' ? errorBody.error : text || `Provider HTTP ${response.status}`);
+      const failureClass = classifyProviderHttpFailure(response.status, detail);
+      payload = { exitCode: response.status, stdout: '', stderr: detail, failureClass,
+        rate_limited: failureClass === 'rate_limit', budget_exceeded: failureClass === 'budget',
+        auth_failed: failureClass === 'auth', permission_denied: failureClass === 'permission',
+        timed_out: isUpstreamTimeoutStatus(response.status), dropped_out: true,
+        provider_timeout_source: isUpstreamTimeoutStatus(response.status) ? 'provider_api_status' : null,
+        model_invocation: rejectedHttpModelInvocation(response.status), provider_api_error_status: response.status,
+        ...(diagnosticCode ? { transport_diagnostic_code: diagnosticCode } : {}) };
+    } else {
+      if (hosted) {
+        const text = await readProviderBody(response, { signal: controller.signal,
+          maxBytes: Math.min(supervisor.opts.maxOutputBytes, HTTP_PROVIDER_LIMITS.maxWireBytes), onWireBytes: wireProgress });
+        let document;
+        try { document = JSON.parse(text); } catch { throw Object.assign(new Error('Provider body contains malformed JSON.'), { failureClass: 'provider_protocol_error' }); }
+        const parsed = parseHostedTerminal(document);
+        if (acceptTerminal(parsed, parsed.usage)) lifecycle.observeOutput(parsed.output, (accepted) => { semanticOutput = accepted; });
+        sealTerminal();
+      } else {
+        await readOllamaStream(response, { signal: controller.signal,
+          maxOutputBytes: Math.min(supervisor.opts.maxOutputBytes, HTTP_PROVIDER_LIMITS.maxOutputBytes),
+          onWireBytes: wireProgress,
+          onTerminal: (value) => acceptTerminal(value, usageFromTerminal(value)),
+          onDelta: (delta) => {
+            lifecycle.observeOutput(delta, (accepted) => { semanticOutput += accepted; });
+            return !lifecycle.snapshot().stop;
+          }, onTerminalAccepted: sealTerminal });
       }
-      return;
-    }
-
-    let rawOutput = payload.response || payload.message?.content || '';
-    if (entry.strip_thinking) {
-      const closeTag = String(rawOutput).lastIndexOf('</think>');
-      if (closeTag >= 0) rawOutput = String(rawOutput).slice(closeTag + '</think>'.length);
-    }
-    const stdout = cleanOutput(rawOutput);
-    const providerModel = typeof payload.model === 'string' ? payload.model.trim().slice(0, 160) : '';
-    const configuredModel = typeof entry.model === 'string' ? entry.model.trim().slice(0, 160) : '';
-    route.resolved_model = providerModel || configuredModel || null;
-    route.observed_model = providerModel || null;
-    const inputTokens = nonnegativeUsageNumber(payload.prompt_eval_count);
-    const outputTokens = nonnegativeUsageNumber(payload.eval_count);
-    const usage = {
-      input_tokens: inputTokens,
-      output_tokens: outputTokens,
-      total_tokens: inputTokens !== null && outputTokens !== null
-        ? safeTokenSum([inputTokens, outputTokens]) : null,
-      total_duration_ns: Number.isFinite(Number(payload.total_duration)) ? Number(payload.total_duration) : null,
-      load_duration_ns: Number.isFinite(Number(payload.load_duration)) ? Number(payload.load_duration) : null,
-      done_reason: payload.done_reason || null,
-    };
-    const budgetOutcome = terminalProviderBudgetOutcome(usage, providerBudget);
-    if (!clientGone && !res.writableEnded) {
-      sendOneShotResult(res, {
-        kind: route.provider,
-        route,
-        exitCode: 0,
-        stdout,
-        stderr: '',
-        usage,
-        failureClass: budgetOutcome.exceeded ? 'token_budget' : null,
-        stop_reason: budgetOutcome.exceeded ? 'token_budget' : null,
-        supervisor_stop_reason: budgetOutcome.exceeded ? 'token_budget' : null,
-        stop_detail: budgetOutcome.detail,
-        provider_budget: budgetOutcome.budget,
-        provider_budget_enforcement: inputTokens !== null || outputTokens !== null ? 'terminal' : 'unavailable',
-        rate_limited: false,
-        budget_exceeded: false,
-        auth_failed: false,
-        permission_denied: false,
-        timed_out: false,
-        dropped_out: budgetOutcome.exceeded || !stdout,
-        model_invocation: true,
-      }, { kind: route.provider, prompt, route, startedAt, accountId });
+      payload = sealedPayload || { exitCode: -1, stdout: '', stderr: '', dropped_out: true };
     }
   } catch (error) {
-    if (!clientGone && !res.writableEnded) {
-      sendOneShotResult(res, {
-        kind: route.provider,
-        route,
-        exitCode: -1,
-        stdout: '',
-        stderr: cleanOutput(error?.message || String(error)),
-        timed_out: timedOut,
-        dropped_out: true,
-        model_invocation: requestStarted ? null : false,
-      }, { kind: route.provider, prompt, route, startedAt, accountId });
-    }
+    if (sealedPayload) {
+      payload = sealedPayload;
+      transportDiagnostic = typeof error.code === 'string' ? error.code : (error.name === 'AbortError' ? 'http_drain_aborted' : 'http_drain_failed');
+    } else payload = { exitCode: -1, stdout: '', stderr: cleanOutput(error?.message || String(error)),
+      failureClass: error.failureClass || (isHostedApiKeyMissingError(error) ? 'auth' : 'provider_error'),
+      errorCode: error.code || null, auth_failed: isHostedApiKeyMissingError(error),
+      dropped_out: true, model_invocation: requestStarted ? (responseStatus && responseStatus >= 200 && responseStatus < 300 ? true : null) : false };
   } finally {
-    clearTimeout(timer);
+    res.removeListener('close', detach);
+    lifecycle.sealOutcome(payload);
+    const state = lifecycle.snapshot();
+    const progress = supervisor.snapshot();
+    const stop = state.stop;
+    if (stop) {
+      const clientStop = stop.source === 'client';
+      payload = { ...payload, stdout: '', failureClass: stop.reason === 'token_budget' ? 'token_budget'
+        : clientStop ? stop.reason : stop.reason === 'output_cap' ? 'output_cap' : 'timeout',
+        stop_reason: stop.reason, supervisor_stop_reason: stop.source === 'supervisor' ? stop.reason : null,
+        stop_detail: stop.detail, cancelled: clientStop, timed_out: !clientStop && stop.reason !== 'token_budget' && stop.reason !== 'output_cap',
+        provider_timeout_source: stop.source === 'supervisor' && !['token_budget', 'output_cap'].includes(stop.reason) ? 'relay_supervisor' : null,
+        budget_exceeded: stop.reason === 'token_budget', dropped_out: true,
+        usage: acceptedUsage || payload?.usage || null };
+    }
+    payload = { ...payload, kind: route.provider, route, runId, progress,
+      usage: acceptedUsage || payload?.usage || null,
+      provider_stop_reason: payload?.provider_stop_reason || (hosted ? terminal?.reason : terminal?.done_reason) || null,
+      provider_terminal_compatibility: terminal?.compatibility || null,
+      ...(transportDiagnostic ? { transport_diagnostic_code: transportDiagnostic } : {}),
+      physical_attempt_count: state.dispatched ? 1 : 0,
+      provider_budget: progress.providerBudget, provider_budget_enforcement: progress.providerUsagePhase,
+      transport_lifecycle: { ...state, physicalEvidence: state.dispatched ? 'http_transport_settled' : 'not_dispatched' } };
+    await lifecycle.settlePhysical({ evidence: state.dispatched ? 'http_transport_settled' : 'not_dispatched',
+      cleanup: cleanupResources,
+      persist: ({ snapshot, cleanup }) => sendOneShotResult(res, {
+        ...payload, transport_lifecycle: snapshot,
+        ...(cleanup?.ok === false ? { failureClass: 'isolation_cleanup', dropped_out: true } : {}),
+      }, meta) });
   }
 }
 
@@ -2377,7 +2256,7 @@ const MAX_ACTIVE_ONESHOTS = Math.max(1, Math.min(Number(envFirst('RELAYBRIDGE_MA
 const MAX_ACTIVE_PER_PROVIDER = Math.max(1, Math.min(Number(envFirst('RELAYBRIDGE_MAX_ACTIVE_PER_PROVIDER', 'PS_BRIDGE_MAX_ACTIVE_PER_PROVIDER') || 1), 4));
 let activeOneShotCount = 0;
 
-function acquireOneShot(kind, res) {
+function acquireOneShot(kind) {
   const providerCount = activeOneShots.get(kind) || 0;
   if (activeOneShotCount >= MAX_ACTIVE_ONESHOTS || providerCount >= MAX_ACTIVE_PER_PROVIDER) return null;
   activeOneShotCount++;
@@ -2390,8 +2269,6 @@ function acquireOneShot(kind, res) {
     const next = Math.max(0, (activeOneShots.get(kind) || 1) - 1);
     if (next) activeOneShots.set(kind, next); else activeOneShots.delete(kind);
   };
-  res.once('finish', release);
-  res.once('close', release);
   return release;
 }
 function trackChild(proc) {
@@ -3573,6 +3450,7 @@ app.get('/api/runs/active', (req, res) => {
       runId: run.runId, kind: run.kind, route: run.route, pid: run.pid,
       startedAt: new Date(run.startedAt).toISOString(),
       ...snap,
+      ...(run.lifecycle ? { transportLifecycle: run.lifecycle.snapshot() } : {}),
       assessment: snap.phase === 'streaming' ? 'producing output right now â€” leave it alone'
         : snap.phase === 'working' ? 'recently active â€” still working'
           : snap.phase === 'suspect_loop' ? 'repeating itself â€” watch this one'
@@ -4220,6 +4098,7 @@ app.post('/api/exec', execRequestLimit, (req, res) => {
 const ONESHOT_CLOSE_GRACE_MS = 2000;
 async function executeOneShot(body, res) {
   const startedAt = Date.now();
+  let releaseAdmission = null;
   const { kind, prompt, timeoutMs, cwd, dangerous } = body || {};
 
   // Run association for the GitHub tracker: who did this, and any
@@ -4234,8 +4113,9 @@ async function executeOneShot(body, res) {
   const requestId = normalizeOneShotRequestId(body);
   const { invocationId, attemptId } = canonicalAttemptIdentity(requestId);
   const outerReceiptId = normalizeOuterReceiptId(body);
-  const rejectBeforeAdmission = (statusCode, failureClass, payload, route = null) =>
-    sendOneShotPreAdmissionRejection(res, {
+  const rejectBeforeAdmission = (statusCode, failureClass, payload, route = null) => {
+    releaseAdmission?.();
+    return sendOneShotPreAdmissionRejection(res, {
       statusCode,
       payload,
       kind,
@@ -4245,17 +4125,17 @@ async function executeOneShot(body, res) {
       startedAt,
       route,
     });
+  };
   // Two timeout regimes compose here. The timeout policy bounds any EXPLICIT
   // caller timeout, so a caller can neither starve a run nor exceed the
   // transport ceiling the MCP client allows. When the caller sends nothing, no
   // clock is armed for CLI runs at all â€” the progress-based supervisor decides
-  // when a run is actually stuck (lib/run-supervisor.js). The hosted adapter
-  // paths (Ollama/OpenAI-compatible HTTP) are not supervised and keep a fixed
-  // clock: the caller's bounded value, or the policy default.
+  // when a run is actually stuck (lib/run-supervisor.js). HTTP adapters now
+  // share that supervisor and own their physical reader lifetime independently
+  // of the requesting socket; they never claim process CPU evidence.
   const explicitTimeout = Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
     ? TIMEOUT_POLICY.normalizeOneShotTimeoutMs(timeoutMs)
     : null;
-  const adapterTimeoutMs = explicitTimeout ?? TIMEOUT_POLICY.oneShotDefaultMs;
   if (!kind || typeof prompt !== 'string' || !prompt.trim()) {
     return rejectBeforeAdmission(400, 'validation', { error: 'kind + non-empty prompt required' });
   }
@@ -4456,7 +4336,8 @@ async function executeOneShot(body, res) {
       });
     }
   }
-  if (!acquireOneShot(kind, res)) {
+  releaseAdmission = acquireOneShot(kind);
+  if (!releaseAdmission) {
     return rejectBeforeAdmission(429, 'admission_limit', {
       error: 'provider concurrency limit reached; retry with backoff',
       kind,
@@ -4655,6 +4536,7 @@ async function executeOneShot(body, res) {
   // process could recreate state after deletion. Defer that receipt until the
   // child close/error path has confirmed termination and terminal cleanup.
   res.once('close', () => {
+    if (res._relayLifecycle) return;
     if (res.writableEnded || res._relayReceiptPersisted) return;
     if (route.isolated_home_cleanup === 'pending') {
       res._relayIsolationReceiptDeferred = true;
@@ -4670,20 +4552,13 @@ async function executeOneShot(body, res) {
       ? body.budgetTaskTier
       : execution.resolvedTaskTier,
   }).providerBudget;
-  if (entry.oneshot_adapter === 'ollama_api') {
-    cleanupPromptFile();
-    return runOllamaApiOneShot({
-      entry: { ...entry, model: execution.model }, prompt, effectivePrompt, timeoutMs: adapterTimeoutMs, res, route, startedAt,
-      providerBudget: resolvedProviderBudget,
-      accountId: dispatchAccount.account?.id || null,
-    });
-  }
-  if (entry.oneshot_adapter === 'openai_chat_api') {
-    cleanupPromptFile();
-    return runOpenAIChatOneShot({
-      entry: { ...entry, model: execution.model }, prompt, effectivePrompt, timeoutMs: adapterTimeoutMs, res, route, startedAt,
-      providerBudget: resolvedProviderBudget,
-      accountId: dispatchAccount.account?.id || null,
+  if (['ollama_api', 'openai_chat_api'].includes(entry.oneshot_adapter)) {
+    return runHttpProviderOneShot({
+      entry: { ...entry, model: execution.model }, prompt, effectivePrompt, res, route, startedAt, cwd: resolvedCwd,
+      supervisorOptions: resolveSupervisorOptions({ entry, globals: cfg._supervisor || {}, providerBudget: resolvedProviderBudget,
+        hardCapMs: explicitTimeout, startedAt }),
+      accountId: dispatchAccount.account?.id || null, releaseAdmission,
+      cleanupResources: () => { cleanupPromptFile(); return cleanupProviderHome(); },
     });
   }
   let proc;
@@ -4721,6 +4596,7 @@ async function executeOneShot(body, res) {
   } catch (err) {
     cleanupPromptFile();
     cleanupProviderHome();
+    releaseAdmission();
     if (err.validation) {
       return rejectBeforeAdmission(400, 'validation', {
         error: err.validation.reason,
@@ -4900,6 +4776,7 @@ async function executeOneShot(body, res) {
     finishSupervision();
     cleanupPromptFile();
     const isolationCleanup = cleanupProviderHome();
+    releaseAdmission();
     if (clientGone || res.writableEnded) {
       if (res._relayIsolationReceiptDeferred) persistCancellationReceipt();
       return;
@@ -4915,6 +4792,7 @@ async function executeOneShot(body, res) {
     finishSupervision();
     cleanupPromptFile();
     const isolationCleanup = cleanupProviderHome();
+    releaseAdmission();
     if (clientGone || res.writableEnded) {
       if (res._relayIsolationReceiptDeferred) persistCancellationReceipt();
       return;

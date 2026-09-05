@@ -42,6 +42,12 @@ test('MCP provider accounting rejects malformed usage and contradictory retry ag
     input_tokens: 10, output_tokens: 5, cache_read_input_tokens: '999',
     cache_creation_input_tokens: 0, total_tokens: 15,
   }, true), null);
+  const inclusive = normalizeProviderUsage({ input_tokens: 12, output_tokens: 6, total_tokens: 18,
+    cache_read_input_tokens: 7, cache_input_included: true }, true);
+  assert.equal(inclusive.total_tokens, 18); assert.equal(inclusive.cache_read_input_tokens, 7);
+  assert.equal(inclusive.cache_input_included, true);
+  assert.equal(normalizeProviderUsage({ input_tokens: 12, output_tokens: 6, total_tokens: 18,
+    cache_read_input_tokens: 7 }, true).total_tokens, 25, 'Claude-style exclusive cache input remains additive');
   for (const malformedCost of [false, '1.25', -1, Infinity]) {
     assert.equal(normalizeProviderUsage({
       input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0,

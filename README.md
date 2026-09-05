@@ -658,7 +658,28 @@ the MCP transport deadline is `mcp_deadline_cancelled`. Neither is retried.
 `modelInvocation` remains truthful, and token usage stays `unknown` unless the
 provider itself reported usage; raw transport bytes are never treated as billed
 tokens. Completion and sticky supervisor verdicts win races idempotently, and
-process-tree cleanup still drives the active one-shot census back to zero.
+physical transport cleanup, rather than socket closure, owns HTTP admission.
+
+Ollama and hosted HTTP attempts appear in `/api/runs/active` before the first
+response byte, with their own `runId`, supervisor progress and
+`transportLifecycle`. HTTP CPU evidence is unavailable; local cancellation
+does not prove remote inference stopped. A fully validated terminal seals
+semantic output after usage and final-text budget checks. Admission remains
+held through bounded EOF/abort drainage and resource cleanup. Later malformed
+bytes are transport diagnostics and cannot replace an accepted answer or its
+usage. A pre-terminal disconnect still cancels this synchronous endpoint.
+
+HTTP `length` results are incomplete (`max_tokens`), refusals are not success,
+and tool requests are `tool_deferred`; these never enter the success cache.
+Unknown and administrative terminal reasons are incomplete. For legacy Ollama
+responses only, an omitted `done_reason` with `done:true` is supported and
+explicitly marked `ollama_done_without_reason_v1`. This is a compatibility
+policy, not evidence of a reported stop reason. See the official
+[Ollama response fields](https://docs.ollama.com/api/generate) and
+[Groq completion schema](https://github.com/groq/groq-typescript/blob/main/src/resources/chat/completions.ts).
+HTTP usage marks `cache_input_included:true`: cached-input counts are a
+breakdown of input tokens, not additional tokens. Claude's exclusive cache
+counts retain their additive accounting.
 
 Timeout receipts distinguish the causal layer. A Relay liveness stop reports
 `providerTimeoutSource: relay_supervisor`; an upstream HTTP timeout reports
