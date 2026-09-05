@@ -234,6 +234,42 @@ test('provider-reported multi-turn usage stops at a distinct token budget withou
   assert.equal(s.snapshot(T0 + 3000).providerUsagePhase, 'incremental');
 });
 
+test('provider token reserve requests finalization once without weakening the hard ceiling', () => {
+  const s = make({
+    providerBudget: {
+      maxOutputTokens: null, maxTotalTokens: 10000, maxCacheReadTokens: null,
+      maxCacheCreationTokens: null, maxTurns: null,
+    },
+    providerBudgetFinalizationReserve: {
+      maxOutputTokens: 0, maxTotalTokens: 2000,
+      maxCacheReadTokens: 0, maxCacheCreationTokens: 0,
+    },
+  });
+  s.recordProviderUsage({ total_tokens: 8999 }, { phase: 'incremental' });
+  assert.equal(s.evaluate(T0 + 1000).action, 'continue');
+  s.recordProviderUsage({ total_tokens: 9000 }, { phase: 'incremental' });
+  const reserve = s.evaluate(T0 + 2000);
+  assert.equal(reserve.action, 'finalize');
+  assert.equal(reserve.reason, 'token_budget_reserve');
+  assert.equal(reserve.reserve.reserve, 1000, 'reserve is capped at 10% of a small caller budget');
+  assert.equal(s.evaluate(T0 + 3000).action, 'continue', 'finalization is requested only once');
+  s.recordProviderUsage({ total_tokens: 10001 }, { phase: 'incremental' });
+  const killed = s.evaluate(T0 + 4000);
+  assert.equal(killed.action, 'kill');
+  assert.equal(killed.reason, 'token_budget');
+  assert.equal(s.snapshot(T0 + 4000).finalizationRequested.threshold, 9000);
+});
+
+test('terminal usage never requests a pointless finalization turn', () => {
+  const s = make({ providerBudget: {
+    maxOutputTokens: null, maxTotalTokens: 10000, maxCacheReadTokens: null,
+    maxCacheCreationTokens: null, maxTurns: null,
+  } });
+  s.recordProviderUsage({ total_tokens: 9500 }, { phase: 'terminal' });
+  assert.equal(s.evaluate(T0 + 1000).action, 'continue');
+  assert.equal(s.snapshot(T0 + 1000).finalizationRequested, null);
+});
+
 test('missing or malformed provider usage never falls back to output-size enforcement', () => {
   const s = make({ providerBudget: {
     maxOutputTokens: 1, maxTotalTokens: 1, maxCacheReadTokens: 1,

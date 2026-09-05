@@ -217,6 +217,8 @@
     "oneshot_safe": [
       "claude",
       "-p",
+      "--input-format",
+      "stream-json",
       "--output-format",
       "stream-json",
       "--verbose",
@@ -241,6 +243,8 @@
     "oneshot_dangerous": [
       "claude",
       "-p",
+      "--input-format",
+      "stream-json",
       "--output-format",
       "stream-json",
       "--verbose",
@@ -261,6 +265,7 @@
       "--dangerously-skip-permissions"
     ],
     "oneshot_output_parser": "claude_json",
+    "oneshot_graceful_finalize": "claude_stream_json",
     "probe": [
       "claude",
       "auth",
@@ -357,6 +362,8 @@
     "oneshot_safe": [
       "claude",
       "-p",
+      "--input-format",
+      "stream-json",
       "--output-format",
       "stream-json",
       "--verbose",
@@ -380,6 +387,7 @@
     ],
     "oneshot_dangerous": [],
     "oneshot_output_parser": "claude_json",
+    "oneshot_graceful_finalize": "claude_stream_json",
     "probe": [
       "claude",
       "auth",

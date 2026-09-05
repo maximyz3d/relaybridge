@@ -140,6 +140,24 @@ function clip(value, maxChars) {
   };
 }
 
+function clipUtf8Tail(value, maxBytes) {
+  const text = String(value || '');
+  const originalBytes = Buffer.byteLength(text, 'utf8');
+  if (originalBytes <= maxBytes) return { text, truncated: false, originalBytes };
+  let tail = text.slice(-maxBytes);
+  if (tail && /[\uDC00-\uDFFF]/.test(tail[0])) tail = tail.slice(1);
+  let low = 0;
+  let high = tail.length;
+  while (low < high) {
+    const mid = Math.floor((low + high) / 2);
+    if (Buffer.byteLength(tail.slice(mid), 'utf8') > maxBytes) low = mid + 1;
+    else high = mid;
+  }
+  let start = low;
+  if (start < tail.length && /[\uDC00-\uDFFF]/.test(tail[start])) start += 1;
+  return { text: tail.slice(start), truncated: true, originalBytes };
+}
+
 function boundTranscript(messages, maxChars) {
   const original = Array.isArray(messages) ? messages : [];
   const items = [...original];
@@ -1082,7 +1100,7 @@ export function normalizeProviderActionRequired(value) {
   return null;
 }
 
-function sanitizeProviderResponse(response) {
+export function sanitizeProviderResponse(response) {
   const stdout = clip(response.stdout || '', 24000);
   const stderr = clip(response.stderr || '', 4000);
   const modelInvocation = response.model_invocation === false ? false
@@ -1090,6 +1108,10 @@ function sanitizeProviderResponse(response) {
   const rawFailureClass = strictBoundedString(response.failureClass);
   const terminalReason = strictBoundedString(response.provider_terminal_reason);
   const partialDiagnostic = clip(response.partial_diagnostic || '', 12000);
+  const partialResult = response.partial_result === true;
+  const partialCheckpoint = partialResult
+    ? clipUtf8Tail(response.partial_checkpoint || '', 12000)
+    : { text: '', truncated: false, originalBytes: 0 };
   const apiErrorStatusCandidate = response.provider_api_error_status === null
     || response.provider_api_error_status === undefined ? null
     : strictTokenCount(response.provider_api_error_status);
@@ -1134,7 +1156,7 @@ function sanitizeProviderResponse(response) {
     providerErrorObserved: strictTokenCount(response.provider_error_observed),
     providerErrorInvalid: strictTokenCount(response.provider_error_invalid),
     providerErrorDiagnosticTruncated: response.provider_error_diagnostic_truncated === true,
-    partialResult: response.partial_result === true,
+    partialResult,
     failureSentinel: strictBoundedString(response.failure_sentinel),
     failureSentinelSource: strictBoundedString(response.failure_sentinel_source),
     partialDiagnostic: partialDiagnostic.text,
@@ -1142,9 +1164,76 @@ function sanitizeProviderResponse(response) {
     partialDiagnosticSha256: stableHash(response.partial_diagnostic || ''),
     partialDiagnosticTruncated: response.partial_diagnostic_truncated === true
       || partialDiagnostic.truncated,
+    partialCheckpoint: partialCheckpoint.text,
+    partialCheckpointBytes: partialResult ? Buffer.byteLength(partialCheckpoint.text, 'utf8') : 0,
+    partialCheckpointOriginalBytes: partialResult
+      ? strictTokenCount(response.partial_checkpoint_original_bytes) : 0,
+    partialCheckpointSha256: partialResult
+      ? (partialCheckpoint.truncated
+        ? stableHash(partialCheckpoint.text)
+        : (typeof response.partial_checkpoint_hash === 'string'
+          && /^[0-9a-f]{64}$/.test(response.partial_checkpoint_hash)
+          ? response.partial_checkpoint_hash : stableHash(response.partial_checkpoint || '')))
+      : null,
+    partialCheckpointTruncated: partialResult && (response.partial_checkpoint_truncated === true
+      || partialCheckpoint.truncated),
+    partialCheckpointEventType: partialResult && response.partial_checkpoint_event_type === 'assistant'
+      ? 'assistant' : null,
+    partialCheckpointMessageIdHash: partialResult
+      && typeof response.partial_checkpoint_message_id_hash === 'string'
+      && /^[0-9a-f]{64}$/.test(response.partial_checkpoint_message_id_hash)
+      ? response.partial_checkpoint_message_id_hash : null,
+    partialCheckpointUnavailableReason: partialResult
+      ? strictBoundedString(response.partial_checkpoint_unavailable_reason) : null,
+    partialCheckpointSelectionReason: partialResult
+      ? strictBoundedString(response.partial_checkpoint_selection_reason) : null,
     progressAtCancellation: response.progress_at_cancellation
       || (response.cancelled ? response.progress || null : null),
     cleanedOutputUnavailable: response.cleaned_output_unavailable ?? null,
+    cleanedOutputUnavailableReason: strictBoundedString(response.cleaned_output_unavailable_reason),
+    gracefulFinalization: response.graceful_finalization && typeof response.graceful_finalization === 'object'
+      ? {
+        supported: response.graceful_finalization.supported === true,
+        requested: response.graceful_finalization.requested === true,
+        sent: response.graceful_finalization.sent === true,
+        method: strictBoundedString(response.graceful_finalization.method),
+        reason: strictBoundedString(response.graceful_finalization.reason),
+        reserve: response.graceful_finalization.reserve
+          && typeof response.graceful_finalization.reserve === 'object'
+          ? {
+            budgetField: strictBoundedString(response.graceful_finalization.reserve.budgetField),
+            usageField: strictBoundedString(response.graceful_finalization.reserve.usageField),
+            threshold: strictTokenCount(response.graceful_finalization.reserve.threshold),
+            limit: strictTokenCount(response.graceful_finalization.reserve.limit),
+            observed: strictTokenCount(response.graceful_finalization.reserve.observed),
+            reserve: strictTokenCount(response.graceful_finalization.reserve.reserve),
+          } : null,
+      } : null,
+    writerDiffSummary: response.writer_diff_summary && typeof response.writer_diff_summary === 'object'
+      ? {
+        available: response.writer_diff_summary.available === true,
+        reason: strictBoundedString(response.writer_diff_summary.reason),
+        beforeHead: /^[0-9a-f]{40,64}$/.test(String(response.writer_diff_summary.beforeHead || ''))
+          ? response.writer_diff_summary.beforeHead : null,
+        afterHead: /^[0-9a-f]{40,64}$/.test(String(response.writer_diff_summary.afterHead || ''))
+          ? response.writer_diff_summary.afterHead : null,
+        headChanged: response.writer_diff_summary.headChanged === true,
+        changedFileCount: strictTokenCount(response.writer_diff_summary.changedFileCount),
+        filesTruncated: response.writer_diff_summary.filesTruncated === true,
+        fingerprintsTruncated: response.writer_diff_summary.fingerprintsTruncated === true,
+        statusHash: /^[0-9a-f]{64}$/.test(String(response.writer_diff_summary.statusHash || ''))
+          ? response.writer_diff_summary.statusHash : null,
+        files: Array.isArray(response.writer_diff_summary.files)
+          ? response.writer_diff_summary.files.slice(0, 50).map((file) => ({
+            path: file?.sensitivePath === true ? '[redacted-sensitive-path]'
+              : clip(String(file?.path || ''), 500).text,
+            pathHash: file?.sensitivePath === true ? null
+              : (/^[0-9a-f]{64}$/.test(String(file?.pathHash || '')) ? file.pathHash : null),
+            beforeStatus: strictBoundedString(file?.beforeStatus, 32),
+            afterStatus: strictBoundedString(file?.afterStatus, 32),
+            sensitivePath: file?.sensitivePath === true,
+          })) : [],
+      } : null,
     transportOutputChars: strictTokenCount(response.transport_output_chars),
     transportOutputHash: typeof response.transport_output_hash === 'string'
       && /^[0-9a-f]{64}$/.test(response.transport_output_hash) ? response.transport_output_hash : null,
@@ -1552,8 +1641,19 @@ async function callProvider({
     partialDiagnosticHash: sanitized.partialResult
       ? sanitized.partialDiagnosticSha256 : null,
     partialDiagnosticTruncated: sanitized.partialDiagnosticTruncated === true,
+    partialCheckpointBytes: sanitized.partialCheckpointBytes ?? 0,
+    partialCheckpointOriginalBytes: sanitized.partialCheckpointOriginalBytes ?? 0,
+    partialCheckpointHash: sanitized.partialResult ? sanitized.partialCheckpointSha256 : null,
+    partialCheckpointTruncated: sanitized.partialCheckpointTruncated === true,
+    partialCheckpointEventType: sanitized.partialCheckpointEventType ?? null,
+    partialCheckpointMessageIdHash: sanitized.partialCheckpointMessageIdHash ?? null,
+    partialCheckpointUnavailableReason: sanitized.partialCheckpointUnavailableReason ?? null,
+    partialCheckpointSelectionReason: sanitized.partialCheckpointSelectionReason ?? null,
     progressAtCancellation: sanitized.progressAtCancellation || null,
     cleanedOutputUnavailable: sanitized.cleanedOutputUnavailable ?? null,
+    cleanedOutputUnavailableReason: sanitized.cleanedOutputUnavailableReason ?? null,
+    gracefulFinalization: sanitized.gracefulFinalization ?? null,
+    writerDiffSummary: sanitized.writerDiffSummary ?? null,
     transportOutputChars: sanitized.transportOutputChars ?? null,
     transportOutputHash: sanitized.transportOutputHash ?? null,
     modelInvocation: sanitized.modelInvocation ?? null,
