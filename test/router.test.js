@@ -76,6 +76,26 @@ function readyDiagnostics() {
   ].map((kind) => [kind, { found: true, ready: true, detail: 'test ready' }]));
 }
 
+test('Fable critical planning qualification retains exact observed evidence and no writer slot', () => {
+  const evidence = router.loadRoutingData().evidence.providers.claude_fable;
+  assert.equal(evidence.maxRecommendedTier, 'critical');
+  assert.equal(evidence.qualificationEvidence.receiptId, 'rcpt_mtnq79ny_eaa8acc5');
+  assert.equal(evidence.qualificationEvidence.resolvedModelIdentity, 'claude-fable-5');
+  assert.equal(evidence.qualificationEvidence.result, 'completed_plan_ready');
+  const config = require('../cli-config.json');
+  assert.ok(!config.claude_fable.oneshot_dangerous?.length);
+  const route = router.routeTask({ task: 'Critical security architecture planning for fail-closed native process ownership and crash recovery.',
+    diagnostics: { ...readyDiagnostics(), claude_fable: { found: true, ready: true } }, preferredProviders: ['claude_fable'] });
+  assert.equal(route.candidates.find((row) => row.kind === 'claude_fable').eligible, true);
+  const { buildTaskPlan } = require('../lib/task-plan');
+  const safe = buildTaskPlan({ route, config, requestedKind: 'claude_fable', requestedModelTier: 'heavy' });
+  assert.equal(safe.primary.execution.model, 'fable');
+  assert.equal(safe.primary.execution.authorityMode, 'safe');
+  const writer = buildTaskPlan({ route, config, requestedKind: 'claude_fable', requestedModelTier: 'heavy', dangerous: true });
+  assert.equal(writer.primary.blocked, true);
+  assert.equal(writer.primary.execution, null);
+});
+
 test('utility lookup is local-first and a complex coding task fails up', () => {
   const utility = router.routeTask({
     task: 'Define the word deterministic in one sentence.',

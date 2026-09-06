@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "updatedAt": "2026-08-11",
+  "updatedAt": "2026-09-06",
   "qualificationPolicy": {
     "levels": [
       "discovered",
@@ -317,14 +317,14 @@
       "costClass": "subscription_quota",
       "privacyBoundary": "hosted_provider",
       "modelIdentity": "claude-fable-5",
-      "qualification": "available",
+      "qualification": "task_evaluated",
       "capabilities": ["coding", "code_review", "reasoning", "general"],
       "capabilityProvenance": {"coding": "operator_declared", "code_review": "operator_declared", "reasoning": "operator_declared", "general": "operator_declared"},
-      "maxRecommendedTier": "standard",
-      "evidence": ["rcpt_msmhmoym_c94b62b9"],
+      "maxRecommendedTier": "critical",
+      "evidence": ["rcpt_msmhmoym_c94b62b9", "rcpt_mtnq79ny_eaa8acc5", "rcpt_mtp5dcu3_a7ec7f28", "rcpt_mtp5j0b6_af87cd59"],
       "references": ["terminal_bench", "livecodebench", "bfcl"],
-      "qualificationEvidence": {"testedAt": "2026-08-10T00:24:00Z", "receiptId": "rcpt_msmhmoym_c94b62b9", "taskFamily": "read-only release review", "resolvedModelIdentity": "claude-fable-5", "result": "timed_out_without_output"},
-      "limitations": ["Shares the Claude subscription quota with the Opus seat", "The bridge resolved claude-fable-5 but the first five-minute review timed out without output", "No RelayBridge task-family score yet"]
+      "qualificationEvidence": {"testedAt": "2026-09-05T01:50:29.044Z", "receiptId": "rcpt_mtnq79ny_eaa8acc5", "taskFamily": "read-only critical release planning", "resolvedModelIdentity": "claude-fable-5", "result": "completed_plan_ready", "followupReceipts": ["rcpt_mtp5dcu3_a7ec7f28", "rcpt_mtp5j0b6_af87cd59"], "approvalBasis": "operator_requested_hard_problem_planning"},
+      "limitations": ["Shares the Claude subscription quota with the Opus seat", "Critical planning was explicitly requested by the operator and exercised through three completed read-only RelayBridge tasks; this is not a comparative benchmark score", "Read-only planning and review only; Fable has no writer slot", "Historical five-minute review timeout remains recorded; these planning tasks do not establish reliability across all task families", "No RelayBridge task-family score yet"]
     },
     "codex": {
       "family": "openai",
