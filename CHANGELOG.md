@@ -1,3 +1,6 @@
+## v2.1.5 - 2026-09-06
+- #119 feat(ui): add RelayBridge control center
+
 ## v2.1.4 - 2026-09-05
 - #115 chore(actions): bump actions/checkout from 6.0.2 to 7.0.1
 
