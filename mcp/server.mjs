@@ -424,6 +424,7 @@ async function getAccountAwareRoute(args, signal, timeoutMs = ACCOUNT_AWARE_ROUT
         acknowledgeFilesystemWrites: args.acknowledgeFilesystemWrites === true,
         diagnostics,
         effort: args.effort, model: args.model, modelTier: args.modelTier,
+        timeoutMs: args.timeoutMs,
         ...(args.providerBudget ? { providerBudget: args.providerBudget } : {}),
       },
       timeoutMs: routeTimeoutMs,
@@ -794,7 +795,7 @@ const PROVIDER_RETRY_ERROR_CATEGORIES = new Set([
 ]);
 
 const PROVIDER_FAILURE_CLASSES = new Set([
-  'cancelled', 'rate_limit', 'budget', 'auth', 'timeout', 'policy',
+  'cancelled', 'rate_limit', 'budget', 'auth', 'timeout', 'provider_timeout_unclassified', 'policy',
   'max_tokens', 'refusal', 'max_turns', 'structured_output_retry_exhausted',
   'tool_deferred', 'aborted_streaming', 'aborted_tools', 'hook_stopped',
   'stop_hook_prevented', 'blocking_limit', 'prompt_too_long',
@@ -1215,6 +1216,9 @@ function sanitizeProviderResponse(response) {
     providerErrorObserved: strictTokenCount(response.provider_error_observed),
     providerErrorInvalid: strictTokenCount(response.provider_error_invalid),
     providerErrorDiagnosticTruncated: response.provider_error_diagnostic_truncated === true,
+    providerDiagnosticChars: strictTokenCount(response.provider_diagnostic_chars),
+    providerDiagnosticHash: typeof response.provider_diagnostic_hash === 'string' && /^[a-f0-9]{64}$/.test(response.provider_diagnostic_hash)
+      ? response.provider_diagnostic_hash : null,
     partialResult: response.partial_result === true,
     failureSentinel: strictBoundedString(response.failure_sentinel),
     failureSentinelSource: strictBoundedString(response.failure_sentinel_source),
@@ -1683,6 +1687,8 @@ async function callProvider({
     providerErrorObserved: sanitized.providerErrorObserved ?? null,
     providerErrorInvalid: sanitized.providerErrorInvalid ?? null,
     providerErrorDiagnosticTruncated: sanitized.providerErrorDiagnosticTruncated ?? false,
+    providerDiagnosticChars: sanitized.providerDiagnosticChars ?? null,
+    providerDiagnosticHash: sanitized.providerDiagnosticHash ?? null,
     partialResult: sanitized.partialResult === true,
     failureSentinel: sanitized.failureSentinel ?? null,
     failureSentinelSource: sanitized.failureSentinelSource ?? null,
@@ -1932,6 +1938,7 @@ export function buildServer() {
       localOnly: z.boolean().default(false),
       maxProviders: z.number().int().min(1).max(4).optional(),
       committeeMode: z.enum(['advisory', 'consensus']).default('advisory'),
+      timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).max(TIMEOUT_POLICY.oneShotMaxMs).default(TIMEOUT_POLICY.oneShotDefaultMs),
       dangerous: z.boolean().default(false).describe('preview the explicit writer route instead of normal safe routing'),
       acknowledgeFilesystemWrites: z.boolean().default(false).describe('required with dangerous=true; confirms persistent writes are authorized'),
     }),
@@ -1966,14 +1973,15 @@ export function buildServer() {
       model: z.string().min(1).max(160).optional().describe('exact configured or available model; never silently substituted'),
       modelTier: z.enum(MODEL_TIERS).optional(),
       providerBudget: PROVIDER_BUDGET_SCHEMA.nullish(),
+      timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).max(TIMEOUT_POLICY.oneShotMaxMs).default(TIMEOUT_POLICY.oneShotDefaultMs).describe('runtime deadline to use when previewing the provider invocation'),
       dangerous: z.boolean().default(false).describe('plan an explicit writer-capable provider invocation'),
       acknowledgeFilesystemWrites: z.boolean().default(false).describe('required with dangerous=true; confirms persistent writes are authorized'),
     }),
     annotations: READ_ONLY,
-  }, safeHandler(async ({ task, effort, kind, model, modelTier, providerBudget, dangerous, acknowledgeFilesystemWrites, cwd, requiresWorkspaceAccess, inlineEvidence }, context) => {
+  }, safeHandler(async ({ task, effort, kind, model, modelTier, providerBudget, timeoutMs, dangerous, acknowledgeFilesystemWrites, cwd, requiresWorkspaceAccess, inlineEvidence }, context) => {
     const plan = await bridgeRequest('/api/plan', {
       method: 'POST',
-      body: { task, effort, kind, model, modelTier, providerBudget, dangerous, acknowledgeFilesystemWrites, cwd, requiresWorkspaceAccess, inlineEvidence },
+      body: { task, effort, kind, model, modelTier, providerBudget, timeoutMs, dangerous, acknowledgeFilesystemWrites, cwd, requiresWorkspaceAccess, inlineEvidence },
       timeoutMs: 20000,
       signal: context?.mcpReq?.signal,
     });

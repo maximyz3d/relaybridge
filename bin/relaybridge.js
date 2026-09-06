@@ -261,6 +261,9 @@ function buildAskBody(
   if (plan.primary.modelTier) body.modelTier = plan.primary.modelTier;
   if (plan.primary.model) body.model = plan.primary.model;
   if (plan.primary.execution) body.execution = plan.primary.execution;
+  if (Number.isFinite(plan.primary.requestedTimeoutMs) && plan.primary.requestedTimeoutMs > 0) {
+    body.timeoutMs = plan.primary.requestedTimeoutMs;
+  }
   const explicitEffort = typeof explicitlyRequestedEffort === 'string'
     ? explicitlyRequestedEffort.trim().toLowerCase() : null;
   if (explicitEffort) body.effort = explicitEffort;

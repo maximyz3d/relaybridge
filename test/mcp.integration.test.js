@@ -919,8 +919,8 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   assert.equal(providerTimeout.structuredContent.modelInvocation, true);
   assert.equal(providerTimeout.structuredContent.droppedOut, true);
   assert.equal(providerTimeout.structuredContent.timedOut, true);
-  assert.equal(providerTimeout.structuredContent.failureClass, 'timeout');
-  assert.equal(providerTimeout.structuredContent.stopReason, 'provider_internal_timeout');
+  assert.equal(providerTimeout.structuredContent.failureClass, 'provider_timeout_unclassified');
+  assert.equal(providerTimeout.structuredContent.stopReason, 'provider_timeout_unclassified');
   assert.equal(providerTimeout.structuredContent.supervisorStopReason, null);
   assert.equal(providerTimeout.structuredContent.providerTimeoutSource, 'provider_cli_diagnostic');
 
@@ -1487,8 +1487,8 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   const providerTimeoutOuter = receipts.structuredContent.receipts.find((receipt) =>
     receipt.receiptId === providerTimeout.structuredContent.receiptId);
   assert.equal(providerTimeoutOuter.status, 'timed_out');
-  assert.equal(providerTimeoutOuter.failureClass, 'timeout');
-  assert.equal(providerTimeoutOuter.stopReason, 'provider_internal_timeout');
+  assert.equal(providerTimeoutOuter.failureClass, 'provider_timeout_unclassified');
+  assert.equal(providerTimeoutOuter.stopReason, 'provider_timeout_unclassified');
   assert.equal(providerTimeoutOuter.supervisorStopReason, null);
   assert.equal(providerTimeoutOuter.providerTimeoutSource, 'provider_cli_diagnostic');
   assert.match(providerTimeoutOuter.transportReceiptId, /^rcpt_/);

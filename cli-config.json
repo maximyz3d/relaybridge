@@ -874,7 +874,7 @@
       "--mode",
       "plan",
       "--print-timeout",
-      "15m",
+      "{supervisor_print_timeout}",
       "--disable-slash-commands",
       "--sandbox",
       "--print",
@@ -891,12 +891,13 @@
       "--mode",
       "accept-edits",
       "--print-timeout",
-      "15m",
+      "{supervisor_print_timeout}",
       "--disable-slash-commands",
       "--dangerously-skip-permissions",
       "--print",
       "{prompt}"
     ],
+    "print_timeout_policy": "supervisor_margin_v1",
     "prompt_max_chars": 24000,
     "probe": [
       "agy.exe",

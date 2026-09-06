@@ -8,10 +8,11 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
-const { RunSupervisor, resolveSupervisorOptions, normalizeProviderBudget } = require('./lib/run-supervisor');
+const { RunSupervisor, normalizeProviderBudget } = require('./lib/run-supervisor');
 const { createAttemptLifecycle } = require('./lib/attempt-lifecycle');
 const { readOllamaStream, readProviderBody, LIMITS: HTTP_PROVIDER_LIMITS } = require('./lib/http-provider-stream');
 const { parseHostedTerminal, classifyHttpTerminal } = require('./lib/http-provider-terminal');
+const { resolveAttemptTiming, renderCliDeadline } = require('./lib/cli-deadline');
 const { validateProviderBudget } = require('./lib/provider-budget');
 const { promptTransportLimits, preparePrompt, renderPromptSlot } = require('./lib/prompt-transport');
 const { resolveProviderControls, validateControlRequest, modelControls } = require('./lib/execution-contract');
@@ -755,6 +756,9 @@ function appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt }
     providerErrorObserved: nonnegativeUsageNumber(payload.provider_error_observed),
     providerErrorInvalid: nonnegativeUsageNumber(payload.provider_error_invalid),
     providerErrorDiagnosticTruncated: payload.provider_error_diagnostic_truncated === true,
+    providerDiagnosticChars: nonnegativeUsageNumber(payload.provider_diagnostic_chars),
+    providerDiagnosticHash: typeof payload.provider_diagnostic_hash === 'string' && /^[a-f0-9]{64}$/.test(payload.provider_diagnostic_hash)
+      ? payload.provider_diagnostic_hash : null,
     providerErrorHash: payload.provider_error_diagnostic
       ? crypto.createHash('sha256').update(String(payload.provider_error_diagnostic)).digest('hex') : null,
     partialResult: payload.partial_result === true,
@@ -2901,10 +2905,13 @@ function validateProviderIntent(body, cfg = loadConfig(), snapshot = captureAllo
     taskTier: body.taskTier, modelTier: body.modelTier, model: body.model,
     effort: body.effort, maxEffortOverride: body.maxEffortOverride,
     execution: body.execution, dangerous: useDanger, phase });
+  const timing = resolveAttemptTiming({ entry, globals: cfg._supervisor || {}, timeoutMs: body.timeoutMs,
+    providerBudget: body.providerBudget, taskTier: body.budgetTaskTier || controls.execution.resolvedTaskTier });
+  const deadline = renderCliDeadline({ entry, slot: controls.slot, supervisorOptions: timing });
   const grounded = prepareGroundedPrompt({ ...body, cwd: snapshot.resolved, cwdIdentityHash: snapshot.cwdIdentityHash,
     seat: body.kind, seatConfig: entry, dangerous: useDanger });
   if (body.prompt !== undefined) preparePrompt(grounded.prompt, {
-    ...promptTransportLimits(entry, controls.slot),
+    ...promptTransportLimits(entry, deadline.slot),
     policyPrefix: !useDanger && typeof entry.oneshot_safe_prompt_prefix === 'string' ? entry.oneshot_safe_prompt_prefix.trim() : '',
   });
   revalidateAllowedCwdIdentity(snapshot);
@@ -3562,6 +3569,7 @@ app.post('/api/plan', planningRequestLimit, async (req, res) => {
       requestedProviderBudget,
       requestedModel: model,
       requestedModelTier: modelTier,
+      requestedTimeoutMs: req.body?.timeoutMs,
       dangerous: filesystemAuthority.dangerous,
     });
     if (kind && plan.primary?.validation) {
@@ -3663,6 +3671,7 @@ app.post('/api/route', planningRequestLimit, async (req, res) => {
       const planned = buildTaskPlan({ route: { ...route, selected: [pick] }, config: cfg,
         registry: modelRegistry, requestedProviderBudget, requestedEffort: req.body?.effort,
         requestedModel: req.body?.model, requestedModelTier: req.body?.modelTier,
+        requestedTimeoutMs: req.body?.timeoutMs,
         dangerous: filesystemAuthority.dangerous }).primary;
       return {
         ...pick,
@@ -3674,6 +3683,7 @@ app.post('/api/route', planningRequestLimit, async (req, res) => {
         validation: planned.validation, blocked: planned.blocked, ready: planned.ready,
         eligible: pick.eligible && planned.eligible, ineligibilityReasons: [...new Set([...(pick.ineligibilityReasons || []), ...planned.ineligibilityReasons])],
         providerBudget: planned.providerBudget,
+        effectiveTimeoutMs: planned.effectiveTimeoutMs, cliDeadline: planned.cliDeadline,
       };
     };
     const selected = (route.selected || []).map(planCandidate);
@@ -4129,8 +4139,8 @@ async function executeOneShot(body, res) {
   // Two timeout regimes compose here. The timeout policy bounds any EXPLICIT
   // caller timeout, so a caller can neither starve a run nor exceed the
   // transport ceiling the MCP client allows. When the caller sends nothing, no
-  // clock is armed for CLI runs at all â€” the progress-based supervisor decides
-  // when a run is actually stuck (lib/run-supervisor.js). HTTP adapters now
+  // separate caller timer is armed; the supervisor still enforces its finite
+  // hard cap and liveness limits (lib/run-supervisor.js). HTTP adapters now
   // share that supervisor and own their physical reader lifetime independently
   // of the requesting socket; they never claim process CPU evidence.
   const explicitTimeout = Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
@@ -4215,11 +4225,17 @@ async function executeOneShot(body, res) {
       errorCode: error.code || null, validation: error.validation || null });
   }
   const { modelChoice, effortResolution, execution } = controls;
+  const supervisorOptions = resolveAttemptTiming({ entry, globals: cfg._supervisor || {},
+    providerBudget: requestedProviderBudget, timeoutMs, startedAt,
+    taskTier: typeof body?.budgetTaskTier === 'string' ? body.budgetTaskTier : execution.resolvedTaskTier });
+  let cliDeadline;
+  try { cliDeadline = renderCliDeadline({ entry, slot: controls.slot, supervisorOptions }); }
+  catch (error) { return rejectBeforeAdmission(400, 'validation', { error: error.message, errorCode: error.code, validation: error.validation }); }
   const requestedEffort = execution.requestedEffort;
   const tierEffort = execution.effortSource === 'task_tier' ? execution.targetEffort : null;
   const effectiveEffort = execution.targetEffort;
   const effortFallbackReason = execution.effortFallbackReason;
-  let slot = resolveSlot(controls.slot);
+  let slot = resolveSlot(cliDeadline.slot);
   const safePromptPrefix = !useDanger && typeof entry.oneshot_safe_prompt_prefix === 'string'
     ? entry.oneshot_safe_prompt_prefix.trim() : '';
   let preparedPrompt, grounding;
@@ -4459,10 +4475,8 @@ async function executeOneShot(body, res) {
     prompt_policy_chars: safePromptPrefix.length,
     transport_prompt_chars: effectivePrompt.length,
     requested_timeout_ms: Number.isFinite(Number(timeoutMs)) ? Math.trunc(Number(timeoutMs)) : null,
-    // With no explicit timeout the CLI path is governed by supervision, so the
-    // effective ceiling is resolved after the supervisor is constructed below;
-    // this records the caller-facing view.
-    effective_timeout_ms: explicitTimeout,
+    effective_timeout_ms: supervisorOptions.hardCapMs,
+    cli_deadline: cliDeadline.deadline,
     timeout_clamped: explicitTimeout != null && Math.trunc(Number(timeoutMs)) !== explicitTimeout,
     environment_overrides: Object.keys({ ...oneShotEnv, ...(isolatedProviderHome?.env || {}) }).sort(),
     request_id: requestId,
@@ -4544,19 +4558,10 @@ async function executeOneShot(body, res) {
     }
     persistCancellationReceipt();
   });
-  const resolvedProviderBudget = resolveSupervisorOptions({
-    entry,
-    globals: cfg._supervisor || {},
-    providerBudget: requestedProviderBudget,
-    taskTier: typeof body?.budgetTaskTier === 'string'
-      ? body.budgetTaskTier
-      : execution.resolvedTaskTier,
-  }).providerBudget;
   if (['ollama_api', 'openai_chat_api'].includes(entry.oneshot_adapter)) {
     return runHttpProviderOneShot({
       entry: { ...entry, model: execution.model }, prompt, effectivePrompt, res, route, startedAt, cwd: resolvedCwd,
-      supervisorOptions: resolveSupervisorOptions({ entry, globals: cfg._supervisor || {}, providerBudget: resolvedProviderBudget,
-        hardCapMs: explicitTimeout, startedAt }),
+      supervisorOptions,
       accountId: dispatchAccount.account?.id || null, releaseAdmission,
       cleanupResources: () => { cleanupPromptFile(); return cleanupProviderHome(); },
     });
@@ -4685,13 +4690,7 @@ async function executeOneShot(body, res) {
   // emitting new content is left alone to finish; one that goes silent or
   // starts repeating itself is stopped early with a reason, so tokens are not
   // spent on a wedged or looping stage. See lib/run-supervisor.js.
-  const supervisor = new RunSupervisor(resolveSupervisorOptions({
-    entry,
-    globals: cfg._supervisor || {},
-    providerBudget: resolvedProviderBudget,
-    hardCapMs: explicitTimeout,
-    startedAt,
-  }));
+  const supervisor = new RunSupervisor(supervisorOptions);
   const runId = `run_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 8)}`;
   activeRuns.set(runId, { runId, kind, route, startedAt, supervisor, pid: proc.pid });
   let stopReason = null;
@@ -4835,6 +4834,16 @@ async function executeOneShot(body, res) {
       model_usage: [],
     } : null);
     const cleanedStdout = parsedOutput.output;
+    // Codex exec's text mode puts the final answer on stdout and its progress
+    // transcript (including tool output and echoed prompts) on stderr. An
+    // exit-zero final answer cannot acquire quota/budget/auth failure from a
+    // source file that the agent read. Keep count/hash, not that large private
+    // transcript. Failed/no-answer runs still use their diagnostic channel.
+    // https://learn.chatgpt.com/docs/non-interactive-mode
+    const codexProgressTranscript = (kind === 'codex' || entry.npm_package === '@openai/codex')
+      && (entry.oneshot_output_parser || 'text') === 'text' && code === 0 && !!cleanedStdout
+      && !parsedOutput.isError && !parsedOutput.parseError && !parsedOutput.failureClass && !stopReason;
+    const providerStderr = codexProgressTranscript ? '' : stderr;
     if (Array.isArray(parsedOutput.usage?.model_usage) && parsedOutput.usage.model_usage.length) {
       const dominant = [...parsedOutput.usage.model_usage].sort((left, right) =>
         Number(right.cost_usd || 0) - Number(left.cost_usd || 0)
@@ -4854,7 +4863,7 @@ async function executeOneShot(body, res) {
     // or in stdout only when the process itself failed / returned no answer.
     // This prevents an audit discussing "rate limit" or HTTP 429 handling from
     // being misclassified as a provider failure.
-    const failureBlob = (stderr + ((code !== 0 || !cleanedStdout || parsedOutput.isError || parsedOutput.parseError)
+    const failureBlob = (providerStderr + ((code !== 0 || !cleanedStdout || parsedOutput.isError || parsedOutput.parseError)
       ? ('\n' + semanticStdout) : '') + ('\n' + (parsedOutput.diagnostic || ''))).toLowerCase();
     const rate_signals = [
       'rate limit', 'rate-limit', 'too many requests', 'quota exceeded', 'usage limit reached',
@@ -4865,21 +4874,21 @@ async function executeOneShot(body, res) {
     const budget_signals = ['exceeded usd budget','exceeded the usd budget','max-budget-usd','budget exceeded','budget cap reached'];
     const authoritativeApiFailure = claudeApiStatusFailureClass(
       parsedOutput.apiErrorStatus,
-      cleanOutput([stderr, parsedOutput.diagnostic].filter(Boolean).join('\n')),
+      cleanOutput([providerStderr, parsedOutput.diagnostic].filter(Boolean).join('\n')),
     );
     const tokenBudgetExceeded = stopReason === 'token_budget';
     const terminalQuotaEvidence = acceptedTerminalQuotaEvidence(parsedOutput, kind);
     const copilotQuotaEvidence = tokenBudgetExceeded ? null : detectCopilotMonthlyQuota({
       provider: kind,
       stdout: cleanedStdout,
-      stderr,
+      stderr: providerStderr,
       exitCode: code,
     });
     const runClassification = classifyRunFailure({
       provider: kind,
       prompt,
       stdout: cleanedStdout,
-      stderr: cleanOutput([stderr, parsedOutput.diagnostic].filter(Boolean).join('\n')),
+      stderr: cleanOutput([providerStderr, parsedOutput.diagnostic].filter(Boolean).join('\n')),
       exitCode: code,
       modelFlagSent: !!route.model_flag_sent,
       stopReason,
@@ -4908,10 +4917,10 @@ async function executeOneShot(body, res) {
         && runClassification.kind === 'auth_failed');
     const permission_denied = authoritativeApiFailure === 'permission'
       || runClassification.kind === 'headless_command_permission_auto_denied';
-    // Provider CLIs can enforce their own request deadline before RelayBridge's
-    // progress supervisor fires. Promote only authoritative failed/no-answer
-    // diagnostics; healthy model prose that discusses timeouts must remain a
-    // successful response.
+    // This is a CLI-reported timeout, not proof of which timer expired.
+    // Antigravity emits identical text for local context errors and trajectory
+    // errors. Preserve uncertainty unless Relay or structured API status gives
+    // the cause; healthy model prose discussing timeouts remains successful.
     const providerInternalTimedOut = (code !== 0 || !cleanedStdout || parsedOutput.isError)
       && hasProviderInternalTimeoutDiagnostic(failureBlob);
     const providerTimedOut = timedOut || authoritativeApiFailure === 'timeout' || providerInternalTimedOut;
@@ -4924,7 +4933,8 @@ async function executeOneShot(body, res) {
       : authoritativeApiFailure || (rate_limited ? 'rate_limit'
         : budget_exceeded ? 'budget'
           : auth_failed ? 'auth'
-            : providerTimedOut ? 'timeout'
+            : timedOut ? 'timeout'
+              : providerInternalTimedOut ? 'provider_timeout_unclassified'
               : permission_denied ? 'policy'
                 : parsedOutput.failureClass || (code !== 0 ? runClassification.kind : null));
     const dropped_out = !isolationCleanup.ok || tokenBudgetExceeded || providerTimedOut || code !== 0 || permission_denied || rate_limited || budget_exceeded
@@ -4935,7 +4945,9 @@ async function executeOneShot(body, res) {
       route,
       exitCode: code,
       stdout: cleanedStdout,
-      stderr: cleanOutput([stderr, parsedOutput.diagnostic, parsedOutput.parseError].filter(Boolean).join('\n')),
+      stderr: cleanOutput([providerStderr, parsedOutput.diagnostic, parsedOutput.parseError].filter(Boolean).join('\n')),
+      ...(codexProgressTranscript ? { provider_diagnostic_chars: stderr.length,
+        provider_diagnostic_hash: crypto.createHash('sha256').update(stderr).digest('hex') } : {}),
       usage: authoritativeUsage,
       failureClass: finalFailureClass,
       result_subtype: parsedOutput.resultSubtype,
@@ -4971,7 +4983,7 @@ async function executeOneShot(body, res) {
       policy_detail: permission_denied ? runClassification.detail : null,
       model: modelChoice.model,
       model_tier: modelChoice.modelTier,
-      stop_reason: stopReason || (providerInternalTimedOut ? 'provider_internal_timeout' : null),
+      stop_reason: stopReason || (providerInternalTimedOut ? 'provider_timeout_unclassified' : null),
       supervisor_stop_reason: stopReason,
       provider_timeout_source: timedOut ? 'relay_supervisor'
         : authoritativeApiFailure === 'timeout' ? 'provider_api_status'

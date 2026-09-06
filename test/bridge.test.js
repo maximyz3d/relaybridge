@@ -154,8 +154,9 @@ test('provider config uses the installed subscription CLIs and safe headless mod
   assert.deepEqual(config.gemini.login_command, ['agy'], 'Antigravity signs in through its own interactive TUI');
   assert.equal(config.gemini.oneshot_safe[config.gemini.oneshot_safe.indexOf('--add-dir') + 1], '{cwd}');
   assert.equal(config.gemini.oneshot_safe[config.gemini.oneshot_safe.indexOf('--effort') + 1], 'high');
-  assert.equal(config.gemini.oneshot_safe[config.gemini.oneshot_safe.indexOf('--print-timeout') + 1], '15m');
-  assert.equal(config.gemini.oneshot_dangerous[config.gemini.oneshot_dangerous.indexOf('--print-timeout') + 1], '15m');
+  assert.equal(config.gemini.print_timeout_policy, 'supervisor_margin_v1');
+  assert.equal(config.gemini.oneshot_safe[config.gemini.oneshot_safe.indexOf('--print-timeout') + 1], '{supervisor_print_timeout}');
+  assert.equal(config.gemini.oneshot_dangerous[config.gemini.oneshot_dangerous.indexOf('--print-timeout') + 1], '{supervisor_print_timeout}');
   assert.deepEqual(config.gemini.model_tiers.light, {
     args: ['--model', 'gemini-3.5-flash-low'], model: 'gemini-3.5-flash-low',
     suppress_args: [{ flag: '--effort', value_count: 1 }], note: 'current low-effort Flash id reported by agy models',
@@ -2207,7 +2208,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(noTimeoutResponse.status, 200);
   const noTimeoutResult = await noTimeoutResponse.json();
   assert.equal(noTimeoutResult.route.requested_timeout_ms, null);
-  assert.equal(noTimeoutResult.route.effective_timeout_ms, null);
+  assert.equal(noTimeoutResult.route.effective_timeout_ms, 2700000);
   assert.equal(noTimeoutResult.route.timeout_clamped, false);
   assert.equal(noTimeoutResult.stop_reason, null);
 
@@ -2220,8 +2221,8 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   const providerTimeoutResult = await providerTimeoutResponse.json();
   assert.equal(providerTimeoutResult.dropped_out, true);
   assert.equal(providerTimeoutResult.timed_out, true);
-  assert.equal(providerTimeoutResult.failureClass, 'timeout');
-  assert.equal(providerTimeoutResult.stop_reason, 'provider_internal_timeout');
+  assert.equal(providerTimeoutResult.failureClass, 'provider_timeout_unclassified');
+  assert.equal(providerTimeoutResult.stop_reason, 'provider_timeout_unclassified');
   assert.equal(providerTimeoutResult.supervisor_stop_reason, null);
   assert.equal(providerTimeoutResult.provider_timeout_source, 'provider_cli_diagnostic');
   assert.equal(providerTimeoutResult.usage, null);
@@ -2230,8 +2231,8 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   ).trim().split(/\r?\n/).map((line) => JSON.parse(line));
   const providerTimeoutReceipt = providerTimeoutLedger.find((row) => row.receiptId === providerTimeoutResult.receiptId);
   assert.equal(providerTimeoutReceipt.status, 'timed_out');
-  assert.equal(providerTimeoutReceipt.failureClass, 'timeout');
-  assert.equal(providerTimeoutReceipt.stopReason, 'provider_internal_timeout');
+  assert.equal(providerTimeoutReceipt.failureClass, 'provider_timeout_unclassified');
+  assert.equal(providerTimeoutReceipt.stopReason, 'provider_timeout_unclassified');
   assert.equal(providerTimeoutReceipt.supervisorStopReason, null);
   assert.equal(providerTimeoutReceipt.providerTimeoutSource, 'provider_cli_diagnostic');
 

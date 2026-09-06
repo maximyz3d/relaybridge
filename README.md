@@ -414,6 +414,18 @@ Codex receives a host-side tool timeout long enough to cover the provider cap an
 grace. These longer deadlines do not change `dangerous:false`, advisory-only
 committee behavior, or any human gate.
 
+Gemini/Antigravity print slots use `print_timeout_policy: supervisor_margin_v1`
+and the server-owned `{supervisor_print_timeout}` placeholder. Preview and
+dispatch derive its finite wait from the effective supervisor hard cap plus
+30–31 seconds; no fixed 15-minute or unlimited override is used. Both safe and
+writer slots follow this rule, and linked-account flags cannot override it.
+`primary.cliDeadline` and `route.cli_deadline` report the rendered value;
+changing the runtime timeout does not change the bound model/effort tuple.
+The CLI forwards the planned deadline. Raw REST requests with no explicit
+timeout use the supervisor's configured hard cap (45 minutes by default),
+while MCP callers normally supply the shared 20-minute default.
+See [Antigravity headless timeout controls](https://antigravity.google/docs/cli/headless/).
+
 Common setup commands:
 
 ```powershell
@@ -684,10 +696,21 @@ counts retain their additive accounting.
 Timeout receipts distinguish the causal layer. A Relay liveness stop reports
 `providerTimeoutSource: relay_supervisor`; an upstream HTTP timeout reports
 `provider_api_status`; and a provider CLI that exits with an authoritative
-internal-timeout diagnostic reports `provider_cli_diagnostic`. All three are
-normalized to `timed_out` / `failureClass: timeout`, while `stopReason` and
-`supervisorStopReason` preserve whether Relay itself killed the process. Token
-usage remains unknown when the provider did not report it.
+timeout diagnostic reports `provider_cli_diagnostic` and canonical
+`failureClass: provider_timeout_unclassified`. The latter retains the
+provider-reported `timed_out` flag, but does not prove whether a local print
+wait, cancellation, or upstream request failed. Antigravity 1.1.22 uses the
+same error text for more than one of these paths; elapsed time and exact text
+are not sufficient to claim an API status or local timer cause. Confirmed
+Relay/HTTP timeouts remain `failureClass: timeout`; `stopReason` and
+`supervisorStopReason` preserve whether Relay itself stopped the process.
+Token usage remains unknown when the provider did not report it.
+
+A successful Codex text-mode run uses its nonempty final stdout as the answer;
+stderr is a progress transcript, not failure evidence. Such progress text is
+neither returned nor persisted: receipts retain only its character count and
+SHA-256. Failed or empty-answer runs retain diagnostic classification. This
+matches [Codex's stdout/stderr contract](https://learn.chatgpt.com/docs/non-interactive-mode).
 
 Provider success is based on the normalized terminal result, not only the
 process exit code. In particular, a Perplexity exit-zero response whose exact
