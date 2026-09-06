@@ -2,7 +2,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { RunSupervisor } = require('../lib/run-supervisor');
-const { createAttemptLifecycle } = require('../lib/attempt-lifecycle');
+const { createAttemptLifecycle, normalizeTransportLifecycle } = require('../lib/attempt-lifecycle');
 
 function fixture(options = {}) {
   let clock = 0, releases = 0, stops = 0, boundaries = 0;
@@ -165,4 +165,69 @@ test('scheduler failure rolls back admission and reentrant timer cleanup settles
   const result = await life.settlePhysical({ evidence: 'not_dispatched', persist() { persisted++; } });
   assert.equal(persisted, 1); assert.equal(releases, 2); assert.equal(registry.size, 0);
   assert.equal(result.snapshot.callbackErrors.length, 1);
+});
+
+test('quarantine preserves admission and resources until independently verified settlement', async () => {
+  const f = fixture(); f.bind('cli'); f.life.markDispatched();
+  f.life.sealOutcome({ ok: true });
+  let physicalFinished = false, cleaned = 0, persisted = 0, terminal;
+  f.life.physicalDone.then(() => { physicalFinished = true; });
+  const diagnostic = f.life.quarantinePhysical({ error: new Error('private path and provider content') });
+  assert.equal(f.life.quarantinePhysical(), diagnostic);
+  assert.equal(f.life.clientDetached(), false);
+  f.advance(10000); assert.equal(f.life.evaluate(), false);
+  await Promise.resolve();
+  assert.equal(physicalFinished, false); assert.equal(f.registry.size, 1);
+  assert.deepEqual(f.counts(), { releases: 0, stops: 0, boundaries: 0 });
+  assert.equal(f.life.snapshot().phase, 'quarantined');
+  assert.equal(f.life.snapshot().physicalEvidence, null);
+  assert.equal(f.life.snapshot().finalized, false);
+  assert.equal(f.life.snapshot().cleanupStatus, 'quarantined_unverified');
+  assert.equal(JSON.stringify(f.life.snapshot()).includes('private'), false);
+  for (const evidence of ['spawn_failed', 'not_dispatched', 'process_tree_unverified']) {
+    assert.throws(() => f.life.settlePhysical({ evidence }), /matching transport/);
+  }
+  const first = f.life.settlePhysical({ evidence: 'process_tree_settled', cleanup() {
+    cleaned++; assert.equal(f.life.settlePhysical({ evidence: 'process_tree_settled' }), first);
+    assert.equal(f.life.quarantinePhysical(), first); return { ok: true };
+  }, persist({ outcome }) { persisted++; terminal = outcome; } });
+  assert.equal(f.life.settlePhysical({ evidence: 'process_tree_settled' }), first);
+  await first;
+  assert.equal(physicalFinished, true); assert.equal(cleaned, 1); assert.equal(persisted, 1);
+  assert.equal(terminal.ok, true); assert.equal(f.counts().releases, 1); assert.equal(f.registry.size, 0);
+  assert.equal(f.life.snapshot().phase, 'settled');
+});
+
+test('startup quarantine cannot be revived by late identity, output, usage, CPU or timers', async () => {
+  let tick, clearCalls = 0, life;
+  const registry = new Map();
+  life = createAttemptLifecycle({ runId: 'run_startup_quarantine', registry, supervisor: new RunSupervisor(),
+    releaseAdmission() { assert.fail('unknown owner released admission'); }, schedule(fn) { tick = fn; return 1; },
+    clearSchedule() { clearCalls++; assert.equal(life.snapshot().phase, 'quarantined'); tick(); } });
+  life.bindTransport({ type: 'cli', requestStop() { assert.fail('late stop attempted'); } });
+  life.quarantinePhysical();
+  assert.equal(life.markDispatched(), false);
+  assert.throws(() => life.identifyProcess(321), /identity handoff/);
+  assert.equal(life.observeOutput('late'), false);
+  assert.equal(life.observeUsage({ total_tokens: 900 }), false);
+  assert.equal(life.observeCpu(1000), false);
+  assert.equal(life.requestStop({ reason: 'client_cancelled' }), false);
+  tick(); assert.equal(clearCalls, 1); assert.equal(registry.size, 1);
+  assert.equal(life.sealOutcome({ status: 'unsettled' }), true);
+  assert.equal(life.snapshot().phase, 'quarantined');
+  const normalized = normalizeTransportLifecycle({ ...life.snapshot(),
+    quarantine: { ...life.snapshot().quarantine, detail: 'private prose', diagnosticHash: 'bad' } });
+  assert.equal(normalized.phase, 'quarantined'); assert.equal(normalized.physicalEvidence, null);
+  assert.deepEqual(Object.keys(normalized.quarantine).sort(), ['at', 'code']);
+  assert.equal(JSON.stringify(normalized).includes('private'), false);
+});
+
+test('quarantine preserves the first stop reason and rejects non-CLI transports', async () => {
+  const f = fixture(); f.bind('cli'); f.life.markDispatched();
+  f.life.requestStop({ reason: 'token_budget', source: 'supervisor' }); f.life.quarantinePhysical();
+  f.life.clientDetached(); assert.equal(f.life.snapshot().stop.reason, 'token_budget');
+  assert.deepEqual(f.counts(), { releases: 0, stops: 1, boundaries: 1 });
+  await f.life.settlePhysical({ evidence: 'process_tree_settled' });
+  const http = fixture(); http.bind(); assert.throws(() => http.life.quarantinePhysical(), /CLI transport/);
+  await http.life.settlePhysical({ evidence: 'not_dispatched' });
 });
