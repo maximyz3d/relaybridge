@@ -109,6 +109,41 @@ function createInput(cwd, taskTier = 'complex', permissionMode = 'full') {
   };
 }
 
+test('expired implementation status is inert and explains why renewal/completion are unavailable', (t) => {
+  const f = fixture(t);
+  const created = f.controller.create(createInput(f.cwd));
+  f.pipeline.completeResearch(created.runId, { markdown: 'Research.' });
+  f.pipeline.startPlanning(created.runId);
+  f.pipeline.completePlanning(created.runId, { markdown: 'Accepted bounded plan.' });
+  const started = f.controller.startImplementation(created.runId, { leaseMs: 100 });
+  const before = JSON.stringify(f.pipeline.get(created.runId));
+  const live = f.controller.view(created.runId, { includeArtifacts: false });
+  assert.deepEqual(live.nextActions, ['complete_pipeline_implementation', 'renew_pipeline_writer_lease']);
+  assert.equal(live.blockedActions, undefined);
+  f.clock.value = started.lease.expiresAt;
+  for (let read = 0; read < 3; read += 1) {
+    const view = f.controller.view(created.runId, { includeArtifacts: false });
+    assert.equal(view.workflow.phase, 'implementing');
+    assert.deepEqual(view.nextActions, []);
+    assert.deepEqual(view.blockedActions, [{ code: 'LEASE_EXPIRED', recovery: 'unavailable_unbound_owner',
+      actions: ['complete_pipeline_implementation', 'renew_pipeline_writer_lease'] }]);
+    assert.equal(JSON.stringify(f.pipeline.get(created.runId)), before);
+    assert.equal(f.tasks.size, 0, 'status never dispatches a replacement provider');
+  }
+  assert.throws(() => f.controller.renewWriterLease(created.runId, { leaseToken: started.lease.leaseToken }),
+    (error) => error.code === 'LEASE_EXPIRED');
+  assert.throws(() => f.controller.completeImplementation(created.runId, {
+    leaseToken: started.lease.leaseToken, markdown: 'Must not advance expired work.' }),
+  (error) => error.code === 'LEASE_EXPIRED');
+  assert.equal(JSON.stringify(f.pipeline.get(created.runId)), before);
+});
+
+test('missing implementation lease identity never advertises completion or renewal', (t) => {
+  const f = fixture(t);
+  assert.deepEqual(f.controller.nextActions({ phase: 'implementing', writerLease: null }), []);
+  assert.deepEqual(f.controller.nextActions({ phase: 'implementing', writerLease: { expiresAt: 'later' } }), []);
+});
+
 test('controller drives the complete Codex-Claude handoff without overlapping writers', (t) => {
   const f = fixture(t);
   const created = f.controller.create(createInput(f.cwd));

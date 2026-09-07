@@ -6,6 +6,8 @@ const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
 
 const {
   PHASES,
@@ -330,8 +332,8 @@ test('cancelling during provider retry backoff clears retry state cleanly', (t) 
   assert.equal(cancelled.providerRetry, null);
 });
 
-test('one canonical cwd has one writer; only an expired lock may be reclaimed', (t) => {
-  const { pipeline, cwd, root, clock } = fixture(t, { pipeline: { leaseMs: 100 } });
+test('one canonical cwd has one writer; expiry never authorizes takeover, including after restart', (t) => {
+  const { pipeline, cwd, root, dataDir, clock, restart } = fixture(t, { pipeline: { leaseMs: 100 } });
   const alias = path.join(root, 'project-alias');
   fs.symlinkSync(cwd, alias, 'dir');
   const firstId = 'wf_first_333333333333';
@@ -341,18 +343,98 @@ test('one canonical cwd has one writer; only an expired lock may be reclaimed', 
   assert.equal(pipeline.get(firstId).cwd, pipeline.get(secondId).cwd, 'symlink paths must canonicalize');
 
   const first = pipeline.startImplementation(firstId, { actor: 'codex-a' });
+  const lockPath = path.join(dataDir, 'writer-locks', `${pipeline.get(firstId).writerLease.cwdSha256}.json`);
+  const originalLock = fs.readFileSync(lockPath, 'utf8');
   clock.value += 99;
   throwsCode(() => pipeline.startImplementation(secondId, { actor: 'codex-b' }), 'WRITER_CONFLICT');
   clock.value += 1;
-  const second = pipeline.startImplementation(secondId, { actor: 'codex-b' });
-  assert.notEqual(second.lease.leaseToken, first.lease.leaseToken);
+  for (const instance of [pipeline, restart(), restart()]) {
+    assert.throws(() => instance.startImplementation(secondId, { actor: 'codex-b' }), (error) => {
+      assert.equal(error.code, 'WRITER_LEASE_HELD_EXPIRED');
+      assert.equal(error.details.runId, firstId);
+      assert.equal(error.details.expired, true);
+      assert.equal(error.details.recovery, 'unavailable_unbound_owner');
+      assert.equal(JSON.stringify(error.details).includes(first.lease.leaseToken), false);
+      return true;
+    });
+    assert.equal(fs.readFileSync(lockPath, 'utf8'), originalLock, 'expired ownership must remain byte-for-byte intact');
+    assert.equal(instance.get(secondId).phase, 'plan_ready');
+  }
   throwsCode(() => pipeline.completeImplementation(firstId, {
     actor: 'codex-a', leaseToken: first.lease.leaseToken, markdown: '# Implementation\nStale writer.',
-  }), 'LEASE_MISMATCH');
-  const done = pipeline.completeImplementation(secondId, {
-    actor: 'codex-b', leaseToken: second.lease.leaseToken, markdown: '# Implementation\nCurrent writer.',
+  }), 'LEASE_EXPIRED');
+  assert.equal(pipeline.get(firstId).phase, 'implementing');
+});
+
+test('concurrent restarted processes cannot replace expired workspace ownership', async (t) => {
+  const { pipeline, cwd, dataDir, clock } = fixture(t, { pipeline: { leaseMs: 100 } });
+  const ownerId = 'wf_owner_333333333333';
+  const contenders = ['wf_racea_444444444444', 'wf_raceb_555555555555'];
+  for (const id of [ownerId, ...contenders]) advanceToPlanReady(pipeline, cwd, id);
+  pipeline.startImplementation(ownerId);
+  clock.value += 100;
+  const lockPath = path.join(dataDir, 'writer-locks', `${pipeline.get(ownerId).writerLease.cwdSha256}.json`);
+  const originalLock = fs.readFileSync(lockPath, 'utf8');
+  const script = `const p = require(process.argv[1]).createWorkflowPipeline({ dataDir: process.argv[2], now: () => Number(process.argv[3]) });
+    try { p.startImplementation(process.argv[4]); process.exitCode = 2; }
+    catch (error) { process.stdout.write(JSON.stringify({ code: error.code, phase: p.get(process.argv[4]).phase })); }`;
+  const results = await Promise.all(contenders.map((id) => promisify(execFile)(process.execPath,
+    ['-e', script, require.resolve('../lib/workflow-pipeline'), dataDir, String(clock.value), id],
+    { timeout: 10000, maxBuffer: 8192 })));
+  for (const result of results) assert.deepEqual(JSON.parse(result.stdout), {
+    code: 'WRITER_LEASE_HELD_EXPIRED', phase: 'plan_ready',
   });
-  assert.equal(done.phase, 'implementation_ready');
+  assert.equal(fs.readFileSync(lockPath, 'utf8'), originalLock);
+});
+
+for (const method of ['lstatSync', 'readFileSync']) {
+  test(`an authorized release during ${method} after EEXIST permits a fresh exclusive claim`, (t) => {
+    const { pipeline, cwd, dataDir } = fixture(t);
+    const ownerId = 'wf_release_333333333333', nextId = 'wf_next_444444444444';
+    for (const id of [ownerId, nextId]) advanceToPlanReady(pipeline, cwd, id);
+    const first = pipeline.startImplementation(ownerId);
+    const lockPath = path.join(dataDir, 'writer-locks', `${pipeline.get(ownerId).writerLease.cwdSha256}.json`);
+    const original = fs[method];
+    let armed = true, releases = 0;
+    fs[method] = function (file, ...args) {
+      if (String(file) === lockPath && armed) {
+        armed = false;
+        pipeline.completeImplementation(ownerId, { leaseToken: first.lease.leaseToken,
+          markdown: 'The original writer explicitly finished before the contender inspected its lock.' });
+        releases += 1;
+      }
+      return original.call(this, file, ...args);
+    };
+    let next;
+    try { next = pipeline.startImplementation(nextId); }
+    finally { fs[method] = original; }
+    assert.equal(releases, 1);
+    assert.equal(next.workflow.phase, 'implementing');
+    assert.equal(pipeline.get(ownerId).phase, 'implementation_ready');
+    assert.notEqual(next.lease.leaseToken, first.lease.leaseToken);
+    assert.equal(JSON.parse(fs.readFileSync(lockPath, 'utf8')).runId, nextId);
+  });
+}
+
+test('malformed and unreadable existing locks remain untouched during acquisition', (t) => {
+  const { pipeline, cwd, dataDir } = fixture(t);
+  const ownerId = 'wf_badlock_333333333333', nextId = 'wf_denied_444444444444';
+  for (const id of [ownerId, nextId]) advanceToPlanReady(pipeline, cwd, id);
+  pipeline.startImplementation(ownerId);
+  const lockPath = path.join(dataDir, 'writer-locks', `${pipeline.get(ownerId).writerLease.cwdSha256}.json`);
+  const original = fs.readFileSync;
+  const prior = original(lockPath, 'utf8');
+  fs.readFileSync = function (file, ...args) {
+    if (String(file) === lockPath) throw Object.assign(new Error('synthetic denial'), { code: 'EACCES' });
+    return original.call(this, file, ...args);
+  };
+  try { throwsCode(() => pipeline.startImplementation(nextId), 'LOCK_CORRUPT'); }
+  finally { fs.readFileSync = original; }
+  assert.equal(fs.readFileSync(lockPath, 'utf8'), prior);
+  fs.writeFileSync(lockPath, '{corrupt fixture', 'utf8');
+  throwsCode(() => pipeline.startImplementation(nextId), 'LOCK_CORRUPT');
+  assert.equal(fs.readFileSync(lockPath, 'utf8'), '{corrupt fixture');
+  assert.equal(pipeline.get(nextId).phase, 'plan_ready');
 });
 
 test('wrong actor or token cannot complete, renew, release, or terminate a writer lease', (t) => {
