@@ -9,6 +9,9 @@ Transfer: `RB-QUEUE-EXTERNAL-2026-09-07`.
 - Starting main: `7c0ccd41360b1c2157e3f4d74336afeb7fd7b655`.
 - Starting base/PR120 head: `32838571fa3d2f6397f99e3d4330968f49e741bd`.
 - Branch: `external/queue-reliability-20260907`, isolated Linux-native worktree.
+- Direct upstream push was denied (the connected account has pull-only access).
+  Delivery uses the `soverSQ4D/relaybridge` fork and the same feature branch; no
+  credentials or shared remote configuration were changed.
 - Stacked PR base: `codex/control-center-repair`. Depends on open draft PR120.
 - Initial frozen implementation: `afc70ff31131231771747e099aedeff5ebfd2635`.
 - Final code after timer corrections: `0089374d60d38f1b516da7a6fb87f25fcbba2674`.
@@ -79,7 +82,12 @@ with focused fixtures before the frozen implementation commit.
 A fresh native Astra review of `afc70ff` reproduced two timer defects: a due
 admission retry lost its deadline wakeup behind occupied slots, and repeated
 uncertain-writer reconciliation kept resetting the lease heartbeat. Commit
-`0089374` fixes both with deterministic regression tests.
+`0089374` fixes both with deterministic regression tests. A fresh supplementary
+Astra verification read back `0089374d60d38f1b516da7a6fb87f25fcbba2674`, independently
+ran the two new regressions (2 passed), confirmed both findings resolved, and
+reported no additional confirmed material defects in the reviewed owned lane.
+This local Codex verification has no provider receipt and does not replace the
+missing Claude verdict.
 
 The fresh Claude final-review request explicitly selected Sonnet/high and frozen
 commit `afc70ff31131231771747e099aedeff5ebfd2635`. It was rejected by admission
