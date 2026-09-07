@@ -83,6 +83,8 @@ tasks per batch checked before planning. A rejected submission returns HTTP 429,
 This is a local request-burst guard, not provider concurrency or vendor quota;
 already accepted tasks and status reads are unaffected. Clients must retain a
 rejected request and retry after the indicated interval, not report it queued.
+Local loopback clients share an IP and therefore share this burst allowance;
+it is not a separate allowance per chat.
 
 - **Classify** — `classifyTask` decides the tier. A caller may declare a *lower*
   tier than the classifier, never a higher one; raising it here would be an

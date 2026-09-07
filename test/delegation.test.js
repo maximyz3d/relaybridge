@@ -606,3 +606,27 @@ test('records remain in the normalized dedicated directory across reopen', () =>
   assert.equal(reopened.get(record.delegationId).delegationId, record.delegationId);
   assert.equal(reopened.list()[0].delegationId, record.delegationId);
 });
+
+test('list and stats ignore benign stray filenames in the storage directory', () => {
+  const { delegation, dir } = coordinator();
+  const record = delegation.delegate({ cwd: CWD, tasks: [task()] });
+  for (const name of ['dlg_a copy.json', 'notes.json', 'dlg_.json']) {
+    fs.writeFileSync(path.join(dir, name), JSON.stringify({ note: 'unrelated local file' }));
+  }
+  assert.deepEqual(delegation.list().map((entry) => entry.delegationId), [record.delegationId]);
+  assert.deepEqual(delegation.stats(), { queued: 0, running: 1, awaitingEscalation: 0, settled: 0, blocked: 0 });
+});
+
+test('repeated normal atomic writes retain one complete record without temporary leaves', () => {
+  const { delegation, queue, dir } = coordinator();
+  const record = delegation.delegate({ cwd: CWD, tasks: [task()] });
+  const queued = queue.tasks.get(record.entries[0].correlation.taskId);
+  for (const status of ['queued', 'running', 'done']) {
+    queued.status = status;
+    const loaded = delegation.get(record.delegationId);
+    assert.equal(loaded.entries[0].status, status);
+    assert.deepEqual(fs.readdirSync(dir), [`${record.delegationId}.json`]);
+    const persisted = JSON.parse(fs.readFileSync(path.join(dir, `${record.delegationId}.json`), 'utf8'));
+    assert.equal(persisted.entries[0].status, status);
+  }
+});
