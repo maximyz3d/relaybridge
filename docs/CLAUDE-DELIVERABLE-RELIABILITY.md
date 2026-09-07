@@ -1,5 +1,40 @@
 # Claude final-deliverable reliability
 
+## Operator hotfix verification (2026-09-07)
+
+Source changes are published in PR120; publishing does not deploy a running
+bridge. The approved Claude/Fable headless arrays from164859a were separately
+applied to the effective operator configuration. The existing server reads that
+configuration per request, allowing this scoped mitigation without a restart.
+Every other parsed configuration field was preserved. The prompt-module change
+and the whole candidate branch have **not** been installed by this operation.
+
+A real safe bridge-mediated Sonnet/medium call returned a complete
+`VERIFICATION: PASS`: outer receipt `rcpt_mtruwlq1_98dcc207`, transport receipt
+`rcpt_mtruwtmd_2eae4764`, five turns, exit0, no permission denials, provider errors
+or retries. This verifies that model/profile combination, not all accounts,
+Fable generation, the whole PR, or every pipeline phase. A successful call also
+cleared the existing seat cooldown through ordinary success handling; no quota
+records were manually reset. A separate supervisor-token-budget versus rate-limit
+accounting contradiction remains diagnosed but unrepaired.
+
+### Repair client identity before retrying provider work
+
+An existing MCP process pins its expected build when it starts. Reconnect it
+after upgrades. If a fresh process still fails, check the checkout selected by
+the launcher against the actual running server: a fresh client from a different
+or stale-manifest checkout cannot fix itself simply by reconnecting again.
+Align MCP, CLI and autostart launchers to the same verified frozen release;
+do not copy a build ID, bypass identity checks, or repeatedly restart a healthy
+shared listener. Move client and server together at the next reviewed deployment.
+
+Validate an identity-gated, non-provider action such as `route_preview`, not only
+the ungated health/status endpoint. The local launcher correction passed this
+check without changing the running server PID/build. Old adapters still require
+one reconnect; other clients can use a fresh matching adapter in the meantime.
+Preserve failed workflows as no verdict and resume only their authorized next
+action; connection repair is not permission to replay an interrupted writer.
+
 ## Failure and bounded mitigation
 
 A successful Claude CLI exit is not an accepted plan or review. In an observed
