@@ -94,6 +94,48 @@ MCP: `usage_gauges`, `usage_totals`, `usage_advise` — all reads, so they stay
 available through the connector's safe profile. Knowing how much fuel is left
 is exactly what a remote surface needs to decide whether to delegate at all.
 
+## The capacity view (`/api/fuel`)
+
+`GET /api/fuel` (MCP: `fuel_gauge`) answers "can this bridge take more work right
+now, and what is it burning?" in one read. It is a pure assembly over state the
+bridge already owns — the task queue, admission control, the usage ledger, and
+the cooldown store — not a new source of truth.
+
+| field | source |
+|---|---|
+| `queue.depth`, `queue.active`, `queue.saturated` | `task_queue` |
+| `localRuns.byProvider`, `atFleetLimit`, `providersAtLimit` | `admission_control` |
+| `providerUsage` | usage ledger, **only** where the provider reports authoritatively |
+| `vendorSignals` | recognized 429 evidence, operator readings, active cooldowns |
+| `delegations`, `incidents` | delegation and incident backlogs |
+
+Depth alone hides the difference between "busy" and "wedged", so saturation
+against the configured concurrency is reported as its own flag.
+
+### What it refuses to say
+
+**RelayBridge has no account-wide real-time quota for any provider.** A second
+machine, a browser tab, or a teammate can burn the same seat without this
+process ever hearing about it. So the view carries
+`claims.accountWideRealTimeQuota: false` and reports the gaps explicitly rather
+than omitting them — an omitted field reads as zero, and "zero usage outside
+this bridge" is a claim we are not entitled to make:
+
+```json
+"unknown": {
+  "accountWideQuota": "unknown",
+  "usageOutsideThisBridge": "unknown",
+  "concurrentSessionsElsewhere": "unknown",
+  "providersWithoutAuthoritativeUsage": ["claude"]
+}
+```
+
+A seat whose provider capability is not `tokens: "authoritative"` reports
+`source: "unavailable"` and `tokens: null` — never a character-count estimate.
+An estimate here would look like a meter while being wrong in the expensive
+direction. A seat with no capability entry at all is treated as unavailable, not
+as available.
+
 Dashboard: **⛽ Fuel** — per-seat bars, burn rate, time-to-empty, per-model
 breakdown, plan value vs metered spend, and a fleet-balance banner. Active
 vendor observations show actual/limit, model, and conservative expiry.

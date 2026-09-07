@@ -3104,6 +3104,143 @@ export function buildServer() {
     annotations: READ_ONLY,
   }, safeHandler(async (input, context) => result(await bridgeRequest('/api/usage/advise', { method: 'POST', body: input, signal: context?.mcpReq?.signal }))));
 
+  server.registerTool('fuel_gauge', {
+    title: 'Capacity this bridge can actually observe',
+    description: 'Queue depth, active local runs per provider, configured concurrency limits, provider-reported token usage where the provider reports it authoritatively, and recognized vendor quota or rate-limit signals. Fields outside this bridge\'s view are reported as explicit unknowns. This is NOT account-wide real-time quota and never claims to be: usage from other machines, browser sessions, or teammates is invisible here.',
+    inputSchema: z.object({ windowMs: z.number().int().min(60000).max(2592000000).default(86400000) }),
+    annotations: READ_ONLY,
+  }, safeHandler(async ({ windowMs }, context) => result(await bridgeRequest(`/api/fuel?windowMs=${windowMs}`, { signal: context?.mcpReq?.signal }))));
+
+  // ---- Delegation and the incident inbox ---------------------------------
+
+  server.registerTool('delegate_tasks', {
+    title: 'Delegate a batch of tasks under explicit contracts',
+    description: 'Classify and rank several tasks, pick the CHEAPEST capable provider for each, and queue them under a handoff contract naming owned files, cwd, base SHA, tier, model/effort, tool policy, budget, done-when and non-goals. Work queues when capacity is unavailable rather than failing. Overlapping owned files are rejected: exactly one writer per path.',
+    inputSchema: z.object({
+      tasks: z.array(z.object({
+        prompt: z.string().min(1).max(100000),
+        objective: z.string().max(4000).optional(),
+        title: z.string().max(120).optional(),
+        cwd: z.string().max(1024).optional(),
+        baseSha: z.string().min(1).max(80),
+        ownedFiles: z.array(z.string().min(1).max(400)).min(1).max(200),
+        doneWhen: z.array(z.string().min(1).max(2000)).min(1).max(40),
+        nonGoals: z.array(z.string().max(2000)).max(40).optional(),
+        constraints: z.array(z.string().max(2000)).max(40).optional(),
+        taskTier: z.enum(['deterministic','utility','standard','complex','critical']).optional(),
+        effort: z.enum(EFFORT_LEVELS).optional(),
+        kind: z.string().max(64).optional(),
+        priority: z.number().int().min(0).max(100).optional(),
+        dangerous: z.boolean().default(false),
+        acknowledgeFilesystemWrites: z.boolean().default(false),
+        providerBudget: PROVIDER_BUDGET_SCHEMA.optional(),
+        toolPolicy: z.object({
+          allow: z.array(z.string().max(120)).max(64).optional(),
+          deny: z.array(z.string().max(120)).max(64).optional(),
+        }).optional(),
+      })).min(1).max(50),
+      requestId: z.string().max(200).optional(),
+      actor: z.string().max(64).optional(),
+      baseSha: z.string().max(80).optional(),
+      cwd: z.string().max(1024).optional(),
+    }),
+    annotations: ACTION,
+  }, safeHandler(async (input) => {
+    const response = await bridgeRequest('/api/delegate', { method: 'POST', body: input });
+    const receipt = appendReceipt({ event: 'delegate_tasks', status: response.status, delegationId: response.delegationId });
+    return result({ ...response, receiptId: receipt.receiptId });
+  }));
+
+  server.registerTool('get_delegation', {
+    title: 'Resume a delegation from any surface',
+    description: 'Fetch one delegation by id and refresh every entry against the task queue: contract, correlation ids (request/invocation/attempt/task/receipt), current status, outcome and any pending escalation. This is how another surface picks up delegated work without repeating it.',
+    inputSchema: z.object({ id: z.string().regex(/^dlg_[A-Za-z0-9_]+$/) }),
+    annotations: READ_ONLY,
+  }, safeHandler(async ({ id }, context) => result(await bridgeRequest(`/api/delegations/${encodeURIComponent(id)}`, { signal: context?.mcpReq?.signal }))));
+
+  server.registerTool('list_delegations', {
+    title: 'List delegations',
+    description: 'Recent delegation batches newest-first with per-entry status counts, including how many entries are waiting on an escalation decision.',
+    inputSchema: z.object({
+      status: z.enum(['active','awaiting_escalation','settled']).optional(),
+      limit: z.number().int().min(1).max(200).default(50),
+    }),
+    annotations: READ_ONLY,
+  }, safeHandler(async ({ status, limit }, context) => {
+    const q = new URLSearchParams();
+    if (status) q.set('status', status);
+    q.set('limit', String(limit));
+    return result(await bridgeRequest(`/api/delegations?${q.toString()}`, { signal: context?.mcpReq?.signal }));
+  }));
+
+  server.registerTool('record_delegation_outcome', {
+    title: 'Record what a delegated task actually produced',
+    description: 'Accept a delegated result, or report observed evidence that it was wrong, empty, partial or failed. Only observed evidence opens an escalation — never "this looked hard". The escalation is created pending; it does not re-dispatch anything until it is approved.',
+    inputSchema: z.object({
+      id: z.string().regex(/^dlg_[A-Za-z0-9_]+$/),
+      taskRef: z.string().min(1).max(120),
+      classification: z.enum(['accepted','wrong_result','empty_result','partial_result','failed_result']),
+      observed: z.string().max(4000).optional(),
+      blockedWithout: z.string().max(2000).optional(),
+      kinds: z.array(z.enum(['file_scope','tool_policy','task_tier','model_tier','effort','budget','permission','cwd'])).max(8).optional(),
+      attemptsMade: z.number().int().min(0).max(20).optional(),
+      actor: z.string().max(64).optional(),
+      receiptId: z.string().max(200).optional(),
+    }),
+    annotations: ACTION,
+  }, safeHandler(async ({ id, ...body }) => {
+    const response = await bridgeRequest(`/api/delegations/${encodeURIComponent(id)}/outcome`, { method: 'POST', body });
+    const receipt = appendReceipt({ event: 'record_delegation_outcome', status: body.classification, delegationId: id });
+    return result({ ...response, receiptId: receipt.receiptId });
+  }));
+
+  server.registerTool('decide_delegation_escalation', {
+    title: 'Approve or deny a pending escalation',
+    description: 'The human/delegator gate. Approving widens the contract into a NEW contract with its own id and lineage and requeues the task; denying stops it. Raising task tier, model tier, or write permission requires approverKind=human — a model may never approve its own escalation.',
+    inputSchema: z.object({
+      id: z.string().regex(/^dlg_[A-Za-z0-9_]+$/),
+      taskRef: z.string().min(1).max(120),
+      approved: z.boolean(),
+      approver: z.string().min(1).max(120),
+      approverKind: z.enum(['human','delegator']),
+      provider: z.string().max(64).optional(),
+      note: z.string().max(2000).optional(),
+    }),
+    annotations: ACTION,
+  }, safeHandler(async ({ id, ...body }) => {
+    const response = await bridgeRequest(`/api/delegations/${encodeURIComponent(id)}/escalation`, { method: 'POST', body });
+    const receipt = appendReceipt({ event: 'decide_delegation_escalation', status: body.approved ? 'approved' : 'denied', delegationId: id });
+    return result({ ...response, receiptId: receipt.receiptId });
+  }));
+
+  server.registerTool('list_incidents', {
+    title: 'Incidents where a phase produced no usable verdict',
+    description: 'Sanitized, deduplicated reports of runs that returned output but no verdict marker, returned nothing, or blocked — each with its exact request, invocation, attempt, task and receipt ids, a classification, and an occurrence count. Raw provider output is never stored; only a digest and a length.',
+    inputSchema: z.object({
+      status: z.enum(['open','acknowledged']).optional(),
+      classification: z.enum(['no_verdict','blocked_verdict','empty_output','plan_not_ready','revision_not_applied','contract_escalation','delegation_escalation']).optional(),
+      limit: z.number().int().min(1).max(200).default(50),
+    }),
+    annotations: READ_ONLY,
+  }, safeHandler(async ({ status, classification, limit }, context) => {
+    const q = new URLSearchParams();
+    if (status) q.set('status', status);
+    if (classification) q.set('classification', classification);
+    q.set('limit', String(limit));
+    return result(await bridgeRequest(`/api/incidents?${q.toString()}`, { signal: context?.mcpReq?.signal }));
+  }));
+
+  server.registerTool('acknowledge_incident', {
+    title: 'Acknowledge an incident',
+    description: 'Mark one incident as handled so it stops surfacing as open. Acknowledging does not retry anything.',
+    inputSchema: z.object({
+      id: z.string().regex(/^inc_[A-Za-z0-9_]+$/),
+      actor: z.string().max(120).optional(),
+      note: z.string().max(2000).optional(),
+    }),
+    annotations: ACTION,
+  }, safeHandler(async ({ id, ...body }) => result(await bridgeRequest(`/api/incidents/${encodeURIComponent(id)}/ack`, { method: 'POST', body }))));
+
   return server;
 }
 

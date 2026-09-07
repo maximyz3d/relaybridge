@@ -21,6 +21,9 @@ const { buildRegistry, parseModelList, pinIsRetired } = require('./lib/model-reg
 const { buildTaskPlan, costClassFor } = require('./lib/task-plan');
 const { createWorkflowPipeline } = require('./lib/workflow-pipeline');
 const { createWorkflowController } = require('./lib/workflow-controller');
+const { createIncidentLog } = require('./lib/incident-log');
+const { createDelegationCoordinator } = require('./lib/delegation');
+const { buildFuelGauge } = require('./lib/fuel-gauge');
 const { buildQuotaSeatGroups } = require('./lib/quota-seat');
 const providerAccounts = require('./lib/provider-accounts');
 const { providerUsageCapability, providerUsageCapabilities } = require('./lib/provider-usage-capability');
@@ -3722,6 +3725,57 @@ app.post('/api/models/refresh', async (req, res) => {
 // a CSS tweak to a frontier seat, or arithmetic to a max-effort reasoning model,
 // costs real money for no gain. This returns the cheapest capable combination
 // and says why, so callers do not have to guess.
+//
+// Shared with delegation, so delegated work is routed through exactly the same
+// cheapest-capable logic an operator sees in a preview. A second copy here
+// would be a second routing policy, and the two would drift.
+async function planTask({ task, requestedEffort = null, kind = null, requestedProviderBudget, filesystemAuthority }) {
+  const router = await ROUTER_MODULE_PROMISE;
+  const cfg = loadConfig();
+  let diagnostics = await completePlanningDiagnostics(
+    cfg,
+    lastDiagnostics?.results,
+    'path-only check',
+  );
+  const gauges = usageLedger.gaugeAll(seatCostClasses());
+  const routingInputs = accountAwareRoutingInputs(cfg, diagnostics, gauges, coolingQuotaStates());
+  const fleetInput = applyCooldownsToDiagnostics(
+    routingInputs.diagnostics, routingInputs.cooling, kind ? [kind] : [],
+  );
+  const vendorQuotaInput = applyVendorQuotaExhaustionToDiagnostics(
+    fleetInput.diagnostics, routingInputs.gauges,
+  );
+  const filesystemInput = applyFilesystemEligibilityToDiagnostics(vendorQuotaInput.diagnostics, cfg, filesystemAuthority);
+  diagnostics = filesystemInput.diagnostics;
+  let route = router.routeTask({ task, diagnostics, dangerous: filesystemAuthority.dangerous });
+  route = levelRouteSelection(route, routingInputs.gauges, seatCostClassMap());
+  route.fleetState = {
+    cooldownSkipped: fleetInput.skipped,
+    vendorQuotaSkipped: vendorQuotaInput.skipped,
+    balance: fleetBalance(gauges),
+    vendorQuota: vendorQuotaFleet(gauges),
+    operatorQuota: operatorQuotaFleet(gauges),
+    quotaSeats: currentQuotaSeatGroups(),
+    accountSelection: routingInputs.accountSelection,
+    filesystemSkipped: filesystemInput.skipped,
+    filesystemAuthority,
+  };
+  const plan = buildTaskPlan({
+    route,
+    config: cfg,
+    registry: modelRegistry,
+    resolveModelArgs,
+    // lib/task-plan predates xhigh.  Use its conservative high mechanics to
+    // choose the same provider/model, then restore the caller's explicit
+    // xhigh intent below; execution performs the provider capability check.
+    requestedEffort: requestedEffort === 'xhigh' ? 'high' : requestedEffort,
+    requestedKind: kind || null,
+    requestedProviderBudget,
+  });
+  if (requestedEffort) annotateRequestedPlanEffort(plan, cfg, requestedEffort);
+  return { plan, fleetState: route.fleetState };
+}
+
 app.post('/api/plan', async (req, res) => {
   const { task, effort, kind, providerBudget: rawBudget } = req.body || {};
   if (!task || typeof task !== 'string' || !task.trim()) {
@@ -3741,50 +3795,10 @@ app.post('/api/plan', async (req, res) => {
   try { filesystemAuthority = planningFilesystemAuthority(req.body || {}); }
   catch (err) { return res.status(400).json({ error: err.message }); }
   try {
-    const router = await ROUTER_MODULE_PROMISE;
-    const cfg = loadConfig();
-    let diagnostics = await completePlanningDiagnostics(
-      cfg,
-      lastDiagnostics?.results,
-      'path-only check',
-    );
-    const gauges = usageLedger.gaugeAll(seatCostClasses());
-    const routingInputs = accountAwareRoutingInputs(cfg, diagnostics, gauges, coolingQuotaStates());
-    const fleetInput = applyCooldownsToDiagnostics(
-      routingInputs.diagnostics, routingInputs.cooling, kind ? [kind] : [],
-    );
-    const vendorQuotaInput = applyVendorQuotaExhaustionToDiagnostics(
-      fleetInput.diagnostics, routingInputs.gauges,
-    );
-    const filesystemInput = applyFilesystemEligibilityToDiagnostics(vendorQuotaInput.diagnostics, cfg, filesystemAuthority);
-    diagnostics = filesystemInput.diagnostics;
-    let route = router.routeTask({ task, diagnostics, dangerous: filesystemAuthority.dangerous });
-    route = levelRouteSelection(route, routingInputs.gauges, seatCostClassMap());
-    route.fleetState = {
-      cooldownSkipped: fleetInput.skipped,
-      vendorQuotaSkipped: vendorQuotaInput.skipped,
-      balance: fleetBalance(gauges),
-      vendorQuota: vendorQuotaFleet(gauges),
-      operatorQuota: operatorQuotaFleet(gauges),
-      quotaSeats: currentQuotaSeatGroups(),
-      accountSelection: routingInputs.accountSelection,
-      filesystemSkipped: filesystemInput.skipped,
-      filesystemAuthority,
-    };
-    const plan = buildTaskPlan({
-      route,
-      config: cfg,
-      registry: modelRegistry,
-      resolveModelArgs,
-      // lib/task-plan predates xhigh.  Use its conservative high mechanics to
-      // choose the same provider/model, then restore the caller's explicit
-      // xhigh intent below; execution performs the provider capability check.
-      requestedEffort: requestedEffort === 'xhigh' ? 'high' : requestedEffort,
-      requestedKind: kind || null,
-      requestedProviderBudget,
+    const { plan, fleetState } = await planTask({
+      task, requestedEffort, kind: kind || null, requestedProviderBudget, filesystemAuthority,
     });
-    if (requestedEffort) annotateRequestedPlanEffort(plan, cfg, requestedEffort);
-    res.json({ ok: true, task: task.slice(0, 400), ...plan, fleetState: route.fleetState });
+    res.json({ ok: true, task: task.slice(0, 400), ...plan, fleetState });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -5416,6 +5430,138 @@ app.post('/api/tasks/:id/cancel', (req, res) => {
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 
+// ---- Incident inbox (lib/incident-log.js) --------------------------------
+// A phase that stops because the provider omitted its verdict marker looks
+// exactly like a crash from the outside.  This records which it was, with the
+// exact ids, sanitized and deduplicated.
+const incidentLog = createIncidentLog({
+  dataDir: path.join(DATA_DIR, 'incidents'),
+  log: (m) => console.log(m),
+});
+
+app.get('/api/incidents', (req, res) => {
+  try {
+    res.json({
+      incidents: incidentLog.list({
+        status: req.query.status, classification: req.query.classification, limit: req.query.limit,
+      }),
+      stats: incidentLog.stats(),
+    });
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+app.get('/api/incidents/:id', (req, res) => {
+  const incident = incidentLog.get(req.params.id);
+  if (!incident) return res.status(404).json({ error: 'incident not found' });
+  res.json(incident);
+});
+app.post('/api/incidents/:id/ack', (req, res) => {
+  try { res.json(incidentLog.acknowledge(req.params.id, req.body || {})); }
+  catch (err) { res.status(404).json({ error: err.message }); }
+});
+
+// ---- Delegation (lib/delegation.js) --------------------------------------
+// Accepts a batch of asks, ranks them, picks the cheapest capable provider for
+// each, and hands them to the queue above under an explicit handoff contract.
+// It owns no processes and no second queue.
+// Classification and provider selection are async (the router module and the
+// diagnostics sweep both are), while the coordinator is deliberately sync so it
+// can be tested without a bridge.  The route resolves both up front and hands
+// the results in.
+let delegationClassifier = () => ({ tier: 'standard' });
+let delegationSelection = new Map();
+
+const delegation = createDelegationCoordinator({
+  dataDir: path.join(DATA_DIR, 'delegations'),
+  taskQueue,
+  incidents: incidentLog,
+  classify: (prompt) => delegationClassifier(prompt),
+  selectProvider: ({ prompt }) => delegationSelection.get(prompt) || {
+    ready: false, reason: 'no plan was computed for this task',
+  },
+  log: (m) => console.log(m),
+});
+
+app.post('/api/delegate', async (req, res) => {
+  const input = req.body || {};
+  const tasks = Array.isArray(input.tasks) ? input.tasks : [];
+  if (!tasks.length) return res.status(400).json({ error: 'tasks (non-empty array) required' });
+  try {
+    const { classifyTask } = await ROUTER_MODULE_PROMISE;
+    delegationClassifier = classifyTask;
+    const selection = new Map();
+    for (const task of tasks) {
+      const prompt = String(task?.prompt || task?.objective || '').trim();
+      if (!prompt || selection.has(prompt)) continue;
+      let plan;
+      try {
+        // A task that cannot be planned is recorded as blocked with the reason,
+        // not allowed to fail the whole batch: the other asks are still valid.
+        plan = (await planTask({
+          task: prompt,
+          requestedEffort: task?.effort ? normalizeEffort(String(task.effort)) : null,
+          kind: typeof task?.kind === 'string' ? task.kind : null,
+          requestedProviderBudget: validateProviderBudget(task?.providerBudget),
+          filesystemAuthority: planningFilesystemAuthority({
+            dangerous: task?.dangerous === true,
+            acknowledgeFilesystemWrites: task?.acknowledgeFilesystemWrites === true,
+          }),
+        })).plan;
+      } catch (err) {
+        selection.set(prompt, { ready: false, reason: err.message });
+        continue;
+      }
+      // Cheapest capable, not "the best available": the whole point of
+      // delegating is that a frontier seat is the last resort, not the default.
+      const choice = plan.cheapestCapable || plan.primary;
+      selection.set(prompt, choice && choice.ready !== false ? {
+        kind: choice.kind,
+        modelTier: choice.modelTier,
+        effort: choice.effort,
+        costClass: choice.costClass,
+        providerBudget: choice.providerBudget,
+        ready: true,
+        alternates: (plan.alternates || []).map((alt) => ({ kind: alt.kind, costClass: alt.costClass })),
+      } : {
+        ready: false,
+        kind: choice?.kind || null,
+        reason: choice?.reason || plan.guidance?.[0] || 'no ready provider for this task',
+      });
+    }
+    delegationSelection = selection;
+    res.json(delegation.delegate({ ...input, actor: input.actor || req.get('X-RelayBridge-Client') || 'delegator' }));
+  } catch (err) {
+    const status = err.code === 'OWNERSHIP_CONFLICT' ? 409 : 400;
+    res.status(status).json({ error: err.message, code: err.code || null });
+  } finally {
+    delegationSelection = new Map();
+  }
+});
+app.get('/api/delegations', (req, res) => {
+  try { res.json({ delegations: delegation.list({ status: req.query.status, limit: req.query.limit }), stats: delegation.stats() }); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+app.get('/api/delegations/:id', (req, res) => {
+  try {
+    const record = delegation.resume(req.params.id);
+    res.json(record);
+  } catch (err) { res.status(err.code === 'NOT_FOUND' ? 404 : 400).json({ error: err.message }); }
+});
+app.post('/api/delegations/:id/outcome', (req, res) => {
+  const { taskRef, ...outcome } = req.body || {};
+  if (!taskRef) return res.status(400).json({ error: 'taskRef required' });
+  try { res.json(delegation.recordOutcome(req.params.id, taskRef, outcome)); }
+  catch (err) { res.status(err.code === 'NOT_FOUND' ? 404 : 400).json({ error: err.message, code: err.code || null }); }
+});
+app.post('/api/delegations/:id/escalation', (req, res) => {
+  const { taskRef, ...decision } = req.body || {};
+  if (!taskRef) return res.status(400).json({ error: 'taskRef required' });
+  try { res.json(delegation.decideEscalation(req.params.id, taskRef, decision)); }
+  catch (err) {
+    const status = err.code === 'NOT_FOUND' ? 404 : err.code === 'HUMAN_GATE_REQUIRED' ? 403 : 400;
+    res.status(status).json({ error: err.message, code: err.code || null });
+  }
+});
+
 // ---- Codex -> Claude staged workflows -----------------------------------
 // The controller owns phase dispatch; the pipeline owns durable artifacts and
 // the single canonical-workspace writer lease.  Provider tasks stay in the
@@ -5426,6 +5572,7 @@ const workflowController = createWorkflowController({
   pipeline: workflowPipeline,
   taskQueue,
   loadConfig,
+  incidents: incidentLog,
   log: (message) => console.log(message),
 });
 
@@ -6320,6 +6467,33 @@ app.get('/api/usage/gauges', (req, res) => {
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
+// The fuel gauge: capacity this bridge can actually observe.  Assembled from
+// the queue, the admission counters, the usage ledger, and recognized vendor
+// signals — with everything outside that scope reported as unknown rather than
+// silently omitted.  It never claims account-wide real-time quota.
+app.get('/api/fuel', (req, res) => {
+  try {
+    const windowMs = Number(req.query.windowMs) || 86400000;
+    const gauges = usageLedger.gaugeAll(seatCostClasses(), windowMs);
+    const runtimeVersions = Object.fromEntries(Object.entries(lastDiagnostics?.results || {})
+      .map(([kind, result]) => [kind, result.runtimeVersion || '']));
+    res.json(buildFuelGauge({
+      windowMs,
+      queueStats: taskQueue.stats(),
+      activeByProvider: activeOneShots,
+      concurrency: {
+        maxActiveOneShots: MAX_ACTIVE_ONESHOTS,
+        maxActivePerProvider: MAX_ACTIVE_PER_PROVIDER,
+      },
+      gauges,
+      providerUsageCapabilities: providerUsageCapabilities(loadConfig(), runtimeVersions),
+      cooldowns: coolingQuotaStates(),
+      delegations: delegation.stats(),
+      incidents: incidentLog.stats(),
+    }));
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.get('/api/usage/operator-quota', (req, res) => {
   res.json({
     observations: usageLedger.operatorQuotaObservations(),

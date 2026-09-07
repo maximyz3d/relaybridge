@@ -195,7 +195,10 @@ restart open AI clients:
 ```
 
 For the staged Codex-orchestrated planning, implementation, and review workflow,
-see [Codex-Claude pipeline](docs/CODEX-CLAUDE-PIPELINE.md).
+see [Codex-Claude pipeline](docs/CODEX-CLAUDE-PIPELINE.md). For queueing a batch
+of bounded, contract-scoped work from a lower-tier coordinator — and for the
+capacity view and no-verdict incident inbox that go with it — see
+[Delegation and handoff contracts](docs/DELEGATION.md).
 At the start of each new or resumed client session, use `list_pipelines` before
 creating a workflow. Resume a matching active run with status-only
 `get_pipeline` and follow its `nextActions`; active provider phases advance only
