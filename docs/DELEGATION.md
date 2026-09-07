@@ -16,16 +16,23 @@ collides with another agent's work.
 lower-tier coordinator — Codex, a script, the MCP connector — builds one; the
 writer receives it rendered into its prompt.
 
+The contract is a request record, **not a sandbox**. The generic delegation
+endpoint currently accepts only read/search policy and `dangerous:false`.
+Writable or additional-tool requests fail with `WRITE_SCOPE_UNENFORCED`; use
+the existing managed writer workflow for implementation. Its lease coordinates
+writers, but is not a host filesystem sandbox either. Provider readiness and
+actual runtime policy must still be checked.
+
 | field | meaning |
 |---|---|
-| `ownedFiles` | the **only** paths this writer may modify; workspace-relative, normalized |
-| `cwd` | the workspace root; paths outside it are refused at build time |
+| `ownedFiles` | requested file scope; normalized, not OS-enforced confinement |
+| `cwd` | working directory, not a sandbox root |
 | `baseSha` | the revision the work was planned against |
 | `taskTier` | `deterministic` → `utility` → `standard` → `complex` → `critical` |
 | `model` | provider, model tier, effort, cost class |
-| `toolPolicy` | **fail-closed** allow-list; an explicit deny always wins |
+| `toolPolicy` | requested allow/deny list; the helper does not intercept provider tool calls |
 | `permissions` | filesystem is `read_only_enforced` unless the delegator set `dangerous` |
-| `budget` | token/turn/wall-clock ceilings, where the provider can enforce them |
+| `budget` | token/turn bounds forwarded as `providerBudget`; unsupported USD/wall-clock bounds are rejected |
 | `doneWhen` | the acceptance test, stated up front |
 | `nonGoals` | what the writer must leave alone |
 
@@ -47,8 +54,9 @@ rather than queueing unbounded work.
 }
 ```
 
-`scopeExpanded: false` is the whole point: the request is refused *and* recorded.
-Nothing widens as a side effect of asking.
+`evaluateRequest` is a pure helper: the result neither intercepts a CLI tool
+call nor writes an incident automatically. Calling code must enforce and record
+the decision. Nothing widens as a side effect of evaluating a request.
 
 To actually widen, `requestEscalation` demands a structured justification citing
 **observed** evidence — `wrong_result`, `empty_result`, `partial_result`,
@@ -82,12 +90,13 @@ contract, queue.
   work waits.
 
 Two tasks claiming overlapping paths in the same workspace fail the **whole
-batch** with `409 OWNERSHIP_CONFLICT` before anything is dispatched. One writer
-per path is easier to guarantee than to repair.
+batch** with `409 OWNERSHIP_CONFLICT` before anything is dispatched. This is a
+batch-local consistency check, not a global writer lease.
 
 The record is persisted *before* any task becomes runnable. A crash during
-submission leaves a `planned` entry that `resume()` can report, rather than a
-silently lost ask.
+submission retains a reserved task ID before queue submission. Reconciliation
+can find an already-persisted task without blindly dispatching a duplicate.
+Interrupted or blocked work is not automatically retried.
 
 ### Resuming elsewhere
 
@@ -103,6 +112,9 @@ MCP session sees identical truth. Every entry carries
 classes with a mandatory `observed`. Only evidence opens a *pending* escalation;
 nothing re-dispatches until `POST /api/delegations/:id/escalation` clears the
 gate. An approval widens the contract and requeues under the new one.
+Acceptance requires a `done` task and its matching receipt. Escalation cannot
+replace an active task, and provider changes require a new plan. List and fleet
+stats reconcile from queue state without dispatching new work.
 
 ## The incident inbox
 
@@ -114,7 +126,11 @@ same broken prompt gets retried for days.
 `lib/incident-log.js` records the five no-verdict conditions the workflow
 controller already detects — `empty_output`, `plan_not_ready`, `no_verdict`,
 `blocked_verdict`, `revision_not_applied` — plus `contract_escalation` and
-`delegation_escalation`.
+`delegation_escalation`. Queue failures and failed workflow tasks also report
+budget, explicit context-limit, unavailable-provider, timeout, interrupted, or
+generic provider failure incidents. `token_budget` means local supervisor
+exhaustion, not proof of vendor quota or context capacity. Other budget signals
+retain uncertainty about the source of the limit.
 
 **Sanitized.** The offending output is exactly the text most likely to contain a
 capability token, an API key, or an absolute home path, so the raw text is never
@@ -123,11 +139,16 @@ enough to tell "the same failure again" from "a new one". Summaries pass through
 credential and home-path redaction and are truncated.
 
 **Deduplicated.** Identity is the failure, not the observation: one incident per
-(classification + exact correlation ids), with an `occurrences` counter. A
+(classification + task/receipt ids when available), with an `occurrences` counter. A
 wedged workflow re-settling the same attempt does not flood the inbox.
+Workflow reconciliation enriches the queue incident instead of duplicating it.
+Acknowledging a specific immutable task failure remains acknowledged on repeated
+observation. A later failed task has a distinct identity and opens a new incident.
 
-Incident logging never throws into the caller; a failure to record is logged and
-the workflow continues.
+Queue and workflow hooks contain logging failures so diagnostics cannot change
+execution status. Direct incident API calls can still report storage errors.
+The durable JSON inbox is under the configured data directory; it is not yet an
+automatic export into a separate cross-chat Markdown inbox.
 
 ## Endpoints
 

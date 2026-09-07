@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const { createIncidentLog, sanitizeText } = require('../lib/incident-log');
+const { createIncidentLog, sanitizeText, taskFailureDetails } = require('../lib/incident-log');
 
 function tempLog(overrides = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rb-incidents-'));
@@ -109,6 +109,53 @@ test('a long summary is truncated so one incident cannot dominate the inbox', ()
   assert.ok(incident.summary.endsWith('…'));
 });
 
+test('bearer credentials and metadata fields are sanitized, not just the summary', () => {
+  const { log, file } = tempLog();
+  const secret = 'exampleSensitiveCredential';
+  const dirty = `Authorization: Bearer ${secret}`;
+  log.report({ ...NO_VERDICT, provider: dirty, runId: dirty, modelTier: dirty,
+    effort: dirty, failureClass: dirty, markerSeen: dirty,
+    correlation: { taskId: dirty }, summary: dirty });
+  assert.equal(fs.readFileSync(file, 'utf8').includes(secret), false);
+  assert.equal(sanitizeText(`Bearer ${secret}`).includes(secret), false);
+});
+
+test('standalone task failures deduplicate by task, not by absent workflow ids', () => {
+  const { log } = tempLog();
+  const first = taskFailureDetails({ id: 't_first', status: 'failed', error: 'raw failure' });
+  log.report(first);
+  assert.equal(log.report(first).deduplicated, true);
+  log.report(taskFailureDetails({ id: 't_second', status: 'failed' }));
+  assert.equal(log.stats().total, 2);
+});
+
+test('workflow reconciliation enriches the queue incident instead of duplicating it', () => {
+  const { log } = tempLog();
+  const details = taskFailureDetails({ id: 't_shared', receiptId: 'rcpt_shared', failureClass: 'token_budget' });
+  const first = log.report(details).incident;
+  const next = log.report({ ...details, runId: 'wf_shared', phase: 'planning',
+    correlation: { ...details.correlation, requestId: 'wf_shared', invocationId: 't_shared' } });
+  assert.equal(next.deduplicated, true);
+  assert.equal(next.incident.incidentId, first.incidentId);
+  assert.equal(next.incident.runId, 'wf_shared');
+  assert.equal(next.incident.correlation.requestId, 'wf_shared');
+  assert.equal(log.stats().total, 1);
+});
+
+test('local budgets remain distinct from provider context capacity', () => {
+  const details = taskFailureDetails({ id: 't_budget', status: 'failed',
+    failureClass: 'token_budget', flags: { budget_exceeded: true }, error: '50060 exceeded maxTotalTokens 50000' });
+  assert.equal(details.classification, 'budget_exceeded');
+  assert.match(details.summary, /local execution budget/);
+  assert.equal(taskFailureDetails({ failureClass: 'token_budget', flags: { rate_limited: true } }).classification, 'budget_exceeded');
+  assert.equal(taskFailureDetails({ failureClass: 'token_budget_total' }).classification, 'budget_exceeded');
+  assert.equal(taskFailureDetails({ failureClass: 'context_length_exceeded' }).classification, 'context_limit');
+  assert.equal(taskFailureDetails({ flags: { timed_out: true } }).classification, 'provider_timeout');
+  assert.equal(taskFailureDetails({ failureClass: 'account_unavailable' }).classification, 'provider_unavailable');
+  assert.equal(taskFailureDetails({ status: 'interrupted' }).classification, 'bridge_interrupted');
+  assert.doesNotMatch(taskFailureDetails({ failureClass: 'budget' }).summary, /local execution budget exceeded/);
+});
+
 test('acknowledging closes an incident and keeps it out of the open stats', () => {
   const { log } = tempLog();
   const { incident } = log.report(NO_VERDICT);
@@ -144,10 +191,23 @@ test('the inbox survives a restart and a corrupt file does not block boot', () =
 test('the ring drops acknowledged incidents before open ones', () => {
   const { log } = tempLog({ maxEntries: 20 });
   for (let i = 0; i < 30; i += 1) {
-    const { incident } = log.report({ ...NO_VERDICT, runId: `wf_${i}` });
+    const { incident } = log.report({ ...NO_VERDICT, runId: `wf_${i}`,
+      correlation: { ...NO_VERDICT.correlation, taskId: `t_${i}` } });
     if (i % 2 === 0) log.acknowledge(incident.incidentId);
   }
   const kept = log.list({ limit: 200 });
   assert.equal(kept.length, 20);
   assert.equal(kept.filter((entry) => entry.status === 'open').length, 15);
+  const runNumbers = kept.map((entry) => Number(entry.runId.slice(3)));
+  assert.deepEqual(runNumbers, [...runNumbers].sort((a, b) => b - a));
+});
+
+test('observing the same acknowledged physical failure again does not reopen it', () => {
+  const { log } = tempLog();
+  const first = log.report(NO_VERDICT).incident;
+  log.acknowledge(first.incidentId, { note: 'Investigated this immutable task result.' });
+  log.report(NO_VERDICT);
+  assert.equal(log.stats().open, 0);
+  log.report({ ...NO_VERDICT, correlation: { ...NO_VERDICT.correlation, taskId: 't_new' } });
+  assert.equal(log.stats().open, 1, 'a new failed task is a new open incident');
 });

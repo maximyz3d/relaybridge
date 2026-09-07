@@ -204,9 +204,10 @@ test('the same paths in different workspaces are not a conflict', () => {
 test('the rendered brief states the bounds and the stop rule', () => {
   const brief = renderHandoffBrief(contract());
   assert.match(brief, /Base revision: abc1234/);
-  assert.match(brief, /Files you own \(exclusive writer\)/);
+  assert.match(brief, /Assigned file scope \(not a filesystem sandbox or writer lease\)/);
+  assert.match(brief, /this prompt is not an interceptor/);
   assert.match(brief, /- lib\/task-queue\.js/);
-  assert.match(brief, /fail-closed/);
+  assert.match(brief, /runtime enforcement must be verified separately/);
   assert.match(brief, /maxTokens=50000/);
   assert.match(brief, /## Done when/);
   assert.match(brief, /## Non-goals/);

@@ -169,6 +169,84 @@ test('an executor that throws still settles the task', async () => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+for (const [label, payload, expectedClass] of [
+  ['budget exhaustion', { stdout: 'partial review', exitCode: 0, budget_exceeded: true, stop_reason: 'token_budget_total', stop_detail: 'cumulative token budget exceeded' }, 'budget'],
+  ['timeout', { stdout: 'partial review', exitCode: 0, timed_out: true }, 'timeout'],
+  ['nonzero exit', { stdout: 'partial review', exitCode: 2 }, 'provider_exit'],
+  ['signal exit', { stdout: 'partial review', exitCode: -1 }, 'provider_exit'],
+  ['typed failure', { stdout: 'partial review', exitCode: 0, failureClass: 'token_budget_total' }, 'token_budget_total'],
+  ['empty output', { stdout: '  \n', exitCode: 0 }, 'no_verdict'],
+  ['partial checkpoint', { stdout: 'unfinished review', exitCode: 0, partial_result: true }, 'no_verdict'],
+  ['rate limit', { stdout: 'try later', exitCode: 0, rate_limited: true }, 'rate_limit'],
+]) {
+  test(`${label} at HTTP 200 is failed, never a completed verdict`, async () => {
+    const dir = tmpdir();
+    const failures = [];
+    const q = createTaskQueue({
+      dataDir: dir,
+      onFailure: (task) => {
+        assert.equal(q.get(task.id).status, 'failed', 'persist before reporting');
+        failures.push(task);
+      },
+      executeOneShot: fakeExecutor(async () => ({ payload: { ...payload, receiptId: 'receipt_exact' } })),
+    });
+    const { id } = q.submit({ kind: 'claude', prompt: 'review' });
+    const task = await settled(q, id);
+    assert.equal(task.status, 'failed');
+    assert.equal(task.failureClass, expectedClass);
+    assert.equal(task.result, payload.stdout);
+    assert.equal(task.receiptId, 'receipt_exact');
+    assert.equal(task.stopReason, payload.stop_reason || null);
+    assert.equal(task.stopDetail, payload.stop_detail || '');
+    assert.equal(failures.length, 1);
+    assert.equal(failures[0].id, id);
+    assert.equal(q.list({ status: 'done' }).length, 0);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+}
+
+for (const asynchronous of [false, true]) {
+  test(`a ${asynchronous ? 'rejecting' : 'throwing'} diagnostic sink cannot change failure or stop queue progress`, async () => {
+    const dir = tmpdir();
+    const messages = [];
+    let calls = 0;
+    const q = createTaskQueue({
+      dataDir: dir, maxConcurrent: 1,
+      log: (message) => messages.push(message),
+      onFailure: (task) => {
+        calls++;
+        task.status = 'done';
+        task.body.prompt = 'tampered';
+        if (asynchronous) return Promise.reject(new Error('PRIVATE_SINK_DETAIL'));
+        throw new Error('PRIVATE_SINK_DETAIL');
+      },
+      executeOneShot: fakeExecutor(async (body) => body.prompt === 'fail'
+        ? { throw: 'provider failed' } : { payload: { stdout: 'answer', exitCode: 0 } }),
+    });
+    const failedId = q.submit({ kind: 'claude', prompt: 'fail' }).id;
+    const successId = q.submit({ kind: 'claude', prompt: 'success' }).id;
+    const failed = await settled(q, failedId);
+    assert.equal((await settled(q, successId)).status, 'done');
+    assert.equal(failed.status, 'failed');
+    assert.equal(failed.body.prompt, 'fail');
+    assert.equal(calls, 1, 'successful tasks must not invoke failure sink');
+    assert.ok(messages.some((message) => message.includes('diagnostic sink failed')));
+    assert.ok(messages.every((message) => !message.includes('PRIVATE_SINK_DETAIL')));
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+}
+
+test('a silent handler is reported exactly once to the failure sink', async () => {
+  const dir = tmpdir();
+  const failures = [];
+  const q = createTaskQueue({ dataDir: dir, executeOneShot: async () => {}, onFailure: (task) => failures.push(task) });
+  const { id } = q.submit({ kind: 'claude', prompt: 'review' });
+  assert.equal((await settled(q, id)).status, 'failed');
+  assert.equal(failures.length, 1);
+  assert.match(failures[0].error, /without a response/);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 test('tasks interrupted by a bridge restart are reconciled, never left running', () => {
   const dir = tmpdir();
   // Simulate what a killed process leaves behind.
@@ -179,13 +257,26 @@ test('tasks interrupted by a bridge restart are reconciled, never left running',
     id: 't_def456', status: 'queued', kind: 'claude', createdAt: Date.now(), body: {},
   }));
 
-  const q = createTaskQueue({ dataDir: dir, executeOneShot: async () => {} });
+  const failures = [];
+  let executions = 0;
+  const q = createTaskQueue({
+    dataDir: dir, executeOneShot: async () => { executions++; },
+    onFailure: (task) => {
+      failures.push(task);
+      throw new Error('diagnostic unavailable');
+    },
+  });
   for (const id of ['t_abc123', 't_def456']) {
     const t = q.get(id);
     assert.equal(t.status, 'interrupted', `${id} must not still claim to be running`);
+    assert.equal(t.failureClass, 'interrupted');
     assert.match(t.error, /resubmit/);
     assert.ok(t.finishedAt, 'an interrupted task needs a finish time so pollers stop waiting');
   }
+  assert.equal(failures.length, 2);
+  q.reconcileOnStartup();
+  assert.equal(failures.length, 2, 'terminal tasks must not be reported repeatedly');
+  assert.equal(executions, 0, 'interrupted writes must never automatically replay');
   fs.rmSync(dir, { recursive: true, force: true });
 });
 

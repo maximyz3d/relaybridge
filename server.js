@@ -21,7 +21,7 @@ const { buildRegistry, parseModelList, pinIsRetired } = require('./lib/model-reg
 const { buildTaskPlan, costClassFor } = require('./lib/task-plan');
 const { createWorkflowPipeline } = require('./lib/workflow-pipeline');
 const { createWorkflowController } = require('./lib/workflow-controller');
-const { createIncidentLog } = require('./lib/incident-log');
+const { createIncidentLog, taskFailureDetails } = require('./lib/incident-log');
 const { createDelegationCoordinator } = require('./lib/delegation');
 const { buildFuelGauge } = require('./lib/fuel-gauge');
 const { buildQuotaSeatGroups } = require('./lib/quota-seat');
@@ -5390,10 +5390,16 @@ app.post('/api/oneshot', (req, res) => executeOneShot({
 // Submission is decoupled from collection so work outlives the surface that
 // started it: submit from a chat, collect from Cowork or the CLI later.
 const { createTaskQueue } = require('./lib/task-queue');
+// Initialize before the queue: startup reconciliation also reports failures.
+const incidentLog = createIncidentLog({
+  dataDir: path.join(DATA_DIR, 'incidents'),
+  log: (m) => console.log(m),
+});
 const taskQueue = createTaskQueue({
   dataDir: path.join(DATA_DIR, 'tasks'),
   executeOneShot, readCollab, writeCollab,
   maxConcurrent: Number(process.env.RELAYBRIDGE_MAX_TASKS) || 3,
+  onFailure: (task) => incidentLog.report(taskFailureDetails(task)),
   log: (m) => console.log(m),
 });
 
@@ -5434,11 +5440,6 @@ app.post('/api/tasks/:id/cancel', (req, res) => {
 // A phase that stops because the provider omitted its verdict marker looks
 // exactly like a crash from the outside.  This records which it was, with the
 // exact ids, sanitized and deduplicated.
-const incidentLog = createIncidentLog({
-  dataDir: path.join(DATA_DIR, 'incidents'),
-  log: (m) => console.log(m),
-});
-
 app.get('/api/incidents', (req, res) => {
   try {
     res.json({
@@ -5475,7 +5476,7 @@ const delegation = createDelegationCoordinator({
   taskQueue,
   incidents: incidentLog,
   classify: (prompt) => delegationClassifier(prompt),
-  selectProvider: ({ prompt }) => delegationSelection.get(prompt) || {
+  selectProvider: ({ task }) => delegationSelection.get(task) || {
     ready: false, reason: 'no plan was computed for this task',
   },
   log: (m) => console.log(m),
@@ -5491,7 +5492,7 @@ app.post('/api/delegate', async (req, res) => {
     const selection = new Map();
     for (const task of tasks) {
       const prompt = String(task?.prompt || task?.objective || '').trim();
-      if (!prompt || selection.has(prompt)) continue;
+      if (!prompt) continue;
       let plan;
       try {
         // A task that cannot be planned is recorded as blocked with the reason,
@@ -5507,13 +5508,13 @@ app.post('/api/delegate', async (req, res) => {
           }),
         })).plan;
       } catch (err) {
-        selection.set(prompt, { ready: false, reason: err.message });
+        selection.set(task, { ready: false, reason: err.message });
         continue;
       }
       // Cheapest capable, not "the best available": the whole point of
       // delegating is that a frontier seat is the last resort, not the default.
       const choice = plan.cheapestCapable || plan.primary;
-      selection.set(prompt, choice && choice.ready !== false ? {
+      selection.set(task, choice && choice.ready !== false ? {
         kind: choice.kind,
         modelTier: choice.modelTier,
         effort: choice.effort,

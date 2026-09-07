@@ -7,6 +7,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { createWorkflowPipeline } = require('../lib/workflow-pipeline');
 const { createWorkflowController, WorkflowControllerError } = require('../lib/workflow-controller');
+const { createIncidentLog } = require('../lib/incident-log');
 
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rb-controller-'));
@@ -40,8 +41,9 @@ function fixture(t) {
     claude_fable: { oneshot_safe: ['fable-safe'], oneshot_dangerous: [] },
   };
   const pipeline = createWorkflowPipeline({ dataDir, now: () => clock.value });
+  const incidents = createIncidentLog({ dataDir: path.join(root, 'incidents') });
   const controller = createWorkflowController({
-    pipeline, taskQueue, loadConfig: () => config, now: () => clock.value,
+    pipeline, taskQueue, incidents, loadConfig: () => config, now: () => clock.value,
   });
   return {
     cwd,
@@ -52,6 +54,7 @@ function fixture(t) {
     config,
     pipeline,
     controller,
+    incidents,
     finish(task, result, status = 'done', extra = {}) {
       Object.assign(tasks.get(task.id), {
         status,
@@ -93,6 +96,25 @@ test('status reads are inert and explicit reconciliation advances persisted hand
   assert.equal(reconciled.workflow.phase, 'planning');
   assert.ok(reconciled.workflow.providerTask);
   assert.equal(f.tasks.size, 1, 'only explicit reconciliation may dispatch the handoff');
+});
+
+test('failed planning writes a correlated budget incident before failing without approval', (t) => {
+  const f = fixture(t);
+  const created = f.controller.create(createInput(f.cwd));
+  const planning = f.controller.submitResearch(created.runId, { markdown: 'Research evidence.' });
+  f.finish(planning.task, '50060 exceeded maxTotalTokens 50000', 'failed', {
+    failureClass: 'budget_exceeded', flags: { budget_exceeded: true }, receiptId: 'rcpt_budget',
+  });
+  const result = f.controller.reconcile(created.runId);
+  assert.equal(result.workflow.phase, 'failed');
+  const [incident] = f.incidents.list();
+  assert.equal(incident.classification, 'budget_exceeded');
+  assert.equal(incident.correlation.taskId, planning.task.id);
+  assert.equal(incident.correlation.receiptId, 'rcpt_budget');
+  assert.equal(incident.phase, 'planning');
+  assert.equal(incident.summary.includes('50060'), false);
+  f.controller.reconcile(created.runId);
+  assert.equal(f.incidents.stats().total, 1);
 });
 
 function createInput(cwd, taskTier = 'complex', permissionMode = 'full') {
