@@ -882,6 +882,19 @@ test('prompt-file transport preserves long special-character prompts and cleans 
 
   const auth = await capabilityHeaders(baseUrl);
   const jsonAuth = await capabilityHeaders(baseUrl, true);
+  const requestPayload = { requestId: 'rest-coverage', actor: 'test', requirements: [{ requirementId: 'R1', summary: 'Bounded attributed assertions' }] };
+  const requestPost = (body, headers = jsonAuth) => fetch(baseUrl + '/api/requests', {
+    method: 'POST', headers, body: JSON.stringify(body),
+  });
+  assert.equal((await requestPost(requestPayload, { 'content-type': 'application/json' })).status, 401);
+  assert.equal((await requestPost(requestPayload, { ...jsonAuth, 'x-relaybridge-client': 'mcp' })).status, 409);
+  for (const body of [null, [], {}, { ...requestPayload, requirements: [null] }, { ...requestPayload, requirements: Array(65).fill(requestPayload.requirements[0]) }]) {
+    assert.equal((await requestPost(body)).status, 400);
+  }
+  assert.equal((await requestPost(requestPayload)).status, 201);
+  assert.equal((await requestPost(requestPayload)).status, 409);
+  assert.equal((await fetch(baseUrl + '/api/requests/rest-coverage?revision=main', { headers: auth })).status, 400);
+  assert.equal((await fetch(baseUrl + '/api/requests/missing', { headers: auth })).status, 404);
   const dashboard = await fetch(baseUrl + '/');
   assert.equal(dashboard.headers.get('x-frame-options'), 'DENY');
   assert.match(dashboard.headers.get('content-security-policy') || '', /frame-ancestors 'none'/);
@@ -1577,6 +1590,8 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   const multiTurnBudgetResult = await multiTurnBudgetResponse.json();
   assert.equal(multiTurnBudgetResult.stop_reason, 'token_budget');
   assert.equal(multiTurnBudgetResult.failureClass, 'token_budget');
+  assert.equal(multiTurnBudgetResult.rate_limited, false, 'partial tool prose is not vendor quota evidence');
+  assert.ok(!multiTurnBudgetResult.cooldown, 'local budget stop must not cool the shared seat');
   assert.equal(multiTurnBudgetResult.timed_out, false);
   assert.equal(multiTurnBudgetResult.dropped_out, true);
   assert.equal(multiTurnBudgetResult.provider_num_turns, 3);

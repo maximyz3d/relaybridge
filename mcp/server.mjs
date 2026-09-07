@@ -8,6 +8,7 @@ import { McpServer } from '@modelcontextprotocol/server';
 import { serveStdio } from '@modelcontextprotocol/server/stdio';
 import { z } from 'zod';
 import TIMEOUT_POLICY from '../timeout-policy.cjs';
+import requestContract from '../lib/request-contract.js';
 import {
   BASE_URL,
   BRIDGE_ROOT,
@@ -3012,6 +3013,31 @@ export function buildServer() {
     },
   ))));
 
+  for (const spec of [
+    { name: 'create_request', schema: requestContract.create, path: () => '/api/requests' },
+    { name: 'link_request_workflow', schema: requestContract.link.extend({ requestId: requestContract.id }), path: (id) => `/api/requests/${encodeURIComponent(id)}/workflows` },
+    { name: 'record_requirement_evidence', schema: requestContract.evidence.extend({ requestId: requestContract.id }), path: (id) => `/api/requests/${encodeURIComponent(id)}/evidence` },
+  ]) {
+    server.registerTool(spec.name, {
+      title: spec.name.replaceAll('_', ' '),
+      description: 'Record a bounded, attributed requirement assertion. Evidence refers to an immutable revision; this is never verified acceptance and does not advance workflows.',
+      inputSchema: spec.schema, annotations: ACTION,
+    }, safeHandler(async (input, context) => {
+      const { requestId, ...rest } = input;
+      return result(await bridgeRequest(spec.path(requestId), { method: 'POST',
+        body: spec.name === 'create_request' ? input : rest, actionIdentity: true, signal: context?.mcpReq?.signal }));
+    }));
+  }
+  server.registerTool('get_request', {
+    title: 'Read requirement assertions', description: 'Read request evidence and optional revision-specific coverage. Assertions are attributed claims, not automatic approval.',
+    inputSchema: z.object({ requestId: requestContract.id, revision: requestContract.revision.optional() }).strict(), annotations: READ_ONLY,
+  }, safeHandler(async ({ requestId, revision }, context) => result(await bridgeRequest(
+    `/api/requests/${encodeURIComponent(requestId)}${revision ? `?revision=${revision}` : ''}`, { signal: context?.mcpReq?.signal }))));
+  server.registerTool('list_requests', {
+    title: 'List requirement requests', description: 'List bounded request-ledger summaries; queued, implemented and verified are distinct states.',
+    inputSchema: z.object({}).strict(), annotations: READ_ONLY,
+  }, safeHandler(async (_input, context) => result(await bridgeRequest('/api/requests', { signal: context?.mcpReq?.signal }))));
+
   server.registerTool('submit_task', {
     title: 'Submit a background task',
     description: 'Queue a prompt to a provider and return a task id IMMEDIATELY without waiting for the run. Use for work longer than a chat turn, or when the result should be collectable later from a different surface. Link a collab id to append the result to that shared thread.',
@@ -3019,6 +3045,11 @@ export function buildServer() {
       kind: z.string().min(1).max(64), prompt: z.string().min(1).max(100000),
       collab: z.string().max(64).optional(), title: z.string().max(120).optional(),
       cwd: z.string().max(1024).optional(), user: z.string().max(64).optional(),
+      notBefore: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+      dependsOn: z.array(z.string().regex(/^t_[A-Za-z0-9_]+$/)).max(64).optional(),
+      requirementIds: z.array(z.string().min(1).max(120)).max(64).optional(),
+      correlation: z.object(Object.fromEntries(['requestId', 'runId', 'invocationId', 'attemptId', 'contractId', 'delegationId']
+        .map((key) => [key, z.string().min(1).max(200).optional()]))).strict().optional(),
       providerBudget: PROVIDER_BUDGET_SCHEMA.optional(),
       taskTier: z.enum(['utility', 'standard', 'complex', 'critical']).optional(),
       modelTier: z.enum(['light', 'standard', 'heavy']).optional(),

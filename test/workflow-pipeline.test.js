@@ -330,8 +330,8 @@ test('cancelling during provider retry backoff clears retry state cleanly', (t) 
   assert.equal(cancelled.providerRetry, null);
 });
 
-test('one canonical cwd has one writer; only an expired lock may be reclaimed', (t) => {
-  const { pipeline, cwd, root, clock } = fixture(t, { pipeline: { leaseMs: 100 } });
+test('one canonical cwd has one writer; expiry never proves termination, including legacy locks after restart', (t) => {
+  const { pipeline, cwd, root, clock, restart } = fixture(t, { pipeline: { leaseMs: 100 } });
   const alias = path.join(root, 'project-alias');
   fs.symlinkSync(cwd, alias, 'dir');
   const firstId = 'wf_first_333333333333';
@@ -344,15 +344,12 @@ test('one canonical cwd has one writer; only an expired lock may be reclaimed', 
   clock.value += 99;
   throwsCode(() => pipeline.startImplementation(secondId, { actor: 'codex-b' }), 'WRITER_CONFLICT');
   clock.value += 1;
-  const second = pipeline.startImplementation(secondId, { actor: 'codex-b' });
-  assert.notEqual(second.lease.leaseToken, first.lease.leaseToken);
+  throwsCode(() => pipeline.startImplementation(secondId, { actor: 'codex-b' }), 'WRITER_EXECUTION_UNCERTAIN');
+  throwsCode(() => restart().startImplementation(secondId, { actor: 'codex-b' }), 'WRITER_EXECUTION_UNCERTAIN');
   throwsCode(() => pipeline.completeImplementation(firstId, {
     actor: 'codex-a', leaseToken: first.lease.leaseToken, markdown: '# Implementation\nStale writer.',
-  }), 'LEASE_MISMATCH');
-  const done = pipeline.completeImplementation(secondId, {
-    actor: 'codex-b', leaseToken: second.lease.leaseToken, markdown: '# Implementation\nCurrent writer.',
-  });
-  assert.equal(done.phase, 'implementation_ready');
+  }), 'LEASE_EXPIRED');
+  assert.equal(pipeline.get(firstId).phase, 'implementing');
 });
 
 test('wrong actor or token cannot complete, renew, release, or terminate a writer lease', (t) => {
@@ -400,6 +397,9 @@ test('bound writer recovery survives restart and releases only its own expired l
   clock.value += 101;
 
   const recovered = restart();
+  const contender = 'wf_contender_999999999991';
+  advanceToPlanReady(recovered, cwd, contender);
+  throwsCode(() => recovered.startImplementation(contender), 'WRITER_EXECUTION_UNCERTAIN');
   throwsCode(() => recovered.failBoundWriterTask(runId, {
     actor: 'claude-reviser', taskId: 't_someone_else', reason: 'No.',
   }), 'PROVIDER_TASK_MISMATCH');

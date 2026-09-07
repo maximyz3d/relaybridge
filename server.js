@@ -1111,11 +1111,12 @@ function sendOneShotResult(res, payload, meta) {
       const ok = payload.exitCode === 0 && !payload.dropped_out;
       // Classify once and use it for BOTH accounting and cooldown, so the two
       // can never disagree about why a run ended.
-      const failureKind = payload.provider_action_required?.kind === 'usage_quota_exhausted'
-        ? 'quota_exhausted'
-        : payload.rate_limited ? 'rate_limited'
-        : payload.auth_failed ? 'auth_failed'
-        : payload.failureClass || (classified.kind !== 'ok' ? classified.kind : null);
+      const failureKind = receiptFailureKind({
+        supervisorStopReason: payload.supervisor_stop_reason,
+        failureClass: payload.failureClass, apiErrorStatus: payload.provider_api_error_status,
+        rateLimited: payload.rate_limited, authFailed: payload.auth_failed,
+        actionRequiredKind: payload.provider_action_required?.kind, classifiedKind: classified.kind,
+      });
       const effectiveQuotaSeat = payload.route?.quota_seat || meta.route?.quota_seat
         || quotaSeatForProvider(meta.kind);
       if (failureKind === 'rate_limited') {
@@ -1123,7 +1124,8 @@ function sendOneShotResult(res, payload, meta) {
           provider: meta.kind,
           rateLimited: payload.rate_limited,
           failureClass: payload.failureClass,
-          text: `${payload.stdout || ''}\n${payload.stderr || ''}`,
+          text: vendorEvidenceText({ stdout: payload.stdout, stderr: payload.stderr,
+            includeStdout: true, supervisorStopReason: payload.supervisor_stop_reason }),
           model: payload.route?.resolved_model_identity || payload.model || null,
         });
         if (vendorQuota) {
@@ -1168,7 +1170,8 @@ function sendOneShotResult(res, payload, meta) {
           // scope, so it conservatively applies to the shared quota seat.
           const cooldownSeat = payload.vendor_quota?.scope === 'model' ? meta.kind : effectiveQuotaSeat;
           const cooldown = cooldowns.noteFailure(cooldownSeat, failureKind, {
-            retryAfterSec: parseRetryAfter(`${payload.stdout || ''}\n${payload.stderr || ''}`, payload.retry_after),
+            retryAfterSec: parseRetryAfter(vendorEvidenceText({ stdout: payload.stdout, stderr: payload.stderr,
+              includeStdout: true, supervisorStopReason: payload.supervisor_stop_reason }), payload.retry_after),
             scope: payload.vendor_quota?.scope === 'model' ? 'model' : 'account',
           });
           if (cooldown?.until) {
@@ -3230,6 +3233,13 @@ app.get('/api/config', (req, res) => {
   res.json(loadConfig());
 });
 
+app.use('/api', (req, res, next) => {
+  if (shuttingDown && !['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
+    return res.status(503).json({ ok: false, code: 'BRIDGE_SHUTTING_DOWN' });
+  }
+  next();
+});
+
 // Authenticated workspace-policy discovery keeps browser defaults aligned with
 // an operator-supplied allowlist. The public health endpoint intentionally does
 // not expose local filesystem paths.
@@ -5198,8 +5208,9 @@ async function executeOneShot(body, res) {
     // or in stdout only when the process itself failed / returned no answer.
     // This prevents an audit discussing "rate limit" or HTTP 429 handling from
     // being misclassified as a provider failure.
-    const failureBlob = (stderr + ((code !== 0 || !cleanedStdout || parsedOutput.isError || parsedOutput.parseError)
-      ? ('\n' + stdout) : '') + ('\n' + (parsedOutput.diagnostic || ''))).toLowerCase();
+    const failureBlob = vendorEvidenceText({ stderr, stdout, diagnostic: parsedOutput.diagnostic,
+      includeStdout: code !== 0 || !cleanedStdout || parsedOutput.isError || parsedOutput.parseError,
+      supervisorStopReason: stopReason }).toLowerCase();
     const rate_signals = [
       'rate limit', 'rate-limit', 'too many requests', 'quota exceeded', 'usage limit reached',
       'hit your usage limit', 'hit your limit', "you've hit your session limit",
@@ -5213,13 +5224,14 @@ async function executeOneShot(body, res) {
     );
     const copilotQuotaEvidence = detectCopilotMonthlyQuota({
       provider: kind,
-      stdout: cleanedStdout,
+      stdout: stopReason ? '' : cleanedStdout,
       stderr,
       exitCode: code,
     });
     const runClassification = classifyRunFailure({
       provider: kind,
       prompt,
+      stopReason,
       stdout: cleanedStdout,
       stderr: cleanOutput([stderr, parsedOutput.diagnostic].filter(Boolean).join('\n')),
       exitCode: code,
@@ -5230,11 +5242,11 @@ async function executeOneShot(body, res) {
     const rate_limited = parsedOutput.resultSubtype !== 'error_max_budget_usd'
       && !cursorUsageQuotaExhausted
       && (authoritativeApiFailure === 'rate_limit' || !!copilotQuotaEvidence
-        || rate_signals.some(s => failureBlob.includes(s)));
+        || (!stopReason && rate_signals.some(s => failureBlob.includes(s))));
     const budget_exceeded = parsedOutput.resultSubtype === 'error_max_budget_usd'
       || authoritativeApiFailure === 'budget'
       || cursorUsageQuotaExhausted
-      || budget_signals.some(s => failureBlob.includes(s));
+      || (!stopReason && budget_signals.some(s => failureBlob.includes(s)));
     // Some CLIs report unrelated MCP authentication warnings on stderr even
     // after the selected provider completed successfully. Only classify the
     // provider route as unauthenticated when the command failed or produced no
@@ -5572,11 +5584,14 @@ app.post('/api/delegations/:id/escalation', (req, res) => {
 // existing queue so they survive client disconnects and retain normal receipt,
 // quota, timeout, and filesystem-policy handling.
 const workflowPipeline = createWorkflowPipeline({ dataDir: DATA_DIR });
+const { createRequestLedger } = require('./lib/request-ledger');
+const requestLedger = createRequestLedger({ dataDir: path.join(DATA_DIR, 'requests') });
 const workflowController = createWorkflowController({
   pipeline: workflowPipeline,
   taskQueue,
   loadConfig,
   incidents: incidentLog,
+  requestLedger,
   log: (message) => console.log(message),
 });
 
@@ -5588,6 +5603,7 @@ const WORKFLOW_CONFLICT_CODES = new Set([
   'REVISION_REQUIRED', 'PROVIDER_TASK_ACTIVE', 'PROVIDER_TASK_MISMATCH',
   'PROVIDER_TASK_REUSED', 'PROVIDER_RETRY_MISMATCH', 'PROVIDER_RETRY_EXHAUSTED',
   'PROVIDER_RETRY_NOT_ALLOWED', 'FULL_PERMISSION_REQUIRED',
+  'WRITER_EXECUTION_UNCERTAIN', 'EXECUTION_TERMINATION_REQUIRED',
 ]);
 
 function sendWorkflowError(res, error) {
@@ -5623,6 +5639,43 @@ function workflowCreationInput(body) {
     permissionMode,
   };
 }
+
+const requestContract = require('./lib/request-contract');
+function sendRequestError(res, error) {
+  const message = String(error?.message || '');
+  const notFound = ['request not found', 'requirement not found'].includes(message);
+  const conflict = ['request already exists', 'conflicting eventId', 'workflow link capacity reached',
+    'request ledger capacity reached; archive explicitly before adding requests',
+    'event capacity reached; evidence history was preserved',
+    'request ledger byte capacity reached; prior evidence was preserved'].includes(message);
+  const invalid = error?.name === 'ZodError' || /^(?:invalid (?:requestId|actor|requirementId|summary|eventId|evidence ref|runId|taskId|incidentId|receiptId|invocationId|attemptId)|duplicate requirementId|confirmed milestones require evidence|rejected or missing evidence requires a reason)$/.test(message);
+  if (!notFound && !conflict && !invalid) return sendWorkflowError(res, error);
+  return res.status(notFound ? 404 : conflict ? 409 : 400).json({ ok: false,
+    code: notFound ? 'REQUEST_NOT_FOUND' : conflict ? 'REQUEST_CONFLICT' : 'INVALID_REQUEST',
+    error: error?.name === 'ZodError' ? 'invalid request shape or bounds' : message });
+}
+app.get('/api/requests', (req, res) => res.json({ requests: requestLedger.list(), assertionsOnly: true }));
+app.post('/api/requests', (req, res) => {
+  try { res.status(201).json({ request: workflowController.createRequest(requestContract.create.parse(req.body)), assertionsOnly: true }); }
+  catch (error) { sendRequestError(res, error); }
+});
+app.get('/api/requests/:requestId', (req, res) => {
+  try { res.json({ request: workflowController.getRequest(requestContract.id.parse(req.params.requestId), {
+    revision: req.query.revision == null ? undefined : requestContract.revision.parse(req.query.revision),
+  }), assertionsOnly: true }); }
+  catch (error) { sendRequestError(res, error); }
+});
+app.post('/api/requests/:requestId/workflows', (req, res) => {
+  try {
+    const input = requestContract.link.parse(req.body);
+    res.json({ link: workflowController.linkRequest(input.runId, { ...input, requestId: requestContract.id.parse(req.params.requestId) }), assertionsOnly: true });
+  } catch (error) { sendRequestError(res, error); }
+});
+app.post('/api/requests/:requestId/evidence', (req, res) => {
+  try { res.json({ event: workflowController.recordRequirementEvidence(requestContract.id.parse(req.params.requestId),
+    requestContract.evidence.parse(req.body)), assertionsOnly: true }); }
+  catch (error) { sendRequestError(res, error); }
+});
 
 app.post('/api/workflows', (req, res) => {
   try {
@@ -5705,6 +5758,8 @@ const { createCooldownStore, parseRetryAfter } = require('./lib/provider-cooldow
 const { checkGrounding, verifyReferencedPaths } = require('./lib/workspace-grounding');
 const {
   classifyRunFailure,
+  vendorEvidenceText,
+  receiptFailureKind,
   classifyProviderHttpFailure,
   detectCopilotMonthlyQuota,
   isHostedApiKeyMissingError,
@@ -7029,6 +7084,10 @@ app.post('/api/projects', (req, res) => {
 // wait for the singleton bridge to release its port, and start the new build.
 // The capability-token middleware protects this destructive endpoint.
 app.post('/api/admin/shutdown', (req, res) => {
+  const active = taskQueue.stats().active + activeChildren.size + sessions.size;
+  if (active > 0 && req.body?.force !== true) {
+    return res.status(409).json({ ok: false, code: 'BRIDGE_BUSY', active });
+  }
   res.json({ ok: true, stopping: true, pid: process.pid, instanceId: INSTANCE_ID });
   setTimeout(shutdown, 100);
 });
@@ -7229,6 +7288,9 @@ let shuttingDown = false;
 function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
+  // Stop dispatch and heartbeats before terminating any worker process.
+  try { taskQueue.shutdown(); } catch (error) { console.error('[RelayBridge] queue shutdown failed:', error.message); }
+  try { workflowController.shutdown(); } catch (error) { console.error('[RelayBridge] workflow shutdown failed:', error.message); }
   console.log('\n[RelayBridge] shutting downâ€¦');
   for (const s of sessions.values()) s.kill();
   for (const proc of activeChildren) killProcessTree(proc);

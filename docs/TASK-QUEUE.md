@@ -159,24 +159,28 @@ also requires recorded fencing. Missing activity is never used as proof.
 
 ## Required coordinator integration
 
-These are outstanding runtime requirements, not delivered end-to-end behavior:
+Coordinator integration status (2026-09-07 release candidate; deployment is a separate gate):
 
 1. In `server.js`, configure `authorizeRecovery` only after implementing exact
    owner/process fencing and revalidating authority. Without it, automatic restart
    recovery remains disabled. Expose authenticated `confirmStopped` only with that
    trusted evidence boundary; do not accept a caller's assertion as process proof.
-2. Call `taskQueue.shutdown()` before child termination in server shutdown, and
-   `workflowController.shutdown()` when disposing its lease timers.
-3. Wire a request ledger instance into the controller, then expose authenticated
-   coverage/link/evidence operations through the coordinator's REST/MCP surfaces.
-   Module/controller tests do not establish browser or MCP availability.
+2. Implemented: queue/controller shutdown hooks run before child termination.
+   Administrative shutdown refuses active tasks/processes/sessions unless explicitly forced.
+3. Implemented: authenticated `/api/requests` create/list/read, workflow linking and
+   evidence recording; MCP `create_request`, `list_requests`, `get_request`,
+   `link_request_workflow`, `record_requirement_evidence`. REST and MCP share bounded
+   schemas. Milestones are attributed assertions, never automatic acceptance.
+   `submit_task` now forwards dependencies, not-before time and requirement correlations.
+   Browser coverage editing remains outstanding.
 4. The server's global/provider counts and response-driven admission release are
    separate. Supply authoritative lifecycle evidence distinguishing process-tree
    termination/fencing from an exit grace period with surviving descendants.
-5. `lib/workflow-pipeline.js` currently reclaims expired writer leases based on
-   time alone. Prevent reclamation of uncertain/live bound writers until affirmative
-   termination/fencing exists, including after restart. The owned controller keeps
-   an uncertain revision heartbeat while it can, but cannot enforce that store-level
-   invariant against other workflows or a dead controller.
+5. Implemented: ALL existing expired writer locks fail closed with
+   `WRITER_EXECUTION_UNCERTAIN`, including legacy markerless locks and restart.
+   Expiry never proves termination. Expired manual/unbound locks can remain stranded;
+   do not delete them or claim token-owned cancellation works after expiry.
+   Operator recovery with authoritative owner fencing remains outstanding.
 
-The external R13–R16 lane does not change these server/pipeline integration files.
+The external R13–R16 lane did not change server/pipeline integration files; the
+coordinator integration adds the delivered surfaces above without enabling recovery.

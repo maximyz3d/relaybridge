@@ -388,6 +388,7 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
     'complete_pipeline_implementation', 'start_pipeline_revision',
     'start_pipeline_final_review', 'retry_failed_pipeline_provider',
     'renew_pipeline_writer_lease', 'cancel_pipeline',
+    'create_request', 'get_request', 'list_requests', 'link_request_workflow', 'record_requirement_evidence',
     'open_in_chrome',
   ]) {
     assert.ok(toolNames.has(expected), `missing MCP tool ${expected}`);
@@ -439,6 +440,33 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   assert.equal(fetchedPipeline.structuredContent.artifactContents['base-revision'], 'test-base');
   assert.match(fetchedPipeline.structuredContent.artifactContents['file-scope'], /lib\/target\.js/);
   assert.deepEqual(fetchedPipeline.structuredContent.nextActions, ['submit_pipeline_research']);
+
+  const requestInput = { requestId: 'integration-request', actor: 'test-coordinator',
+    requirements: [{ requirementId: 'R1', summary: 'Keep assertions separate from release approval' }] };
+  const createdRequest = await client.callTool({ name: 'create_request', arguments: requestInput });
+  assert.equal(createdRequest.isError, undefined, JSON.stringify(createdRequest.structuredContent));
+  assert.equal(createdRequest.structuredContent.assertionsOnly, true);
+  const requestLink = await client.callTool({ name: 'link_request_workflow', arguments: {
+    requestId: requestInput.requestId, runId: pipelineId, actor: 'test-coordinator',
+  } });
+  assert.equal(requestLink.isError, undefined, JSON.stringify(requestLink.structuredContent));
+  const assertion = { requestId: requestInput.requestId, eventId: 'e1', requirementId: 'R1', actor: 'test-coordinator',
+    revision: 'a'.repeat(40), milestone: 'tested', outcome: 'confirmed', evidence: [{ kind: 'test', ref: 'test:coverage' }] };
+  const recorded = await client.callTool({ name: 'record_requirement_evidence', arguments: assertion });
+  assert.equal(recorded.isError, undefined, JSON.stringify(recorded.structuredContent));
+  const coverage = await client.callTool({ name: 'get_request', arguments: { requestId: requestInput.requestId, revision: assertion.revision } });
+  assert.equal(coverage.structuredContent.request.coverage[0].milestones.tested.outcome, 'confirmed');
+  assert.equal(coverage.structuredContent.request.coverage[0].milestones.approved.outcome, 'unknown');
+  const otherRevision = await client.callTool({ name: 'get_request', arguments: { requestId: requestInput.requestId, revision: 'b'.repeat(40) } });
+  assert.equal(otherRevision.structuredContent.request.coverage[0].milestones.tested.outcome, 'unknown');
+  const mutableRevision = await client.callTool({ name: 'record_requirement_evidence', arguments: { ...assertion, revision: 'main' } });
+  assert.equal(mutableRevision.isError, true);
+  const duplicate = await client.callTool({ name: 'record_requirement_evidence', arguments: assertion });
+  assert.equal(duplicate.isError, undefined);
+  const conflict = await client.callTool({ name: 'record_requirement_evidence', arguments: { ...assertion, milestone: 'approved' } });
+  assert.equal(conflict.isError, true);
+  const requestList = await client.callTool({ name: 'list_requests', arguments: {} });
+  assert.ok(requestList.structuredContent.requests.some((r) => r.requestId === requestInput.requestId));
 
   // Build a due retry without invoking a provider. GET must remain a pure
   // status read, and the action-identity middleware must reject reconciliation
