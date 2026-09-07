@@ -20,6 +20,12 @@ const { validationError } = require('./lib/validation-contract');
 const { normalizeEffort } = require('./lib/effort-controls');
 const { modelConfigStaleness, modelTierForTaskTier } = require('./lib/model-tiers');
 const { buildRegistry, parseModelList } = require('./lib/model-registry');
+const { extractClaudeAssistantCheckpoint, redactCheckpointSecrets } = require('./lib/partial-checkpoint');
+const { guardProviderInput } = require('./lib/provider-input-guard');
+const {
+  captureWriterWorkspaceSnapshot,
+  summarizeWriterWorkspaceDiff,
+} = require('./lib/writer-diff-summary');
 const { buildTaskPlan, costClassFor } = require('./lib/task-plan');
 const { createWorkflowPipeline } = require('./lib/workflow-pipeline');
 const { createWorkflowController } = require('./lib/workflow-controller');
@@ -770,6 +776,29 @@ function appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt }
       ? crypto.createHash('sha256').update(String(payload.partial_diagnostic || '')).digest('hex') : null,
     partialDiagnosticTruncated: payload.partial_result === true
       ? payload.partial_diagnostic_truncated === true : false,
+    partialCheckpointBytes: payload.partial_result === true
+      ? nonnegativeUsageNumber(payload.partial_checkpoint_bytes) : 0,
+    partialCheckpointOriginalBytes: payload.partial_result === true
+      ? nonnegativeUsageNumber(payload.partial_checkpoint_original_bytes) : 0,
+    partialCheckpointHash: payload.partial_result === true
+      && /^[0-9a-f]{64}$/.test(String(payload.partial_checkpoint_hash || ''))
+      ? payload.partial_checkpoint_hash : null,
+    partialCheckpointTruncated: payload.partial_result === true
+      ? payload.partial_checkpoint_truncated === true : false,
+    partialCheckpointEventType: payload.partial_result === true
+      ? normalizeClaudeResultString(payload.partial_checkpoint_event_type) : null,
+    partialCheckpointMessageIdHash: payload.partial_result === true
+      && /^[0-9a-f]{64}$/.test(String(payload.partial_checkpoint_message_id_hash || ''))
+      ? payload.partial_checkpoint_message_id_hash : null,
+    partialCheckpointUnavailableReason: payload.partial_result === true
+      ? normalizeClaudeResultString(payload.partial_checkpoint_unavailable_reason) : null,
+    partialCheckpointSelectionReason: payload.partial_result === true
+      ? normalizeClaudeResultString(payload.partial_checkpoint_selection_reason) : null,
+    cleanedOutputUnavailableReason: normalizeClaudeResultString(payload.cleaned_output_unavailable_reason),
+    gracefulFinalization: payload.graceful_finalization && typeof payload.graceful_finalization === 'object'
+      ? payload.graceful_finalization : null,
+    writerDiffSummary: payload.writer_diff_summary && typeof payload.writer_diff_summary === 'object'
+      ? payload.writer_diff_summary : null,
     stopReason: normalizeClaudeResultString(payload.stop_reason),
     supervisorStopReason: normalizeClaudeResultString(payload.supervisor_stop_reason),
     providerTimeoutSource: normalizeClaudeResultString(payload.provider_timeout_source),
@@ -1549,7 +1578,7 @@ function normalizeClaudeJsonUsage(document) {
 // the terminal result, when present, replaces the aggregate with the CLI's
 // complete model census. Other providers remain explicitly terminal-only or
 // unavailable rather than being policed with character-count guesses.
-function createProviderUsageObserver(parserName, supervisor) {
+function createProviderUsageObserver(parserName, supervisor, { onTerminal = null } = {}) {
   if (parserName !== 'claude_json') {
     return { record(chunk) { return String(chunk || '').length; }, flush() {} };
   }
@@ -1568,6 +1597,10 @@ function createProviderUsageObserver(parserName, supervisor) {
       const turns = nonnegativeUsageNumber(event.num_turns);
       if (usage) supervisor.recordProviderUsage({ ...usage, turns }, { phase: 'terminal' });
       else if (turns !== null) supervisor.recordProviderUsage({ turns }, { phase: 'terminal' });
+      if (typeof onTerminal === 'function'
+          && !parseConfiguredOneShotOutput({ oneshot_output_parser: 'claude_json' }, line).parseError) {
+        onTerminal(event);
+      }
       return supervisor.evaluate().action !== 'kill';
     }
     if (event?.type !== 'assistant' || !event.message || typeof event.message !== 'object') return true;
@@ -1651,7 +1684,7 @@ function extractClaudeAssistantDiagnostic(events, maxChars = CLAUDE_PARTIAL_DIAG
       .filter((block) => block && block.type === 'text' && typeof block.text === 'string')
       .map((block) => block.text)
       .join('\n');
-    const cleaned = cleanOutput(text);
+    const cleaned = redactCheckpointSecrets(cleanOutput(text));
     if (!messages.has(id)) {
       messages.set(id, { text: cleaned, conflicted: false });
       continue;
@@ -1669,7 +1702,7 @@ function extractClaudeAssistantDiagnostic(events, maxChars = CLAUDE_PARTIAL_DIAG
   const chunks = [...messages.values()]
     .filter((state) => !state.conflicted && state.text)
     .map((state) => state.text);
-  const diagnostic = cleanOutput(chunks.join('\n\n'));
+  const diagnostic = redactCheckpointSecrets(cleanOutput(chunks.join('\n\n')));
   if (!diagnostic || diagnostic.length <= maxChars) {
     return { text: diagnostic, truncated: false, originalChars: diagnostic.length };
   }
@@ -1923,6 +1956,13 @@ function parseConfiguredOneShotOutput(entry, rawOutput, { ignoreTerminalResult =
     // enter this parser, even when they share a transport chunk with the stop.
     if (!document || typeof document !== 'object' || Array.isArray(document)) throw new Error('result is not an object');
     if (document.type !== 'result') throw new Error('document type is not result');
+    // A finalization message can queue another turn after an earlier result.
+    // That result no longer describes the accepted semantic prefix. Treat it
+    // as incomplete, preserving the newer observer usage/checkpoint instead
+    // of overwriting them (or quota/duration provenance) at close/disconnect.
+    if (events.slice(events.lastIndexOf(document) + 1).some((event) => event.type === 'assistant')) {
+      throw new Error('result precedes newer assistant output');
+    }
     const subtype = (normalizeClaudeResultString(document.subtype) || '').toLowerCase();
     if (subtype !== 'success' && !/^error_/.test(subtype)) throw new Error('result subtype is unsupported');
     if (typeof document.is_error !== 'boolean') throw new Error('result is_error is not boolean');
@@ -1974,10 +2014,12 @@ function parseConfiguredOneShotOutput(entry, rawOutput, { ignoreTerminalResult =
       providerApiDurationMs: nonnegativeUsageNumber(document.duration_api_ms),
       resultSchemaDisagreement,
       partialDiagnostic: partial?.text || '', partialDiagnosticTruncated: partial?.truncated === true,
+      partialCheckpoint: ignoreTerminalResult ? extractClaudeAssistantCheckpoint(events) : null,
       parseError: null,
     };
   } catch (error) {
     const partial = extractClaudeAssistantDiagnostic(events);
+    const checkpoint = extractClaudeAssistantCheckpoint(events);
     return {
       output: '', usage: null, isError: true,
       resultSubtype: null, failureClass: 'provider_error',
@@ -1990,9 +2032,22 @@ function parseConfiguredOneShotOutput(entry, rawOutput, { ignoreTerminalResult =
       retries: normalizeClaudeRetryEvents(events),
       partialDiagnostic: partial.text,
       partialDiagnosticTruncated: partial.truncated,
+      partialCheckpoint: checkpoint,
       parseError: `claude_json parse failed: ${error.message}`,
     };
   }
+}
+
+function acceptedProviderUsage(parsed, supervisedUsage) {
+  return parsed.usage || (supervisedUsage ? {
+    input_tokens: supervisedUsage.input_tokens ?? 0,
+    output_tokens: supervisedUsage.output_tokens ?? 0,
+    cache_read_input_tokens: supervisedUsage.cache_read_input_tokens ?? 0,
+    cache_creation_input_tokens: supervisedUsage.cache_creation_input_tokens ?? 0,
+    total_tokens: supervisedUsage.total_tokens ?? null,
+    token_source: 'provider_reported',
+    model_usage: [],
+  } : null);
 }
 
 function acceptedTerminalQuotaEvidence(parsed, provider) {
@@ -2000,6 +2055,17 @@ function acceptedTerminalQuotaEvidence(parsed, provider) {
   return { provider, scope: 'account', kind: 'rate_limit', source: 'claude_terminal_api_status',
     status: 429, errorCount: parsed.errorCount,
     errorDiagnosticHash: crypto.createHash('sha256').update(parsed.diagnostic || '').digest('hex') };
+}
+
+function claudeStreamUserMessage(text) {
+  return `${JSON.stringify({
+    type: 'user',
+    message: {
+      role: 'user',
+      content: [{ type: 'text', text: String(text || '') }],
+    },
+    parent_tool_use_id: null,
+  })}\n`;
 }
 
 function ollamaManifestIdentity(entry) {
@@ -4403,7 +4469,11 @@ async function executeOneShot(body, res) {
     }
   }
   const slotResolved = renderPromptSlot(slot, { prompt_file: promptFile, prompt: promptForArgs, cwd: resolvedCwd });
-  const promptTransport = preparedPrompt.evidence.transport;
+  const supportsClaudeStreamFinalization = entry.oneshot_graceful_finalize === 'claude_stream_json'
+    && preparedPrompt.evidence.transport === 'stdin'
+    && slotResolved.some((arg, index) => arg === '--input-format' && slotResolved[index + 1] === 'stream-json');
+  const promptTransport = supportsClaudeStreamFinalization ? 'stdin_stream_json' : preparedPrompt.evidence.transport;
+  const initialStreamFrame = supportsClaudeStreamFinalization ? claudeStreamUserMessage(effectivePrompt) : null;
   const cleanupPromptFile = () => {
     if (!promptFileDir) return;
     try { fs.rmSync(promptFileDir, { recursive: true, force: true }); } catch {}
@@ -4470,6 +4540,10 @@ async function executeOneShot(body, res) {
     prompt_transport: promptTransport,
     prompt_truncated: false,
     prompt_evidence: preparedPrompt.evidence,
+    prompt_wire_input: initialStreamFrame === null ? null : {
+      transport: 'stdin_stream_json', bytes: Buffer.byteLength(initialStreamFrame, 'utf8'),
+      sha256: crypto.createHash('sha256').update(initialStreamFrame).digest('hex'),
+    },
     prompt_policy: safePromptPrefix
       ? (entry.oneshot_safe_prompt_policy || 'configured_safe_prompt_prefix') : null,
     prompt_policy_chars: safePromptPrefix.length,
@@ -4567,6 +4641,10 @@ async function executeOneShot(body, res) {
     });
   }
   let proc;
+  let writerWorkspaceBaseline = null;
+  let providerInputWriteError = false;
+  let gracefulFinalization = null;
+  let providerExited = false;
   try {
     // Re-check both the startup-pinned allowed-root identity and the selected
     // directory immediately before child creation. Node's spawn API has no
@@ -4580,6 +4658,7 @@ async function executeOneShot(body, res) {
       );
     }
     resolvedCwd = spawnCwdIdentity.resolved;
+    if (useDanger) writerWorkspaceBaseline = captureWriterWorkspaceSnapshot(resolvedCwd);
     const spawnOpts = {
       cwd: resolvedCwd,
       env: launch.env,
@@ -4594,6 +4673,16 @@ async function executeOneShot(body, res) {
       // to be audited before the group can be created. Tracked separately.
     };
     proc = trackChild(spawn(launch.file, launch.args, spawnOpts));
+    // ChildProcess stdin errors are emitted asynchronously and are not caught
+    // by try/catch around write(). Always consume them so an early provider
+    // exit (EPIPE) cannot crash the bridge process.
+    guardProviderInput(proc.stdin, () => {
+      providerInputWriteError = true;
+      if (gracefulFinalization?.requested) {
+        gracefulFinalization.sent = false;
+        gracefulFinalization.reason = 'provider_input_write_failed';
+      }
+    });
     // executeOneShot returns after wiring the child events; the response is
     // delivered by proc.on('close'). Background-task capture must distinguish
     // that intentional deferred response from a handler that forgot to reply.
@@ -4625,6 +4714,79 @@ async function executeOneShot(body, res) {
   let timedOut = false;
   let clientGone = false;
   let settled = false;
+  let writerDiffSummary = null;
+  let providerInputClosed = false;
+  const closeProviderInput = () => {
+    if (providerInputClosed) return;
+    providerInputClosed = true;
+    try { proc.stdin.end(); } catch {}
+  };
+  gracefulFinalization = {
+    supported: supportsClaudeStreamFinalization,
+    requested: false,
+    sent: false,
+    method: supportsClaudeStreamFinalization ? 'claude_stream_json_user_message' : null,
+    reason: supportsClaudeStreamFinalization ? null : 'provider_transport_does_not_support_mid_run_input',
+    reserve: null,
+  };
+  const requestGracefulFinalization = (verdict) => {
+    if (gracefulFinalization.requested) return;
+    gracefulFinalization.requested = true;
+    gracefulFinalization.reserve = verdict?.reserve || null;
+    supervisor.acknowledgeFinalization(gracefulFinalization.reserve);
+    if (!supportsClaudeStreamFinalization || providerInputClosed
+      || providerInputWriteError
+      || proc.stdin.destroyed || proc.stdin.writableEnded) {
+      gracefulFinalization.reason = providerInputWriteError
+        ? 'provider_input_write_failed'
+        : providerInputClosed
+          ? 'provider_input_already_closed' : 'provider_transport_does_not_support_mid_run_input';
+      return;
+    }
+    const message = [
+      'RelayBridge token-budget reserve reached. Stop starting new work.',
+      'Return a concise final checkpoint now: completed findings, exact files changed, tests run, and remaining work.',
+      'Do not include secrets, credentials, raw tool arguments, or raw command output.',
+    ].join(' ');
+    try {
+      proc.stdin.write(claudeStreamUserMessage(message), (error) => {
+        if (settled) return;
+        if (error) {
+          providerInputWriteError = true;
+          gracefulFinalization.sent = false;
+          gracefulFinalization.reason = 'provider_input_write_failed';
+        } else if (!providerInputWriteError) {
+          gracefulFinalization.sent = true;
+          gracefulFinalization.reason = null;
+        }
+      });
+    } catch (error) {
+      providerInputWriteError = true;
+      gracefulFinalization.sent = false;
+      gracefulFinalization.reason = 'provider_input_write_failed';
+    }
+  };
+  const collectWriterDiffSummary = () => {
+    if (!useDanger) return null;
+    if (!providerExited) {
+      return {
+        available: false,
+        reason: 'provider_still_running',
+        changedFileCount: null,
+        changedFileCountLowerBound: 0,
+        changeCountComplete: false,
+        files: [],
+        filesTruncated: false,
+      };
+    }
+    if (!writerDiffSummary) {
+      writerDiffSummary = summarizeWriterWorkspaceDiff(
+        writerWorkspaceBaseline,
+        captureWriterWorkspaceSnapshot(resolvedCwd),
+      );
+    }
+    return writerDiffSummary;
+  };
   res._relayCancellationPayload = () => {
     const semanticStdout = supervisorStdout ?? stdout;
     const transportStdout = stdout + lateStdout;
@@ -4632,6 +4794,8 @@ async function executeOneShot(body, res) {
       ignoreTerminalResult: stopReason === 'token_budget',
     });
     const retainedPartial = stopReason === 'token_budget' && !!parsedOutput.partialDiagnostic;
+    const checkpoint = stopReason === 'token_budget'
+      ? parsedOutput.partialCheckpoint : null;
     const cancellationState = resolveCancellationTerminalState({
       stopReason,
       timedOut,
@@ -4646,7 +4810,7 @@ async function executeOneShot(body, res) {
       exitCode: -1,
       stdout: parsedOutput.output,
       stderr: cleanOutput([stderr, parsedOutput.diagnostic, parsedOutput.parseError].filter(Boolean).join('\n')),
-      usage: parsedOutput.usage,
+      usage: acceptedProviderUsage(parsedOutput, progress.providerUsage),
       failureClass: cancellationState.failureClass,
       result_subtype: parsedOutput.resultSubtype,
       result_schema_disagreement: parsedOutput.resultSchemaDisagreement,
@@ -4658,7 +4822,7 @@ async function executeOneShot(body, res) {
       rate_limited: parsedOutput.apiErrorStatus === 429,
       budget_exceeded: stopReason === 'token_budget',
       provider_permission_denials: parsedOutput.permissionDenials,
-      provider_num_turns: parsedOutput.numTurns,
+      provider_num_turns: parsedOutput.numTurns ?? progress.providerUsage?.turns ?? null,
       provider_duration_ms: parsedOutput.providerDurationMs,
       provider_api_duration_ms: parsedOutput.providerApiDurationMs,
       provider_error_count: parsedOutput.errorCount,
@@ -4670,9 +4834,25 @@ async function executeOneShot(body, res) {
         partial_result: true,
         partial_diagnostic: parsedOutput.partialDiagnostic,
         partial_diagnostic_truncated: parsedOutput.partialDiagnosticTruncated === true,
+        partial_checkpoint: checkpoint?.text || '',
+        partial_checkpoint_bytes: checkpoint?.bytes || 0,
+        partial_checkpoint_original_bytes: checkpoint?.originalBytes || 0,
+        partial_checkpoint_hash: checkpoint?.sha256 || null,
+        partial_checkpoint_truncated: checkpoint?.truncated === true,
+        partial_checkpoint_event_type: checkpoint?.eventType || null,
+        partial_checkpoint_message_id_hash: checkpoint?.messageIdHash || null,
+        partial_checkpoint_unavailable_reason: checkpoint?.unavailableReason || null,
+        partial_checkpoint_selection_reason: checkpoint?.selectionReason || null,
       } : {}),
       ...(stopReason === 'token_budget'
-        ? { cleaned_output_unavailable: !parsedOutput.output } : {}),
+        ? {
+          cleaned_output_unavailable: !parsedOutput.output,
+          cleaned_output_unavailable_reason: !parsedOutput.output
+            ? (parsedOutput.parseError ? 'incomplete_or_malformed_terminal_result' : 'terminal_result_had_no_clean_text')
+            : null,
+          graceful_finalization: { ...gracefulFinalization },
+          writer_diff_summary: collectWriterDiffSummary(),
+        } : {}),
       transport_output_chars: String(transportStdout).length,
       transport_output_hash: crypto.createHash('sha256').update(String(transportStdout)).digest('hex'),
       stop_reason: cancellationState.stopReason,
@@ -4690,14 +4870,19 @@ async function executeOneShot(body, res) {
   // emitting new content is left alone to finish; one that goes silent or
   // starts repeating itself is stopped early with a reason, so tokens are not
   // spent on a wedged or looping stage. See lib/run-supervisor.js.
-  const supervisor = new RunSupervisor(supervisorOptions);
+  const supervisor = new RunSupervisor({ ...supervisorOptions,
+    finalizationSupported: supportsClaudeStreamFinalization });
   const runId = `run_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 8)}`;
   activeRuns.set(runId, { runId, kind, route, startedAt, supervisor, pid: proc.pid });
   let stopReason = null;
   let stopDetail = '';
   let stopBudgetEnforcement = null;
   let sampling = false;
-  const usageObserver = createProviderUsageObserver(entry.oneshot_output_parser, supervisor);
+  const usageObserver = createProviderUsageObserver(entry.oneshot_output_parser, supervisor, {
+    onTerminal: () => {
+      if (supportsClaudeStreamFinalization) closeProviderInput();
+    },
+  });
   const latchSupervisorVerdict = (verdict) => {
     if (verdict.action !== 'kill' || stopReason) return false;
     stopReason = verdict.reason;
@@ -4718,6 +4903,10 @@ async function executeOneShot(body, res) {
     if (settled) return finishSupervision();
     const applyVerdict = () => {
       const verdict = supervisor.evaluate();
+      if (verdict.action === 'finalize') {
+        requestGracefulFinalization(verdict);
+        return;
+      }
       if (latchSupervisorVerdict(verdict)) killProcessTree(proc);
     };
     // CPU is only sampled once a run has gone quiet, so healthy runs never pay
@@ -4761,7 +4950,8 @@ async function executeOneShot(body, res) {
     const lateChunk = chunk.slice(semanticChars);
     if (semanticChunk && supervisor.recordOutput(semanticChunk)) stdout += semanticChunk;
     const verdict = supervisor.evaluate();
-    if (latchSupervisorVerdict(verdict)) {
+    if (verdict.action === 'finalize') requestGracefulFinalization(verdict);
+    else if (latchSupervisorVerdict(verdict)) {
       retainLateStdout(lateChunk);
       killProcessTree(proc);
     }
@@ -4771,6 +4961,7 @@ async function executeOneShot(body, res) {
   });
   proc.on('error', (err) => {
     if (settled) return;
+    providerExited = true;
     settled = true;
     finishSupervision();
     cleanupPromptFile();
@@ -4787,6 +4978,7 @@ async function executeOneShot(body, res) {
   });
   const settleFromClose = (code) => {
     if (settled) return;
+    providerExited = true;
     settled = true;
     finishSupervision();
     cleanupPromptFile();
@@ -4824,15 +5016,7 @@ async function executeOneShot(body, res) {
       }
     }
     const supervisedUsage = supervisor.snapshot().providerUsage;
-    const authoritativeUsage = parsedOutput.usage || (supervisedUsage ? {
-      input_tokens: supervisedUsage.input_tokens ?? 0,
-      output_tokens: supervisedUsage.output_tokens ?? 0,
-      cache_read_input_tokens: supervisedUsage.cache_read_input_tokens ?? 0,
-      cache_creation_input_tokens: supervisedUsage.cache_creation_input_tokens ?? 0,
-      total_tokens: supervisedUsage.total_tokens ?? null,
-      token_source: 'provider_reported',
-      model_usage: [],
-    } : null);
+    const authoritativeUsage = acceptedProviderUsage(parsedOutput, supervisedUsage);
     const cleanedStdout = parsedOutput.output;
     // Codex exec's text mode puts the final answer on stdout and its progress
     // transcript (including tool output and echoed prompts) on stderr. An
@@ -4925,6 +5109,7 @@ async function executeOneShot(body, res) {
       && hasProviderInternalTimeoutDiagnostic(failureBlob);
     const providerTimedOut = timedOut || authoritativeApiFailure === 'timeout' || providerInternalTimedOut;
     const retainedPartial = tokenBudgetExceeded && !!parsedOutput.partialDiagnostic;
+    const checkpoint = retainedPartial ? parsedOutput.partialCheckpoint : null;
     const finalFailureClass = !isolationCleanup.ok ? 'isolation_cleanup'
       : tokenBudgetExceeded ? 'token_budget'
       : parsedOutput.resultSubtype === 'error_max_budget_usd' ? 'budget'
@@ -4969,8 +5154,25 @@ async function executeOneShot(body, res) {
         partial_result: true,
         partial_diagnostic: parsedOutput.partialDiagnostic,
         partial_diagnostic_truncated: parsedOutput.partialDiagnosticTruncated === true,
+        partial_checkpoint: checkpoint?.text || '',
+        partial_checkpoint_bytes: checkpoint?.bytes || 0,
+        partial_checkpoint_original_bytes: checkpoint?.originalBytes || 0,
+        partial_checkpoint_hash: checkpoint?.sha256 || null,
+        partial_checkpoint_truncated: checkpoint?.truncated === true,
+        partial_checkpoint_event_type: checkpoint?.eventType || null,
+        partial_checkpoint_message_id_hash: checkpoint?.messageIdHash || null,
+        partial_checkpoint_unavailable_reason: checkpoint?.unavailableReason || null,
+        partial_checkpoint_selection_reason: checkpoint?.selectionReason || null,
       } : {}),
-      ...(tokenBudgetExceeded ? { cleaned_output_unavailable: !cleanedStdout } : {}),
+      ...(tokenBudgetExceeded ? {
+        cleaned_output_unavailable: !cleanedStdout,
+        cleaned_output_unavailable_reason: !cleanedStdout
+          ? (parsedOutput.parseError ? 'incomplete_or_malformed_terminal_result' : 'terminal_result_had_no_clean_text')
+          : null,
+        writer_diff_summary: collectWriterDiffSummary(),
+      } : {}),
+      graceful_finalization: tokenBudgetExceeded || gracefulFinalization.requested
+        ? { ...gracefulFinalization } : null,
       quota_evidence: terminalQuotaEvidence || copilotQuotaEvidence,
       provider_action_required: cursorActionRequired,
       transport_output_chars: String(transportStdout).length,
@@ -5021,7 +5223,18 @@ async function executeOneShot(body, res) {
   });
   // Providers without a placeholder (Claude/Codex/Perplexity wrapper) read
   // stdin. Antigravity consumes {prompt}; Grok consumes {prompt_file}.
-  if (promptTransport === 'stdin') {
+  if (promptTransport === 'stdin_stream_json') {
+    try {
+      proc.stdin.write(initialStreamFrame, (error) => {
+        if (!error) return;
+        providerInputWriteError = true;
+        closeProviderInput();
+      });
+    } catch {
+      providerInputWriteError = true;
+      closeProviderInput();
+    }
+  } else if (promptTransport === 'stdin') {
     try { proc.stdin.write(effectivePrompt); proc.stdin.end(); } catch {}
   } else {
     try { proc.stdin.end(); } catch {}

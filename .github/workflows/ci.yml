@@ -52,11 +52,11 @@ jobs:
       - name: Test
         run: npm test
 
-      - name: Test Windows installer lifecycle
-        run: npm run test:install
-
       - name: Test Windows MCP registration lifecycle
         run: npm run test:install-mcp
+
+      - name: Test Windows installer lifecycle
+        run: npm run test:install
 
       - name: Audit production dependencies
         run: npm audit --omit=dev

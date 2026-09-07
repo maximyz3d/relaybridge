@@ -10,6 +10,8 @@ if ($env:RELAYBRIDGE_SKIP_INSTALL_TEST -eq '1') {
 }
 
 $repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).ProviderPath
+$releaseVersion = [string](([IO.File]::ReadAllText((Join-Path $repoRoot 'package.json')) | ConvertFrom-Json).version)
+$releaseBuildIdPattern = '^' + [regex]::Escape($releaseVersion) + '\+[a-f0-9]{16}$'
 $installer = Join-Path $repoRoot 'install.ps1'
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ('relaybridge-install-test-' + [Guid]::NewGuid().ToString('N'))
 $installRoot = Join-Path $testRoot 'RelayBridge'
@@ -62,12 +64,14 @@ function Invoke-TestInstall(
   [int]$Port = 0,
   [string]$TargetInstallDir = '',
   [string]$MigrationSource = '',
-  [string]$InstallSource = ''
+  [string]$InstallSource = '',
+  [switch]$FailRollbackCleanup
 ) {
   if (-not $Port) { $Port = Get-FreePort }
   if (-not $TargetInstallDir) { $TargetInstallDir = $installRoot }
   if (-not $InstallSource) { $InstallSource = $repoRoot }
   $previousFailAt = $env:RELAYBRIDGE_INSTALL_TEST_FAIL_AT
+  $previousFailRollbackCleanup = $env:RELAYBRIDGE_INSTALL_TEST_FAIL_ROLLBACK_CLEANUP
   $previousErrorFile = $env:RELAYBRIDGE_INSTALL_TEST_ERROR_FILE
   $previousGitHubRegistry = $env:RELAYBRIDGE_GITHUB_REPOS
   $previousDataDir = $env:RELAYBRIDGE_DATA_DIR
@@ -75,6 +79,7 @@ function Invoke-TestInstall(
   $errorFile = Join-Path $testRoot ('install-error-' + [Guid]::NewGuid().ToString('N') + '.txt')
   try {
     $env:RELAYBRIDGE_INSTALL_TEST_FAIL_AT = $FailAt
+    $env:RELAYBRIDGE_INSTALL_TEST_FAIL_ROLLBACK_CLEANUP = if ($FailRollbackCleanup) { '1' } else { $null }
     $env:RELAYBRIDGE_INSTALL_TEST_ERROR_FILE = $errorFile
     # Host-specific runtime paths must never leak into the disposable Windows
     # fixture (especially when this script is launched through powershell.exe
@@ -98,11 +103,13 @@ function Invoke-TestInstall(
       [IO.File]::ReadAllText($errorFile, [Text.UTF8Encoding]::new($false)).Trim()
     } else { '' }
     if ($exitCode -ne 0) {
-      Write-Host "[RelayBridge] Installer test diagnostic ($FailAt): $diagnostic" -ForegroundColor DarkGray
+      $boundedDiagnostic = if ($diagnostic) { $diagnostic.Substring(0, [Math]::Min(12000, $diagnostic.Length)) } else { '(child installer produced no diagnostic file)' }
+      Write-Host "[RelayBridge test] installer exit=$exitCode failpoint=$FailAt port=$Port`n$boundedDiagnostic"
     }
     return [pscustomobject]@{ ExitCode = $exitCode; Port = $Port; Diagnostic = $diagnostic }
   } finally {
     $env:RELAYBRIDGE_INSTALL_TEST_FAIL_AT = $previousFailAt
+    $env:RELAYBRIDGE_INSTALL_TEST_FAIL_ROLLBACK_CLEANUP = $previousFailRollbackCleanup
     $env:RELAYBRIDGE_INSTALL_TEST_ERROR_FILE = $previousErrorFile
     $env:RELAYBRIDGE_GITHUB_REPOS = $previousGitHubRegistry
     $env:RELAYBRIDGE_DATA_DIR = $previousDataDir
@@ -538,6 +545,88 @@ Write-Host '[RelayBridge] Windows exact candidate-PID rejection passed.' -Foregr
 # through a live process. Mock only the handle acquisition, health probe, port
 # probe, shutdown request, and sleep - all in child scope - so the real function
 # body still runs.
+foreach ($pidCase in @(
+  [pscustomobject]@{ capabilityAuth = $true },
+  [pscustomobject]@{ capabilityAuth = $true; pid = $null },
+  [pscustomobject]@{ capabilityAuth = $true; pid = 0 },
+  [pscustomobject]@{ capabilityAuth = $true; pid = -1 },
+  [pscustomobject]@{ capabilityAuth = $true; pid = 'not-a-pid' },
+  [pscustomobject]@{ capabilityAuth = $true; pid = '2147483648' }
+)) {
+  & {
+    $counter = @{ capture = 0; shutdown = 0; port = 0; sleep = 0 }
+    function Get-BridgeHealth([int]$BridgePort, [int]$TimeoutSec = 2) { return $pidCase }
+    function Test-Path { return $true }
+    function Get-Content { return ('a' * 64) }
+    function Get-BridgeShutdownProcessHandle([int]$ProcessId) { $counter.capture++; return $null }
+    function Invoke-RestMethod { $counter.shutdown++ }
+    function Test-LocalPortInUse([int]$BridgePort) { $counter.port++; return $false }
+    function Start-Sleep([int]$Milliseconds) { $counter.sleep++ }
+    $stoppedHealth = $null
+    $errorMessage = ''
+    try { Stop-BridgeForCutover 'C:\fake-runtime-root' 8787 ([ref]$stoppedHealth) }
+    catch { $errorMessage = $_.Exception.Message }
+    Assert-True ($errorMessage -match 'valid process identity') 'missing or invalid PID must fail before shutdown'
+    Assert-True ($null -eq $stoppedHealth) 'invalid PID must not create restart evidence'
+    Assert-True ($counter.capture -eq 0 -and $counter.shutdown -eq 0 -and $counter.port -eq 0 -and $counter.sleep -eq 0) 'invalid PID must not capture, stop, poll, or sleep'
+  }
+}
+Write-Host '[RelayBridge] Stop-BridgeForCutover invalid-PID cases passed.' -ForegroundColor DarkGray
+
+& {
+  $counter = @{ captureIds = @(); shutdown = 0; port = 0; sleep = 0 }
+  function Get-BridgeHealth([int]$BridgePort, [int]$TimeoutSec = 2) { return [pscustomobject]@{ capabilityAuth = $true; pid = 4242 } }
+  function Test-Path { return $true }
+  function Get-Content { return ('a' * 64) }
+  function Get-BridgeShutdownProcessHandle([int]$ProcessId) { $counter.captureIds += $ProcessId; return $null }
+  function Invoke-RestMethod { $counter.shutdown++ }
+  function Test-LocalPortInUse([int]$BridgePort) { $counter.port++; return $false }
+  function Start-Sleep([int]$Milliseconds) { $counter.sleep++ }
+  $stoppedHealth = $null
+  $errorMessage = ''
+  try { Stop-BridgeForCutover 'C:\fake-runtime-root' 8787 ([ref]$stoppedHealth) }
+  catch { $errorMessage = $_.Exception.Message }
+  Assert-True ($errorMessage -match 'could not be pinned') 'an unpinnable process identity must fail before shutdown'
+  Assert-True ($counter.captureIds.Count -eq 1 -and $counter.captureIds[0] -eq 4242) 'capture must target the exact reported PID once'
+  Assert-True ($null -eq $stoppedHealth -and $counter.shutdown -eq 0 -and $counter.port -eq 0 -and $counter.sleep -eq 0) 'pin failure must not stop, poll, sleep, or record restart evidence'
+}
+Write-Host '[RelayBridge] Stop-BridgeForCutover unpinnable-PID case passed.' -ForegroundColor DarkGray
+
+& {
+  $counter = @{ order = @(); portChecks = 0; waitMilliseconds = @(); dispose = 0 }
+  $health = [pscustomobject]@{ capabilityAuth = $true; pid = 4242 }
+  function Get-BridgeHealth([int]$BridgePort, [int]$TimeoutSec = 2) { return $health }
+  function Test-Path { return $true }
+  function Get-Content { return ('a' * 64) }
+  function Get-BridgeShutdownProcessHandle([int]$ProcessId) {
+    $counter.order += 'capture'
+    $process = [pscustomobject]@{ Counter = $counter }
+    $process | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {
+      param($Milliseconds)
+      $this.Counter.order += 'wait'
+      $this.Counter.waitMilliseconds += $Milliseconds
+      return $true
+    }
+    $process | Add-Member -MemberType ScriptMethod -Name Dispose -Value {
+      $this.Counter.order += 'dispose'
+      $this.Counter.dispose++
+    }
+    return $process
+  }
+  function Invoke-RestMethod { $counter.order += 'shutdown'; return '{"ok":true}' }
+  function Test-LocalPortInUse([int]$BridgePort) { $counter.order += 'port'; $counter.portChecks++; return ($counter.portChecks -gt 1) }
+  function Start-Sleep([int]$Milliseconds) { throw 'closed listener must not sleep' }
+  $stoppedHealth = $null
+  $errorMessage = ''
+  try { Stop-BridgeForCutover 'C:\fake-runtime-root' 8787 ([ref]$stoppedHealth) }
+  catch { $errorMessage = $_.Exception.Message }
+  Assert-True ($errorMessage -match 'occupied again after shutdown') 'reacquired listener must reject cutover'
+  Assert-True (($counter.order -join ',') -eq 'capture,shutdown,port,wait,port,dispose') 'cutover must recheck port after waiting on the pinned process'
+  Assert-True ($counter.portChecks -eq 2 -and $counter.waitMilliseconds.Count -eq 1 -and $counter.waitMilliseconds[0] -eq 10000 -and $counter.dispose -eq 1) 'reacquired port must wait and dispose exactly once'
+  Assert-True ([object]::ReferenceEquals($health, $stoppedHealth)) 'reacquisition failure must preserve the original restart evidence'
+}
+Write-Host '[RelayBridge] Stop-BridgeForCutover reacquired-port case passed.' -ForegroundColor DarkGray
+
 & {
   $counter = @{ order = @(); waitForExitCalls = 0; waitForExitMilliseconds = @(); disposeCalls = 0 }
   $health = [pscustomobject]@{ pid = 4242; capabilityAuth = $true }
@@ -613,7 +702,7 @@ Write-Host '[RelayBridge] Stop-BridgeForCutover WaitForExit-timeout case passed.
   Assert-True $threw 'exhausting every port-close attempt must fail cutover'
   Assert-True ($errorMessage -match 'did not stop before cutover') 'the port-exhaustion failure must name the stalled bridge'
   Assert-True ($null -ne $stoppedHealth -and $stoppedHealth.pid -eq 4242) 'restart evidence must be preserved even when the port never closes'
-  Assert-True ($counter.portChecks -eq 50 -and $counter.sleeps -eq 50) 'port-close polling must stop at exactly the bounded attempt count'
+  Assert-True ($counter.portChecks -eq 100 -and $counter.sleeps -eq 100) 'port-close polling must stop at exactly the bounded attempt count'
   Assert-True (($counter.sleepMilliseconds | Where-Object { $_ -ne 100 }).Count -eq 0) 'every port-close poll must wait the exact production interval'
   Assert-True ($counter.waitForExitCalls -eq 0) 'the process exit wait must never run once port-close polling is exhausted'
   Assert-True ($counter.disposeCalls -eq 1) 'the captured process handle must be disposed exactly once'
@@ -688,7 +777,7 @@ Write-Host '[RelayBridge] Stop-BridgeForCutover authenticated-shutdown-failure c
   Assert-True ($null -ne $stoppedHealth -and $stoppedHealth.pid -eq $result.pid -and $stoppedHealth.buildId -eq $result.buildId) 'StoppedHealth must record the identical snapshot returned to the caller'
   Assert-True ($counter.waitForExitCalls -eq 1 -and $counter.waitForExitMilliseconds[0] -eq 10000) 'WaitForExit must be called with the exact production timeout'
   Assert-True ($counter.disposeCalls -eq 1) 'the captured process handle must be disposed exactly once'
-  Assert-True ($counter.portChecks -ge 1) 'a clean shutdown must still confirm the listener port has closed'
+  Assert-True ($counter.portChecks -eq 2) 'a clean shutdown must confirm listener closure before and after process exit'
 }
 Write-Host '[RelayBridge] Stop-BridgeForCutover clean-exit success case passed.' -ForegroundColor DarkGray
 
@@ -730,11 +819,16 @@ const port = Number(process.env.PORT);
 const server = http.createServer((req, res) => {
   if (req.method === 'GET' && req.url === '/api/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
+    // Legacy identity shape: version but no buildId/buildIdentityReady. It
+    // must still identify its exact process so rollback cannot accept an
+    // unrelated listener that wins the port race.
     return res.end(JSON.stringify({ version: '2.0.0', capabilityAuth: true, pid: process.pid }));
   }
   if (req.method === 'POST' && req.url === '/api/admin/shutdown' && req.headers['x-relaybridge-token'] === token) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end('{"ok":true}', () => server.close(() => process.exit(0)));
+    // Close the listener first but deliberately retain the process/cwd briefly.
+    // Windows cutover must wait for full process exit before renaming this tree.
+    return res.end('{"ok":true}', () => server.close(() => setTimeout(() => process.exit(0), 750)));
   }
   res.writeHead(404);
   res.end();
@@ -851,12 +945,20 @@ server.listen(port, '127.0.0.1');
   }
   Assert-True ($legacyHealth.version -eq '2.0.0') 'legacy fixture must be healthy before cutover'
 
-  $failed = Invoke-TestInstall 'after-promote' -Port $legacyPort -InstallSource $migrationFixtureSource
+  $failed = Invoke-TestInstall 'after-promote' -Port $legacyPort -InstallSource $migrationFixtureSource -FailRollbackCleanup
   Assert-True ($failed.ExitCode -ne 0) 'the injected post-promotion failure must fail the installer'
   Assert-True ($failed.Diagnostic -match [Regex]::Escape('Injected installer failure at after-promote')) 'post-promotion rollback regression must prove staging and promotion reached the injected checkpoint'
+  Assert-True ($failed.Diagnostic -match 'failed release cleanup deferred: Injected rollback cleanup failure') 'rollback diagnostics must retain a non-fatal failed-release cleanup warning'
   Assert-True ((Get-TreeFingerprint $installRoot) -eq $before) 'automatic rollback must restore retained release/runtime files byte-for-byte'
-  $restoredHealth = Invoke-RestMethod -Uri "http://127.0.0.1:$legacyPort/api/health" -TimeoutSec 3 -UseBasicParsing
+  try {
+    $restoredHealth = Invoke-RestMethod -Uri "http://127.0.0.1:$legacyPort/api/health" -TimeoutSec 3 -UseBasicParsing
+  } catch {
+    throw "rollback did not restore the legacy health endpoint. Installer diagnostics:`n$($failed.Diagnostic)"
+  }
   Assert-True ($restoredHealth.version -eq '2.0.0') 'rollback must restart a pre-buildId RelayBridge by its legacy version'
+  $failedRecoveryRoots = @(Get-ChildItem -LiteralPath $testRoot -Directory | Where-Object { $_.Name -like 'RelayBridge.failed.*' })
+  Assert-True ($failedRecoveryRoots.Count -eq 1) 'a failed-release cleanup warning must preserve exactly one quarantined recovery tree'
+  Remove-Item -LiteralPath $failedRecoveryRoots[0].FullName -Recurse -Force
   $legacyToken = (Get-Content -LiteralPath (Join-Path $installRoot '.bridge-token') -Raw).Trim()
   Invoke-RestMethod -Uri "http://127.0.0.1:$legacyPort/api/admin/shutdown" -Method Post -Headers @{ 'X-RelayBridge-Token' = $legacyToken } -ContentType 'application/json' -Body '{}' -TimeoutSec 3 -UseBasicParsing | Out-Null
   for ($attempt = 0; $attempt -lt 50 -and (Get-NetTCPConnection -State Listen -LocalPort $legacyPort -ErrorAction SilentlyContinue); $attempt++) { Start-Sleep -Milliseconds 100 }
@@ -935,6 +1037,7 @@ server.listen(port, '127.0.0.1');
     $unmanagedSlotArgs = @($merged.claude_fable.$unmanagedSlotName)
     $unmanagedEffortIndex = [Array]::IndexOf($unmanagedSlotArgs, '--effort')
     Assert-True ($unmanagedEffortIndex -ge 0 -and $unmanagedSlotArgs[$unmanagedEffortIndex + 1] -eq 'max') "claude_fable.$unmanagedSlotName is unmanaged and must retain the installed fixture effort value"
+    Assert-True (Test-ExactJsonStringArray @($merged.claude_fable.$unmanagedSlotName) @($operatorConfig.claude_fable.$unmanagedSlotName)) "undeclared claude_fable.$unmanagedSlotName operator arguments must remain byte-exact"
   }
   Assert-True ($merged.claude.safe[[Array]::IndexOf(@($merged.claude.safe), '--model') + 1] -eq 'operator-claude-model') 'managed-argument migration must preserve an operator model choice'
   Assert-True (@($merged.claude.safe) -contains '--operator-flag') 'managed-argument migration must preserve unrelated operator flags'
@@ -958,7 +1061,7 @@ server.listen(port, '127.0.0.1');
   Assert-True ($routing.taskPriorities.general[0] -eq 'custom_provider') 'operator routing priority must win'
 
   $build = [IO.File]::ReadAllText((Join-Path $installRoot 'build-info.json'), [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
-  Assert-True ([string]$build.buildId -match '^2\.0\.1\+[a-f0-9]{16}$') 'installed release must have an exact code-hash build identity'
+  Assert-True ([string]$build.buildId -match $releaseBuildIdPattern) 'installed release must have an exact code-hash build identity'
   $health = Invoke-RestMethod -Uri "http://127.0.0.1:$($success.Port)/api/health" -TimeoutSec 3 -UseBasicParsing
   Assert-True ([string]$health.buildId -eq [string]$build.buildId) 'promoted server health must report the exact staged build identity'
   Assert-True ($health.buildIdentityReady -eq $true) 'promoted server must report a ready exact build identity before install succeeds'

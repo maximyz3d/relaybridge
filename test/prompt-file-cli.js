@@ -157,6 +157,22 @@ if (process.argv.includes('--claude-json-longrun')) {
   return;
 }
 
+if (process.argv.includes('--claude-json-older-terminal-budget')) {
+  const events = [
+    { type: 'assistant', message: { id: 'older-assistant', usage: { input_tokens: 1, output_tokens: 1 },
+      content: [{ type: 'text', text: 'OLDER_ASSISTANT' }] } },
+    { type: 'result', is_error: false, subtype: 'success', result: 'OLDER_TERMINAL_MUST_NOT_WIN',
+      num_turns: 7, terminal_reason: 'completed', stop_reason: 'end_turn', duration_ms: 123, duration_api_ms: 100,
+      usage: { input_tokens: 1, output_tokens: 1 } },
+    { type: 'assistant', message: { id: 'newer-accepted-checkpoint',
+      usage: { input_tokens: 600, output_tokens: 600, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+      content: [{ type: 'text', text: 'NEWER_ACCEPTED_CHECKPOINT' }] } },
+  ];
+  process.stdout.write(events.map((event) => JSON.stringify(event) + '\n').join(''));
+  setInterval(() => {}, 1000);
+  return;
+}
+
 if (process.argv.includes('--claude-json-multiturn-bounded')) {
   const events = [
     {

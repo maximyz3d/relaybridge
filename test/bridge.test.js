@@ -85,8 +85,10 @@ test('provider config uses the installed subscription CLIs and safe headless mod
   assert.equal(config.claude.oneshot_safe[config.claude.oneshot_safe.indexOf('--tools') + 1], 'Read,Glob,Grep');
   assert.equal(config.claude.oneshot_safe[config.claude.oneshot_safe.indexOf('--mcp-config') + 1], '{"mcpServers":{}}');
   assert.equal(config.claude.oneshot_safe[config.claude.oneshot_safe.indexOf('--output-format') + 1], 'stream-json');
+  assert.equal(config.claude.oneshot_safe[config.claude.oneshot_safe.indexOf('--input-format') + 1], 'stream-json');
   assert.ok(config.claude.oneshot_safe.includes('--include-partial-messages'));
   assert.equal(config.claude.oneshot_output_parser, 'claude_json');
+  assert.equal(config.claude.oneshot_graceful_finalize, 'claude_stream_json');
   assert.deepEqual(config.claude.probe, ['claude', 'auth', 'status']);
   assert.ok(config.claude.strip_env.includes('ANTHROPIC_API_KEY'));
   assert.ok(config.claude.strip_env.includes('CLAUDE_CODE_OAUTH_TOKEN'));
@@ -104,9 +106,11 @@ test('provider config uses the installed subscription CLIs and safe headless mod
     }
   }
   assert.equal(config.claude_fable.oneshot_safe[config.claude_fable.oneshot_safe.indexOf('--output-format') + 1], 'stream-json');
+  assert.equal(config.claude_fable.oneshot_safe[config.claude_fable.oneshot_safe.indexOf('--input-format') + 1], 'stream-json');
   assert.ok(config.claude_fable.oneshot_safe.includes('--include-partial-messages'));
   assert.equal(config.claude_fable.oneshot_output_parser, 'claude_json');
   assert.equal(config.claude_fable.model, 'fable');
+  assert.equal(config.claude_fable.oneshot_graceful_finalize, 'claude_stream_json');
   assert.equal(config.claude_fable.quota_seat, config.claude.quota_seat);
   assert.deepEqual(config.claude_fable.probe, ['claude', 'auth', 'status']);
   assert.ok(config.claude_fable.strip_env.includes('ANTHROPIC_API_KEY'));
@@ -405,6 +409,8 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   fs.mkdirSync(promptTemp);
   fs.mkdirSync(realProviderHome);
   const helper = path.join(ROOT, 'test', 'prompt-file-cli.js');
+  const streamHelper = path.join(ROOT, 'test', 'claude-stream-cli.js');
+  const closedStreamHelper = path.join(ROOT, 'test', 'claude-stdin-closed-cli.js');
   const configPath = path.join(tempRoot, 'config.json');
   const tokenPath = path.join(tempRoot, 'capability.token');
   const lateFinalPidMarker = path.join(tempRoot, 'late-final-provider.pid');
@@ -596,6 +602,15 @@ test('prompt-file transport preserves long special-character prompts and cleans 
       oneshot_dangerous: [...baseSlot, '--claude-json-multiturn-late-final', '--pid-marker', lateFinalPidMarker],
       oneshot_output_parser: 'claude_json',
     },
+    usage_json_older_terminal_budget: {
+      label: 'Older Terminal Newer Accepted Checkpoint',
+      transport: 'subscription:anthropic',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--claude-json-older-terminal-budget'],
+      oneshot_dangerous: [...baseSlot, '--claude-json-older-terminal-budget'],
+      oneshot_output_parser: 'claude_json',
+    },
     usage_json_multiturn_bounded: {
       label: 'Bounded Incremental Claude Diagnostic',
       transport: 'subscription:anthropic',
@@ -604,6 +619,46 @@ test('prompt-file transport preserves long special-character prompts and cleans 
       oneshot_safe: [...baseSlot, '--claude-json-multiturn-bounded'],
       oneshot_dangerous: [...baseSlot, '--claude-json-multiturn-bounded'],
       oneshot_output_parser: 'claude_json',
+    },
+    usage_json_stream_finalize: {
+      label: 'Claude Stream Finalization Fixture',
+      transport: 'subscription:anthropic',
+      safe: [process.execPath, streamHelper, '--version'],
+      dangerous: [process.execPath, streamHelper, '--version'],
+      oneshot_safe: [process.execPath, streamHelper, '--finalize', '--input-format', 'stream-json'],
+      oneshot_dangerous: [process.execPath, streamHelper, '--finalize', '--input-format', 'stream-json'],
+      oneshot_output_parser: 'claude_json',
+      oneshot_graceful_finalize: 'claude_stream_json',
+    },
+    usage_json_stream_healthy: {
+      label: 'Claude Healthy Stream Fixture',
+      transport: 'subscription:anthropic',
+      safe: [process.execPath, streamHelper, '--version'],
+      dangerous: [process.execPath, streamHelper, '--version'],
+      oneshot_safe: [process.execPath, streamHelper, '--healthy', '--input-format', 'stream-json'],
+      oneshot_dangerous: [process.execPath, streamHelper, '--healthy', '--input-format', 'stream-json'],
+      oneshot_output_parser: 'claude_json',
+      oneshot_graceful_finalize: 'claude_stream_json',
+    },
+    usage_json_stream_finalize_epipe: {
+      label: 'Claude Stream Finalization EPIPE Fixture',
+      transport: 'subscription:anthropic',
+      safe: [process.execPath, closedStreamHelper, '--version'],
+      dangerous: [process.execPath, closedStreamHelper, '--version'],
+      oneshot_safe: [process.execPath, closedStreamHelper, '--input-format', 'stream-json'],
+      oneshot_dangerous: [process.execPath, closedStreamHelper, '--input-format', 'stream-json'],
+      oneshot_output_parser: 'claude_json',
+      oneshot_graceful_finalize: 'claude_stream_json',
+    },
+    usage_json_stream_writer_budget: {
+      label: 'Claude Stream Writer Budget Fixture',
+      transport: 'subscription:anthropic',
+      safe: [process.execPath, streamHelper, '--version'],
+      dangerous: [process.execPath, streamHelper, '--version'],
+      oneshot_safe: [process.execPath, streamHelper, '--writer-budget', '--input-format', 'stream-json'],
+      oneshot_dangerous: [process.execPath, streamHelper, '--writer-budget', '--input-format', 'stream-json'],
+      oneshot_output_parser: 'claude_json',
+      oneshot_graceful_finalize: 'claude_stream_json',
     },
     usage_json_longrun: {
       label: 'Healthy Long Agentic Claude Run',
@@ -1591,7 +1646,16 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(multiTurnBudgetResult.partial_result, true);
   assert.equal(multiTurnBudgetResult.partial_diagnostic, 'turn 2\n\nturn 3');
   assert.equal(multiTurnBudgetResult.partial_diagnostic_truncated, false);
+  assert.equal(multiTurnBudgetResult.partial_checkpoint, 'turn 3');
+  assert.equal(multiTurnBudgetResult.partial_checkpoint_bytes, Buffer.byteLength('turn 3'));
+  assert.equal(multiTurnBudgetResult.partial_checkpoint_original_bytes, Buffer.byteLength('turn 3'));
+  assert.equal(multiTurnBudgetResult.partial_checkpoint_truncated, false);
+  assert.equal(multiTurnBudgetResult.partial_checkpoint_event_type, 'assistant');
+  assert.match(multiTurnBudgetResult.partial_checkpoint_hash, /^[0-9a-f]{64}$/);
+  assert.match(multiTurnBudgetResult.partial_checkpoint_message_id_hash, /^[0-9a-f]{64}$/);
+  assert.equal(multiTurnBudgetResult.partial_checkpoint_unavailable_reason, null);
   assert.equal(multiTurnBudgetResult.cleaned_output_unavailable, true);
+  assert.equal(multiTurnBudgetResult.cleaned_output_unavailable_reason, 'incomplete_or_malformed_terminal_result');
   assert.doesNotMatch(multiTurnBudgetResult.partial_diagnostic,
     /THINKING_MUST_NOT_ESCAPE|TOOL_INPUT_MUST_NOT_ESCAPE|DUPLICATE_ID_MUST_NOT_ESCAPE/);
   const lateFinalPid = Number(fs.readFileSync(lateFinalPidMarker, 'utf8').trim());
@@ -1635,6 +1699,37 @@ test('prompt-file transport preserves long special-character prompts and cleans 
     item.seat === 'subscription:anthropic:default'), false,
   'a terminal-only-detected budget stop must never mutate account cooldown state');
 
+  const olderTerminalResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ kind: 'usage_json_older_terminal_budget', prompt: 'newer accepted checkpoint', dangerous: false,
+      providerBudget: { maxOutputTokens: null, maxTotalTokens: 1000, maxCacheReadTokens: null,
+        maxCacheCreationTokens: null, maxTurns: null } }),
+  });
+  assert.equal(olderTerminalResponse.status, 200);
+  const olderTerminal = await olderTerminalResponse.json();
+  assert.equal(olderTerminal.stop_reason, 'token_budget');
+  assert.equal(olderTerminal.failureClass, 'token_budget');
+  assert.equal(olderTerminal.budget_exceeded, true);
+  assert.equal(olderTerminal.dropped_out, true);
+  assert.equal(olderTerminal.provider_budget_enforcement, 'incremental');
+  assert.equal(olderTerminal.stdout, '');
+  assert.equal(olderTerminal.partial_result, true);
+  assert.equal(olderTerminal.partial_checkpoint, 'NEWER_ACCEPTED_CHECKPOINT');
+  assert.equal(olderTerminal.partial_checkpoint_event_type, 'assistant');
+  assert.equal(olderTerminal.partial_checkpoint_unavailable_reason, null);
+  assert.equal(olderTerminal.partial_checkpoint_hash,
+    crypto.createHash('sha256').update('NEWER_ACCEPTED_CHECKPOINT').digest('hex'));
+  assert.equal(olderTerminal.usage.total_tokens, 1202, 'an older terminal must not overwrite the budget-tripping cumulative');
+  assert.equal(olderTerminal.progress.providerUsage.total_tokens, 1202);
+  assert.equal(olderTerminal.progress.providerUsagePhase, 'incremental');
+  assert.equal(olderTerminal.provider_num_turns, 2);
+  assert.equal(olderTerminal.provider_terminal_reason, null);
+  assert.equal(olderTerminal.provider_stop_reason, null);
+  assert.equal(olderTerminal.provider_duration_ms, null);
+  assert.equal(olderTerminal.provider_api_duration_ms, null);
+  assert.equal(olderTerminal.provider_api_error_status, null);
+  assert.match(olderTerminal.stderr, /result precedes newer assistant output/);
+
   const boundedBudgetResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST',
     headers: jsonAuth,
@@ -1660,6 +1755,107 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.doesNotMatch(boundedBudgetResult.partial_diagnostic,
     /HEAD_SHOULD_TRUNCATE|BOUNDED_THINKING_MUST_NOT_ESCAPE|BOUNDED_TOOL_INPUT_MUST_NOT_ESCAPE/);
   assert.equal(boundedBudgetResult.cleaned_output_unavailable, true);
+  assert.equal(boundedBudgetResult.partial_checkpoint, 'final bounded turn');
+  assert.equal(boundedBudgetResult.partial_checkpoint_truncated, false);
+
+  const healthyStreamPrompt = 'finish one healthy stream turn\n' + 'unicode 😀 quotes " and backslash \\ newline\n'.repeat(1000);
+  const healthyStreamResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST',
+    headers: jsonAuth,
+    body: JSON.stringify({
+      kind: 'usage_json_stream_healthy', prompt: healthyStreamPrompt, dangerous: false,
+    }),
+  });
+  assert.equal(healthyStreamResponse.status, 200);
+  const healthyStream = await healthyStreamResponse.json();
+  assert.equal(healthyStream.stdout, 'HEALTHY_STREAM_OK:' + crypto.createHash('sha256').update(healthyStreamPrompt).digest('hex'));
+  assert.equal(healthyStream.dropped_out, false);
+  assert.equal(healthyStream.route.prompt_transport, 'stdin_stream_json');
+  assert.equal(healthyStream.route.prompt_evidence.effectiveHash, crypto.createHash('sha256').update(healthyStreamPrompt).digest('hex'));
+  const expectedFrame = JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: healthyStreamPrompt }] }, parent_tool_use_id: null }) + '\n';
+  assert.equal(healthyStream.route.prompt_wire_input.bytes, Buffer.byteLength(expectedFrame));
+  assert.equal(healthyStream.route.prompt_wire_input.sha256, crypto.createHash('sha256').update(expectedFrame).digest('hex'));
+  assert.equal(healthyStream.graceful_finalization, null);
+
+  const gracefulFinalizeResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST',
+    headers: jsonAuth,
+    body: JSON.stringify({
+      kind: 'usage_json_stream_finalize', prompt: 'finish before the hard ceiling', dangerous: false,
+      providerBudget: {
+        maxOutputTokens: null, maxTotalTokens: 1000, maxCacheReadTokens: null,
+        maxCacheCreationTokens: null, maxTurns: null,
+      },
+    }),
+  });
+  assert.equal(gracefulFinalizeResponse.status, 200);
+  const gracefulFinalize = await gracefulFinalizeResponse.json();
+  assert.equal(gracefulFinalize.stdout, 'FINALIZED_OK');
+  assert.equal(gracefulFinalize.dropped_out, false);
+  assert.equal(gracefulFinalize.stop_reason, null);
+  assert.equal(gracefulFinalize.route.prompt_transport, 'stdin_stream_json');
+  assert.equal(gracefulFinalize.graceful_finalization.supported, true);
+  assert.equal(gracefulFinalize.graceful_finalization.requested, true);
+  assert.equal(gracefulFinalize.graceful_finalization.sent, true);
+  assert.equal(gracefulFinalize.graceful_finalization.method, 'claude_stream_json_user_message');
+  assert.equal(gracefulFinalize.graceful_finalization.reserve.budgetField, 'maxTotalTokens');
+  assert.equal(gracefulFinalize.graceful_finalization.reserve.usageField, 'total_tokens');
+  assert.equal(gracefulFinalize.graceful_finalization.reserve.threshold, 900);
+  assert.equal(gracefulFinalize.graceful_finalization.reserve.limit, 1000);
+  assert.equal(gracefulFinalize.usage.total_tokens, 910);
+
+  const epipeResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST',
+    headers: jsonAuth,
+    body: JSON.stringify({
+      kind: 'usage_json_stream_finalize_epipe', prompt: 'provider closes before reserve message', dangerous: false,
+      providerBudget: {
+        maxOutputTokens: null, maxTotalTokens: 1000, maxCacheReadTokens: null,
+        maxCacheCreationTokens: null, maxTurns: null,
+      },
+    }),
+  });
+  assert.equal(epipeResponse.status, 200, 'an asynchronous stdin EPIPE must not crash the bridge');
+  const epipe = await epipeResponse.json();
+  assert.equal(epipe.dropped_out, true);
+  assert.equal(epipe.graceful_finalization.requested, true);
+  assert.ok(epipe.graceful_finalization.sent === true
+    || epipe.graceful_finalization.reason === 'provider_input_write_failed',
+  'Windows may acknowledge a buffered pipe write before surfacing EPIPE; either state must remain nonfatal');
+
+  const writerRepo = path.join(tempRoot, 'writer-repo');
+  fs.mkdirSync(writerRepo);
+  for (const args of [
+    ['init', '-q'],
+    ['config', 'user.email', 'test@example.invalid'],
+    ['config', 'user.name', 'Relay Test'],
+  ]) assert.equal(spawnSync('git', args, { cwd: writerRepo }).status, 0);
+  fs.writeFileSync(path.join(writerRepo, 'base.txt'), 'base\n');
+  assert.equal(spawnSync('git', ['add', 'base.txt'], { cwd: writerRepo }).status, 0);
+  assert.equal(spawnSync('git', ['commit', '-qm', 'base'], { cwd: writerRepo }).status, 0);
+  const writerBudgetResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST',
+    headers: jsonAuth,
+    body: JSON.stringify({
+      kind: 'usage_json_stream_writer_budget', prompt: 'write then exceed the budget',
+      dangerous: true, cwd: writerRepo,
+      providerBudget: {
+        maxOutputTokens: null, maxTotalTokens: 1000, maxCacheReadTokens: null,
+        maxCacheCreationTokens: null, maxTurns: null,
+      },
+    }),
+  });
+  assert.equal(writerBudgetResponse.status, 200);
+  const writerBudget = await writerBudgetResponse.json();
+  assert.equal(writerBudget.stop_reason, 'token_budget');
+  assert.equal(writerBudget.partial_result, true);
+  assert.equal(writerBudget.partial_checkpoint, 'writer checkpoint api_key=[REDACTED]');
+  assert.doesNotMatch(JSON.stringify(writerBudget), /must-not-leak|STREAM_TOOL_ARG_MUST_NOT_ESCAPE|STREAM_THINKING_MUST_NOT_ESCAPE/);
+  assert.equal(writerBudget.writer_diff_summary.available, true);
+  assert.equal(writerBudget.writer_diff_summary.changedFileCount, 1);
+  assert.equal(writerBudget.writer_diff_summary.files[0].path, 'writer-change.txt');
+  assert.equal(writerBudget.writer_diff_summary.files[0].afterStatus, '??');
+  assert.match(writerBudget.writer_diff_summary.statusHash, /^[0-9a-f]{64}$/);
 
   const budgetReceipts = fs.readFileSync(
     path.join(tempRoot, 'data', 'receipts', new Date().toISOString().slice(0, 10) + '.jsonl'), 'utf8',
@@ -1681,6 +1877,10 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(multiTurnReceipt.providerBudgetEnforcement, 'incremental');
   assert.ok(multiTurnReceipt.transportOutputChars > 0,
     'late terminal bytes remain represented only by transport diagnostic evidence');
+  assert.equal(multiTurnReceipt.partialCheckpointBytes, Buffer.byteLength('turn 3'));
+  assert.equal(multiTurnReceipt.partialCheckpointEventType, 'assistant');
+  assert.equal(multiTurnReceipt.partialCheckpointTruncated, false);
+  assert.equal(multiTurnReceipt.cleanedOutputUnavailableReason, 'incomplete_or_malformed_terminal_result');
   assert.equal(boundedReceipt.partialResult, true);
   assert.equal(boundedReceipt.partialDiagnosticChars, 12000);
   assert.equal(boundedReceipt.partialDiagnosticTruncated, true);

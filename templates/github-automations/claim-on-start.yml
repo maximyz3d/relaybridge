@@ -27,7 +27,8 @@ on:
 permissions:
   contents: read
   issues: write
-  pull-requests: read
+  # Claim state is stored in a bot-authored PR comment as well as issue comments.
+  pull-requests: write
 
 # Claims share issue assignments across PRs, so serialize repository-wide.
 # Keeping the full FIFO queue avoids a close/edit event overtaking an open.

@@ -845,7 +845,7 @@ test('an unready REST build rejects an MCP mutation even when display version an
   let health;
   try { health = await waitForHealth(`http://127.0.0.1:${port}`, proc); }
   catch (error) { throw new Error(`${error.message}\n${output}`); }
-  assert.equal(health.buildId, '2.0.1');
+  assert.equal(health.buildId, require('../package.json').version);
   assert.equal(health.buildIdentityReady, false);
   assert.equal(health.buildIdentitySource, 'package_version_fallback');
   assert.equal(health.buildIdentityReason, 'test_unready');
@@ -1278,6 +1278,27 @@ test('lifecycle scripts guard credentials, preserve generated identity, and requ
   assert.match(releaseInstall, /FileAttributes\]::ReparsePoint/);
   assert.match(releaseInstall, /buildIdentityReady -ne \$true/);
   assert.match(releaseInstall, /\$reportedPid -ne \[int64\]\$proc\.Id/);
+  const cutoverStopBlock = releaseInstall.slice(
+    releaseInstall.indexOf('function Stop-BridgeForCutover'),
+    releaseInstall.indexOf('function Start-StagedBridge'),
+  );
+  assert.match(cutoverStopBlock, /\$shutdownProcess = Get-BridgeShutdownProcessHandle \$shutdownPid/,
+    'Windows cutover must pin the process identity reported by authenticated health');
+  const captureBlock = releaseInstall.slice(releaseInstall.indexOf('function Get-BridgeShutdownProcessHandle'), releaseInstall.indexOf('function Stop-BridgeForCutover'));
+  assert.match(captureBlock, /\$null = \$process\.Handle/,
+    'Windows cutover must open the exact process handle before requesting shutdown');
+  assert.doesNotMatch(cutoverStopBlock, /Stop-Process/,
+    'Windows cutover must fail closed instead of signaling a health-reported PID');
+  assert.match(cutoverStopBlock, /if \(-not \$shutdownProcess\)/,
+    'failure to capture the exact process must reject cutover');
+  const cutoverExitBarrier = releaseInstall.indexOf('$shutdownProcess.WaitForExit(10000)');
+  const cutoverReturn = releaseInstall.indexOf('return $health', cutoverExitBarrier);
+  assert.ok(cutoverExitBarrier >= 0 && cutoverReturn > cutoverExitBarrier,
+    'Windows cutover must wait for the health-reported process and its listener to terminate');
+  const rollbackRestart = releaseInstall.indexOf('if ($restoreSucceeded -and $oldHealth');
+  const failedReleaseCleanup = releaseInstall.indexOf('if ($restoreSucceeded -and $rollbackErrors.Count -eq 0 -and (Test-Path -LiteralPath $failedRoot))');
+  assert.ok(rollbackRestart >= 0 && failedReleaseCleanup > rollbackRestart,
+    'Windows rollback must restart the restored release before attempting non-critical failed-release cleanup');
   assert.match(windowsStart, /prepare-build-info\.cjs/);
   assert.match(windowsStart, /buildIdentityReady -ne \$true/);
   assert.match(windowsStart, /\$reportedPid -ne \[int64\]\$process\.Id/);
