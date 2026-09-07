@@ -584,3 +584,25 @@ test('null contract aliases preserve finite execution limits from the provider p
   assert.equal(record.entries[0].contract.budget.maxTokens, null);
   assert.deepEqual(queue.submitted[0].body.providerBudget, { maxTotalTokens: 1000, maxTurns: 3 });
 });
+
+test('delegation lookup requires a bounded primitive string identifier', () => {
+  const { delegation } = coordinator();
+  for (const id of [null, undefined, 12, {}, [], '', 'ordinary-name', 'dlg_has space', 'dlg_padded ', `dlg_${'a'.repeat(125)}`]) {
+    assert.throws(() => delegation.get(id), { code: 'INVALID_ARGUMENT' });
+  }
+  assert.equal(delegation.get('dlg_missing_123'), null);
+});
+
+test('records remain in the normalized dedicated directory across reopen', () => {
+  const { delegation, queue, dir } = coordinator();
+  const record = delegation.delegate({ cwd: CWD, tasks: [task()] });
+  const reopened = createDelegationCoordinator({
+    dataDir: `${dir}${path.sep}.`, taskQueue: queue,
+    classify: () => ({ tier: 'standard' }), selectProvider: () => ({ kind: 'gemini' }),
+  });
+  const names = fs.readdirSync(dir);
+  assert.deepEqual(names, [`${record.delegationId}.json`]);
+  assert.equal(path.dirname(path.resolve(dir, names[0])), fs.realpathSync(dir));
+  assert.equal(reopened.get(record.delegationId).delegationId, record.delegationId);
+  assert.equal(reopened.list()[0].delegationId, record.delegationId);
+});

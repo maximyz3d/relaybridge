@@ -3,6 +3,8 @@
 // falls back to child_process pipes otherwise.
 
 const express = require('express');
+const { rateLimit } = require('express-rate-limit');
+const { delegationRateLimitOptions } = require('./lib/delegation-rate-limit');
 const http = require('http');
 const path = require('path');
 const fs = require('fs');
@@ -5482,10 +5484,11 @@ const delegation = createDelegationCoordinator({
   log: (m) => console.log(m),
 });
 
-app.post('/api/delegate', async (req, res) => {
+app.post('/api/delegate', rateLimit(delegationRateLimitOptions), async (req, res) => {
   const input = req.body || {};
   const tasks = Array.isArray(input.tasks) ? input.tasks : [];
   if (!tasks.length) return res.status(400).json({ error: 'tasks (non-empty array) required' });
+  if (tasks.length > 50) return res.status(400).json({ error: 'a delegation batch is limited to 50 tasks' });
   try {
     const { classifyTask } = await ROUTER_MODULE_PROMISE;
     delegationClassifier = classifyTask;

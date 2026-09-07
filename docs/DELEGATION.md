@@ -77,6 +77,13 @@ describe the bounds that were actually in force.
 `POST /api/delegate` accepts up to 50 tasks. For each: classify, rank, plan,
 contract, queue.
 
+Submission is capped at 60 batches per minute per client IP, with at most 50
+tasks per batch checked before planning. A rejected submission returns HTTP 429,
+`Retry-After`, `failureClass: bridge_request_rate_limit`, and `accepted: false`.
+This is a local request-burst guard, not provider concurrency or vendor quota;
+already accepted tasks and status reads are unaffected. Clients must retain a
+rejected request and retry after the indicated interval, not report it queued.
+
 - **Classify** — `classifyTask` decides the tier. A caller may declare a *lower*
   tier than the classifier, never a higher one; raising it here would be an
   ungated escalation by another name.
