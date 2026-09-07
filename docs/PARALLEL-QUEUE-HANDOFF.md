@@ -2,6 +2,24 @@
 
 Transfer ID: `RB-QUEUE-EXTERNAL-2026-09-07`.
 
+## Priority addendum — Claude no-verdict reliability
+
+On 2026-09-07 the owner raised repeated Claude no-verdict failures to the top
+of the coordinator's local backlog. External R16 retains incident reporting;
+the coordinator is investigating prevention in provider transport, phase
+prompts/scaffolds and root-owned integration. This does not transfer or reclaim
+the external lane's queue/incident/controller files. Coordinate any interface
+change explicitly; do not build a second implementation of the same fix.
+
+Keep distinct outcomes: missing final deliverable/marker, explicit BLOCKED
+with inaccessible evidence, local token-budget overflow, vendor context/quota
+limits, and transport interruption. A completed CLI process is not a verdict.
+Acceptance requires bounded phase evidence readable in the assigned workspace,
+complete final output, classified diagnostics and regression tests. Do not
+accept a stale earlier marker or silently turn provider failure into approval.
+Root's local prevention investigation is active; this addendum is not evidence
+that the external chat has received or accepted a new work order.
+
 ## Assignment and authority
 
 Shane assigns R13-R16 to the new-account chat. That chat is the lead writer for
