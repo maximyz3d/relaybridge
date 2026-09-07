@@ -32,6 +32,31 @@ const settled = async (q, id, tries = 60) => {
   throw new Error(`task ${id} never settled (status ${q.get(id)?.status})`);
 };
 
+test('aggregate queued includes admission backoff and removes cancelled waits', async (t) => {
+  const dir = tmpdir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let calls = 0;
+  const q = createTaskQueue({
+    dataDir: dir,
+    executeOneShot: async (_body, res) => {
+      calls++;
+      res.status(429).json({ failureClass: 'admission_limit', model_invocation: false });
+    },
+  });
+  const task = q.submit({ kind: 'claude', prompt: 'wait for a seat' });
+  q._pump();
+  await new Promise(setImmediate);
+  assert.equal(q.get(task.id).status, 'queued');
+  assert.equal(q.stats().active, 0);
+  assert.equal(q.stats().queued, 1, 'deferred admission is still queued work');
+  q.cancel(task.id);
+  assert.equal(q.stats().queued, 0);
+  t.mock.timers.tick(1000);
+  await new Promise(setImmediate);
+  assert.equal(calls, 1, 'a cancelled admission wait never executes again');
+});
+
 test('a caller-reserved task id is persisted exactly once', async () => {
   const dir = tmpdir();
   const q = createTaskQueue({
