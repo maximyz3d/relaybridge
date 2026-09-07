@@ -87,3 +87,32 @@ the scoped patch, with no data migration.
 Operator overrides may retain old command arrays after an upgrade. Inspect
 the effective Claude/Fable headless profiles during the separate installation
 handoff; do not claim changing the packaged default migrated a live override.
+
+## Frozen candidate evidence — 2026-09-07
+
+- Prompt patch: `eedb3d2`; companion headless configuration: `164859a`.
+- Planning workflow `wf_mtrr483h_f92550b20163` produced a complete plan via
+  `t_mtrr4tb6_6yg8pk` / `rcpt_mtrr6i7n_d9be39f7` (Sonnet/medium).
+- Its old-configuration review `t_mtrraf8p_0uvlsd` /
+  `rcpt_mtrrbtg9_d21730d2` explicitly identified the Plan Mode conflict and
+  omitted a verdict. That workflow remains failed, not retroactively approved.
+- Root's follow-up used a documented one-writer loop. An isolated Claude call
+  assessed the companion plan; root resolved its missing CLI-semantics and
+  implementation evidence before the fresh closing review.
+- Fresh non-persistent Sonnet/high review of `164859a`, using the candidate's
+  generated final-review prompt and headless configuration, returned
+  `REVIEW_VERDICT: APPROVE`, successful exit, no permission denials, and no
+  blocking findings. This was direct local CLI verification because the live
+  bridge retained the faulty scaffold; it has no fabricated RelayBridge receipt.
+- Root verified 12 focused configuration/prompt tests and the updated full
+  suite: 625 passed, 2 skipped, zero failed. The earlier prompt/controller
+  compatibility run passed 20 tests. `git diff --check` passed, and parsed
+  configuration comparison proved all fields outside the two headless arrays
+  unchanged from `eedb3d2`. Source remained frozen during closing review.
+
+Reviewer limitations: current-file inspection, not independent git-diff or test
+execution; runtime evidence initially supplied by root. The review call itself
+adds another successful Sonnet run but does not establish Fable/all-account
+coverage. Local sanitized review evidence is retained by the coordinator; no
+raw provider transport or private configuration is published here. This is
+candidate approval, not main-merge, release or installation approval.
