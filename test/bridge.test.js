@@ -66,7 +66,7 @@ test('provider config uses the installed subscription CLIs and safe headless mod
     },
   });
   assert.equal(config.claude.safe[config.claude.safe.indexOf('--permission-mode') + 1], 'plan');
-  assert.equal(config.claude.oneshot_safe[config.claude.oneshot_safe.indexOf('--permission-mode') + 1], 'plan');
+  assert.equal(config.claude.oneshot_safe[config.claude.oneshot_safe.indexOf('--permission-mode') + 1], 'dontAsk');
   assert.equal(config.claude.oneshot_safe_filesystem_policy, 'read_only_enforced');
   for (const flag of ['--safe-mode', '--restricted', '--strict-mcp-config', '--no-session-persistence', '--autocompact']) {
     assert.ok(config.claude.oneshot_safe.includes(flag), `claude safe one-shot includes ${flag}`);

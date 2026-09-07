@@ -41,10 +41,34 @@ chat transcripts, or broaden read permissions to satisfy a missing input.
 Incident storage, queue scheduling and controller changes remain with the
 external R13–R16 lane; this patch does not implement those features.
 
+## Confirmed headless Plan Mode conflict
+
+A subsequent fresh review explicitly refused a verdict because built-in Plan
+Mode required a plan file and ExitPlanMode, while the same invocation exposed
+only Read/Glob/Grep. Prompt instructions cannot override that CLI scaffold.
+The prompt-only mitigation was therefore insufficient and its failed review
+was preserved as no verdict.
+
+The companion configuration change replaces `plan` with `dontAsk` only in
+`claude.oneshot_safe` and `claude_fable.oneshot_safe`, explicitly pre-approving
+Read/Glob/Grep. The available-tool list remains exactly those three tools;
+restricted workspace access, safe mode, strict empty MCP, subscription auth
+environment stripping and no session persistence remain unchanged. Interactive
+and writer profiles are untouched; Fable still has no writer profile.
+
+The installed CLI's help lists `dontAsk`; the official
+[permission-mode documentation](https://code.claude.com/docs/en/permission-modes)
+describes it as denying tool requests that would otherwise require approval.
+This is not bypassPermissions and not an OS sandbox. One isolated Sonnet call
+with these flags returned a complete assessment, successful exit and no tool
+permission denials. This does not verify every model/account or Fable runtime.
+
 ## Verification and rollout
 
 Run `node --test test/workflow-prompts.test.js`,
 `node --test test/workflow-controller.test.js`, then `npm test`.
+Also run `node --test test/claude-headless-config.test.js test/bridge.test.js`
+for the companion configuration change.
 Fixtures verify contract retention under oversized artifacts, role separation,
 postscript-only UNKNOWN and unchanged explicit blocking semantics. They do not
 prove a model always obeys the prompt or validate a complete review's substance.
@@ -59,3 +83,7 @@ idle/handoff boundary. An already-running bridge continues using its loaded
 prompt module; changing a worktree does not update it. No runtime restart,
 main merge or deployment is part of this patch. Rollback is a new revert of
 the scoped patch, with no data migration.
+
+Operator overrides may retain old command arrays after an upgrade. Inspect
+the effective Claude/Fable headless profiles during the separate installation
+handoff; do not claim changing the packaged default migrated a live override.
