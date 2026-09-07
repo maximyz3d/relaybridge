@@ -719,3 +719,43 @@ test('silent or throwing executors reserve uncertain capacity until affirmative 
   assert.equal(attempts, 2);
   assert.equal(q.get(task.id).status, 'failed', 'fencing never replays the interrupted operation');
 });
+
+test('submission snapshots prevent caller mutation from changing dispatched authority', async (t) => {
+  const f = durableFixture(t);
+  const q = f.open();
+  const submitted = q.submit({ kind: 'claude', prompt: 'approved', dangerous: false });
+  submitted.body.prompt = 'tampered';
+  submitted.body.dangerous = true;
+  await flushQueue();
+  assert.equal(f.calls[0].prompt, 'approved');
+  assert.equal(f.calls[0].dangerous, false);
+  assert.equal(q.get(submitted.id).body.prompt, 'approved');
+});
+
+test('post-response exceptions do not overwrite a settled outcome or reserve another slot', async (t) => {
+  const f = durableFixture(t, { maxConcurrent: 1, executeOneShot: async (_body, res) => {
+    res.json({ stdout: 'done' });
+    throw new Error('late diagnostic');
+  } });
+  const q = f.open();
+  const ids = [1, 2].map(() => q.submit({ kind: 'claude', prompt: 'work' }).id);
+  await flushQueue();
+  for (const id of ids) assert.equal(q.get(id).status, 'done');
+  assert.equal(q.stats().uncertain, 0);
+});
+
+test('malformed startup records cannot crash status reads or authorize recovery', async (t) => {
+  const f = durableFixture(t);
+  const q = f.open();
+  const task = q.submit({ kind: 'claude', prompt: 'work', notBefore: 12000, recovery: resumable });
+  q.shutdown();
+  const record = JSON.parse(fs.readFileSync(path.join(f.dir, `${task.id}.json`)));
+  record.dependsOn = ['../../outside'];
+  fs.writeFileSync(path.join(f.dir, `${task.id}.json`), JSON.stringify(record));
+  fs.writeFileSync(path.join(f.dir, 't_null_1.json'), 'null');
+  const next = f.open({ authorizeRecovery: recoveryAuthorization });
+  assert.equal(next.get(task.id).status, 'interrupted');
+  assert.equal(next.stats().queued, 0);
+  await f.advance(10000);
+  assert.equal(f.calls.length, 0);
+});

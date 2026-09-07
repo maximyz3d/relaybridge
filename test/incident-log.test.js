@@ -211,3 +211,36 @@ test('observing the same acknowledged physical failure again does not reopen it'
   log.report({ ...NO_VERDICT, correlation: { ...NO_VERDICT.correlation, taskId: 't_new' } });
   assert.equal(log.stats().open, 1, 'a new failed task is a new open incident');
 });
+
+for (const [failureClass, expected] of [
+  ['admission_limit', 'admission_limit'], ['auth', 'authentication'], ['vendor_exhausted', 'provider_quota'],
+  ['rate_limit', 'provider_quota'], ['cooldown', 'cooldown'], ['dependency_failed', 'dependency_blocked'],
+  ['approval_required', 'approval_required'], ['capacity_unknown', 'capacity_unknown'], ['partial_output', 'partial_output'],
+  ['empty_output', 'empty_output'], ['context_limit', 'context_limit'], ['token_budget_total', 'budget_exceeded'],
+]) {
+  test(`failure explanations distinguish ${failureClass} with a safe next action`, () => {
+    const details = taskFailureDetails({ id: 't_exact', status: 'failed', failureClass });
+    assert.equal(details.classification, expected);
+    assert.match(details.summary, /No verdict/);
+    assert.ok(details.nextAction.length > 30);
+  });
+}
+
+test('request/requirement correlations and sanitized safe actions persist without mutable aliases', () => {
+  const { dir, log, file } = tempLog();
+  const details = taskFailureDetails({ id: 't_linked', kind: 'claude', status: 'failed', failureClass: 'partial_output',
+    receiptId: 'rcpt_linked', requirementIds: ['R16'], execution: { state: 'uncertain' },
+    correlation: { requestId: 'req_original', runId: 'wf_linked', invocationId: 'invoke_1', attemptId: 'attempt_1' },
+    error: 'Authorization: Bearer PRIVATE_ERROR' });
+  const first = log.report(details).incident;
+  first.correlation.requestId = 'tampered';
+  first.evidence.failureClass = 'tampered';
+  const next = log.report({ ...details, nextAction: `${details.nextAction} token=PRIVATE_ACTION` }).incident;
+  assert.equal(next.correlation.requestId, 'req_original');
+  assert.deepEqual(next.requirementIds, ['R16']);
+  assert.equal(next.occurrences, 2);
+  const reopened = createIncidentLog({ dataDir: dir }).get(first.incidentId);
+  assert.equal(reopened.runId, 'wf_linked');
+  assert.match(reopened.nextAction, /authoritative termination/);
+  assert.doesNotMatch(fs.readFileSync(file, 'utf8'), /PRIVATE_ERROR|PRIVATE_ACTION/);
+});
