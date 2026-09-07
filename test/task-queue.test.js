@@ -759,3 +759,28 @@ test('malformed startup records cannot crash status reads or authorize recovery'
   await f.advance(10000);
   assert.equal(f.calls.length, 0);
 });
+
+test('admission deadlines expire even while a different execution occupies every slot', async (t) => {
+  let occupyingResponse;
+  let attempts = 0;
+  const f = durableFixture(t, { maxConcurrent: 1, admissionWaitMs: 1500,
+    executeOneShot: async (body, res) => {
+      attempts++;
+      if (body.prompt === 'wait') res.status(429).json({ failureClass: 'admission_limit', model_invocation: false });
+      else { res._relayDeferredResponse = true; occupyingResponse = res; }
+    },
+  });
+  const q = f.open();
+  const waiting = q.submit({ kind: 'claude', prompt: 'wait' });
+  q.submit({ kind: 'claude', prompt: 'occupier' });
+  await flushQueue();
+  await f.advance(1000);
+  assert.equal(q.stats().active, 1);
+  assert.equal(q.get(waiting.id).status, 'queued');
+  await f.advance(500);
+  assert.equal(q.get(waiting.id).status, 'failed');
+  assert.equal(q.get(waiting.id).failureClass, 'admission_limit');
+  assert.equal(attempts, 2);
+  occupyingResponse.json({ stdout: 'finished' });
+  await flushQueue();
+});

@@ -513,3 +513,19 @@ test('workflow request links persist but planning success and status reads do no
   for (const key of ['implemented', 'tested', 'approved', 'merged', 'deployed']) assert.equal(coverage.milestones[key].outcome, 'unknown');
   assert.throws(() => f.controller.createRequest({}), (e) => e.code === 'REQUEST_LEDGER_UNAVAILABLE');
 });
+
+test('frequent uncertain-writer reconciliation cannot postpone its lease heartbeat', (t) => {
+  const f = fixture(t);
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const created = reachReviewReady(f);
+  const revision = f.controller.startRevision(created.runId, { leaseMs: 60000 });
+  Object.assign(f.tasks.get(revision.task.id), { status: 'cancelled', execution: { state: 'uncertain' } });
+  const originalExpiry = f.pipeline.get(created.runId).writerLease.expiresAt;
+  for (let i = 0; i < 25; i++) {
+    f.clock.value += 1000;
+    assert.throws(() => f.controller.reconcile(created.runId), (e) => e.code === 'WRITER_EXECUTION_UNCERTAIN');
+    t.mock.timers.tick(1000);
+  }
+  assert.ok(f.pipeline.get(created.runId).writerLease.expiresAt > originalExpiry,
+    'the existing heartbeat must run despite reconciliation on every second');
+});
