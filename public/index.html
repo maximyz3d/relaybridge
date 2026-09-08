@@ -452,7 +452,7 @@
   <div class="dlg-head"><strong id="tasks-heading">Background tasks</strong><button class="btn" id="tasks-close-btn">Close</button></div>
   <div class="dlg-body">
     <p class="task-intro">Plan a request, follow its progress, and collect the result from any surface. Saved tasks retain their execution state; uncertain work requires an ownership check.</p>
-    <div class="task-composer">
+    <div class="task-composer" id="task-composer">
       <label for="task-prompt">What should the AI deliver?<textarea id="task-prompt" placeholder="Describe the outcome, constraints, and what a useful answer should include."></textarea></label>
       <div class="task-fields">
         <label for="task-kind">Provider<select id="task-kind"></select></label>
@@ -488,6 +488,7 @@
           <p id="workflow-phase"></p><p id="workflow-workspace" class="muted"></p><p id="workflow-objective-view"></p>
           <p id="workflow-writer" class="muted"></p><p id="workflow-notice" class="task-notice"></p>
           <details><summary>Latest saved review</summary><pre id="workflow-review" class="task-output" tabindex="0"></pre></details>
+          <details><summary>Saved plan and acceptance criteria</summary><pre id="workflow-plan" class="task-output" tabindex="0"></pre><pre id="workflow-criteria" class="task-output" tabindex="0"></pre></details>
           <label for="workflow-evidence">Evidence for the next stage<textarea id="workflow-evidence" maxlength="24000" placeholder="Research, implementation validation, or corrective evidence"></textarea></label>
           <label for="workflow-token">Writer token from another client (optional)<input id="workflow-token" type="password" autocomplete="off" spellcheck="false"></label>
           <button class="btn" id="workflow-copy-token" disabled>Copy writer token</button>
@@ -3082,7 +3083,7 @@ taskDetailDialog.addEventListener('close', () => {
   if (tasksDialog.open) (detailOpener?.isConnected ? detailOpener : $('#task-refresh')).focus();
   detailOpener = null;
 });
-for (const field of document.querySelectorAll('.task-composer input, .task-composer textarea, .task-composer select')) {
+for (const field of document.querySelectorAll('#task-composer input, #task-composer textarea, #task-composer select')) {
   field.addEventListener('input', invalidateTaskPreview); field.addEventListener('change', invalidateTaskPreview);
 }
 $('#task-preview').addEventListener('click', async () => {

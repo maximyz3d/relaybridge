@@ -38,7 +38,7 @@ test('browser workflow panel is lazy, pins Astra, retains late claims and requir
   const workflow = { runId:'wf_fixture', phase:'scoping', profile:'codex-astra-ultra', phasePolicy, cwd:'/fixture', permissionMode:'full', writerLease:null };
   let actions = ['submit_pipeline_research'], blockedActions = [];
   const projection = () => ({ workflow:structuredClone(workflow), nextActions:[...actions], blockedActions,
-    artifactContents:{ objective:'Fixture objective', review:'Fixture saved review. REVIEW_VERDICT: REVISE' } });
+    artifactContents:{ objective:'Fixture objective', plan:'Fixture saved plan', acceptance:'Fixture criteria', review:'Fixture saved review. REVIEW_VERDICT: REVISE' } });
   await context.route('**/*', async route => {
     const req = route.request(), url = new URL(req.url());
     const json = value => route.fulfill({ status:200, contentType:'application/json', body:JSON.stringify(value) });
@@ -100,6 +100,8 @@ test('browser workflow panel is lazy, pins Astra, retains late claims and requir
   await page.locator('#staged-workflows .task-composer > details > summary').click();
   workflow.phase = 'review_ready'; actions = ['claim_pipeline_revision'];
   await page.locator('#workflow-refresh').click(); await page.locator('[data-workflow-action="claim_pipeline_revision"]').waitFor();
+  assert.equal(await page.locator('#workflow-plan').textContent(),'Fixture saved plan');
+  assert.equal(await page.locator('#workflow-criteria').textContent(),'Fixture criteria');
   const writesBeforeRefresh = writes.length;
   await page.locator('#workflow-refresh').click();
   assert.equal(writes.length, writesBeforeRefresh);
@@ -158,10 +160,14 @@ test('browser workflow panel is lazy, pins Astra, retains late claims and requir
     fs.mkdirSync(process.env.RELAYBRIDGE_UI_SCREENSHOT_DIR, {recursive:true});
     await page.screenshot({path:path.join(process.env.RELAYBRIDGE_UI_SCREENSHOT_DIR,'staged-workflow.png')});
   }
+  await page.locator('#workflow-evidence').fill('Evidence from the prior run');
+  await page.locator('#workflow-token').fill('Token from the prior run');
   workflow.profile='codex-claude'; workflow.phasePolicy=null; actions=['submit_pipeline_research'];
   await page.locator('#staged-workflows .task-composer > details > summary').click();
   await page.locator('#workflow-create').click();
   await page.locator('#workflow-status').filter({hasText:'did not confirm'}).waitFor();
+  assert.equal(await page.locator('#workflow-evidence').inputValue(),'');
+  assert.equal(await page.locator('#workflow-token').inputValue(),'');
   assert.equal(await page.locator('[data-workflow-action]:visible').count(),0);
   await page.locator('#workflow-refresh').click();
   await page.locator('#workflow-notice').filter({hasText:'verified Astra'}).waitFor();

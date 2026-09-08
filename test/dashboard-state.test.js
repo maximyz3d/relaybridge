@@ -179,6 +179,8 @@ test('task UI preserves focus, rejects late refreshes, and submits the previewed
   await page.locator('#task-prompt').fill('Explain the bounded fixture result.');
   await page.locator('#task-preview').click(); await page.locator('#task-plan').waitFor({ state:'visible' });
   assert.equal(writes.filter(item => item.path === '/api/tasks').length, 0);
+  await page.locator('#workflow-evidence').evaluate(el => { el.value='Independent workflow draft'; el.dispatchEvent(new Event('input',{bubbles:true})); });
+  assert.equal(await page.locator('#task-plan').isVisible(),true,'workflow drafts leave task previews intact');
   failPlan = true; await page.locator('#task-preview').click();
   await page.locator('#task-submit-status').filter({ hasText:'Preview failed' }).waitFor();
   assert.equal(await page.locator('#task-plan').isVisible(), false);

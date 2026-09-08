@@ -193,3 +193,11 @@ profile rejection, four-hour renewal, final-review gating, and 390/640-pixel
 layouts. Provider responses were local fixtures; this is browser acceptance,
 not installed runtime or live provider qualification. Screenshots were inspected
 locally and contain only fixtures. Full-suite and closing review remain pending.
+
+Pass-3 full suite at `1849dcca41fd23476b9569140f6122a602f0dedb`:
+1,040 tests, 1,036 passed, zero failed, four platform/optional skips; both
+Chromium browser cases ran. A subsequent Astra review found two small UI
+isolation defects: creating a new workflow retained the prior evidence input,
+and workflow edits invalidated the unrelated task preview. Root corrected both,
+added saved plan/acceptance inspection, and reran all eight state/browser checks
+successfully. Evidence typed during an in-flight action is preserved.

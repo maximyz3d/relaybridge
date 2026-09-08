@@ -24,6 +24,8 @@
       setText('#workflow-notice', model.notice + (model.blocked.length ? ' Ownership held: ' + model.blocked.join(', ') + '. Independent recovery evidence is required.' : '')
         + (model.unsupportedActions.length ? ' Continue through the existing client: ' + model.unsupportedActions.join(', ') + '.' : ''));
       setText('#workflow-review', model.review || 'No saved review verdict.');
+      setText('#workflow-plan', model.plan || 'No saved plan.');
+      setText('#workflow-criteria', model.acceptance || 'No saved acceptance criteria.');
       const actions = $('#workflow-actions');
       const focused = document.activeElement?.dataset?.workflowAction;
       actions.replaceChildren();
@@ -103,7 +105,13 @@
       } finally {
         busy = false;
         if (visible()) {
-          if (succeeded) { if (selected === runId) $('#workflow-token').value = ''; await refreshDetail(); }
+          if (succeeded) {
+            if (selected === runId) {
+              $('#workflow-token').value = '';
+              if (action.evidence && $('#workflow-evidence').value === markdown) $('#workflow-evidence').value = '';
+            }
+            await refreshDetail();
+          }
           else render();
         }
       }
@@ -121,6 +129,7 @@
         const runId = data.workflow?.runId;
         if (typeof runId !== 'string') throw new Error('No workflow identity returned');
         selected = runId; snapshot = null; detailGate.begin();
+        $('#workflow-evidence').value = ''; $('#workflow-token').value = '';
         if (data.workflow.profile !== body.profile || !dashboard.workflowDetailModel(data).astraPolicy) throw new Error('The server did not confirm the requested Astra/ultra policy; no advisor action is enabled');
         if (visible()) { await refreshList(runId); status('Created ' + runId + '. Submit research when it is ready.'); }
       } catch (error) { status('Creation response unavailable: ' + error.message + '. Refresh the list before trying again.'); }

@@ -94,6 +94,7 @@
       astraPolicy,
       profile:text(workflow.profile) || 'legacy', cwd:text(workflow.cwd), permissionMode:text(workflow.permissionMode),
       objective:text(snapshot.artifactContents?.objective),
+      plan:text(snapshot.artifactContents?.plan), acceptance:text(snapshot.artifactContents?.acceptance),
       review:text(snapshot.artifactContents?.['final-review']) || text(snapshot.artifactContents?.review),
       writer:lease ? `${text(lease.actor) || 'unknown actor'} · ${text(lease.mode) || 'unknown ownership'}` : 'No recorded writer',
       expiresAt:count(lease?.expiresAt),
