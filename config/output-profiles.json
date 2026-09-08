@@ -27,7 +27,7 @@
       "version": 1,
       "title": "Decisions and problem solving",
       "description": "Compare feasible choices and explain what would change the recommendation.",
-      "text": "State the decision, objective and binding constraints. Compare the few feasible alternatives using the criteria that matter to this request. Explain the main tradeoff and recommend a next action with its rationale. Identify the assumption or missing evidence most likely to reverse the recommendation. Prefer a cheap reversible check when uncertainty is material. Avoid fabricated precision, exhaustive option lists and hidden assumptions. Treat these criteria as selection guidance, not mandatory sections. Preserve the user's format, word limit and required behavior. Answer directly; omit redundant restatement and unnecessary headings. Under tight limits, drop optional commentary before required content."
+      "text": "Apply binding constraints first and rule out infeasible options. Lead with a feasible recommendation and its main reason. Name only the missing evidence that could change it, then give a bounded next check if useful. Do not restate the whole problem, invent precision or expand into an exhaustive option list. Preserve the requested format and required content. A word limit covers the entire answer; aim comfortably below it and omit optional commentary before required reasoning."
     },
     {
       "id": "collaboration-synthesis",
@@ -41,7 +41,7 @@
       "version": 1,
       "title": "UI and design",
       "description": "User flows, accessible interactions, and specific visual improvements.",
-      "text": "Assess the interface against the user task, information hierarchy and interaction states. Prioritize observable friction: unclear actions, missing feedback, inaccessible controls, narrow layouts or lost context. Connect each proposed adjustment to a specific user benefit and a way to check it. Distinguish a visual inspection from a tested interaction or accessibility audit. Preserve the product character and avoid cosmetic changes with no demonstrated benefit. Treat these criteria as selection guidance, not mandatory sections. Preserve the user's format, word limit and required behavior. Answer directly; omit redundant restatement and unnecessary headings. Under tight limits, drop optional commentary before required content."
+      "text": "Give the requested number of useful refinements, prioritizing the stated user task and observable friction. Connect each adjustment to its user benefit. Preserve accessible naming, feedback, keyboard operation and context where relevant. Suggest a check only when it adds necessary information and fits the requested length. A supplied description is not a visual inspection or tested interaction; do not invent browser or accessibility evidence. Preserve the requested format and aim comfortably below any word limit, including headings."
     }
   ]
 }

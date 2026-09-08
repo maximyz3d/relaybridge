@@ -3345,6 +3345,9 @@ test('linked provider accounts fail closed, isolate cooldowns, and refresh mutat
 
   const authRefresh = await fetch(`${baseUrl}/api/auth/status?refresh=1`, { headers });
   assert.equal(authRefresh.status, 200);
+  const versionProbeAgents = await (await fetch(`${baseUrl}/api/agents`, { headers })).json();
+  assert.equal(versionProbeAgents.agents.find(agent => agent.id === 'default_stale_pool').readiness.detail,
+    'probe passed; authentication unverified', 'an exit-zero version probe must not display authenticated');
   accountStatus = await (await fetch(`${baseUrl}/api/accounts`, { headers })).json();
   assert.equal(accountStatus.providers.default_stale_pool.accounts
     .find((account) => account.id === 'default').authUnavailable, true,
@@ -3357,9 +3360,13 @@ test('linked provider accounts fail closed, isolate cooldowns, and refresh mutat
 
   const authoritativeProbeConfig = JSON.parse(fs.readFileSync(configPath, 'utf8'));
   authoritativeProbeConfig.default_stale_pool.probe_auth_authoritative = true;
+  authoritativeProbeConfig.default_stale_pool.probe_success_detail = 'fixture authentication verified';
   fs.writeFileSync(configPath, JSON.stringify(authoritativeProbeConfig), 'utf8');
   const authoritativeAuthRefresh = await fetch(`${baseUrl}/api/auth/status?refresh=1`, { headers });
   assert.equal(authoritativeAuthRefresh.status, 200);
+  const authProbeAgents = await (await fetch(`${baseUrl}/api/agents`, { headers })).json();
+  assert.equal(authProbeAgents.agents.find(agent => agent.id === 'default_stale_pool').readiness.detail,
+    'fixture authentication verified');
   accountStatus = await (await fetch(`${baseUrl}/api/accounts`, { headers })).json();
   assert.equal(accountStatus.providers.default_stale_pool.accounts
     .find((account) => account.id === 'default').authUnavailable, false,

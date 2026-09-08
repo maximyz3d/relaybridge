@@ -3863,7 +3863,10 @@ app.get('/api/auth/status', diagnosticRequestLimit, async (req, res) => {
           authAuthoritative: completed && entry.probe_auth_authoritative === true,
           qualificationFailure: result.validation || null,
           transientProbeFailure: result.admissionRejected || result.aborted || result.timedOut || result.model_invocation === false,
-          detail: result.exitCode === 0 ? 'authenticated' : probeText.split('\n')[0].slice(0, 160),
+          detail: completed && result.exitCode === 0
+            ? String(entry.probe_success_detail || (entry.probe_auth_authoritative === true
+              ? 'authenticated' : 'probe passed; authentication unverified')).slice(0, 160)
+            : probeText.split('\n')[0].slice(0, 160),
         }];
       }));
       const refreshedResults = Object.fromEntries(pairs.filter(([, v]) => v));
