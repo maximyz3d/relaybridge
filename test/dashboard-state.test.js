@@ -93,6 +93,9 @@ test('task UI preserves focus, rejects late refreshes, and submits the previewed
     requestedTaskTier:'standard', resolvedTaskTier:'standard', requestedModelTier:'standard', resolvedModelTier:'standard',
     requestedEffort:null, targetEffort:'medium', appliedEffort:'medium', effortSource:'task_tier',
     effortMethod:'flag', effortControl:'--effort', effortFallbackReason:null, configFingerprint:'fixture' };
+  let profileCatalog = require('../lib/output-profiles').listOutputProfiles();
+  let workflowLibrary = require('../lib/workflow-library').listWorkflowLibrary(), failLibrary = false;
+  const profileKey = id => { const p = profileCatalog.profiles.find(profile => profile.id === id); return `${p.id}@${p.version}:${p.digest}`; };
   await context.route('**/*', async route => {
     const req = route.request(), url = new URL(req.url());
     const json = body => route.fulfill({ status:200, contentType:'application/json', body:JSON.stringify(body) });
@@ -107,7 +110,8 @@ test('task UI preserves focus, rejects late refreshes, and submits the previewed
       const body = req.postDataJSON(); writes.push({ path:url.pathname, body });
       if (url.pathname === '/api/plan') return failPlan
         ? route.fulfill({ status:409, contentType:'application/json', body:'{"error":"provider no longer available"}' })
-        : json({ tier:'standard', primary:{ kind:'claude', ready:true, execution } });
+        : json({ tier:'standard', primary:{ kind:'claude', ready:true, execution },
+          ...(body.outputProfile ? { outputProfile:profileCatalog.profiles.find(profile => profile.id === body.outputProfile.id && profile.version === body.outputProfile.version) } : {}) });
       if (url.pathname === '/api/tasks') {
         if (delaySubmit) await new Promise(resolve => { releaseSubmit = resolve; });
         return json({ id:'t_fixture_submitted', status:'queued' });
@@ -126,6 +130,8 @@ test('task UI preserves focus, rejects late refreshes, and submits the previewed
       if (delayAgents) await new Promise(resolve => { releaseAgents = resolve; });
       return json({ agents:[{ id:'claude', label:'Claude fixture' }] });
     }
+    if (url.pathname === '/api/output-profiles') return json(profileCatalog);
+    if (url.pathname === '/api/workflow-library') return failLibrary ? route.fulfill({ status:503, contentType:'application/json', body:'{"error":"fixture offline"}' }) : json(workflowLibrary);
     if (url.pathname === '/api/tasks') {
       listCalls++;
       if (failList) return route.fulfill({ status:503, contentType:'application/json', body:'{"error":"fixture offline"}' });
@@ -181,6 +187,54 @@ test('task UI preserves focus, rejects late refreshes, and submits the previewed
   await page.locator('#task-submit-status').filter({ hasText:'Submitted t_fixture' }).waitFor();
   assert.deepEqual(writes.find(item => item.path === '/api/tasks').body.execution, execution);
   assert.equal(writes.find(item => item.path === '/api/tasks').body.dangerous, false);
+  // Optional guidance pins the selected content without rewriting the user's draft.
+  await page.locator('#task-output-profile').selectOption(profileKey('code-debug'));
+  assert.match(await page.locator('#task-output-description').innerText(), /diagnosis/);
+  await page.locator('#task-prompt').fill('Diagnose the supplied failing fixture.');
+  await page.locator('#task-preview').click(); await page.locator('#task-plan').waitFor({ state:'visible' });
+  assert.match(await page.locator('#task-plan').innerText(), /Code and debugging/);
+  await page.locator('#task-output-profile').selectOption(profileKey('design-critique'));
+  assert.equal(await page.locator('#task-plan').isVisible(), false);
+  await page.locator('#task-preview').click(); await page.locator('#task-plan').waitFor({ state:'visible' });
+  await page.locator('#task-submit').click();
+  await page.locator('#task-submit-status').filter({ hasText:'Submitted t_fixture' }).waitFor();
+  const guidedSubmission = writes.filter(item => item.path === '/api/tasks').at(-1).body;
+  const selectedProfile = profileCatalog.profiles.find(profile => profile.id === 'design-critique');
+  assert.deepEqual(guidedSubmission.outputProfile, { id:selectedProfile.id, version:selectedProfile.version, digest:selectedProfile.digest });
+  assert.equal(guidedSubmission.prompt, 'Diagnose the supplied failing fixture.');
+  await page.locator('#task-output-profile').selectOption('');
+  await page.locator('#task-workflow-library > summary').click();
+  assert.equal(await page.locator('#task-library-entries article').count(), 6);
+  assert.equal(await page.locator('#task-library-entries a').first().getAttribute('href'), workflowLibrary.entries[0].url);
+  assert.doesNotMatch(await page.locator('#task-library-entries').innerText(), /undefined|Installed|Connected/);
+  const sourceLink = page.locator('#task-library-entries a').first();
+  await sourceLink.focus(); await page.evaluate(() => loadTaskGuidance(tasksGate.begin().epoch));
+  assert.equal(await sourceLink.evaluate(el => el === document.activeElement), true);
+  workflowLibrary = { ...workflowLibrary, catalogVersion:2 };
+  await page.evaluate(() => loadTaskGuidance(tasksGate.begin().epoch));
+  assert.equal(await sourceLink.evaluate(el => el === document.activeElement), true);
+  failLibrary = true; await page.evaluate(() => loadTaskGuidance(tasksGate.begin().epoch));
+  assert.equal(await sourceLink.evaluate(el => el === document.activeElement), true);
+  assert.equal(await page.locator('#task-library-entries article').count(), 6); failLibrary = false;
+  await page.locator('#task-workflow-library > summary').click();
+  // Multiple versions remain independently selectable; removed guidance stays selected.
+  const originalProfiles = profileCatalog;
+  const firstVersion = profileCatalog.profiles[0];
+  const secondVersion = require('../lib/output-profiles').listOutputProfiles({ catalogVersion:2, profiles:[{
+    id:firstVersion.id, version:2, title:'Updated criteria', description:'Different criteria', text:'State the evidence gaps.' }] }).profiles[0];
+  profileCatalog = { ...profileCatalog, profiles:[firstVersion,secondVersion] };
+  await page.evaluate(() => loadTaskGuidance(tasksGate.begin().epoch));
+  await page.locator('#task-output-profile').selectOption(`${firstVersion.id}@1:${firstVersion.digest}`);
+  assert.equal(await page.evaluate(() => taskDraft().outputProfile.version), 1);
+  profileCatalog = { ...profileCatalog, profiles:[secondVersion] };
+  await page.evaluate(() => loadTaskGuidance(tasksGate.begin().epoch));
+  assert.deepEqual(await page.evaluate(() => taskDraft().outputProfile), { id:firstVersion.id, version:1, digest:firstVersion.digest });
+  assert.match(await page.locator('#task-output-description').innerText(), /no longer/);
+  await page.locator('#task-output-profile').selectOption(`${secondVersion.id}@2:${secondVersion.digest}`);
+  assert.equal(await page.evaluate(() => taskDraft().outputProfile.version), 2);
+  profileCatalog = originalProfiles;
+  await page.locator('#task-output-profile').selectOption('');
+  await page.evaluate(() => loadTaskGuidance(tasksGate.begin().epoch));
   // A prior submission must not clear a new draft with the same prompt text.
   delaySubmit = true; await page.locator('#task-prompt').fill('Retain this new draft.');
   await page.locator('#task-submit').click();

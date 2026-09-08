@@ -1,0 +1,131 @@
+{
+  "catalogVersion": 1,
+  "entries": [
+    {
+      "id": "systematic-debugging",
+      "title": "Systematic debugging",
+      "sourceKind": "skill",
+      "url": "https://github.com/obra/superpowers/blob/b36e0829c6d0140e93cfef2ca599b1b07d4a7797/skills/systematic-debugging/SKILL.md",
+      "pinnedCommit": "b36e0829c6d0140e93cfef2ca599b1b07d4a7797",
+      "contentDigest": "808fc5717aa88ad65efff312b11c186294d3e6ee301afb584e2f86599b137787",
+      "license": "MIT",
+      "licenseUrl": "https://github.com/obra/superpowers/blob/b36e0829c6d0140e93cfef2ca599b1b07d4a7797/LICENSE",
+      "sourceVersion": "v6.3.0",
+      "verifiedAt": "2026-09-08",
+      "phases": [
+        "diagnosis",
+        "verification"
+      ],
+      "use": "Use when a failure needs reproduction and a supported root cause before choosing a fix.",
+      "localGuidance": "Reproduce the symptom, identify a discriminating check, and verify the smallest relevant correction. Do not treat a plausible cause as an observed one.",
+      "integrationState": "available_not_connected",
+      "connectionEvidence": null,
+      "trustNotes": "Reference source only. No upstream hooks, commands, MCP tools or plugins are loaded by this catalog. Locally authored guidance grants no permissions."
+    },
+    {
+      "id": "mcp-builder",
+      "title": "MCP tool design",
+      "sourceKind": "skill",
+      "url": "https://github.com/anthropics/skills/blob/41bbe19d1a1a7eaab5e7bb9050a417e5c6cffc8f/skills/mcp-builder/SKILL.md",
+      "pinnedCommit": "41bbe19d1a1a7eaab5e7bb9050a417e5c6cffc8f",
+      "contentDigest": "0f4592dcb53cf2b5d6b7febee6b4152018b565551a1c29e3c612f57b218ab295",
+      "license": "Apache-2.0",
+      "licenseUrl": "https://github.com/anthropics/skills/blob/41bbe19d1a1a7eaab5e7bb9050a417e5c6cffc8f/skills/mcp-builder/LICENSE.txt",
+      "sourceVersion": "snapshot 2026-09-03",
+      "verifiedAt": "2026-09-08",
+      "phases": [
+        "planning",
+        "integration"
+      ],
+      "use": "Use when designing bounded tool inputs, useful error responses, and integration evaluations.",
+      "localGuidance": "Describe what a tool can actually observe or change. Preserve request correlation in failures and test meaningful outcomes rather than schema shape alone.",
+      "integrationState": "available_not_connected",
+      "connectionEvidence": null,
+      "trustNotes": "Reference source only. No upstream hooks, commands, MCP tools or plugins are loaded by this catalog. Locally authored guidance grants no permissions."
+    },
+    {
+      "id": "agent-skills",
+      "title": "Agent Skills specification",
+      "sourceKind": "specification",
+      "url": "https://github.com/agentskills/agentskills/blob/69ef37e9424c0a7ea9dd2293b559e43ec8176379/docs/specification.mdx",
+      "pinnedCommit": "69ef37e9424c0a7ea9dd2293b559e43ec8176379",
+      "contentDigest": "b9079c0c10b7930e8c6a20ff2bc10cda2a3343c55185120e3f1116a1a529b220",
+      "license": "CC-BY-4.0",
+      "licenseUrl": "https://github.com/agentskills/agentskills/blob/69ef37e9424c0a7ea9dd2293b559e43ec8176379/docs/LICENSE",
+      "sourceVersion": "snapshot 2026-08-09",
+      "verifiedAt": "2026-09-08",
+      "phases": [
+        "discovery",
+        "authoring"
+      ],
+      "use": "Use to make a skill discoverable and keep detailed guidance scoped to the task.",
+      "localGuidance": "Keep metadata precise and load detailed guidance only when useful. A skill description or allowed-tools declaration does not grant execution authority.",
+      "integrationState": "available_not_connected",
+      "connectionEvidence": null,
+      "trustNotes": "Reference source only. No upstream hooks, commands, MCP tools or plugins are loaded by this catalog. Locally authored guidance grants no permissions."
+    },
+    {
+      "id": "github-mcp",
+      "title": "GitHub MCP server",
+      "sourceKind": "mcp",
+      "url": "https://github.com/github/github-mcp-server/blob/9205304fedf10540c33ae41fcf6352fa97dcc9be/docs/server-configuration.md",
+      "pinnedCommit": "9205304fedf10540c33ae41fcf6352fa97dcc9be",
+      "contentDigest": "a97322ee13019d6e91196417de0d64cef7fe40ce874881a02f1891d807925cd6",
+      "license": "MIT",
+      "licenseUrl": "https://github.com/github/github-mcp-server/blob/9205304fedf10540c33ae41fcf6352fa97dcc9be/LICENSE",
+      "sourceVersion": "v1.12.0",
+      "verifiedAt": "2026-09-08",
+      "phases": [
+        "coordination",
+        "review"
+      ],
+      "use": "Consider when a configured GitHub connection adds useful issue or review evidence beyond existing tools.",
+      "localGuidance": "Compare the selected connection with existing GitHub tooling before adding it. Verify its actual tool inventory and granted account permissions; a filter is not an authorization boundary.",
+      "integrationState": "available_not_connected",
+      "connectionEvidence": null,
+      "trustNotes": "Reference source only. No upstream hooks, commands, MCP tools or plugins are loaded by this catalog. Locally authored guidance grants no permissions."
+    },
+    {
+      "id": "context7",
+      "title": "Context7 versioned documentation",
+      "sourceKind": "mcp",
+      "url": "https://github.com/upstash/context7/blob/a37d30cf14f69341e12c226fcc729c62b4f0a900/packages/mcp/README.md",
+      "pinnedCommit": "a37d30cf14f69341e12c226fcc729c62b4f0a900",
+      "contentDigest": "51aa47eba44abd6998823221f3ecb132ad8e40fc38e72a236835aea93c88c550",
+      "license": "MIT",
+      "licenseUrl": "https://github.com/upstash/context7/blob/a37d30cf14f69341e12c226fcc729c62b4f0a900/LICENSE",
+      "sourceVersion": "@upstash/context7-mcp@4.0.5",
+      "verifiedAt": "2026-09-08",
+      "phases": [
+        "research",
+        "coding"
+      ],
+      "use": "Consider when a library version matters and primary documentation is missing from the current evidence.",
+      "localGuidance": "Identify the package and version before retrieving documentation. Preserve the source and report missing or conflicting version evidence. Tool names and hosted access must be probed on the actual connection.",
+      "integrationState": "available_not_connected",
+      "connectionEvidence": null,
+      "trustNotes": "Reference source only. No upstream hooks, commands, MCP tools or plugins are loaded by this catalog. Locally authored guidance grants no permissions."
+    },
+    {
+      "id": "playwright-cli",
+      "title": "Playwright browser workflows",
+      "sourceKind": "browser",
+      "url": "https://github.com/microsoft/playwright-cli/blob/397ee39c83a651e1314cfb010b94e8a3aac11261/README.md",
+      "pinnedCommit": "397ee39c83a651e1314cfb010b94e8a3aac11261",
+      "contentDigest": "c2ce333c9da1645fc30c495a47ccd90b3e13c491599034253cc7cfb4fff4eaa3",
+      "license": "Apache-2.0",
+      "licenseUrl": "https://github.com/microsoft/playwright-cli/blob/397ee39c83a651e1314cfb010b94e8a3aac11261/LICENSE",
+      "sourceVersion": "v0.1.19",
+      "verifiedAt": "2026-09-08",
+      "phases": [
+        "design",
+        "verification"
+      ],
+      "use": "Consider for reproducible interaction checks in an isolated browser context.",
+      "localGuidance": "Check a real user path with controlled state. Separate screenshots, tested interactions, viewport reflow and accessibility evidence; none automatically establishes the others.",
+      "integrationState": "available_not_connected",
+      "connectionEvidence": null,
+      "trustNotes": "Reference source only. No upstream hooks, commands, MCP tools or plugins are loaded by this catalog. Locally authored guidance grants no permissions."
+    }
+  ]
+}

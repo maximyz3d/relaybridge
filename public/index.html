@@ -458,6 +458,9 @@
         <label for="task-kind">Provider<select id="task-kind"></select></label>
         <label for="task-collab">Conversation ID (optional)<input id="task-collab" autocomplete="off" placeholder="Attach the result to an existing conversation"></label>
       </div>
+      <label for="task-output-profile">Output guidance (optional)<select id="task-output-profile" aria-describedby="task-output-description"><option value="">Use my request as written</option></select></label>
+      <p id="task-output-description" class="muted">Choose criteria for a more focused answer. Your request still sets the scope and length.</p>
+      <details id="task-output-details" hidden><summary>Read the selected criteria</summary><p id="task-output-criteria"></p></details>
       <details><summary>Model and workspace settings</summary><div class="task-fields">
         <label for="task-model-tier">Model tier<select id="task-model-tier"><option value="">Automatic</option><option value="light">Light</option><option value="standard">Standard</option><option value="heavy">Heavy</option></select></label>
         <label for="task-effort">Requested effort<select id="task-effort"><option value="">Provider default</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></label>
@@ -467,6 +470,7 @@
       <div id="task-plan" class="task-plan" role="status" hidden></div>
       <div id="task-submit-status" role="status" class="muted"></div>
     </div>
+    <details id="task-workflow-library"><summary>Skills and tools to explore</summary><p class="muted">Curated references with original sources and licenses. These tools are available to explore; listing them does not install or connect them.</p><p id="task-library-status" class="muted" role="status"></p><div id="task-library-entries">Loading references…</div></details>
     <div id="tasks-stats" role="status"></div><div id="tasks-breakdown"></div>
     <div id="tasks-held" class="task-notice" hidden></div>
     <div class="task-filter"><label for="task-search">Search recent tasks<input id="task-search" type="search" placeholder="Title, provider or task ID"></label><label for="task-filter">State<select id="task-filter"><option value="">All states</option><option value="queued">Queued</option><option value="running">Running</option><option value="done">Completed</option><option value="failed">Failed</option><option value="cancelled">Cancelled</option><option value="interrupted">Interrupted</option></select></label><button class="btn" id="task-refresh">Refresh</button></div>
@@ -2844,12 +2848,13 @@ const taskDetailDialog = $('#task-detail-dialog');
 const dashboard = window.RelayBridgeDashboardState;
 const tasksGate = dashboard.createRequestGate();
 const detailGate = dashboard.createRequestGate();
-let tasksTimer = null, taskSnapshots = new Map(), taskPreview = null;
+let tasksTimer = null, taskSnapshots = new Map(), taskPreview = null, taskOutputProfiles = new Map(), taskLibrarySnapshot = null;
+const taskProfileKey = profile => `${profile.id}@${profile.version}:${profile.digest}`;
 let detailTaskId = null, detailOpener = null;
 const taskDate = value => Number.isFinite(value) ? new Date(value).toLocaleString() : 'Unknown';
 for (const dialog of [tasksDialog, taskDetailDialog]) dialog.addEventListener('keydown', event => {
   if (event.key !== 'Tab') return;
-  const controls = [...dialog.querySelectorAll('button, input, textarea, select, summary, [tabindex]')]
+  const controls = [...dialog.querySelectorAll('button, input, textarea, select, summary, a[href], [tabindex]')]
     .filter(el => el.tabIndex >= 0 && !el.disabled && el.getClientRects().length);
   if (!controls.length) return;
   const index = controls.indexOf(document.activeElement);
@@ -2939,6 +2944,7 @@ async function openTasksPanel(){
   const epoch = tasksGate.open();
   tasksDialog.showModal();
   refreshTasks(); tasksTimer = setInterval(refreshTasks, 4000);
+  void loadTaskGuidance(epoch);
   try {
     const { agents } = await api('/api/agents');
     if (!tasksGate.isOpen(epoch) || !tasksDialog.open) return;
@@ -2947,6 +2953,45 @@ async function openTasksPanel(){
     if ([...$('#task-kind').options].some(option => option.value === selected)) $('#task-kind').value = selected;
     invalidateTaskPreview();
   } catch (error) { if (tasksGate.isOpen(epoch)) $('#task-submit-status').textContent = 'Provider list unavailable: ' + error.message; }
+}
+function renderSelectedTaskGuidance() {
+  const profile = taskOutputProfiles.get($('#task-output-profile').value);
+  $('#task-output-description').textContent = profile?.unavailable ? 'These selected criteria are no longer in the current catalog. Choose an available version or explicitly choose to use your request as written.' : profile?.description || 'Choose criteria for a more focused answer. Your request still sets the scope and length.';
+  $('#task-output-criteria').textContent = profile?.text || '';
+  $('#task-output-details').hidden = !profile;
+}
+async function loadTaskGuidance(epoch) {
+  await Promise.allSettled([
+    (async () => {
+      try {
+        const catalog = await api('/api/output-profiles');
+        if (!tasksGate.isOpen(epoch)) return;
+        if (!Array.isArray(catalog.profiles)) throw new Error('Incomplete guidance catalog');
+        const before = JSON.stringify(taskDraft()), selected = $('#task-output-profile').value, previous = taskOutputProfiles.get(selected);
+        taskOutputProfiles = new Map(catalog.profiles.map(profile => [taskProfileKey(profile), profile]));
+        if (previous && !taskOutputProfiles.has(selected)) taskOutputProfiles.set(selected, { ...previous, unavailable:true });
+        $('#task-output-profile').innerHTML = '<option value="">Use my request as written</option>' + [...taskOutputProfiles].map(([key,profile]) => `<option value="${esc(key)}">${esc(profile.title)} · v${profile.version}${profile.unavailable ? ' (unavailable)' : ''}</option>`).join('');
+        if (taskOutputProfiles.has(selected)) $('#task-output-profile').value = selected;
+        renderSelectedTaskGuidance();
+        if (before !== JSON.stringify(taskDraft())) invalidateTaskPreview();
+      } catch (error) { if (tasksGate.isOpen(epoch)) $('#task-output-description').textContent = 'Guidance catalog could not refresh. Previously loaded criteria may be stale; submission validates them again.'; }
+    })(),
+    (async () => {
+      try {
+        const library = await api('/api/workflow-library');
+        if (!tasksGate.isOpen(epoch)) return;
+        if (!Array.isArray(library.entries)) throw new Error('Incomplete reference library');
+        const snapshot = JSON.stringify(library), container = $('#task-library-entries');
+        if (snapshot !== taskLibrarySnapshot) {
+          const focused = container.contains(document.activeElement) ? document.activeElement.getAttribute('href') : null;
+          container.innerHTML = library.entries.map(entry => `<article><h4>${esc(entry.title)}</h4><p>${esc(entry.use)} ${esc(entry.localGuidance)}</p><p class="muted">Available to explore · ${esc(entry.license)} · <a href="${esc(entry.url)}" target="_blank" rel="noopener noreferrer">Pinned source</a> · <a href="${esc(entry.licenseUrl)}" target="_blank" rel="noopener noreferrer">License</a></p></article>`).join('');
+          taskLibrarySnapshot = snapshot;
+          if (focused) ([...container.querySelectorAll('a')].find(link => link.getAttribute('href') === focused) || $('#task-workflow-library > summary')).focus({ preventScroll:true });
+        }
+        $('#task-library-status').textContent = '';
+      } catch (error) { if (tasksGate.isOpen(epoch)) $('#task-library-status').textContent = 'References could not refresh; previous entries may be stale: ' + error.message; }
+    })(),
+  ]);
 }
 function detailFields(model) {
   const correlation = model.correlation && typeof model.correlation === 'object' ? model.correlation : {};
@@ -2987,6 +3032,8 @@ function taskDraft() {
   for (const [id, key] of [['task-collab','collab'],['task-cwd','cwd'],['task-model-tier','modelTier'],['task-effort','effort']]) {
     const value = $('#' + id).value.trim(); if (value) body[key] = value;
   }
+  const profile = taskOutputProfiles.get($('#task-output-profile').value);
+  if (profile) body.outputProfile = { id:profile.id, version:profile.version, digest:profile.digest };
   return body;
 }
 function invalidateTaskPreview() {
@@ -2998,6 +3045,7 @@ tasksDialog.addEventListener('close', closeTasksPanel);
 tasksDialog.addEventListener('cancel', closeTasksPanel);
 $('#task-refresh').addEventListener('click', refreshTasks);
 $('#task-search').addEventListener('input', renderTaskRows); $('#task-filter').addEventListener('change', renderTaskRows);
+$('#task-output-profile').addEventListener('change', renderSelectedTaskGuidance);
 $('#task-detail-close').addEventListener('click', () => taskDetailDialog.close());
 $('#task-detail-refresh').addEventListener('click', refreshTaskDetails);
 taskDetailDialog.addEventListener('close', () => {
@@ -3019,8 +3067,10 @@ $('#task-preview').addEventListener('click', async () => {
     if (!tasksGate.isOpen(epoch.epoch) || fingerprint !== JSON.stringify(taskDraft())) return;
     const primary = plan.primary;
     if (!primary?.execution || primary.blocked || primary.ready === false || primary.validation) throw new Error(primary?.validation?.reason || 'No executable provider plan is available.');
+    if (body.outputProfile && (!plan.outputProfile || ['id','version','digest'].some(key => plan.outputProfile[key] !== body.outputProfile[key]))) throw new Error('Guidance changed. Reload the catalog and preview again.');
     taskPreview = { fingerprint, execution:primary.execution, kind:primary.kind };
     $('#task-plan').textContent = `${primary.kind} · ${primary.execution.model || 'model not reported'}\nTier: ${plan.tier || primary.execution.resolvedTaskTier} · requested effort: ${primary.execution.requestedEffort || 'automatic'} · applied effort: ${primary.execution.appliedEffort || 'not controlled'}\n${primary.execution.effortFallbackReason || 'Exact model and effort settings will be validated again on submission.'}`;
+    if (plan.outputProfile) $('#task-plan').textContent += '\nOutput guidance: ' + plan.outputProfile.title;
     $('#task-plan').hidden = false; $('#task-submit').textContent = 'Submit this plan';
     $('#task-submit-status').textContent = '';
   } catch (error) { if (tasksGate.isOpen(epoch.epoch)) $('#task-submit-status').textContent = 'Preview failed: ' + error.message; }

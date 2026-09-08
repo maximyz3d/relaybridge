@@ -94,5 +94,38 @@ Independent native read-only review found and root fixed four concrete
 submission/focus/partial-output/stale-preview defects; regression cases passed afterward.
 This supplements rather than replaces the pending fresh Claude closing gate.
 
-Final tests, reviewed SHAs, provider qualification results and closing verdicts
+## Pass 2 — output criteria and public workflow references
+
+Six optional profiles now reach REST/MCP preview, direct/routed execution,
+committee members/chair, broadcast and queued tasks. Queue records retain
+ordinary compiled text and existing execution/tier fields. Full prompt checks
+preserve original grounding, reject expanded queue overflow, pin admission to
+dispatch with the actual final-prompt hash, and prevent inconsistent responses
+from becoming cacheable completed results. No new execution-state store exists.
+
+The Tasks composer exposes exact profile choices and criteria; stale selections
+remain visible rather than silently disappearing. A curated library contains
+six immutable public source/license references with source-file digests and
+locally authored guidance. Every entry is explicitly unconnected. A standalone
+output-quality skill and corrected RelayBridge usage instructions are included;
+existing client registrations and the shared installed bridge are unchanged.
+
+Validation: 16/16 focused tests passed, including actual Chromium UI acceptance,
+profile/compiler/catalog checks and disposable REST/MCP/queue/grounding fixtures.
+The fixture provider captured actual delivered prompt text. Cases include
+multiple profile versions, removed selections, reference-link focus after
+refresh/failure, cached-result admission tampering, missing actual response hash,
+policy drift rejected before invocation, and a later committee member's expanded
+input rejection before any member starts. An additional 17/17 bridge/MCP
+integration tests passed. Both changed/new skills passed `quick_validate.py`;
+`git diff --check` passed.
+
+Native read-only reviews found and root corrected profile version collisions,
+removed-selection fallback, link focus loss, committee preflight omission,
+routing selector omission and prompt-hash correlation gaps. Focused backend
+re-review reported no remaining material findings. This is supplementary static
+review, not the fresh Claude closing gate. Behavioral evaluation prompts are
+committed, but no measured model-output improvement is claimed yet.
+
+Final suite results, reviewed SHAs, provider qualification and closing verdicts
 will be recorded here when obtained. No overnight completion claim yet.

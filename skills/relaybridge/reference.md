@@ -18,11 +18,29 @@ remain available.
 
 ### `GET /api/diag`
 Per-provider readiness. Each entry has `found` (binary resolves on PATH),
-`ready` (probe succeeded, meaning authenticated), and `detail`. Probes are
+`ready` (the configured readiness probe succeeded), and `detail`. Version-only
+probes do not establish authentication. Probes are
 redacted where the CLI echoes account information.
 
-Route only to providers that are `found && ready`. A `found: true, ready: false`
-provider needs a one-time interactive login and will fail every call until then.
+Routing also requires execution, filesystem-policy, account, model and grounding
+eligibility. A provider can be installed yet blocked for reasons other than
+authentication; use the classified reason before proposing a login or retry.
+
+### Output guidance and workflow references
+
+Authenticated `GET /api/output-profiles` returns `catalogVersion` and profile
+metadata, text and digest. `GET /api/workflow-library` returns pinned source and
+license references, locally authored guidance and explicit unconnected state.
+Neither route invokes a model or installs a tool.
+
+`outputProfile` is supported by `/api/plan`, `/api/route`, `/api/workspace/validate`,
+`/api/oneshot`, `/api/tasks` and `/api/broadcast`. Plan and workspace admission
+return `outputProfile` plus ordinary `preparedPrompt`; workspace admission also
+returns `promptEvidence` for the final text including grounding and policy.
+Send the original request with the selector, or the compiled ordinary text
+without a selector. Queue submission stores the latter and existing execution
+fields; it does not introduce a separate profile store. Compiled queued prompts
+over 100,000 UTF-16 code units reject before storage.
 
 ### `POST /api/oneshot`
 The main delegation call.
@@ -34,9 +52,11 @@ The main delegation call.
 | `requestId` | string | Caller-generated unique identity (`[A-Za-z0-9._:-]`, 8-160 characters). Mandatory for concurrent raw callers; retain it with the direct response tuple. |
 | `dangerous` | boolean | Optional. `false` (default) runs the read-only/plan slot. `true` allows the CLI to act agentically — only with explicit human intent. |
 | `cwd` | string | Optional working directory, validated against the allow list. |
-| `timeoutMs` | number | Optional **hard ceiling only**. Omit it; supervision decides when a run is stuck. |
+| `timeoutMs` | number | Optional bounded deadline; omission uses the configured default. Progress supervision and provider budgets also apply. |
 | `taskTier` | string | Optional. `utility` / `standard` / `complex` / `critical` — selects the model weight class. |
 | `modelTier` | string | Optional. `light` / `standard` / `heavy`. Overrides `taskTier`. |
+| `outputProfile` | object | Optional exact `{id, version, digest?}` from `/api/output-profiles`; appended as ordinary output criteria after the original request. |
+| `expectedPromptHash` | string | Optional SHA-256 of the fully prepared prompt from profile admission; mismatch rejects before invocation. Used by MCP to bind dispatch to admission. |
 
 Response:
 

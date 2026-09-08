@@ -1,0 +1,47 @@
+{
+  "catalogVersion": 1,
+  "profiles": [
+    {
+      "id": "code-debug",
+      "version": 1,
+      "title": "Code and debugging",
+      "description": "A focused diagnosis or implementation with evidence and verification.",
+      "text": "Identify the observed behavior and the intended behavior. Separate a reproduced cause from a hypothesis. For a proposed change, connect the smallest relevant change to the failure it addresses. Include meaningful verification and its actual result; distinguish checks performed from checks suggested. State unresolved edge cases that could change the conclusion. Respect the requested scope and response length; do not add a rewrite or a test checklist by default."
+    },
+    {
+      "id": "implementation-plan",
+      "version": 1,
+      "title": "Implementation planning",
+      "description": "Dependencies, ownership, acceptance checks, and realistic next actions.",
+      "text": "Make the intended outcome and constraints clear. Order concrete steps by their real dependencies. Identify an owner or role and an observable acceptance condition where coordination is needed. Call out the assumptions that could change the approach, and resolve ordinary reversible choices rather than presenting needless forks. Distinguish a proposal from completed work. Include a rollback or stopping condition when the operation warrants one."
+    },
+    {
+      "id": "research-synthesis",
+      "version": 1,
+      "title": "Research and synthesis",
+      "description": "Source-backed conclusions with dates, uncertainty, and useful gaps.",
+      "text": "Answer the question with the strongest relevant evidence available. Attribute factual claims to sources that actually support them; distinguish retrieved evidence, supplied material and inference. Preserve publication or event dates when freshness matters, and identify missing or conflicting evidence. Do not invent links, quotations or verification. Organize around the decision the reader needs to make, and use the requested depth instead of a fixed report template."
+    },
+    {
+      "id": "decision-analysis",
+      "version": 1,
+      "title": "Decisions and problem solving",
+      "description": "Compare feasible choices and explain what would change the recommendation.",
+      "text": "State the decision, objective and binding constraints. Compare the few feasible alternatives using the criteria that matter to this request. Explain the main tradeoff and recommend a next action with its rationale. Identify the assumption or missing evidence most likely to reverse the recommendation. Prefer a cheap reversible check when uncertainty is material. Avoid fabricated precision, exhaustive option lists and hidden assumptions."
+    },
+    {
+      "id": "collaboration-synthesis",
+      "version": 1,
+      "title": "AI collaboration",
+      "description": "Reconcile independent findings without turning consensus into approval.",
+      "text": "Preserve independent findings and their evidence before synthesizing them. Separate agreement, disagreement and missing information. Resolve disagreements with verifiable evidence or a bounded next check; a majority vote is not proof. Attribute material findings and keep task, request or receipt identifiers when supplied. Assign a concrete next owner only within the existing assignment. A planning result or incomplete review does not establish implementation, approval, merge or deployment."
+    },
+    {
+      "id": "design-critique",
+      "version": 1,
+      "title": "UI and design",
+      "description": "User flows, accessible interactions, and specific visual improvements.",
+      "text": "Assess the interface against the user task, information hierarchy and interaction states. Prioritize observable friction: unclear actions, missing feedback, inaccessible controls, narrow layouts or lost context. Connect each proposed adjustment to a specific user benefit and a way to check it. Distinguish a visual inspection from a tested interaction or accessibility audit. Preserve the product character and avoid cosmetic changes with no demonstrated benefit."
+    }
+  ]
+}
