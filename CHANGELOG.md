@@ -1,3 +1,6 @@
+## v2.3.0 - 2026-09-08
+- #127 feat: add Astra workflows, queued result recovery, and Gemini quota gates
+
 ## v2.2.2 - 2026-09-08
 - #126 feat: refine task UI, optional output guidance and native provider diagnostics
 
