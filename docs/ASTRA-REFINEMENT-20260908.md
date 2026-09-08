@@ -1,5 +1,11 @@
 # Astra refinement and remaining acceptance
 
+Current closing result: **APPROVE** for code head
+`b69450c21a0134063843c816b633262e43937613`; local suite 1,045 passed,
+zero failed, four skipped. See [closing acceptance](#closing-acceptance-for-pr127)
+for the exact receipt and limits. Earlier pending/revision statements below are
+historical checkpoints; GitHub PR127 is authoritative for final checks and merge.
+
 Base: `b04ae3a0fec6a8ef5245711aabf6c18f729397fb` (main v2.2.2).
 Branch: `codex/astra-remaining-20260908`, isolated Linux worktree.
 The owner's September 8 instruction transfers remaining implementation to this
@@ -335,3 +341,99 @@ counts. No current production producer of that contradiction was found: the
 only admission-limit rejection explicitly writes zero attempts before dispatch.
 It is a follow-up hardening item, not a demonstrated production replay, and was
 not changed in this release.
+
+## Closing acceptance for PR127
+
+[PR127](https://github.com/maximyz3d/relaybridge/pull/127) preserves every
+implementation and corrective commit on the branch above. Reviewed code head:
+`b69450c21a0134063843c816b633262e43937613`; full base:
+`b04ae3a0fec6a8ef5245711aabf6c18f729397fb`. The implementation worktree was
+clean after the code commit. This subsequent commit changes only this sanitized
+evidence document; it does not amend the reviewed code or rewrite ancestry.
+
+A fresh independent read-only review through an isolated production-mode
+RelayBridge inspected the complete 44-file base-to-head diff and surrounding
+admission, persistence, reconciliation and dispatch code. It returned complete
+**APPROVE**, no material findings, exit 0, one physical/model invocation, no
+failure, dropout or partial-result flag. It confirmed the preceding review
+corrections, including strict task IDs and remote revision exclusion.
+
+- Request/invocation: `astra-review-ce197463-5bdb-430a-a54b-8754227963f9`.
+- Attempt: `astra-review-ce197463-5bdb-430a-a54b-8754227963f9:attempt:1`.
+- Run: `run_mtsvtzl0_913303bd`; receipt: `rcpt_mtsw08bt_102c3e99`.
+- Build: `2.0.1+fdb116f86946edfa`.
+- Receipt store: `498d478af9554d295f62de9b097b7c176e3de948e0e3963ec79bc321209bd977`.
+- Complete answer: 2,665 characters; SHA-256
+  `9b7e475afa3b1d9b1cf3943cb46bfde3a8bf0f406ae11e2550ac84e1a81f9073`.
+
+Requested and outgoing model: `gpt-6-astra`; requested and applied effort:
+`ultra`; no fallback. Observed model and provider terminal reason remain
+unavailable. Receipt usage is estimated (`chars_div_4`), not authoritative
+provider token accounting. The complete answer and exact receipt envelope were
+retained privately; only sanitized findings, hashes and identifiers are
+published. The isolated runtime was cleaned up. These are not shared-runtime
+receipt identifiers and are not Claude evidence. No Claude/Fable calls occurred
+after the user's provider restriction.
+
+Root validation on the exact reviewed code head: **1,049 tests, 1,045 passed,
+zero failed, four platform/optional skips**, 95.16 seconds, with both Chromium
+browser cases enabled. The latest focused remote/local MCP and controller
+checks passed 35/35. Earlier strict-ID queue/result checks passed 65/65, and
+provider/quota/accounting/MCP checks passed 121/121. Production audit reported
+zero vulnerabilities and the skill validator passed; no dependency change
+followed that audit. GitHub Linux/Node24 and CodeQL passed on the code head;
+Windows was pending when this document was committed. PR checks must pass on
+the final evidence head before merge; this paragraph is a pre-merge record.
+
+Changed files (exact base-to-reviewed-head inventory):
+
+```text
+AGENTS.md
+cli-config.json
+docs/ASTRA-REFINEMENT-20260908.md
+docs/CODEX-CLAUDE-PIPELINE.md
+docs/FUEL-GAUGE.md
+docs/TASKS.md
+lib/effort-controls.js
+lib/execution-contract.js
+lib/load-leveller.js
+lib/model-registry.js
+lib/partial-checkpoint.js
+lib/provider-accounts.js
+lib/provider-failure.js
+lib/remote-mcp.js
+lib/result-delivery.js
+lib/task-queue.js
+lib/usage-ledger.js
+lib/vendor-quota.js
+lib/workflow-controller.js
+lib/workflow-pipeline.js
+lib/workflow-prompts.js
+mcp/receipts.mjs
+mcp/router.mjs
+mcp/server.mjs
+public/dashboard-state.js
+public/index.html
+public/workflow-panel.js
+server.js
+skills/codex-claude-pipeline/SKILL.md
+test/astra-workflow.integration.test.js
+test/dashboard-state.test.js
+test/execution-contract.test.js
+test/gemini-quota.integration.test.js
+test/gemini-quota.test.js
+test/mcp-run-status.test.js
+test/mcp.integration.test.js
+test/model-registry.test.js
+test/remote-mcp.test.js
+test/result-delivery.integration.test.js
+test/result-delivery.test.js
+test/router.test.js
+test/workflow-controller.test.js
+test/workflow-pipeline.test.js
+test/workflow-ui.test.js
+```
+
+Approval covers the bounded changes above. All remaining acceptance boundaries
+in this document still apply. No legacy reservation was released or replayed,
+no shared bridge was restarted or installed, and no deployment occurred.
