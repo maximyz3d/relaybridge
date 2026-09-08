@@ -201,3 +201,26 @@ isolation defects: creating a new workflow retained the prior evidence input,
 and workflow edits invalidated the unrelated task preview. Root corrected both,
 added saved plan/acceptance inspection, and reran all eight state/browser checks
 successfully. Evidence typed during an in-flight action is preserved.
+
+## Pass 4: truthful Gemini quota exhaustion
+
+Failed Gemini one-shot terminals now recognize the exact individual-quota
+message, including punctuation/newline reset variants and bounded compound
+hours/minutes/seconds. This is account exhaustion with unknown numerical
+allowance. It is appended to the existing vendor ledger, projected across
+configured aliases, and enforced before new explicit calls. Local budget stops,
+successful quotations and mixed answers cannot become this authority.
+
+MCP/REST receipts preserve the evidence and reset; the UI displays unknown
+allowance. Existing numeric Grok quota semantics remain unchanged. Active
+qualitative observations use the longest remaining reset; two already-in-flight
+failures cannot shorten response/receipt retry guidance with a later weaker
+observation. Heuristic cooldowns retain their actual capped deadline separately.
+
+Astra `astra_provider_audit` found and root corrected a routing provider-key
+collision, message variants, hostile timestamp coercion, and the concurrent
+reset timing mismatch. All 121 focused provider/quota/accounting/MCP tests and
+eight Chromium/state checks passed. New integration exercises real isolated
+REST/queue-adjacent admission and receipts with synthetic CLI failures. No live
+Gemini, Grok or Claude calls occurred. Interactive quota ingestion, native seat
+qualification and pre-reset recovery proof remain separate acceptance work.

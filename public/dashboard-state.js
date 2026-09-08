@@ -8,6 +8,7 @@
   const count = value => Number.isSafeInteger(value) && value >= 0 ? value : null;
   const text = value => typeof value === 'string' ? value : '';
   const display = value => value === null ? 'unknown' : String(value);
+  function qualitativeQuotaLabel(quota) { return quota?.kind === 'quota_exhausted' ? 'Quota exhausted; allowance unknown' : null; }
 
   function queueStatsModel(stats = {}) {
     const values = Object.fromEntries(['active', 'queued', 'ready', 'deferred', 'blocked', 'uncertain', 'maxConcurrent']
@@ -123,5 +124,5 @@
       isOpen(expected) { return open && (expected === undefined || expected === epoch); },
     };
   }
-  return { queueStatsModel, queueReasonModel, executionStateModel, taskRowModel, taskDetailModel, workflowDetailModel, createRequestGate };
+  return { queueStatsModel, queueReasonModel, executionStateModel, taskRowModel, taskDetailModel, workflowDetailModel, qualitativeQuotaLabel, createRequestGate };
 });

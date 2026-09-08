@@ -13,6 +13,7 @@ import { promptTransportLimits, preparePrompt } from '../lib/prompt-transport.js
 import { normalizeGrounding, prepareGroundedPrompt } from '../lib/workspace-grounding.js';
 import { normalizeTransportLifecycle } from '../lib/attempt-lifecycle.js';
 import { compileOutputProfile } from '../lib/output-profiles.js';
+import { normalizeQualitativeQuotaExhaustion } from '../lib/vendor-quota.js';
 
 const OUTPUT_PROFILE_SCHEMA = z.object({ id:z.string().regex(/^[a-z][a-z0-9-]{0,63}$/),
   version:z.number().int().positive(), digest:z.string().regex(/^[0-9a-f]{64}$/).optional() }).strict()
@@ -1079,6 +1080,7 @@ export function normalizeProviderPermissionDenials(value, modelInvocation) {
 
 export function normalizeVendorQuota(value) {
   if (!value || typeof value !== 'object') return null;
+  if (value.kind !== undefined) return normalizeQualitativeQuotaExhaustion(value);
   const actual = strictTokenCount(value.actual);
   const limit = strictTokenCount(value.limit);
   const remaining = strictTokenCount(value.remaining);
@@ -1118,6 +1120,7 @@ export function normalizeVendorQuota(value) {
 
 export function normalizeQuotaEvidence(value) {
   if (!value || typeof value !== 'object') return null;
+  if (value.kind === 'quota_exhausted') return normalizeQualitativeQuotaExhaustion(value);
   if (value.source === 'claude_terminal_api_status') {
     if (!validProviderKey(value.provider)
       || value.scope !== 'account' || value.kind !== 'rate_limit' || value.status !== 429
@@ -1498,13 +1501,14 @@ export function reconcileTransportReceipt({ requestId, sanitized, transportRecei
     usage: usageFromTransportReceipt(transportReceipt),
     providerRetries: providerRetriesFromReceipt(transportReceipt),
     quotaEvidence: normalizeQuotaEvidence(transportReceipt.quotaEvidence),
+    vendorQuota: normalizeVendorQuota(transportReceipt.vendorQuota),
     cooldown: normalizeProviderCooldown(transportReceipt.cooldown),
     retryAt: strictTokenCount(transportReceipt.retryAt),
     retryAfterSec: strictTokenCount(transportReceipt.retryAfterSec),
     providerApiErrorStatus: Number.isSafeInteger(transportReceipt.providerApiErrorStatus)
       && transportReceipt.providerApiErrorStatus >= 100 && transportReceipt.providerApiErrorStatus <= 599
       ? transportReceipt.providerApiErrorStatus : null,
-    rateLimited: normalizeQuotaEvidence(transportReceipt.quotaEvidence)?.kind === 'rate_limit'
+    rateLimited: ['rate_limit','quota_exhausted'].includes(normalizeQuotaEvidence(transportReceipt.quotaEvidence)?.kind)
       || transportReceipt.failureClass === 'rate_limit',
     budgetExceeded: transportReceipt.failureClass === 'token_budget' || transportReceipt.failureClass === 'budget',
     transportReceiptId: transportReceipt.receiptId,

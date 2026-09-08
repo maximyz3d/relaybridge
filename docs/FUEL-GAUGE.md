@@ -9,10 +9,10 @@ Answers four questions the bridge could not previously answer:
 
 ## Honesty about what is known
 
-Subscription plans generally **do not publish a token quota**. So for those seats the
-gauge normally measures against a budget *you configure* in
-`config/usage-budgets.json`, and reports `basis: "configured"` — the UI marks
-those with `· est`. Getting a budget wrong changes advice, not correctness.
+Subscription plans generally **do not publish a token quota**. Their remaining
+allowance stays unknown without a current vendor or operator observation.
+Budgets in `config/usage-budgets.json` are separate configured estimates; they
+cannot establish subscription capacity or exclude/deprioritize a seat.
 
 When a recognized vendor 429 does disclose bounded quota, RelayBridge records
 that evidence separately and reports `basis: "vendor_observed"` ahead of the
@@ -23,10 +23,25 @@ not trusted. Because a rolling window does not reveal which tokens age out
 when, the observation expires conservatively one full stated window after it
 was seen; the API and UI expose that policy and timestamp explicitly.
 
+Gemini's failed terminal diagnostic `Individual quota reached` supplies
+qualitative account exhaustion, not a token allowance. The optional reported
+reset, including compound hours/minutes/seconds, produces a bounded deadline.
+All allowance/count/percentage fields remain null. Missing or malformed reset
+text uses a five-minute conservative expiry, clearly labeled as such. Successful
+quotations, mixed answers and local supervisor stops supply no such authority.
+
+These observations use the existing vendor ledger and account aliases. The
+longest active reset remains the hard pre-admission gate, including explicit
+provider requests. A later weaker observation cannot shorten it. Heuristic
+cooldowns retain their own four-hour cap; response/receipt retry guidance also
+respects the longer active vendor reset. The UI says allowance unknown rather
+than displaying fabricated zero-over-zero tokens. This covers one-shot terminal
+ingestion; interactive PTY ingestion and pre-reset recovery proof are separate.
+
 | basis | meaning |
 |---|---|
 | `configured` | measured against your estimate, not a vendor number |
-| `vendor_observed` | actual/limit directly observed in a recognized vendor 429; temporarily overrides the configured estimate |
+| `vendor_observed` | recognized numerical quota or qualitative exhaustion; unknown allowance fields stay null |
 | `metered` | measured against a real spend cap |
 | `unmetered` | local/free seat — nothing to exhaust, always reads full |
 
@@ -75,7 +90,8 @@ points, it names which seat to shift away from.
 
 Normal `/api/plan` and `/api/route` calls apply the durable cooldown state
 before candidate selection and then apply fuel levelling to the capable
-providers that remain. An explicitly preferred provider is never filtered.
+providers that remain. Explicit preference cannot bypass authoritative vendor
+quota exhaustion, authentication or concurrency safeguards.
 The response includes `fleetState` (including active `vendorQuota` evidence)
 and per-provider `loadLevelling` evidence
 so the changed order is visible rather than implicit.
