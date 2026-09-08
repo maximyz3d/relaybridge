@@ -3024,7 +3024,7 @@ function validateProviderIntent(body, cfg = loadConfig(), snapshot = captureAllo
     policyPrefix: !useDanger && typeof entry.oneshot_safe_prompt_prefix === 'string' ? entry.oneshot_safe_prompt_prefix.trim() : '',
   }) : null;
   revalidateAllowedCwdIdentity(snapshot);
-  return { ...controls, grounding: grounded.grounding,
+  return { ...controls, grounding: grounded.grounding, promptEvidence: prepared?.evidence,
     ...(compiled.profile ? { outputProfile:compiled.profile, preparedPrompt:compiled.prompt, promptEvidence:prepared.evidence } : {}) };
 }
 function rejectInvalidIntent(res, body, error) {
@@ -4918,6 +4918,7 @@ async function executeOneShot(body, res) {
   const supervisor = new RunSupervisor({ ...supervisorOptions,
     finalizationSupported: supportsClaudeStreamFinalization });
   const runId = `run_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 8)}`;
+  route.run_id = runId;
   activeRuns.set(runId, { runId, kind, route, startedAt, supervisor, pid: proc.pid });
   let stopReason = null;
   let stopDetail = '';
@@ -5312,6 +5313,7 @@ const incidentLog = createIncidentLog({
 const taskQueue = createTaskQueue({
   dataDir: path.join(DATA_DIR, 'tasks'),
   executeOneShot, readCollab, writeCollab,
+  receiptStoreId: RECEIPT_STORE_IDENTITY.ready ? RECEIPT_STORE_IDENTITY.id : null,
   maxConcurrent: Number(process.env.RELAYBRIDGE_MAX_TASKS) || 3,
   onFailure: (task) => incidentLog.report(taskFailureDetails(task)),
   log: (m) => console.log(m),
@@ -5320,6 +5322,9 @@ const taskQueue = createTaskQueue({
 app.post('/api/tasks', async (req, res) => {
   try {
     const input = req.body || {};
+    if (input.deliveryMode !== undefined && input.deliveryMode !== 'queued') {
+      throw validationError('invalid_delivery', 'deliveryMode', 'deliveryMode must be queued when supplied');
+    }
     const providerBudget = validateProviderBudget(input.providerBudget);
     const { classifyTask } = await ROUTER_MODULE_PROMISE;
     const classifiedTaskTier = typeof input.prompt === 'string'
@@ -5331,16 +5336,47 @@ app.post('/api/tasks', async (req, res) => {
       ? input.budgetTaskTier
       : input.execution?.resolvedTaskTier || taskTier || classifiedTaskTier;
     const prepared = { ...input, dangerous: input.dangerous === true, providerBudget, budgetTaskTier, taskTier, modelTier };
-    const controls = validateProviderIntent({ ...prepared, dangerous: input.dangerous === true });
+    const snapshot = captureAllowedCwdIdentity(prepared.cwd);
+    const controls = validateProviderIntent(prepared, loadConfig(), snapshot);
     if (controls.outputProfile && controls.preparedPrompt.length > 100000) {
       throw profileError('The compiled task exceeds the queue limit of 100000 characters; shorten the original task or guidance.');
     }
     const { outputProfile: _selection, ...queueBody } = prepared;
-    res.json(taskQueue.submit({ ...queueBody,
+    const submitted = { ...queueBody,
       ...(controls.outputProfile ? { prompt:controls.preparedPrompt, title:input.title || input.prompt.split('\n')[0] } : {}),
-      execution: controls.execution }));
+      execution: controls.execution };
+    if (input.deliveryMode === 'queued') {
+      const { taskId, deliveryMode, ...intent } = submitted;
+      intent.requestId = input.requestId === undefined ? `queued:${taskId}` : input.requestId;
+      intent.cwd = snapshot.resolved;
+      intent.expectedCwdIdentityHash = snapshot.cwdIdentityHash;
+      intent.expectedCwdPolicyId = CWD_POLICY_IDENTITY;
+      intent.expectedPromptHash = controls.promptEvidence.effectiveHash;
+      const task = taskQueue.submitDurable(taskId, intent);
+      return res.status(202).json(taskQueue.getResult(task.id));
+    }
+    res.json(taskQueue.submit(submitted));
   }
-  catch (err) { return rejectInvalidIntent(res, req.body || {}, err); }
+  catch (err) {
+    if (['TASK_INTENT_CONFLICT', 'QUEUE_EXECUTION_UNCERTAIN', 'DELIVERY_UNAVAILABLE', 'INVALID_DELIVERY'].includes(err.code)) return sendDeliveryError(res, err);
+    return rejectInvalidIntent(res, req.body || {}, err);
+  }
+});
+function sendDeliveryError(res, error) {
+  const code = error.code || 'INVALID_DELIVERY';
+  const status = code === 'TASK_NOT_FOUND' ? 404 : ['TASK_INTENT_CONFLICT', 'RESULT_IDENTITY_MISMATCH'].includes(code) ? 409
+    : ['DELIVERY_UNAVAILABLE', 'QUEUE_EXECUTION_UNCERTAIN'].includes(code) ? 503 : 400;
+  return res.status(status).json({ ok: false, code,
+    error: ['TASK_NOT_FOUND', 'TASK_INTENT_CONFLICT', 'RESULT_IDENTITY_MISMATCH', 'DELIVERY_UNAVAILABLE', 'QUEUE_EXECUTION_UNCERTAIN', 'INVALID_DELIVERY'].includes(code)
+      ? error.message : 'invalid result delivery request', model_invocation: false });
+}
+app.get('/api/tasks/:id/result', (req, res) => {
+  try { res.json(taskQueue.getResult(req.params.id)); }
+  catch (error) { sendDeliveryError(res, error); }
+});
+app.post('/api/tasks/:id/result/ack', (req, res) => {
+  try { res.json(taskQueue.acknowledgeResult(req.params.id, req.body || {})); }
+  catch (error) { sendDeliveryError(res, error); }
 });
 app.get('/api/tasks', (req, res) => {
   try { res.json({ tasks: taskQueue.list({ collab: req.query.collab, status: req.query.status, limit: req.query.limit }), stats: taskQueue.stats() }); }

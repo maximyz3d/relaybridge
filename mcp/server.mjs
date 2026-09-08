@@ -3402,6 +3402,8 @@ export function buildServer() {
     title: 'Submit a background task',
     description: 'Queue a prompt to a provider and return a task id IMMEDIATELY without waiting for the run. Use for work longer than a chat turn, or when the result should be collectable later from a different surface. Link a collab id to append the result to that shared thread.',
     inputSchema: z.object({
+      deliveryMode: z.literal('queued').optional().describe('Return a sanitized pending/result handle; taskId must be caller-known for retry without duplicate execution.'),
+      taskId: z.string().regex(/^t_[A-Za-z0-9_]{1,120}$/).optional(),
       outputProfile: OUTPUT_PROFILE_SCHEMA.optional(),
       ...GROUNDING_FIELDS,
       kind: z.string().min(1).max(64), prompt: z.string().min(1).max(100000),
@@ -3422,11 +3424,30 @@ export function buildServer() {
       groundingOverride: z.boolean().default(false),
     }),
     annotations: ACTION,
-  }, safeHandler(async (input) => {
-    const response = await bridgeRequest('/api/tasks', { method: 'POST', body: { ...input, source: 'mcp' } });
-    const receipt = appendReceipt({ event: 'submit_task', status: 'queued', taskId: response.id, provider: input.kind });
+  }, safeHandler(async (input, context) => {
+    if (input.deliveryMode === 'queued' && !input.taskId) throw new Error('queued delivery requires a caller-known taskId');
+    const response = await bridgeRequest('/api/tasks', { method: 'POST', body: { ...input, source: 'mcp' },
+      actionIdentity: true, signal: context?.mcpReq?.signal });
+    const receipt = appendReceipt({ event: 'submit_task', status: response.status || 'queued', taskId: response.taskId || response.id, provider: input.kind });
     return result({ ...response, receiptId: receipt.receiptId });
   }));
+
+  server.registerTool('get_task_result', {
+    title: 'Collect a sanitized queued result',
+    description: 'Read a pending or persisted result by its exact task id without dispatch, retry or acknowledgement. The returned result hash binds the sanitized bytes; completion and delivery acknowledgement are distinct.',
+    inputSchema: z.object({ id: z.string().regex(/^t_[A-Za-z0-9_]{1,120}$/) }), annotations: READ_ONLY,
+  }, safeHandler(async ({ id }, context) => result(await bridgeRequest(`/api/tasks/${encodeURIComponent(id)}/result`, {
+    signal: context?.mcpReq?.signal,
+  }))));
+
+  server.registerTool('ack_task_result', {
+    title: 'Acknowledge exact queued result bytes',
+    description: 'Record that the caller collected this store and result hash. Idempotent; never approves the answer, releases a writer, or replays the task.',
+    inputSchema: z.object({ id: z.string().regex(/^t_[A-Za-z0-9_]{1,120}$/), receiptStoreId: z.string().regex(/^[a-f0-9]{64}$/),
+      sha256: z.string().regex(/^[a-f0-9]{64}$/) }), annotations: ACTION,
+  }, safeHandler(async ({ id, ...body }, context) => result(await bridgeRequest(`/api/tasks/${encodeURIComponent(id)}/result/ack`, {
+    method: 'POST', body, actionIdentity: true, signal: context?.mcpReq?.signal,
+  }))));
 
   server.registerTool('get_task', {
     title: 'Get a task result',

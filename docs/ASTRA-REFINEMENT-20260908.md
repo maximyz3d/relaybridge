@@ -147,3 +147,31 @@ that all reconciliation/cancellation/orphan paths preserve the exact lock bytes
 under contradictory ownership, and mixed URL retrieval keeps Codex ineligible
 under the existing aptitude policy. All 59 focused workflow/router tests passed.
 These corrections still require fresh independent closing review.
+
+## Pass 2 continued: explicit queued result delivery
+
+`submit_task` and `/api/tasks` now accept opt-in queued delivery with a
+caller-known task ID. The existing task JSON stores the result contract,
+sanitized semantic bytes/hash and explicit acknowledgement. GET is inert;
+acknowledgement requires the exact store/hash and cannot release or replay work.
+Known IDs never replay. New admissions retain unknown-execution reservations.
+Workspace/prompt/control identity is pinned before dispatch, invalid correlation
+and oversized prompts reject before invocation, and CLI run references now
+propagate through the existing route/receipt path.
+
+Independent Astra `astra_reliability_audit` found and root corrected short-ID
+normalization, non-boolean partial flags, unvalidated loaded identity, exact
+attempt matching and recognized environment credential-redaction gaps. Tests
+include a corrupt file that attempts to redirect ACK onto another record;
+neither file changes. No runtime credential was used in those tests.
+
+The contract is explicitly scoped in `docs/TASKS.md`: no automatic conversion of
+direct one-shots, no delivery event journal or fsync-qualified power-loss claim,
+no universal removal of unknown secrets/tool narration from generic text, and
+no exactly-once client consumption. Unsupported provider terminal identity stays
+unknown. Issue #104 remains open for its broader acceptance requirements.
+
+Delivery validation checkpoint: all 77 focused queue, result contract,
+redaction, REST and MCP tests passed with zero skips. Those fixtures exercise
+real bridge/queue wiring with local stand-in CLIs, not live provider accounts.
+Fresh independent review of the final combined head remains required.

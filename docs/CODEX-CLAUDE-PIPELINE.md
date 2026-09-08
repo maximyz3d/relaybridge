@@ -35,7 +35,7 @@ Only an explicitly provider-owned, never-bound dispatch gap can use orphan
 recovery. This change supplies no legacy termination proof or unattended
 controller recovery.
 
-This profile makes Codex the user-facing orchestrator and primary implementation
+The default `codex-claude` profile makes Codex the user-facing orchestrator and primary implementation
 writer. Claude contributes a fresh read-only plan, fresh initial and final
 read-only reviews, and a bounded Sonnet revision when a review requests changes,
 after an explicit writer-lease transfer.

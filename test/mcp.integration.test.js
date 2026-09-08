@@ -407,6 +407,7 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
     'renew_pipeline_writer_lease', 'cancel_pipeline',
     'create_request', 'get_request', 'list_requests', 'link_request_workflow', 'record_requirement_evidence',
     'open_in_chrome',
+    'submit_task', 'get_task_result', 'ack_task_result',
   ]) {
     assert.ok(toolNames.has(expected), `missing MCP tool ${expected}`);
   }
@@ -484,6 +485,29 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   assert.equal(conflict.isError, true);
   const requestList = await client.callTool({ name: 'list_requests', arguments: {} });
   assert.ok(requestList.structuredContent.requests.some((r) => r.requestId === requestInput.requestId));
+
+  const submittedResult = await client.callTool({ name: 'submit_task', arguments: {
+    deliveryMode: 'queued', taskId: 't_mcp_delivery', kind: 'gemini', prompt: 'Return a bounded fixture answer.', cwd: allowedRootA,
+  } });
+  assert.equal(submittedResult.isError, undefined, JSON.stringify(submittedResult.structuredContent));
+  let queuedResult;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    queuedResult = await client.callTool({ name: 'get_task_result', arguments: { id: 't_mcp_delivery' } });
+    if (queuedResult.structuredContent.resultState !== 'pending') break;
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  assert.equal(queuedResult.structuredContent.resultPersisted, true, JSON.stringify(queuedResult.structuredContent));
+  const resultHash = require('node:crypto').createHash('sha256').update(queuedResult.structuredContent.result).digest('hex');
+  assert.equal(queuedResult.structuredContent.metadata.sha256, resultHash);
+  assert.match(queuedResult.structuredContent.metadata.providerRunId, /^run_/);
+  const wrongAck = await client.callTool({ name: 'ack_task_result', arguments: {
+    id: 't_mcp_delivery', receiptStoreId: queuedResult.structuredContent.receiptStoreId, sha256: 'f'.repeat(64),
+  } });
+  assert.equal(wrongAck.isError, true);
+  const deliveredAck = await client.callTool({ name: 'ack_task_result', arguments: {
+    id: 't_mcp_delivery', receiptStoreId: queuedResult.structuredContent.receiptStoreId, sha256: resultHash,
+  } });
+  assert.equal(deliveredAck.structuredContent.acknowledged, true);
 
   // Build a due retry without invoking a provider. GET must remain a pure
   // status read, and the action-identity middleware must reject reconciliation
