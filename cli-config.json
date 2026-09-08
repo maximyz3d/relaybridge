@@ -497,9 +497,14 @@
       "max": [
         "--config",
         "model_reasoning_effort=xhigh"
+      ],
+      "ultra": [
+        "--config",
+        "model_reasoning_effort=ultra"
       ]
     },
-    "_effort_note": "Codex CLI configuration supports xhigh as its highest normal reasoning value. RelayBridge maps an explicit cross-provider max request to xhigh instead of silently reducing it to high.",
+    "_effort_note": "Explicit ultra is supported only for gpt-6-astra with a compatible Codex CLI. It is never downgraded. The historical cross-provider max alias still maps to xhigh.",
+    "effort_model_allowlist": { "ultra": ["gpt-6-astra"] },
     "login_command": [
       "codex",
       "login"
@@ -524,10 +529,10 @@
       "heavy": {
         "args": [
           "--model",
-          "gpt-5.6-sol"
+          "gpt-6-astra"
         ],
-        "model": "gpt-5.6-sol",
-        "note": "current recommended default for hard work"
+        "model": "gpt-6-astra",
+        "note": "Astra for hard work; explicit workflow profiles pin their own effort"
       }
     },
     "tags": [

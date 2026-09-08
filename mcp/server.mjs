@@ -3161,7 +3161,7 @@ export function buildServer() {
   }).strict();
 
   server.registerTool('start_codex_claude_pipeline', {
-    title: 'Start a Codex-Claude pipeline',
+    title: 'Start a phase-gated Codex pipeline',
     description: 'Create one durable phase-gated run. Codex remains orchestrator and primary writer; no provider is called until research is submitted. Use list_pipelines first when duplicate work may already exist.',
     inputSchema: z.object({
       cwd: z.string().min(1).max(1024),
@@ -3175,6 +3175,7 @@ export function buildServer() {
       permissionMode: z.enum(['safe', 'full']).optional(),
       acknowledgeFilesystemWrites: z.boolean().optional(),
       providerPreferences: providerPreferencesSchema.optional(),
+      profile: z.enum(['codex-claude', 'codex-astra-ultra']).optional().describe('Explicit codex-astra-ultra pins every advisor to Codex/Astra/ultra and keeps all writes external; no Claude fallback.'),
     }),
     annotations: ACTION,
   }, safeHandler(async (input, context) => {
@@ -3231,8 +3232,8 @@ export function buildServer() {
   ))));
 
   server.registerTool('submit_pipeline_research', {
-    title: 'Submit Codex research and dispatch Claude planning',
-    description: 'Store the compact Codex research brief, then queue one fresh read-only Claude planning task. Repeated calls are rejected by the phase gate.',
+    title: 'Submit Codex research and dispatch planning',
+    description: 'Store the compact Codex research brief, then queue one fresh read-only planning task using the persisted profile. Repeated calls are rejected by the phase gate.',
     inputSchema: z.object({
       runId: workflowIdSchema,
       markdown: z.string().min(1).max(100000),
@@ -3246,7 +3247,7 @@ export function buildServer() {
 
   server.registerTool('claim_pipeline_implementation', {
     title: 'Claim the Codex implementation lease',
-    description: 'After Claude planning is ready, give Codex the one writer lease for this canonical workspace. Preserve the returned lease token until completion or renewal.',
+    description: 'After planning is ready, give Codex the one writer lease for this canonical workspace. Preserve the returned lease token until completion or renewal.',
     inputSchema: z.object({
       runId: workflowIdSchema,
       leaseMs: z.number().int().min(60000).max(86400000).optional(),
@@ -3261,7 +3262,7 @@ export function buildServer() {
 
   server.registerTool('complete_pipeline_implementation', {
     title: 'Complete Codex implementation and dispatch review',
-    description: 'Release Codex\'s writer lease, store exact changed-file and verification evidence, and queue one fresh read-only Claude review.',
+    description: 'Release Codex\'s writer lease, store exact changed-file and verification evidence, and queue one fresh read-only review using the persisted profile.',
     inputSchema: z.object({
       runId: workflowIdSchema,
       leaseToken: z.string().regex(/^[a-f0-9]{64}$/),
@@ -3291,13 +3292,37 @@ export function buildServer() {
   ))));
 
   server.registerTool('start_pipeline_final_review', {
-    title: 'Dispatch the fresh final Claude review',
+    title: 'Dispatch the fresh final review',
     description: 'After an approved review or completed revision, queue an independent read-only final review in a fresh session.',
     inputSchema: z.object({ runId: workflowIdSchema }),
     annotations: EXTERNAL_ACTION,
   }, safeHandler(async ({ runId }, context) => result(await bridgeRequest(
     `/api/workflows/${encodeURIComponent(runId)}/final-review/start`, {
       method: 'POST', body: {}, signal: context?.mcpReq?.signal, actionIdentity: true,
+    },
+  ))));
+
+  server.registerTool('claim_pipeline_revision', {
+    title: 'Claim the external Codex revision lease',
+    description: 'For accepted revision findings in a full-permission workflow, claim the existing exclusive writer lease without dispatching a provider. Keep the returned token for completion or renewal.',
+    inputSchema: z.object({ runId: workflowIdSchema, leaseMs: z.number().int().min(60000).max(86400000).optional() }),
+    annotations: ACTION,
+  }, safeHandler(async ({ runId, leaseMs }, context) => result(await bridgeRequest(
+    `/api/workflows/${encodeURIComponent(runId)}/revision/claim`, {
+      method: 'POST', body: { actor: 'codex', ...(leaseMs == null ? {} : { leaseMs }) },
+      signal: context?.mcpReq?.signal, actionIdentity: true,
+    },
+  ))));
+
+  server.registerTool('complete_pipeline_revision', {
+    title: 'Complete the external Codex revision',
+    description: 'Validate the external writer token, store revision evidence, and release that lease. A fresh final review remains required; this action does not approve or merge anything.',
+    inputSchema: z.object({ runId: workflowIdSchema, leaseToken: z.string().regex(/^[a-f0-9]{64}$/), markdown: z.string().min(1).max(100000) }),
+    annotations: ACTION,
+  }, safeHandler(async ({ runId, leaseToken, markdown }, context) => result(await bridgeRequest(
+    `/api/workflows/${encodeURIComponent(runId)}/revision/complete`, {
+      method: 'POST', body: { actor: 'codex', leaseToken, markdown },
+      signal: context?.mcpReq?.signal, actionIdentity: true,
     },
   ))));
 

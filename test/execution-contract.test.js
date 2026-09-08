@@ -11,6 +11,23 @@ const catalog = (...ids) => ({ providers: { gemini: { probed: true, models: ids.
 const resolveGemini = (args = {}) => resolveProviderControls({ kind: 'gemini', entry: gemini, slot: gemini.oneshot_safe,
   taskTier: 'standard', registry: catalog('gemini-flash-medium', 'gemini-flash-high', 'gemini-pro-high'), ...args });
 
+test('explicit Astra ultra is pinned, consented, and never synthesized or downgraded', () => {
+  const entry = require('../cli-config.json').codex;
+  const input = { kind: 'codex', entry, slot: entry.oneshot_safe, model: 'gpt-6-astra', effort: 'ultra' };
+  assert.throws(() => resolveProviderControls(input), { code: 'extreme_effort_requires_override' });
+  const resolved = resolveProviderControls({ ...input, maxEffortOverride: true });
+  assert.equal(resolved.execution.model, 'gpt-6-astra');
+  assert.equal(resolved.execution.appliedEffort, 'ultra');
+  assert.ok(resolved.slot.includes('model_reasoning_effort=ultra'));
+  assert.equal(resolved.slot[resolved.slot.indexOf('--model') + 1], 'gpt-6-astra');
+  assert.throws(() => resolveProviderControls({ ...input, model: 'gpt-5.6-terra', maxEffortOverride: true }), { code: 'unsupported_effort' });
+  const old = structuredClone(entry); delete old.effort_flags.ultra;
+  assert.throws(() => resolveProviderControls({ ...input, entry: old, maxEffortOverride: true }), { code: 'unsupported_effort' });
+  const changed = structuredClone(entry); changed.effort_model_allowlist.ultra = [];
+  assert.throws(() => resolveProviderControls({ ...input, entry: changed, maxEffortOverride: true,
+    execution: resolved.execution }), { code: 'execution_config_changed' });
+});
+
 test('inferred and explicit effort variants preserve exact Gemini model from plan through replay', () => {
   const plan = resolveGemini({ phase: 'plan', effort: 'high' });
   assert.equal(plan.execution.model, 'gemini-flash-high');

@@ -39,8 +39,10 @@ delegation is exactly what remote access is for.
 
 **`interrupted`** matters: a task that was in flight when the bridge restarted
 is reconciled to this state at startup. It is never left claiming to run, which
-would strand a poller waiting for a result that can no longer arrive. Resubmit
-those.
+would strand a poller waiting for a result that can no longer arrive. Inspect
+the exact execution and ownership evidence before any replacement is considered.
+Never automatically replay an interrupted or uncertain writer. An empty activity
+list, old timestamp, or missing process is not trusted termination proof.
 
 ## Threads
 

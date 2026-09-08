@@ -5661,6 +5661,18 @@ app.post('/api/workflows/:runId/revision/start', (req, res) => {
   catch (error) { sendWorkflowError(res, error); }
 });
 
+app.post('/api/workflows/:runId/revision/claim', (req, res) => {
+  try { res.json(workflowController.claimRevision(req.params.runId, req.body || {})); }
+  catch (error) { sendWorkflowError(res, error); }
+});
+
+app.post('/api/workflows/:runId/revision/complete', (req, res) => {
+  try {
+    const workflow = workflowController.completeRevision(req.params.runId, req.body || {});
+    res.json({ workflow, nextActions: workflowController.nextActions(workflow) });
+  } catch (error) { sendWorkflowError(res, error); }
+});
+
 app.post('/api/workflows/:runId/final-review/start', (req, res) => {
   try { res.status(202).json(workflowController.startFinalReview(req.params.runId)); }
   catch (error) { sendWorkflowError(res, error); }
