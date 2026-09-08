@@ -1,3 +1,6 @@
+## v2.1.7 - 2026-09-08
+- #125 fix(integration): preserve execution contracts with durable queue delegation
+
 ## v2.1.6 - 2026-09-08
 - #120 fix(orchestration): truthful delegation and no-verdict incident handling
 
