@@ -3010,6 +3010,7 @@ for (const field of document.querySelectorAll('.task-composer input, .task-compo
 }
 $('#task-preview').addEventListener('click', async () => {
   const body = taskDraft(), fingerprint = JSON.stringify(body);
+  invalidateTaskPreview();
   if (!body.prompt || !body.kind) { $('#task-submit-status').textContent = 'Enter a task and choose a provider.'; return; }
   const epoch = tasksGate.begin(); // invalidates an older list response, not the panel lifetime
   const button = $('#task-preview'); button.disabled = true;

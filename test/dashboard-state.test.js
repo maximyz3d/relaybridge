@@ -88,7 +88,7 @@ test('task UI preserves focus, rejects late refreshes, and submits the previewed
     failureClass:'incomplete_response', receiptId:'rcpt_fixture', correlation:{ requestId:'fixture:request' } };
   let listCalls = 0, failList = false, delayAgents = false, releaseAgents = null;
   let delayedList = null, releaseList = null;
-  let extraRows = [], delaySubmit = false, releaseSubmit = null;
+  let extraRows = [], delaySubmit = false, releaseSubmit = null, failPlan = false;
   const execution = { version:1, provider:'claude', authorityMode:'safe', model:'fixture-model',
     requestedTaskTier:'standard', resolvedTaskTier:'standard', requestedModelTier:'standard', resolvedModelTier:'standard',
     requestedEffort:null, targetEffort:'medium', appliedEffort:'medium', effortSource:'task_tier',
@@ -105,7 +105,9 @@ test('task UI preserves focus, rejects late refreshes, and submits the previewed
     if (url.pathname === '/favicon.ico') return route.fulfill({ status:204 });
     if (req.method() === 'POST') {
       const body = req.postDataJSON(); writes.push({ path:url.pathname, body });
-      if (url.pathname === '/api/plan') return json({ tier:'standard', primary:{ kind:'claude', ready:true, execution } });
+      if (url.pathname === '/api/plan') return failPlan
+        ? route.fulfill({ status:409, contentType:'application/json', body:'{"error":"provider no longer available"}' })
+        : json({ tier:'standard', primary:{ kind:'claude', ready:true, execution } });
       if (url.pathname === '/api/tasks') {
         if (delaySubmit) await new Promise(resolve => { releaseSubmit = resolve; });
         return json({ id:'t_fixture_submitted', status:'queued' });
@@ -170,6 +172,11 @@ test('task UI preserves focus, rejects late refreshes, and submits the previewed
   await page.locator('#task-prompt').fill('Explain the bounded fixture result.');
   await page.locator('#task-preview').click(); await page.locator('#task-plan').waitFor({ state:'visible' });
   assert.equal(writes.filter(item => item.path === '/api/tasks').length, 0);
+  failPlan = true; await page.locator('#task-preview').click();
+  await page.locator('#task-submit-status').filter({ hasText:'Preview failed' }).waitFor();
+  assert.equal(await page.locator('#task-plan').isVisible(), false);
+  assert.equal(await page.locator('#task-submit').innerText(), 'Submit task');
+  failPlan = false; await page.locator('#task-preview').click(); await page.locator('#task-plan').waitFor({ state:'visible' });
   await page.locator('#task-submit').click();
   await page.locator('#task-submit-status').filter({ hasText:'Submitted t_fixture' }).waitFor();
   assert.deepEqual(writes.find(item => item.path === '/api/tasks').body.execution, execution);

@@ -90,8 +90,8 @@ silently claim browser coverage. Local qualification used Playwright 1.63.0
 and cached Chromium headless shell build1243, with missing Ubuntu libraries
 extracted into a private temporary directory. No system packages were installed.
 
-Independent native read-only review found and root fixed three concrete
-submission/focus/partial-output defects; regression cases passed afterward.
+Independent native read-only review found and root fixed four concrete
+submission/focus/partial-output/stale-preview defects; regression cases passed afterward.
 This supplements rather than replaces the pending fresh Claude closing gate.
 
 Final tests, reviewed SHAs, provider qualification results and closing verdicts
