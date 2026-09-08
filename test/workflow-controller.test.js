@@ -159,6 +159,22 @@ test('expired external and legacy ambiguous revisions remain held across read an
   }
 });
 
+test('a persisted provider mode cannot override the Codex-only external ownership policy', (t) => {
+  const f = fixture(t); f.config.codex = { oneshot_safe: ['codex-safe'] };
+  const created = reachReviewReady(f, { ...createInput(f.cwd), profile: 'codex-astra-ultra', permissionMode: 'full' });
+  f.controller.claimRevision(created.runId);
+  const stateFile = path.join(f.dataDir, 'workflows', created.runId, 'state.json');
+  const state = JSON.parse(fs.readFileSync(stateFile));
+  const lockDirectory = path.join(f.dataDir, 'writer-locks');
+  const locks = fs.readdirSync(lockDirectory).map((name) => [name, fs.readFileSync(path.join(lockDirectory, name))]);
+  state.writerLease.mode = 'provider'; fs.writeFileSync(stateFile, JSON.stringify(state));
+  for (const action of [() => f.controller.reconcile(created.runId), () => f.controller.cancel(created.runId),
+    () => f.pipeline.failOrphanedRevision(created.runId, {}), () => f.pipeline.cancelOrphanedRevision(created.runId, {})]) {
+    assert.throws(action, { code: 'STATE_CORRUPT' });
+    for (const [name, bytes] of locks) assert.deepEqual(fs.readFileSync(path.join(lockDirectory, name)), bytes);
+  }
+});
+
 test('status reads are inert and explicit reconciliation advances persisted handoffs', (t) => {
   const f = fixture(t);
   const created = f.controller.create(createInput(f.cwd));

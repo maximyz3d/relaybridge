@@ -115,3 +115,35 @@ request also failed before invocation. Neither is review evidence.
 
 All 18 focused router/status tests passed, including genuine external-retrieval
 negatives. Live review is still pending. The shared bridge was unchanged.
+
+## First live Codex review and corrections
+
+A disposable production-mode RelayBridge instance reviewed frozen
+`4eccef491171deeda7ac705204195ed366eb0cba` against the original base. Configured
+and outgoing model were `gpt-6-astra`; requested and applied effort were literal
+`ultra`, with no fallback. The CLI returned exit 0, one invoked result and a
+complete **REVISE** verdict. Independently observed model and provider terminal
+reason were unavailable; this is explicit-control invocation evidence, not an
+observed model revision or a Claude review.
+
+- Request/invocation: `astra-review-7f214879-1b82-443b-afc2-0e23f67a7823`.
+- Attempt: `astra-review-7f214879-1b82-443b-afc2-0e23f67a7823:attempt:1`.
+- Receipt: `rcpt_mtssyyhh_deab6766`.
+- Runtime build: `2.0.1+87991f47c3a13bd1`.
+- Complete answer: 4,888 characters, SHA-256
+  `bed0632f8835fa9cd75876ac0381ed1a90a819cd81f74dd8844070e5b09faebd`.
+
+The private runtime was shut down after review. Its receipt-store identity was
+not retained by the harness, so this receipt is not advertised as recoverable
+from the unchanged shared bridge. Raw answers/runtime state are excluded from
+Git; the bounded findings and identifiers are retained here.
+
+The reviewer found two material defects: an externally owned policy could load
+with a contradictory provider ownership mode and reach orphan release; explicit
+HTTP(S) retrieval inside a code task could lose its research gate. Root added
+policy/ownership cross-validation plus an orphan-entry guard, and preserved
+retrieval classification for explicit URL-fetch requests. Regressions verify
+that all reconciliation/cancellation/orphan paths preserve the exact lock bytes
+under contradictory ownership, and mixed URL retrieval keeps Codex ineligible
+under the existing aptitude policy. All 59 focused workflow/router tests passed.
+These corrections still require fresh independent closing review.

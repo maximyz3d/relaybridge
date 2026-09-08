@@ -24,6 +24,8 @@ test('local code evidence remains code review while explicit outside-source work
     'Review server.js against the latest official docs; browse the web and cite sources.',
     'Audit app.js and research the current official documentation.',
     'Review code and find external sources for protocol compatibility.',
+    'Review server.js; retrieve https://nodejs.org/api/http.html and cite sources.',
+    'Review app.js and fetch https://example.com/protocol.',
   ]) {
     const result = router.routeTask({ task, diagnostics: readyDiagnostics(), preferredProviders: ['codex'] });
     assert.equal(result.primaryTag, 'research', task);
