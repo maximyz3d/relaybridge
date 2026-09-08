@@ -318,6 +318,54 @@ actual Chromium run passed all six dashboard tests, including the normally
 skipped browser fixture. `npm audit --omit=dev` reported zero vulnerabilities.
 Both changed/new skill manifests passed the skill validator. `git diff --check`
 passed. Native Windows acceptance belongs to the exact-head GitHub Windows job.
-Fresh Claude review evidence and final CI results will be appended when complete.
+Both fresh read-only Claude reviews approved code/evidence head
+`8bef48a8cfe3b236db0016a17085df25fc5bdcd3` with no material findings. This
+closing receipt addition changes documentation only; it is subsequent to that
+reviewed head, not a claim that either reviewer inspected its own later receipt.
+The canonical workflow `wf_mts54ggk_485952d5a861` reached `complete` after
+the actual final-review artifact was reconciled. No revision writer was launched.
+
+| Phase | Task | Exact receipt | Verdict |
+| --- | --- | --- | --- |
+| Fresh review | `t_mts97qqy_gzrhd2` | `rcpt_mts9bne9_387acf79` | APPROVE |
+| Fresh closing Sonnet/high review | `t_mts9gddl_uxmpnz` | `rcpt_mts9lbn0_7d030ec0` | APPROVE |
+
+Both reported `claude-sonnet-5`, completed/success, `end_turn`, terminal
+completed and nonpartial output. Root read both complete artifacts and matched
+each task's exact prompt hash to its receipt; temporal proximity was not used
+as correlation proof. Complete identifiers and artifact integrity:
+
+- Review request/invocation `oneshot:b064464e-d4ae-4c71-b7d4-e60810c824cd`,
+  attempt `oneshot:b064464e-d4ae-4c71-b7d4-e60810c824cd:attempt:1`;
+  input 32,938 characters, SHA-256
+  `93d211e09f8e37efa51e889fcbc0ad7ead074e21a2cbd4a4cbe0ebb082a1fd18`.
+  Complete verdict 8,141 characters, SHA-256
+  `0919bb70e4fe0c4849b055d8515548c1d540f0e882db2eceeda2b3f4b87869fb`.
+- Closing request/invocation `oneshot:eed49b18-729a-45ca-ae87-7d20473d6b19`,
+  attempt `oneshot:eed49b18-729a-45ca-ae87-7d20473d6b19:attempt:1`;
+  input 41,056 characters, SHA-256
+  `8d1d2f2260214dece1e603ac32f830e78684c0198399f6c34e9589b6493c25b9`.
+  Complete verdict 8,062 characters, SHA-256
+  `e5a34dae1c00b15887804562ce1f3935b6c7e70535375739d41386dde731eda0`.
+
+These reviews used the unchanged shared bridge
+`2.0.1+c3c865c097afa2e8`, receipt store
+`944960e1cbbf509a0357c340af50362a72d3322e87bbce8118f40a8692527bae`.
+They independently inspected code using Read/Grep/Glob. They did not run tests,
+query GitHub CI, re-score behavioral samples or establish authenticated native
+provider usability. Their approval applies to the bounded implementation and
+its honest blocked/unverified states. The closing review also clarified that
+the documented four-call host-command cap differs from the three-task queue
+default; it requested no change. Regex routing remains heuristic.
+
+Root separately verified all required checks on that exact reviewed head:
+[Linux](https://github.com/maximyz3d/relaybridge/actions/runs/34192440416/job/101953103616),
+[Windows including lifecycle checks](https://github.com/maximyz3d/relaybridge/actions/runs/34192440416/job/101953103904),
+[CodeQL analysis](https://github.com/maximyz3d/relaybridge/actions/runs/34192438177/job/101953066270)
+and [CodeQL result](https://github.com/maximyz3d/relaybridge/runs/101953292006)
+all passed. The receipt-only documentation commit requires its own final-head
+CI before merge; consult PR126 for those later check and merge identities.
+At this evidence checkpoint the branch is NOT MERGED / NOT DEPLOYED.
+
 No unattended-ready, native-provider-ready, recovery/controller/goal completion
 or deployment claim is made by this record.
