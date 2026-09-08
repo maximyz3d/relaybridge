@@ -62,15 +62,18 @@ test('Claude aliases share configured fuel and burn while retaining per-model de
   for (const provider of Object.keys(configs)) {
     assert.equal(gauges[provider].quotaSeat, GROUP);
     assert.equal(gauges[provider].used.totalTokens, 800);
-    assert.equal(gauges[provider].percentRemaining, 20);
+    assert.equal(gauges[provider].percentRemaining, null);
+    assert.equal(gauges[provider].configuredEstimate.percentRemaining, 20);
     assert.deepEqual(gauges[provider].aliases, ['claude', 'claude_fable']);
     assert.deepEqual(Object.keys(gauges[provider].models).sort(), ['fable', 'opus']);
   }
   const balance = fleetBalance(gauges);
-  assert.equal(balance.seats, 1);
+  assert.equal(balance.seats, 0);
+  assert.equal(balance.balanced, null);
+  assert.equal(balance.unknownSeats.length, 1);
   assert.equal(balance.mostDrained, undefined);
   assert.equal(balance.freshest, undefined);
-  assert.deepEqual(balance.quotaSeats[0].aliases, ['claude', 'claude_fable']);
+  assert.deepEqual(balance.unknownSeats[0].aliases, ['claude', 'claude_fable']);
   fs.rmSync(dir, { recursive: true, force: true });
 });
 

@@ -66,3 +66,62 @@ test('marker parsers use the last valid standalone marker and fail closed', () =
   assert.equal(parseRevisionStatus('done\nREVISION_STATUS: APPLIED\n'), 'APPLIED');
   assert.equal(parseRevisionStatus('done'), 'UNKNOWN');
 });
+
+const phases = [
+  ['planning', buildPlanningPrompt, 'PLAN_STATUS: BLOCKED', true],
+  ['review', buildReviewPrompt, 'REVIEW_VERDICT: BLOCK', true],
+  ['final review', (input) => buildReviewPrompt(input, { final: true }), 'REVIEW_VERDICT: BLOCK', true],
+  ['revision', buildRevisionPrompt, 'REVISION_STATUS: BLOCKED', false],
+];
+
+for (const [name, build, blockingMarker, readOnly] of phases) {
+  test(`${name} reserves a self-contained final-delivery contract even when body is clipped`, () => {
+    const normal = build(brief);
+    const heading = '# Required output contract';
+    const contract = normal.slice(normal.lastIndexOf(heading));
+    assert.match(contract, /entire requested artifact and its status marker together/);
+    assert.match(contract, /one self-contained final response/);
+    assert.match(contract, /earlier assistant messages are not the deliverable/);
+    assert.match(contract, /Do not substitute a postscript/);
+    assert.match(contract, /Do not invent evidence or approval/);
+    assert.match(contract, /optional gaps without treating them as automatic blockers/);
+    assert.ok(contract.includes(`then end with ${blockingMarker}.`));
+    assert.equal(contract.includes('use Read/Glob/Grep only'), readOnly);
+    assert.equal(contract.includes('Do not use Write, Edit, Bash, or ExitPlanMode'), readOnly);
+    assert.equal(contract.includes('do not create a plan file'), readOnly);
+
+    const huge = 'x'.repeat(200000);
+    const overloaded = Object.fromEntries(Object.keys(brief).map((key) => [key, huge]));
+    // Envelope metadata remains real and bounded; exhaust all artifact/list budgets.
+    Object.assign(overloaded, {
+      runId: brief.runId, cwd: brief.cwd, taskTier: brief.taskTier,
+      constraints: Array(40).fill(huge), nonGoals: Array(40).fill(huge),
+      fileScope: Array(80).fill(huge), acceptanceCriteria: Array(60).fill(huge),
+    });
+    const clipped = build(overloaded);
+    assert.ok(clipped.length <= TOTAL_PROMPT_CHARS);
+    assert.match(clipped, /RelayBridge omitted/);
+    assert.equal(clipped.slice(clipped.lastIndexOf(heading)), contract);
+    if (!readOnly) assert.match(clipped, /exclusive writer lease/);
+  });
+}
+
+test('terminal postscripts cannot substitute for a final artifact marker', () => {
+  const postscript = 'The plan above is the complete deliverable. Write and ExitPlanMode are disabled.';
+  for (const parse of [parsePlanStatus, parseReviewVerdict, parseRevisionStatus]) {
+    assert.equal(parse(postscript), 'UNKNOWN');
+    assert.equal(parse(''), 'UNKNOWN');
+  }
+  // Do not concatenate an earlier assistant approval into the terminal result.
+  const earlierAssistant = 'Inspected the code.\nREVIEW_VERDICT: APPROVE';
+  assert.equal(parseReviewVerdict(earlierAssistant), 'APPROVE');
+  assert.equal(parseReviewVerdict('See my earlier review.'), 'UNKNOWN');
+});
+
+test('explicit missing-evidence blocks preserve existing last-marker semantics', () => {
+  assert.equal(parsePlanStatus('Required file is inaccessible.\nPLAN_STATUS: BLOCKED'), 'BLOCKED');
+  assert.equal(parseReviewVerdict('Required evidence is missing.\nREVIEW_VERDICT: BLOCK'), 'BLOCK');
+  assert.equal(parsePlanStatus('PLAN_STATUS: READY\nMissing required input.\nPLAN_STATUS: BLOCKED'), 'BLOCKED');
+  assert.equal(parseReviewVerdict('REVIEW_VERDICT: APPROVE\nMissing evidence.\nREVIEW_VERDICT: BLOCK'), 'BLOCK');
+  assert.equal(parseRevisionStatus('REVISION_STATUS: APPLIED\nBlocked.\nREVISION_STATUS: BLOCKED'), 'BLOCKED');
+});

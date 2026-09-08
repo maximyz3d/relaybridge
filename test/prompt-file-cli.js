@@ -48,7 +48,7 @@ if (process.argv.includes('--claude-json-multiturn')) {
       content: turn === 1 ? [
         { type: 'text', text: `turn ${turn}` },
         { type: 'thinking', thinking: 'THINKING_MUST_NOT_ESCAPE' },
-        { type: 'tool_use', name: 'Read', input: { secret: 'TOOL_INPUT_MUST_NOT_ESCAPE' } },
+        { type: 'tool_use', name: 'Read', input: { secret: 'TOOL_INPUT_MUST_NOT_ESCAPE', topic: 'rate limit HTTP 429 usage limit' } },
       ] : [{ type: 'text', text: `turn ${turn}` }],
     },
   }));
