@@ -80,6 +80,7 @@ test('task UI preserves focus, rejects late refreshes, and submits the previewed
   const html = fs.readFileSync(path.join(root, 'public/index.html'), 'utf8')
     .replace('__ONE_SHOT_DEFAULT_TIMEOUT_MS__', '1200000').replace('<script>', '<script nonce="fixture">');
   const files = { '/dashboard-state.js':'public/dashboard-state.js',
+    '/workflow-panel.js':'public/workflow-panel.js',
     '/vendor/xterm/lib/xterm.js':'node_modules/@xterm/xterm/lib/xterm.js',
     '/vendor/xterm/css/xterm.css':'node_modules/@xterm/xterm/css/xterm.css',
     '/vendor/xterm-addon-fit/lib/addon-fit.js':'node_modules/@xterm/addon-fit/lib/addon-fit.js' };
@@ -178,6 +179,8 @@ test('task UI preserves focus, rejects late refreshes, and submits the previewed
   await page.locator('#task-prompt').fill('Explain the bounded fixture result.');
   await page.locator('#task-preview').click(); await page.locator('#task-plan').waitFor({ state:'visible' });
   assert.equal(writes.filter(item => item.path === '/api/tasks').length, 0);
+  await page.locator('#workflow-evidence').evaluate(el => { el.value='Independent workflow draft'; el.dispatchEvent(new Event('input',{bubbles:true})); });
+  assert.equal(await page.locator('#task-plan').isVisible(),true,'workflow drafts leave task previews intact');
   failPlan = true; await page.locator('#task-preview').click();
   await page.locator('#task-submit-status').filter({ hasText:'Preview failed' }).waitFor();
   assert.equal(await page.locator('#task-plan').isVisible(), false);

@@ -452,7 +452,7 @@
   <div class="dlg-head"><strong id="tasks-heading">Background tasks</strong><button class="btn" id="tasks-close-btn">Close</button></div>
   <div class="dlg-body">
     <p class="task-intro">Plan a request, follow its progress, and collect the result from any surface. Saved tasks retain their execution state; uncertain work requires an ownership check.</p>
-    <div class="task-composer">
+    <div class="task-composer" id="task-composer">
       <label for="task-prompt">What should the AI deliver?<textarea id="task-prompt" placeholder="Describe the outcome, constraints, and what a useful answer should include."></textarea></label>
       <div class="task-fields">
         <label for="task-kind">Provider<select id="task-kind"></select></label>
@@ -471,6 +471,32 @@
       <div id="task-submit-status" role="status" class="muted"></div>
     </div>
     <details id="task-workflow-library"><summary>Skills and tools to explore</summary><p class="muted">Curated references with original sources and licenses. These tools are available to explore; listing them does not install or connect them.</p><p id="task-library-status" class="muted" role="status"></p><div id="task-library-entries">Loading references…</div></details>
+    <details id="staged-workflows"><summary>Staged workflows · plan, implement and review</summary>
+      <div class="task-composer">
+        <p class="muted">Keep the plan, external writer lease and independent reviews together across sessions. Each stage starts only when you choose its action.</p>
+        <details><summary>Create a workflow</summary>
+          <label for="workflow-cwd">Workspace<input id="workflow-cwd" autocomplete="off" placeholder="Absolute repository path"></label>
+          <label for="workflow-objective">Objective<textarea id="workflow-objective" maxlength="12000"></textarea></label>
+          <label for="workflow-acceptance">Acceptance criteria<textarea id="workflow-acceptance" maxlength="12000"></textarea></label>
+          <label for="workflow-profile">Advisor profile<select id="workflow-profile"><option value="codex-astra-ultra">Codex · Astra / ultra · external implementation and revisions</option></select></label>
+          <p><label><span><input type="checkbox" id="workflow-write-consent" style="width:auto"> I authorize filesystem writes for this workflow.</span></label></p>
+          <button class="btn primary" id="workflow-create">Create workflow record</button>
+        </details>
+        <div class="task-fields"><label for="workflow-select">Saved workflow<select id="workflow-select"><option value="">Select a saved workflow</option></select></label><div class="task-actions"><button class="btn" id="workflow-refresh">Refresh saved state</button></div></div>
+        <p id="workflow-status" role="status" class="muted"></p>
+        <div id="workflow-detail" hidden>
+          <p id="workflow-phase"></p><p id="workflow-workspace" class="muted"></p><p id="workflow-objective-view"></p>
+          <p id="workflow-writer" class="muted"></p><p id="workflow-notice" class="task-notice"></p>
+          <details><summary>Latest saved review</summary><pre id="workflow-review" class="task-output" tabindex="0"></pre></details>
+          <details><summary>Saved plan and acceptance criteria</summary><pre id="workflow-plan" class="task-output" tabindex="0"></pre><pre id="workflow-criteria" class="task-output" tabindex="0"></pre></details>
+          <label for="workflow-evidence">Evidence for the next stage<textarea id="workflow-evidence" maxlength="24000" placeholder="Research, implementation validation, or corrective evidence"></textarea></label>
+          <label for="workflow-token">Writer token from another client (optional)<input id="workflow-token" type="password" autocomplete="off" spellcheck="false"></label>
+          <button class="btn" id="workflow-copy-token" disabled>Copy writer token</button>
+          <p class="muted">Lease tokens stay in this page's memory. Copy yours before closing the page if you will continue from another client. A refresh is read-only; reconciliation can advance an advisor task.</p>
+          <div id="workflow-actions" class="task-actions"></div>
+        </div>
+      </div>
+    </details>
     <div id="tasks-stats" role="status"></div><div id="tasks-breakdown"></div>
     <div id="tasks-held" class="task-notice" hidden></div>
     <div class="task-filter"><label for="task-search">Search recent tasks<input id="task-search" type="search" placeholder="Title, provider or task ID"></label><label for="task-filter">State<select id="task-filter"><option value="">All states</option><option value="queued">Queued</option><option value="running">Running</option><option value="done">Completed</option><option value="failed">Failed</option><option value="cancelled">Cancelled</option><option value="interrupted">Interrupted</option></select></label><button class="btn" id="task-refresh">Refresh</button></div>
@@ -589,6 +615,7 @@
 <script src="/vendor/xterm/lib/xterm.js"></script>
 <script src="/vendor/xterm-addon-fit/lib/addon-fit.js"></script>
 <script src="/dashboard-state.js"></script>
+<script src="/workflow-panel.js"></script>
 <script>
 const API = location.origin;
 const ONE_SHOT_DEFAULT_TIMEOUT_MS = __ONE_SHOT_DEFAULT_TIMEOUT_MS__;
@@ -701,7 +728,7 @@ async function api(path, opts = {}) {
       const parsed = raw ? JSON.parse(raw) : {};
       detail = parsed.error || parsed.detail || raw;
     } catch {}
-    throw new Error(`${res.status} ${res.statusText}${detail ? ': ' + String(detail).slice(0, 1000) : ''}`);
+    throw Object.assign(new Error(`${res.status} ${res.statusText}${detail ? ': ' + String(detail).slice(0, 1000) : ''}`), { status:res.status });
   }
   return res.json();
 }
@@ -2796,7 +2823,7 @@ async function refreshFuel(){
       '<tr class="muted"><th align="left">seat</th><th align="left">fuel</th><th align="left">burn</th><th align="left">runs</th><th align="left">tokens</th><th align="left">cost</th><th align="left">models</th></tr>' +
       rows.map(g => `<tr>
         <td><b>${esc(g.seat)}</b>${coolBySeat[g.seat]?` <span style="color:#f87171" title="rate limited — ${esc(coolBySeat[g.seat].reason||'')}, ${coolBySeat[g.seat].remainingSec}s left">🚫 ${Math.ceil(coolBySeat[g.seat].remainingSec/60)}m</span>`:''}<br><span class="muted" style="font-size:10px;">${esc(g.costClass)}${g.basis==='configured'?' · est':g.basis==='vendor_observed'?' · vendor observed':g.basis==='operator_observed'?' · operator observed':''}</span></td>
-        <td>${fuelBar(g.percentRemaining, g.basis)}${(g.hoursToEmpty!==null&&g.hoursToEmpty!==undefined)?`<br><span class="muted" style="font-size:10px;">~${g.hoursToEmpty}h to empty</span>`:''}${g.vendorQuota?`<br><span style="color:#f87171;font-size:10px;" title="${esc(g.vendorQuota.reset?.note||'')}">${tok(g.vendorQuota.actual)}/${tok(g.vendorQuota.limit)} ${esc(g.vendorQuota.unit)} · ${esc(g.vendorQuota.model)}<br>expires ${esc(new Date(g.vendorQuota.reset.expiresAt).toLocaleString())}</span>`:''}${g.operatorQuota?`<br><span style="color:#facc15;font-size:10px;">${esc(g.operatorQuota.provenance)}<br>observed ${esc(new Date(g.operatorQuota.observedAt).toLocaleString())}<br>expires ${esc(new Date(g.operatorQuota.expiresAt).toLocaleString())}</span>`:''}</td>
+        <td>${fuelBar(g.percentRemaining, g.basis)}${(g.hoursToEmpty!==null&&g.hoursToEmpty!==undefined)?`<br><span class="muted" style="font-size:10px;">~${g.hoursToEmpty}h to empty</span>`:''}${g.vendorQuota?`<br><span style="color:#f87171;font-size:10px;" title="${esc(g.vendorQuota.reset?.note||'')}">${dashboard.qualitativeQuotaLabel(g.vendorQuota) ? esc(dashboard.qualitativeQuotaLabel(g.vendorQuota)) : `${tok(g.vendorQuota.actual)}/${tok(g.vendorQuota.limit)} ${esc(g.vendorQuota.unit)} · ${esc(g.vendorQuota.model)}`}<br>expires ${esc(new Date(g.vendorQuota.reset.expiresAt).toLocaleString())}</span>`:''}${g.operatorQuota?`<br><span style="color:#facc15;font-size:10px;">${esc(g.operatorQuota.provenance)}<br>observed ${esc(new Date(g.operatorQuota.observedAt).toLocaleString())}<br>expires ${esc(new Date(g.operatorQuota.expiresAt).toLocaleString())}</span>`:''}</td>
         <td>${tok(g.burn.tokensPerHour)}/h<br><span class="muted" style="font-size:10px;">${g.burn.runsPerHour}/h runs</span></td>
         <td>${g.used.runs}${g.used.failed?` <span style="color:#f87171">(${g.used.failed}✗)</span>`:''}</td>
         <td>${tok(g.used.totalTokens)}</td><td>${usd(g.used.costUsd)}</td>
@@ -2846,6 +2873,7 @@ $('#operator-quota-clear')?.addEventListener('click', async () => {
 const tasksDialog = $('#tasks-dialog');
 const taskDetailDialog = $('#task-detail-dialog');
 const dashboard = window.RelayBridgeDashboardState;
+const workflowPanel = window.createRelayBridgeWorkflowPanel({ api, dashboard, document });
 const tasksGate = dashboard.createRequestGate();
 const detailGate = dashboard.createRequestGate();
 let tasksTimer = null, taskSnapshots = new Map(), taskPreview = null, taskOutputProfiles = new Map(), taskLibrarySnapshot = null;
@@ -2935,6 +2963,7 @@ async function refreshTasks(){
   }
 }
 function closeTasksPanel() {
+  workflowPanel.close();
   tasksGate.close();
   if (tasksTimer) clearInterval(tasksTimer);
   tasksTimer = null;
@@ -2943,6 +2972,7 @@ async function openTasksPanel(){
   if (tasksDialog.open) return;
   const epoch = tasksGate.open();
   tasksDialog.showModal();
+  workflowPanel.reopen();
   refreshTasks(); tasksTimer = setInterval(refreshTasks, 4000);
   void loadTaskGuidance(epoch);
   try {
@@ -3053,7 +3083,7 @@ taskDetailDialog.addEventListener('close', () => {
   if (tasksDialog.open) (detailOpener?.isConnected ? detailOpener : $('#task-refresh')).focus();
   detailOpener = null;
 });
-for (const field of document.querySelectorAll('.task-composer input, .task-composer textarea, .task-composer select')) {
+for (const field of document.querySelectorAll('#task-composer input, #task-composer textarea, #task-composer select')) {
   field.addEventListener('input', invalidateTaskPreview); field.addEventListener('change', invalidateTaskPreview);
 }
 $('#task-preview').addEventListener('click', async () => {

@@ -87,13 +87,15 @@ test('the full profile cannot be reached by one flag alone', () => {
   });
 });
 
-test('the endpoint speaks MCP over HTTP and refuses unauthenticated callers', async (t) => {
+for (const profile of ['safe', 'full']) {
+test(`the ${profile} endpoint authenticates MCP and excludes local workflow authority`, async (t) => {
   const mcpModule = await import('../mcp/server.mjs');
   const app = express();
   app.use(express.json());
-  const status = withEnv({ RELAYBRIDGE_REMOTE_MCP: '1' }, () =>
-    mountRemoteMcp(app, { token: TOKEN, buildServer: () => mcpModule.buildServer(), log: () => {} }));
+  const status = withEnv({ RELAYBRIDGE_REMOTE_MCP: '1', RELAYBRIDGE_REMOTE_MCP_FULL: '1' }, () =>
+    mountRemoteMcp(app, { token: TOKEN, profile, buildServer: () => mcpModule.buildServer(), log: () => {} }));
   assert.equal(status.enabled, true);
+  assert.equal(status.profile, profile);
 
   const server = app.listen(0);
   t.after(() => server.close());
@@ -143,7 +145,17 @@ test('the endpoint speaks MCP over HTTP and refuses unauthenticated callers', as
     assert.ok(!names.has(terminalTool), `${terminalTool} must NOT be advertised remotely`);
   }
   assert.ok(!names.has('get_context_bundle'), 'the terminal-capable context bundle must NOT be advertised remotely');
-  assert.ok(!names.has('github_onboard_repo'), 'mutating tools must NOT be advertised in safe profile');
+  assert.equal(names.has('github_onboard_repo'), profile === 'full', 'repo mutation requires the full profile');
+
+  // Name these independently of the denylist: iterating the policy itself
+  // cannot catch a newly registered tool that was accidentally omitted.
+  for (const name of ['claim_pipeline_revision', 'complete_pipeline_revision']) {
+    assert.equal(names.has(name), false, `${name} must NOT be advertised in ${profile}`);
+    const called = await fetch(url, { method: 'POST', headers: H2,
+      body: JSON.stringify({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name, arguments: {} } }) });
+    assert.equal(called.status, 200);
+    assert.match(await called.text(), new RegExp(`Tool ${name} not found`), `${name} must be uncallable in ${profile}`);
+  }
 
   const resources = await fetch(url, { method: 'POST', headers: H2, body: JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'resources/list' }) });
   assert.equal(resources.status, 200);
@@ -151,3 +163,4 @@ test('the endpoint speaks MCP over HTTP and refuses unauthenticated callers', as
   assert.doesNotMatch(resourceBody, /psbridge:\/\/sessions/, 'session resources must not be advertised remotely');
   assert.doesNotMatch(resourceBody, /psbridge:\/\/context/, 'context resources must not be advertised remotely');
 });
+}

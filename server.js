@@ -1153,7 +1153,7 @@ function sendOneShotResult(res, payload, meta) {
       const effectiveQuotaSeat = payload.route?.quota_seat || meta.route?.quota_seat
         || quotaSeatForProvider(meta.kind);
       if (failureKind === 'rate_limited') {
-        const vendorQuota = parseGrokQuota429({
+        const vendorQuota = normalizeQualitativeQuotaExhaustion(payload.quota_evidence) || parseGrokQuota429({
           provider: meta.kind,
           rateLimited: payload.rate_limited,
           failureClass: payload.failureClass,
@@ -1203,7 +1203,8 @@ function sendOneShotResult(res, payload, meta) {
           // scope, so it conservatively applies to the shared quota seat.
           const cooldownSeat = payload.vendor_quota?.scope === 'model' ? meta.kind : effectiveQuotaSeat;
           const cooldown = cooldowns.noteFailure(cooldownSeat, cooldownKind, {
-            retryAfterSec: acceptedQuota
+            retryAfterSec: payload.vendor_quota?.kind === 'quota_exhausted' && payload.vendor_quota.reset.kind === 'provider_reset'
+              ? payload.vendor_quota.reset.durationMs / 1000 : acceptedQuota
               ? parseRetryAfter(payload.provider_error_diagnostic || '')
               : parseRetryAfter(vendorEvidenceText({ stdout: payload.stdout, stderr: payload.stderr, includeStdout: true,
                 supervisorStopReason: payload.supervisor_stop_reason }), payload.retry_after),
@@ -1213,8 +1214,11 @@ function sendOneShotResult(res, payload, meta) {
             // Return the deadline actually committed by the shared cooldown
             // store. Workflow/task retry logic must not guess a shorter delay
             // and deliberately invoke a seat the router still considers cool.
-            payload.retry_at = cooldown.until;
-            payload.retry_after = Math.max(1, Math.ceil((cooldown.until - Date.now()) / 1000));
+            const activeQuota = usageLedger.activeVendorQuota(meta.kind,
+              payload.route?.resolved_model_identity || payload.model || null, effectiveQuotaSeat);
+            const vendorReset = activeQuota?.kind === 'quota_exhausted' ? Date.parse(activeQuota.reset.expiresAt) : NaN;
+            payload.retry_at = Math.max(cooldown.until, Number.isFinite(vendorReset) ? vendorReset : 0);
+            payload.retry_after = Math.max(1, Math.ceil((payload.retry_at - Date.now()) / 1000));
             payload.cooldown = {
               seat: cooldown.seat,
               until: cooldown.until,
@@ -3024,7 +3028,7 @@ function validateProviderIntent(body, cfg = loadConfig(), snapshot = captureAllo
     policyPrefix: !useDanger && typeof entry.oneshot_safe_prompt_prefix === 'string' ? entry.oneshot_safe_prompt_prefix.trim() : '',
   }) : null;
   revalidateAllowedCwdIdentity(snapshot);
-  return { ...controls, grounding: grounded.grounding,
+  return { ...controls, grounding: grounded.grounding, promptEvidence: prepared?.evidence,
     ...(compiled.profile ? { outputProfile:compiled.profile, preparedPrompt:compiled.prompt, promptEvidence:prepared.evidence } : {}) };
 }
 function rejectInvalidIntent(res, body, error) {
@@ -4918,6 +4922,7 @@ async function executeOneShot(body, res) {
   const supervisor = new RunSupervisor({ ...supervisorOptions,
     finalizationSupported: supportsClaudeStreamFinalization });
   const runId = `run_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 8)}`;
+  route.run_id = runId;
   activeRuns.set(runId, { runId, kind, route, startedAt, supervisor, pid: proc.pid });
   let stopReason = null;
   let stopDetail = '';
@@ -5123,6 +5128,7 @@ async function executeOneShot(body, res) {
     const runClassification = classifyRunFailure({
       provider: kind,
       prompt,
+      model: route.resolved_model_identity || null,
       stopReason,
       stdout: cleanedStdout,
       stderr: cleanOutput([providerStderr, providerFailureDiagnostic].filter(Boolean).join('\n')),
@@ -5140,6 +5146,7 @@ async function executeOneShot(body, res) {
       && !cursorUsageQuotaExhausted
       && (authoritativeApiFailure === 'rate_limit'
         || !!copilotQuotaEvidence
+        || !!runClassification.quotaEvidence
         || (!stopReason && rate_signals.some(s => failureBlob.includes(s)))));
     const budget_exceeded = tokenBudgetExceeded || parsedOutput.resultSubtype === 'error_max_budget_usd'
       || authoritativeApiFailure === 'budget'
@@ -5226,7 +5233,7 @@ async function executeOneShot(body, res) {
       } : {}),
       graceful_finalization: tokenBudgetExceeded || gracefulFinalization.requested
         ? { ...gracefulFinalization } : null,
-      quota_evidence: terminalQuotaEvidence || copilotQuotaEvidence,
+      quota_evidence: terminalQuotaEvidence || copilotQuotaEvidence || runClassification.quotaEvidence || null,
       provider_action_required: cursorActionRequired,
       transport_output_chars: String(transportStdout).length,
       transport_output_hash: crypto.createHash('sha256').update(String(transportStdout)).digest('hex'),
@@ -5312,6 +5319,7 @@ const incidentLog = createIncidentLog({
 const taskQueue = createTaskQueue({
   dataDir: path.join(DATA_DIR, 'tasks'),
   executeOneShot, readCollab, writeCollab,
+  receiptStoreId: RECEIPT_STORE_IDENTITY.ready ? RECEIPT_STORE_IDENTITY.id : null,
   maxConcurrent: Number(process.env.RELAYBRIDGE_MAX_TASKS) || 3,
   onFailure: (task) => incidentLog.report(taskFailureDetails(task)),
   log: (m) => console.log(m),
@@ -5320,6 +5328,9 @@ const taskQueue = createTaskQueue({
 app.post('/api/tasks', async (req, res) => {
   try {
     const input = req.body || {};
+    if (input.deliveryMode !== undefined && input.deliveryMode !== 'queued') {
+      throw validationError('invalid_delivery', 'deliveryMode', 'deliveryMode must be queued when supplied');
+    }
     const providerBudget = validateProviderBudget(input.providerBudget);
     const { classifyTask } = await ROUTER_MODULE_PROMISE;
     const classifiedTaskTier = typeof input.prompt === 'string'
@@ -5331,16 +5342,47 @@ app.post('/api/tasks', async (req, res) => {
       ? input.budgetTaskTier
       : input.execution?.resolvedTaskTier || taskTier || classifiedTaskTier;
     const prepared = { ...input, dangerous: input.dangerous === true, providerBudget, budgetTaskTier, taskTier, modelTier };
-    const controls = validateProviderIntent({ ...prepared, dangerous: input.dangerous === true });
+    const snapshot = captureAllowedCwdIdentity(prepared.cwd);
+    const controls = validateProviderIntent(prepared, loadConfig(), snapshot);
     if (controls.outputProfile && controls.preparedPrompt.length > 100000) {
       throw profileError('The compiled task exceeds the queue limit of 100000 characters; shorten the original task or guidance.');
     }
     const { outputProfile: _selection, ...queueBody } = prepared;
-    res.json(taskQueue.submit({ ...queueBody,
+    const submitted = { ...queueBody,
       ...(controls.outputProfile ? { prompt:controls.preparedPrompt, title:input.title || input.prompt.split('\n')[0] } : {}),
-      execution: controls.execution }));
+      execution: controls.execution };
+    if (input.deliveryMode === 'queued') {
+      const { taskId, deliveryMode, ...intent } = submitted;
+      intent.requestId = input.requestId === undefined ? `queued:${taskId}` : input.requestId;
+      intent.cwd = snapshot.resolved;
+      intent.expectedCwdIdentityHash = snapshot.cwdIdentityHash;
+      intent.expectedCwdPolicyId = CWD_POLICY_IDENTITY;
+      intent.expectedPromptHash = controls.promptEvidence.effectiveHash;
+      taskQueue.submitDurable(taskId, intent);
+      return res.status(202).json(taskQueue.getResult(taskId));
+    }
+    res.json(taskQueue.submit(submitted));
   }
-  catch (err) { return rejectInvalidIntent(res, req.body || {}, err); }
+  catch (err) {
+    if (['TASK_INTENT_CONFLICT', 'QUEUE_EXECUTION_UNCERTAIN', 'DELIVERY_UNAVAILABLE', 'INVALID_DELIVERY'].includes(err.code)) return sendDeliveryError(res, err);
+    return rejectInvalidIntent(res, req.body || {}, err);
+  }
+});
+function sendDeliveryError(res, error) {
+  const code = error.code || 'INVALID_DELIVERY';
+  const status = code === 'TASK_NOT_FOUND' ? 404 : ['TASK_INTENT_CONFLICT', 'RESULT_IDENTITY_MISMATCH'].includes(code) ? 409
+    : ['DELIVERY_UNAVAILABLE', 'QUEUE_EXECUTION_UNCERTAIN'].includes(code) ? 503 : 400;
+  return res.status(status).json({ ok: false, code,
+    error: ['TASK_NOT_FOUND', 'TASK_INTENT_CONFLICT', 'RESULT_IDENTITY_MISMATCH', 'DELIVERY_UNAVAILABLE', 'QUEUE_EXECUTION_UNCERTAIN', 'INVALID_DELIVERY'].includes(code)
+      ? error.message : 'invalid result delivery request', model_invocation: false });
+}
+app.get('/api/tasks/:id/result', (req, res) => {
+  try { res.json(taskQueue.getResult(req.params.id)); }
+  catch (error) { sendDeliveryError(res, error); }
+});
+app.post('/api/tasks/:id/result/ack', (req, res) => {
+  try { res.json(taskQueue.acknowledgeResult(req.params.id, req.body || {})); }
+  catch (error) { sendDeliveryError(res, error); }
 });
 app.get('/api/tasks', (req, res) => {
   try { res.json({ tasks: taskQueue.list({ collab: req.query.collab, status: req.query.status, limit: req.query.limit }), stats: taskQueue.stats() }); }
@@ -5661,6 +5703,18 @@ app.post('/api/workflows/:runId/revision/start', (req, res) => {
   catch (error) { sendWorkflowError(res, error); }
 });
 
+app.post('/api/workflows/:runId/revision/claim', (req, res) => {
+  try { res.json(workflowController.claimRevision(req.params.runId, req.body || {})); }
+  catch (error) { sendWorkflowError(res, error); }
+});
+
+app.post('/api/workflows/:runId/revision/complete', (req, res) => {
+  try {
+    const workflow = workflowController.completeRevision(req.params.runId, req.body || {});
+    res.json({ workflow, nextActions: workflowController.nextActions(workflow) });
+  } catch (error) { sendWorkflowError(res, error); }
+});
+
 app.post('/api/workflows/:runId/final-review/start', (req, res) => {
   try { res.status(202).json(workflowController.startFinalReview(req.params.runId)); }
   catch (error) { sendWorkflowError(res, error); }
@@ -5710,7 +5764,7 @@ const cooldowns = createCooldownStore({
 const {
   createUsageLedger, OPERATOR_QUOTA_PROVENANCE, MAX_OPERATOR_QUOTA_TTL_MS,
 } = require('./lib/usage-ledger');
-const { parseGrokQuota429 } = require('./lib/vendor-quota');
+const { parseGrokQuota429, normalizeQualitativeQuotaExhaustion } = require('./lib/vendor-quota');
 const {
   disconnectFailureClass,
   resolveCancellationTerminalState,

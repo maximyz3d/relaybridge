@@ -8,6 +8,17 @@ When connected through MCP, call `get_context_bundle` first. It returns the boun
 
 ## Codex-Claude Pipeline
 
+Explicit user provider restrictions take precedence over the default phase
+roles below. When the user selects only Codex Astra/ultra, create the existing
+workflow with `profile:"codex-astra-ultra"`. Its persisted policy dispatches
+only read-only Codex/Astra/ultra advisors; unavailable Codex fails closed.
+Codex holds implementation and revision leases externally. Use
+`claim_pipeline_revision` and `complete_pipeline_revision` for corrections,
+then the existing fresh final-review action. Never call a Claude-only fallback
+or relabel Codex evidence as a Claude verdict. Older installations that lack
+this profile require an explicit Codex-only external workflow; do not send an
+unsupported selector and assume it was enforced.
+
 Codex is the orchestrator and primary implementation writer. Use the
 `$codex-claude-pipeline` skill for cross-agent work:
 

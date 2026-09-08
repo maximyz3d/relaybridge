@@ -25,7 +25,7 @@ function fixture(t) {
     submit(input) { return this.submitReserved(this.newTaskId(), input); },
     submitReserved(id, input) {
       if (tasks.has(id)) throw new Error('task id already exists');
-      const task = { id, status: 'queued', ...input };
+      const task = { id, status: 'queued', ...input, body: { ...input } };
       tasks.set(task.id, task);
       return task;
     },
@@ -83,6 +83,97 @@ function reachReviewReady(f, input = createInput(f.cwd), verdict = 'REVISE') {
   f.controller.reconcile(created.runId);
   return created;
 }
+
+test('Codex-only policy survives external revision restart with exact Astra/ultra and no provider writer', (t) => {
+  const f = fixture(t);
+  f.config.codex = { oneshot_safe: ['codex-safe'] };
+  const created = reachReviewReady(f, { ...createInput(f.cwd), profile: 'codex-astra-ultra', permissionMode: 'full' });
+  assert.deepEqual(f.controller.view(created.runId).nextActions, ['claim_pipeline_revision']);
+  assert.throws(() => f.controller.startRevision(created.runId), { code: 'INVALID_WRITER_MODE' });
+  const count = f.tasks.size;
+  const claimed = f.controller.claimRevision(created.runId);
+  const token = claimed.lease.leaseToken;
+  assert.equal(claimed.workflow.writerLease.mode, 'external');
+  assert.equal(f.tasks.size, count);
+  const restarted = createWorkflowController({ pipeline: createWorkflowPipeline({ dataDir: f.dataDir, now: () => f.clock.value }),
+    taskQueue: f.taskQueue, loadConfig: () => f.config, now: () => f.clock.value });
+  t.after(() => restarted.shutdown());
+  assert.equal(restarted.reconcile(created.runId).workflow.phase, 'revising');
+  assert.deepEqual(restarted.view(created.runId).nextActions, ['complete_pipeline_revision', 'renew_pipeline_writer_lease']);
+  assert.throws(() => restarted.cancel(created.runId, { reason: 'No token' }), { code: 'INVALID_LEASE_TOKEN' });
+  assert.throws(() => restarted.completeRevision(created.runId, { leaseToken: 'a'.repeat(64), markdown: 'invalid' }), { code: 'LEASE_MISMATCH' });
+  assert.throws(() => restarted.startFinalReview(created.runId), { code: 'INVALID_TRANSITION' });
+  restarted.renewWriterLease(created.runId, { leaseToken: token, leaseMs: 60000 });
+  const completed = restarted.completeRevision(created.runId, { leaseToken: token, markdown: 'Corrections and exact test evidence.' });
+  assert.equal(completed.phase, 'revision_ready');
+  assert.equal(completed.writerLease, null);
+  assert.equal(f.tasks.size, count, 'external completion never dispatches or approves');
+  const closing = restarted.startFinalReview(created.runId);
+  f.finish(closing.task, 'Independent closing evidence.\nREVIEW_VERDICT: APPROVE');
+  assert.equal(restarted.reconcile(created.runId).workflow.phase, 'complete');
+  for (const task of f.tasks.values()) {
+    assert.equal(task.kind, 'codex'); assert.equal(task.model, 'gpt-6-astra');
+    assert.equal(task.effort, 'ultra'); assert.equal(task.maxEffortOverride, true); assert.equal(task.dangerous, false);
+    assert.match(task.prompt, /bounded read-only commands/); assert.doesNotMatch(task.prompt, /Claude|Read\/Glob\/Grep/);
+  }
+  assert.equal(f.pipeline.list()[0].profile, 'codex-astra-ultra');
+});
+
+test('Codex-only unavailable provider, retries, and missing verdicts never select Claude', (t) => {
+  const f = fixture(t);
+  assert.throws(() => f.controller.create({ ...createInput(f.cwd), profile: 'codex-astra-ultra',
+    providerPreferences: { planning: ['claude'] } }), { code: 'INVALID_ARGUMENT' });
+  const unavailable = f.controller.create({ ...createInput(f.cwd), profile: 'codex-astra-ultra' });
+  assert.throws(() => f.controller.submitResearch(unavailable.runId, { markdown: 'evidence' }), { code: 'PROVIDER_UNAVAILABLE' });
+  assert.equal(f.tasks.size, 0);
+  f.config.codex = { oneshot_safe: ['codex-safe'] };
+  const created = f.controller.create({ ...createInput(f.cwd), profile: 'codex-astra-ultra' });
+  const planning = f.controller.submitResearch(created.runId, { markdown: 'evidence' });
+  f.finish(planning.task, 'overloaded', 'failed', { failureClass: 'overloaded', execution: { state: 'settled' } });
+  f.controller.reconcile(created.runId);
+  f.clock.value += 20000;
+  const retry = f.controller.reconcile(created.runId).workflow.providerTask;
+  assert.equal(retry.provider, 'codex'); assert.equal(retry.model, 'gpt-6-astra'); assert.equal(retry.effort, 'ultra');
+  f.finish(f.tasks.get(retry.taskId), 'Missing final plan marker.');
+  assert.equal(f.controller.reconcile(created.runId).workflow.phase, 'failed');
+  assert.ok([...f.tasks.values()].every((task) => task.kind === 'codex'));
+});
+
+test('expired external and legacy ambiguous revisions remain held across read and reconcile', (t) => {
+  for (const legacy of [false, true]) {
+    const f = fixture(t);
+    const created = reachReviewReady(f);
+    const claimed = f.controller.claimRevision(created.runId, { leaseMs: 60000 });
+    if (legacy) {
+      const file = path.join(f.dataDir, 'workflows', created.runId, 'state.json');
+      const state = JSON.parse(fs.readFileSync(file));
+      state.schemaVersion = 1; delete state.profile; delete state.phasePolicy; delete state.writerLease.mode;
+      fs.writeFileSync(file, JSON.stringify(state));
+    }
+    f.clock.value += 60001;
+    assert.equal(f.controller.reconcile(created.runId).workflow.phase, 'revising');
+    assert.deepEqual(f.controller.view(created.runId).nextActions, []);
+    assert.throws(() => f.controller.cancel(created.runId, { leaseToken: claimed.lease.leaseToken }), { code: 'LEASE_EXPIRED' });
+    assert.throws(() => f.pipeline.failOrphanedRevision(created.runId, {}), { code: 'WRITER_EXECUTION_UNCERTAIN' });
+    assert.ok(f.pipeline.get(created.runId).writerLease);
+  }
+});
+
+test('a persisted provider mode cannot override the Codex-only external ownership policy', (t) => {
+  const f = fixture(t); f.config.codex = { oneshot_safe: ['codex-safe'] };
+  const created = reachReviewReady(f, { ...createInput(f.cwd), profile: 'codex-astra-ultra', permissionMode: 'full' });
+  f.controller.claimRevision(created.runId);
+  const stateFile = path.join(f.dataDir, 'workflows', created.runId, 'state.json');
+  const state = JSON.parse(fs.readFileSync(stateFile));
+  const lockDirectory = path.join(f.dataDir, 'writer-locks');
+  const locks = fs.readdirSync(lockDirectory).map((name) => [name, fs.readFileSync(path.join(lockDirectory, name))]);
+  state.writerLease.mode = 'provider'; fs.writeFileSync(stateFile, JSON.stringify(state));
+  for (const action of [() => f.controller.reconcile(created.runId), () => f.controller.cancel(created.runId),
+    () => f.pipeline.failOrphanedRevision(created.runId, {}), () => f.pipeline.cancelOrphanedRevision(created.runId, {})]) {
+    assert.throws(action, { code: 'STATE_CORRUPT' });
+    for (const [name, bytes] of locks) assert.deepEqual(fs.readFileSync(path.join(lockDirectory, name)), bytes);
+  }
+});
 
 test('status reads are inert and explicit reconciliation advances persisted handoffs', (t) => {
   const f = fixture(t);
@@ -460,7 +551,7 @@ test('reserved task IDs are bound before queue persistence and restart recovers 
   f.controller.reconcile(created.runId);
 
   // Simulate a hard stop after lease acquisition but before an ID was bound.
-  f.pipeline.startRevision(created.runId, { actor: 'claude-reviser' });
+  f.pipeline.startRevision(created.runId, { actor: 'claude-reviser', mode: 'provider' });
   const restartedPipeline = createWorkflowPipeline({ dataDir: f.dataDir });
   const restartedController = createWorkflowController({
     pipeline: restartedPipeline,

@@ -1,6 +1,41 @@
 # Codex-Claude pipeline
 
-This profile makes Codex the user-facing orchestrator and primary implementation
+## Explicit Codex-only profile
+
+Creation accepts `profile:"codex-astra-ultra"` through the existing REST
+`POST /api/workflows` and MCP `start_codex_claude_pipeline` surface. The tool's
+historical name does not override the selected profile. New workflow schema 2
+persists the complete version-1 phase policy: Codex, exact `gpt-6-astra`, literal
+`ultra`, and explicit extreme-effort consent for planning/review/final review.
+Missing provider capability or incompatible controls fail closed. Retries keep
+the same policy; they cannot select Claude/Fable. The default profile retains
+the established Codex-Claude phases. Historical schema-1 workflows and their
+schema-1 workspace locks remain readable.
+
+The shipped Codex heavy tier names Astra; light/standard tiers and the historical
+max-to-xhigh mapping remain explicit. Ultra requires a declared adapter flag
+and an exact-model allowlist. An installed CLI/account still needs to support
+that model and effort; configuration is not authenticated invocation evidence.
+An explicit profile pins the advisor tuple and does not change client defaults.
+
+All Codex-only writes stay external. After a review requests changes, call
+`claim_pipeline_revision` (`POST /api/workflows/:runId/revision/claim`) with
+optional `leaseMs`. It records external ownership with the existing writer lease
+and dispatches no task. Complete with the returned `leaseToken` and bounded
+`markdown` via `complete_pipeline_revision`
+(`POST /api/workflows/:runId/revision/complete`). This stores corrective evidence
+and reaches `revision_ready`; `start_pipeline_final_review` remains required.
+The workflow must have the existing full-permission acknowledgement pair for
+a revision claim. Permission is not review approval.
+
+Reconciliation cannot release an external writer because a provider task is
+absent. Cancellation requires its live token; expiration retains the hold.
+Historically ambiguous revisions without an ownership mode also remain held.
+Only an explicitly provider-owned, never-bound dispatch gap can use orphan
+recovery. This change supplies no legacy termination proof or unattended
+controller recovery.
+
+The default `codex-claude` profile makes Codex the user-facing orchestrator and primary implementation
 writer. Claude contributes a fresh read-only plan, fresh initial and final
 read-only reviews, and a bounded Sonnet revision when a review requests changes,
 after an explicit writer-lease transfer.
@@ -375,3 +410,19 @@ The MCP installers configure Codex's tool timeout to cover the maximum provider
 run plus transport grace. Re-run the applicable installer after changing
 `config/timeout-policy.json`. See [Codex MCP configuration](https://learn.chatgpt.com/docs/extend/mcp.md)
 and [Claude MCP configuration](https://code.claude.com/docs/en/mcp).
+
+## Browser workflow controls
+
+The Tasks dialog includes a lazily loaded Staged workflows panel. Creation uses
+Astra/ultra with an explicit per-workflow filesystem acknowledgement. The panel
+verifies the returned complete advisor/writer policy before enabling actions;
+legacy and incompatible workflows remain inspectable through existing clients.
+Saved state refresh performs GETs only. Reconciliation and provider-dispatching
+stages have separate, explicitly labeled action buttons.
+
+External implementation/revision claims retain the returned token in page
+memory, even if the dialog closes before the response arrives. Copy the token
+with its explicit button before reloading when continuing in another client;
+it is never placed in browser storage or review text. A masked field accepts a
+token obtained elsewhere. Renewal explicitly requests four hours. Failed or
+expired ownership stays held; a missing task is not release evidence.

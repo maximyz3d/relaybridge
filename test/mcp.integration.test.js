@@ -402,10 +402,12 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
     'start_codex_claude_pipeline', 'list_pipelines', 'get_pipeline', 'reconcile_pipeline',
     'submit_pipeline_research', 'claim_pipeline_implementation',
     'complete_pipeline_implementation', 'start_pipeline_revision',
+    'claim_pipeline_revision', 'complete_pipeline_revision',
     'start_pipeline_final_review', 'retry_failed_pipeline_provider',
     'renew_pipeline_writer_lease', 'cancel_pipeline',
     'create_request', 'get_request', 'list_requests', 'link_request_workflow', 'record_requirement_evidence',
     'open_in_chrome',
+    'submit_task', 'get_task_result', 'ack_task_result',
   ]) {
     assert.ok(toolNames.has(expected), `missing MCP tool ${expected}`);
   }
@@ -484,10 +486,57 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   const requestList = await client.callTool({ name: 'list_requests', arguments: {} });
   assert.ok(requestList.structuredContent.requests.some((r) => r.requestId === requestInput.requestId));
 
+  const submittedResult = await client.callTool({ name: 'submit_task', arguments: {
+    deliveryMode: 'queued', taskId: 't_mcp_delivery', kind: 'gemini', prompt: 'Return a bounded fixture answer.', cwd: allowedRootA,
+  } });
+  assert.equal(submittedResult.isError, undefined, JSON.stringify(submittedResult.structuredContent));
+  let queuedResult;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    queuedResult = await client.callTool({ name: 'get_task_result', arguments: { id: 't_mcp_delivery' } });
+    if (queuedResult.structuredContent.resultState !== 'pending') break;
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  assert.equal(queuedResult.structuredContent.resultPersisted, true, JSON.stringify(queuedResult.structuredContent));
+  const resultHash = require('node:crypto').createHash('sha256').update(queuedResult.structuredContent.result).digest('hex');
+  assert.equal(queuedResult.structuredContent.metadata.sha256, resultHash);
+  assert.match(queuedResult.structuredContent.metadata.providerRunId, /^run_/);
+  const wrongAck = await client.callTool({ name: 'ack_task_result', arguments: {
+    id: 't_mcp_delivery', receiptStoreId: queuedResult.structuredContent.receiptStoreId, sha256: 'f'.repeat(64),
+  } });
+  assert.equal(wrongAck.isError, true);
+  const deliveredAck = await client.callTool({ name: 'ack_task_result', arguments: {
+    id: 't_mcp_delivery', receiptStoreId: queuedResult.structuredContent.receiptStoreId, sha256: resultHash,
+  } });
+  assert.equal(deliveredAck.structuredContent.acknowledged, true);
+
   // Build a due retry without invoking a provider. GET must remain a pure
   // status read, and the action-identity middleware must reject reconciliation
   // from a stale MCP before it can admit the replacement provider process.
   const durablePipeline = createWorkflowPipeline({ dataDir });
+  const astraStarted = await client.callTool({ name: 'start_codex_claude_pipeline', arguments: {
+    cwd: allowedRootA, objective: 'Round-trip Codex-only external revision without provider calls.',
+    acceptance: 'Preserve exact policy and token gates.', profile: 'codex-astra-ultra',
+    permissionMode: 'full', acknowledgeFilesystemWrites: true,
+  } });
+  assert.equal(astraStarted.isError, undefined, JSON.stringify(astraStarted.structuredContent));
+  const astraId = astraStarted.structuredContent.workflow.runId;
+  assert.equal(astraStarted.structuredContent.workflow.phasePolicy.planning.model, 'gpt-6-astra');
+  durablePipeline.completeResearch(astraId, { markdown: 'Synthetic research.' });
+  durablePipeline.startPlanning(astraId);
+  durablePipeline.completePlanning(astraId, { markdown: 'Synthetic plan.' });
+  const impl = durablePipeline.startImplementation(astraId);
+  durablePipeline.completeImplementation(astraId, { leaseToken: impl.lease.leaseToken, markdown: 'Synthetic implementation.' });
+  durablePipeline.startReview(astraId);
+  durablePipeline.completeReview(astraId, { revisionRequested: true, markdown: 'Synthetic requested correction.' });
+  const revisionClaim = await client.callTool({ name: 'claim_pipeline_revision', arguments: { runId: astraId } });
+  assert.equal(revisionClaim.isError, undefined, JSON.stringify(revisionClaim.structuredContent));
+  assert.equal(revisionClaim.structuredContent.workflow.writerLease.mode, 'external');
+  const revisionDone = await client.callTool({ name: 'complete_pipeline_revision', arguments: {
+    runId: astraId, leaseToken: revisionClaim.structuredContent.lease.leaseToken, markdown: 'Synthetic corrected evidence.' } });
+  assert.equal(revisionDone.isError, undefined, JSON.stringify(revisionDone.structuredContent));
+  assert.equal(revisionDone.structuredContent.workflow.phase, 'revision_ready');
+  assert.deepEqual(revisionDone.structuredContent.nextActions, ['start_pipeline_final_review']);
+  durablePipeline.cancel(astraId, { reason: 'Fixture complete; no real review claimed.' });
   const dueRetry = durablePipeline.createWorkflow({
     cwd: allowedRootA,
     objective: 'Prove stale status clients cannot dispatch a due provider retry.',

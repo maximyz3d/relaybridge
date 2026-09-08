@@ -61,6 +61,45 @@ function advanceToPlanReady(pipeline, cwd, runId, extra = {}) {
   return pipeline.get(runId);
 }
 
+test('explicit workflow policy is immutable and malformed new records cannot become legacy', (t) => {
+  const { pipeline, cwd, dataDir, restart } = fixture(t);
+  const id = 'wf_policy_222222222221';
+  create(pipeline, cwd, id, { profile: 'codex-astra-ultra' });
+  const file = path.join(dataDir, 'workflows', id, 'state.json');
+  const original = fs.readFileSync(file, 'utf8');
+  const state = JSON.parse(original);
+  for (const change of [
+    (s) => { delete s.phasePolicy; },
+    (s) => { delete s.phasePolicy; delete s.profile; },
+    (s) => { s.phasePolicy.review.provider = 'claude'; },
+    (s) => { s.phasePolicy.finalReview.effort = 'high'; },
+  ]) {
+    const corrupted = structuredClone(state); change(corrupted); fs.writeFileSync(file, JSON.stringify(corrupted));
+    throwsCode(() => restart().get(id), 'STATE_CORRUPT');
+  }
+  fs.writeFileSync(file, original);
+  pipeline.completeResearch(id, { markdown: 'Research.' }); pipeline.startPlanning(id);
+  throwsCode(() => pipeline.bindProviderTask(id, { actor: 'codex-planner', taskId: 't_other', purpose: 'planning',
+    provider: 'claude', model: 'gpt-6-astra', effort: 'ultra' }), 'INVALID_PROVIDER_TASK');
+});
+
+test('external revision lease prevents provider binding and every orphan-release entry point', (t) => {
+  const { pipeline, restart, cwd } = fixture(t);
+  const runId = 'wf_external_222222222223';
+  advanceToReviewReady(pipeline, cwd, runId);
+  const claimed = pipeline.startRevision(runId, { actor: 'codex', mode: 'external' });
+  const restored = restart();
+  throwsCode(() => restored.bindProviderTask(runId, { actor: 'codex', taskId: 't_overlap', purpose: 'revision', provider: 'codex' }), 'INVALID_WRITER_MODE');
+  for (const action of ['failOrphanedRevision', 'cancelOrphanedRevision']) {
+    throwsCode(() => restored[action](runId, { actor: 'codex' }), 'WRITER_EXECUTION_UNCERTAIN');
+  }
+  const other = 'wf_other_222222222224';
+  advanceToPlanReady(restored, cwd, other);
+  throwsCode(() => restored.startImplementation(other), 'WRITER_CONFLICT');
+  throwsCode(() => restored.completeRevision(runId, { actor: 'another', leaseToken: claimed.lease.leaseToken, markdown: 'No.' }), 'LEASE_MISMATCH');
+  assert.equal(restored.get(runId).writerLease.mode, 'external');
+});
+
 function advanceToReviewReady(pipeline, cwd, runId, revisionRequested = true) {
   advanceToPlanReady(pipeline, cwd, runId);
   const { lease } = pipeline.startImplementation(runId);
@@ -161,7 +200,7 @@ test('exports the closed phase graph and validates review/revision gates through
   assert.equal(rejected.revisionRequested, true);
   throwsCode(() => pipeline.startFinalReview(runId), 'REVISION_REQUIRED');
 
-  pipeline.startRevision(runId, { actor: 'codex' });
+  pipeline.startRevision(runId, { actor: 'codex', mode: 'provider' });
   pipeline.bindProviderTask(runId, {
     actor: 'codex', taskId: 't_revision_1', provider: 'codex',
     modelTier: 'standard', effort: 'medium', attempt: 1, purpose: 'revision',
@@ -271,7 +310,7 @@ test('read-only provider retries are durable, bounded, and never replay a writer
   });
   pipeline.startReview(runId);
   pipeline.completeReview(runId, { markdown: 'review', revisionRequested: true });
-  pipeline.startRevision(runId, { actor: 'claude-reviser' });
+  pipeline.startRevision(runId, { actor: 'claude-reviser', mode: 'provider' });
   pipeline.bindProviderTask(runId, {
     actor: 'claude-reviser', taskId: 't_retry_writer', provider: 'claude',
     purpose: 'revision', attempt: 1,
@@ -474,7 +513,7 @@ test('bound writer recovery survives restart and releases only its own expired l
   const { pipeline, restart, cwd, clock } = fixture(t, { pipeline: { leaseMs: 100 } });
   const runId = 'wf_recover_777777777777';
   advanceToReviewReady(pipeline, cwd, runId, true);
-  pipeline.startRevision(runId, { actor: 'claude-reviser' });
+  pipeline.startRevision(runId, { actor: 'claude-reviser', mode: 'provider' });
   pipeline.bindProviderTask(runId, {
     actor: 'claude-reviser', taskId: 't_revision_recovery', provider: 'claude',
     modelTier: 'heavy', effort: 'high', attempt: 2, purpose: 'revision',

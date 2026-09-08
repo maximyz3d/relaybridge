@@ -44,6 +44,7 @@ test('capability matching prefers the most specific family', () => {
   assert.equal(classifyModel('gemini-3.5-flash-lite').tier, 'light', 'flash-lite must not be swallowed by flash');
   assert.equal(classifyModel('gemini-3.6-flash').tier, 'standard');
   assert.equal(classifyModel('gpt-5.6-sol').tier, 'heavy');
+  assert.equal(classifyModel('gpt-6-astra').tier, 'heavy');
   assert.equal(classifyModel('opus').tier, 'heavy');
 });
 

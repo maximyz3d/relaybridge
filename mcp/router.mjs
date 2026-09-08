@@ -44,13 +44,25 @@ export function classifyTask(task) {
     /```/, /\b(implement|debug|refactor|compile|test failure|stack trace|function|class|typescript|javascript|python|rust|golang|repository|codebase|pull request|\bpr\b)\b/,
     /\.(?:js|mjs|cjs|ts|tsx|jsx|py|rs|go|java|cs|cpp|h|ps1|json|toml|ya?ml)\b/,
     /\b(?:render calls?|binder calls?|placeholder scanner|(?:mutation|regression) tests?|schema validation|cli isolation|fail[- ]closed gates?|races?|architecture)\b/,
+    /\b(?:code review|git diff|worktree)\b/,
+    /\b(?:review|audit|inspect|debug|refactor)\b[^.\n]{0,60}\bcode\b/,
   ]);
   const looksLikeReview = hasAny(text, [
     /\b(review|audit|critique|verify|regression|security review|design review|drc|lint)\b/,
   ]);
-  const looksLikeResearch = hasAny(text, [
+  const researchVocabulary = hasAny(text, [
     /\b(latest|current|research|browse|search the web|sources?|citations?|evidence|compare products?|github projects?)\b/,
   ]);
+  // Local source inspection and file/line evidence are ordinary code work.
+  // Keep the retrieval gate for mixed tasks that actually request outside
+  // sources; merely naming a research handoff must not disqualify code seats.
+  const externalResearch = hasAny(text, [
+    /\b(?:retrieve|fetch|open|read|visit|look up|download|browse|search)\b[\s\S]{0,180}https?:\/\//,
+    /\b(?:browse|search the web|web search|internet|online sources?|external sources?|compare products?|github projects?)\b/,
+    /\b(?:research|find|look up|search|retrieve)\b[^.\n]{0,80}\b(?:official|external|online|web|internet|public sources?)\b/,
+    /\b(?:latest|current|official)\b[^.\n]{0,60}\b(?:news|prices|products?|releases?|documentation|docs|standards?|regulations?)\b/,
+  ]);
+  const looksLikeResearch = externalResearch || (researchVocabulary && !looksLikeCode);
   // A bare mention of a datasheet is not a research contract: the caller may
   // already have the document, or may only be editing prose that names it.
   // Fail up to retrieval only when an authoritative/current document is paired

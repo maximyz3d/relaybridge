@@ -13,6 +13,7 @@ import { promptTransportLimits, preparePrompt } from '../lib/prompt-transport.js
 import { normalizeGrounding, prepareGroundedPrompt } from '../lib/workspace-grounding.js';
 import { normalizeTransportLifecycle } from '../lib/attempt-lifecycle.js';
 import { compileOutputProfile } from '../lib/output-profiles.js';
+import { normalizeQualitativeQuotaExhaustion } from '../lib/vendor-quota.js';
 
 const OUTPUT_PROFILE_SCHEMA = z.object({ id:z.string().regex(/^[a-z][a-z0-9-]{0,63}$/),
   version:z.number().int().positive(), digest:z.string().regex(/^[0-9a-f]{64}$/).optional() }).strict()
@@ -1079,6 +1080,7 @@ export function normalizeProviderPermissionDenials(value, modelInvocation) {
 
 export function normalizeVendorQuota(value) {
   if (!value || typeof value !== 'object') return null;
+  if (value.kind !== undefined) return normalizeQualitativeQuotaExhaustion(value);
   const actual = strictTokenCount(value.actual);
   const limit = strictTokenCount(value.limit);
   const remaining = strictTokenCount(value.remaining);
@@ -1118,6 +1120,7 @@ export function normalizeVendorQuota(value) {
 
 export function normalizeQuotaEvidence(value) {
   if (!value || typeof value !== 'object') return null;
+  if (value.kind === 'quota_exhausted') return normalizeQualitativeQuotaExhaustion(value);
   if (value.source === 'claude_terminal_api_status') {
     if (!validProviderKey(value.provider)
       || value.scope !== 'account' || value.kind !== 'rate_limit' || value.status !== 429
@@ -1498,13 +1501,14 @@ export function reconcileTransportReceipt({ requestId, sanitized, transportRecei
     usage: usageFromTransportReceipt(transportReceipt),
     providerRetries: providerRetriesFromReceipt(transportReceipt),
     quotaEvidence: normalizeQuotaEvidence(transportReceipt.quotaEvidence),
+    vendorQuota: normalizeVendorQuota(transportReceipt.vendorQuota),
     cooldown: normalizeProviderCooldown(transportReceipt.cooldown),
     retryAt: strictTokenCount(transportReceipt.retryAt),
     retryAfterSec: strictTokenCount(transportReceipt.retryAfterSec),
     providerApiErrorStatus: Number.isSafeInteger(transportReceipt.providerApiErrorStatus)
       && transportReceipt.providerApiErrorStatus >= 100 && transportReceipt.providerApiErrorStatus <= 599
       ? transportReceipt.providerApiErrorStatus : null,
-    rateLimited: normalizeQuotaEvidence(transportReceipt.quotaEvidence)?.kind === 'rate_limit'
+    rateLimited: ['rate_limit','quota_exhausted'].includes(normalizeQuotaEvidence(transportReceipt.quotaEvidence)?.kind)
       || transportReceipt.failureClass === 'rate_limit',
     budgetExceeded: transportReceipt.failureClass === 'token_budget' || transportReceipt.failureClass === 'budget',
     transportReceiptId: transportReceipt.receiptId,
@@ -3161,7 +3165,7 @@ export function buildServer() {
   }).strict();
 
   server.registerTool('start_codex_claude_pipeline', {
-    title: 'Start a Codex-Claude pipeline',
+    title: 'Start a phase-gated Codex pipeline',
     description: 'Create one durable phase-gated run. Codex remains orchestrator and primary writer; no provider is called until research is submitted. Use list_pipelines first when duplicate work may already exist.',
     inputSchema: z.object({
       cwd: z.string().min(1).max(1024),
@@ -3175,6 +3179,7 @@ export function buildServer() {
       permissionMode: z.enum(['safe', 'full']).optional(),
       acknowledgeFilesystemWrites: z.boolean().optional(),
       providerPreferences: providerPreferencesSchema.optional(),
+      profile: z.enum(['codex-claude', 'codex-astra-ultra']).optional().describe('Explicit codex-astra-ultra pins every advisor to Codex/Astra/ultra and keeps all writes external; no Claude fallback.'),
     }),
     annotations: ACTION,
   }, safeHandler(async (input, context) => {
@@ -3231,8 +3236,8 @@ export function buildServer() {
   ))));
 
   server.registerTool('submit_pipeline_research', {
-    title: 'Submit Codex research and dispatch Claude planning',
-    description: 'Store the compact Codex research brief, then queue one fresh read-only Claude planning task. Repeated calls are rejected by the phase gate.',
+    title: 'Submit Codex research and dispatch planning',
+    description: 'Store the compact Codex research brief, then queue one fresh read-only planning task using the persisted profile. Repeated calls are rejected by the phase gate.',
     inputSchema: z.object({
       runId: workflowIdSchema,
       markdown: z.string().min(1).max(100000),
@@ -3246,7 +3251,7 @@ export function buildServer() {
 
   server.registerTool('claim_pipeline_implementation', {
     title: 'Claim the Codex implementation lease',
-    description: 'After Claude planning is ready, give Codex the one writer lease for this canonical workspace. Preserve the returned lease token until completion or renewal.',
+    description: 'After planning is ready, give Codex the one writer lease for this canonical workspace. Preserve the returned lease token until completion or renewal.',
     inputSchema: z.object({
       runId: workflowIdSchema,
       leaseMs: z.number().int().min(60000).max(86400000).optional(),
@@ -3261,7 +3266,7 @@ export function buildServer() {
 
   server.registerTool('complete_pipeline_implementation', {
     title: 'Complete Codex implementation and dispatch review',
-    description: 'Release Codex\'s writer lease, store exact changed-file and verification evidence, and queue one fresh read-only Claude review.',
+    description: 'Release Codex\'s writer lease, store exact changed-file and verification evidence, and queue one fresh read-only review using the persisted profile.',
     inputSchema: z.object({
       runId: workflowIdSchema,
       leaseToken: z.string().regex(/^[a-f0-9]{64}$/),
@@ -3291,13 +3296,37 @@ export function buildServer() {
   ))));
 
   server.registerTool('start_pipeline_final_review', {
-    title: 'Dispatch the fresh final Claude review',
+    title: 'Dispatch the fresh final review',
     description: 'After an approved review or completed revision, queue an independent read-only final review in a fresh session.',
     inputSchema: z.object({ runId: workflowIdSchema }),
     annotations: EXTERNAL_ACTION,
   }, safeHandler(async ({ runId }, context) => result(await bridgeRequest(
     `/api/workflows/${encodeURIComponent(runId)}/final-review/start`, {
       method: 'POST', body: {}, signal: context?.mcpReq?.signal, actionIdentity: true,
+    },
+  ))));
+
+  server.registerTool('claim_pipeline_revision', {
+    title: 'Claim the external Codex revision lease',
+    description: 'For accepted revision findings in a full-permission workflow, claim the existing exclusive writer lease without dispatching a provider. Keep the returned token for completion or renewal.',
+    inputSchema: z.object({ runId: workflowIdSchema, leaseMs: z.number().int().min(60000).max(86400000).optional() }),
+    annotations: ACTION,
+  }, safeHandler(async ({ runId, leaseMs }, context) => result(await bridgeRequest(
+    `/api/workflows/${encodeURIComponent(runId)}/revision/claim`, {
+      method: 'POST', body: { actor: 'codex', ...(leaseMs == null ? {} : { leaseMs }) },
+      signal: context?.mcpReq?.signal, actionIdentity: true,
+    },
+  ))));
+
+  server.registerTool('complete_pipeline_revision', {
+    title: 'Complete the external Codex revision',
+    description: 'Validate the external writer token, store revision evidence, and release that lease. A fresh final review remains required; this action does not approve or merge anything.',
+    inputSchema: z.object({ runId: workflowIdSchema, leaseToken: z.string().regex(/^[a-f0-9]{64}$/), markdown: z.string().min(1).max(100000) }),
+    annotations: ACTION,
+  }, safeHandler(async ({ runId, leaseToken, markdown }, context) => result(await bridgeRequest(
+    `/api/workflows/${encodeURIComponent(runId)}/revision/complete`, {
+      method: 'POST', body: { actor: 'codex', leaseToken, markdown },
+      signal: context?.mcpReq?.signal, actionIdentity: true,
     },
   ))));
 
@@ -3377,6 +3406,8 @@ export function buildServer() {
     title: 'Submit a background task',
     description: 'Queue a prompt to a provider and return a task id IMMEDIATELY without waiting for the run. Use for work longer than a chat turn, or when the result should be collectable later from a different surface. Link a collab id to append the result to that shared thread.',
     inputSchema: z.object({
+      deliveryMode: z.literal('queued').optional().describe('Return a sanitized pending/result handle; taskId must be caller-known for retry without duplicate execution.'),
+      taskId: z.string().regex(/^t_[A-Za-z0-9_]{1,120}$/).optional(),
       outputProfile: OUTPUT_PROFILE_SCHEMA.optional(),
       ...GROUNDING_FIELDS,
       kind: z.string().min(1).max(64), prompt: z.string().min(1).max(100000),
@@ -3397,11 +3428,30 @@ export function buildServer() {
       groundingOverride: z.boolean().default(false),
     }),
     annotations: ACTION,
-  }, safeHandler(async (input) => {
-    const response = await bridgeRequest('/api/tasks', { method: 'POST', body: { ...input, source: 'mcp' } });
-    const receipt = appendReceipt({ event: 'submit_task', status: 'queued', taskId: response.id, provider: input.kind });
+  }, safeHandler(async (input, context) => {
+    if (input.deliveryMode === 'queued' && !input.taskId) throw new Error('queued delivery requires a caller-known taskId');
+    const response = await bridgeRequest('/api/tasks', { method: 'POST', body: { ...input, source: 'mcp' },
+      actionIdentity: true, signal: context?.mcpReq?.signal });
+    const receipt = appendReceipt({ event: 'submit_task', status: response.status || 'queued', taskId: response.taskId || response.id, provider: input.kind });
     return result({ ...response, receiptId: receipt.receiptId });
   }));
+
+  server.registerTool('get_task_result', {
+    title: 'Collect a sanitized queued result',
+    description: 'Read a pending or persisted result by its exact task id without dispatch, retry or acknowledgement. The returned result hash binds the sanitized bytes; completion and delivery acknowledgement are distinct.',
+    inputSchema: z.object({ id: z.string().regex(/^t_[A-Za-z0-9_]{1,120}$/) }), annotations: READ_ONLY,
+  }, safeHandler(async ({ id }, context) => result(await bridgeRequest(`/api/tasks/${encodeURIComponent(id)}/result`, {
+    signal: context?.mcpReq?.signal,
+  }))));
+
+  server.registerTool('ack_task_result', {
+    title: 'Acknowledge exact queued result bytes',
+    description: 'Record that the caller collected this store and result hash. Idempotent; never approves the answer, releases a writer, or replays the task.',
+    inputSchema: z.object({ id: z.string().regex(/^t_[A-Za-z0-9_]{1,120}$/), receiptStoreId: z.string().regex(/^[a-f0-9]{64}$/),
+      sha256: z.string().regex(/^[a-f0-9]{64}$/) }), annotations: ACTION,
+  }, safeHandler(async ({ id, ...body }, context) => result(await bridgeRequest(`/api/tasks/${encodeURIComponent(id)}/result/ack`, {
+    method: 'POST', body, actionIdentity: true, signal: context?.mcpReq?.signal,
+  }))));
 
   server.registerTool('get_task', {
     title: 'Get a task result',

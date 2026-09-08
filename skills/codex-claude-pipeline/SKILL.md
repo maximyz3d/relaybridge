@@ -11,6 +11,16 @@ review cycle when changes are required.
 
 ## Invariants
 
+- Honor explicit user provider restrictions before the default roles below.
+  For a Codex-only Astra/ultra run, use the existing creation tool with
+  `profile:"codex-astra-ultra"` and verify that exact persisted profile in its
+  response. Read-only planning and both reviews then use Codex/Astra/ultra;
+  there is no Claude fallback. Claim revisions with `claim_pipeline_revision`,
+  preserve the token, and report corrections with `complete_pipeline_revision`.
+  The fresh final review still gates completion. Missing profile support is a
+  runtime limitation, not permission to invoke a prohibited provider. Record
+  actual reviewer identity; never manufacture a Claude verdict.
+
 - Keep one canonical run packet with the objective, constraints, non-goals,
   scoped files, base revision, decisions, acceptance checks, and artifact IDs.
 - Give every delegated lane one bounded question and one output contract. Return
