@@ -81,6 +81,34 @@
   .ok:not(.btn) { color:var(--safe); }
   .warn:not(.btn) { color:var(--danger); }
   .status-pill { border:1px solid var(--border); border-radius:999px; padding:2px 8px; white-space:nowrap; background:rgba(255,255,255,.025); }
+  .task-dialog { width:min(1120px,96vw); max-width:96vw; }
+  .task-dialog [hidden] { display:none !important; }
+  .task-dialog .dlg-body { max-height:78vh; overflow:auto; }
+  .task-intro { color:var(--muted); margin:0 0 16px; max-width:74ch; }
+  .task-composer { background:var(--panel-2); border:1px solid var(--border); border-radius:10px; padding:14px; margin-bottom:16px; }
+  .task-composer label, .task-filter label { display:flex; flex-direction:column; gap:5px; color:var(--muted); font-size:12px; min-width:0; }
+  .task-composer input, .task-composer select, .task-composer textarea, .task-filter input, .task-filter select { width:100%; min-width:0; background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:8px; font:inherit; }
+  .task-composer textarea { min-height:88px; resize:vertical; }
+  .task-fields { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin:12px 0; }
+  .task-actions, .task-filter { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .task-filter { margin:12px 0; }
+  .task-filter label:first-child { flex:1; min-width:140px; }
+  .task-actions .primary { background:#245c8f; border-color:#4184bd; }
+  .task-plan, .task-notice { border-left:3px solid var(--accent); padding:10px 12px; background:var(--panel-2); border-radius:4px; margin-top:10px; overflow-wrap:anywhere; white-space:pre-wrap; }
+  .task-notice { border-color:var(--warn); }
+  #tasks-stats { font-size:16px; font-weight:600; }
+  #tasks-breakdown, #tasks-refresh-status { color:var(--muted); margin-top:4px; }
+  .task-table-wrap { overflow:auto; }
+  .task-table { width:100%; border-collapse:collapse; text-align:left; }
+  .task-table th { color:var(--muted); font-size:11px; font-weight:600; }
+  .task-table th, .task-table td { padding:10px 8px; border-bottom:1px solid var(--border); vertical-align:top; }
+  .task-table td:nth-child(3) { min-width:150px; max-width:340px; overflow-wrap:anywhere; }
+  .task-table small { display:block; color:var(--muted); margin-top:4px; }
+  .task-detail-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin:16px 0; }
+  .task-detail-grid dt { color:var(--muted); font-size:11px; }
+  .task-detail-grid dd { margin:3px 0 0; overflow-wrap:anywhere; white-space:pre-wrap; }
+  .task-output { padding:14px; background:var(--bg); border:1px solid var(--border); border-radius:8px; white-space:pre-wrap; overflow-wrap:anywhere; font:12px/1.6 ui-monospace,Consolas,monospace; max-height:48vh; overflow:auto; }
+  @media (max-width:600px) { .task-fields, .task-detail-grid { grid-template-columns:1fr; } .task-dialog .dlg-body { padding:12px; } .task-table th:nth-child(4), .task-table td:nth-child(4) { display:none; } .task-table th, .task-table td { padding:8px 4px; } .task-table td:nth-child(3) { min-width:90px; } .task-table .btn { padding:6px; } }
   .team-summary { display:grid; grid-template-columns:repeat(4,minmax(120px,1fr)); gap:8px; margin-bottom:14px; }
   .team-card { background:var(--panel-2); border:1px solid var(--border); border-radius:8px; padding:10px; box-shadow:0 1px 0 rgba(255,255,255,.03) inset; }
   .team-card strong { display:block; font-size:18px; margin-top:2px; }
@@ -420,20 +448,36 @@
   </div>
 </dialog>
 
-<dialog id="tasks-dialog" style="min-width:min(880px,94vw);">
-  <div class="dlg-head"><strong>⏳ Background tasks</strong><button class="btn" id="tasks-close-btn">Close</button></div>
-  <div class="dlg-body" style="max-height:70vh; overflow:auto;">
-    <div class="muted" style="margin-bottom:8px;">Submitted work runs in the background and is stored on disk, so it can be collected from any surface long after the tab that started it is gone.</div>
-    <div style="display:flex; gap:6px; margin-bottom:8px; flex-wrap:wrap;">
-      <select id="task-kind" style="min-width:150px;"></select>
-      <input id="task-prompt" placeholder="Prompt to run in the background" style="flex:1; min-width:260px;">
-      <input id="task-collab" placeholder="collab id (optional)" style="width:150px;">
-      <button class="btn" id="task-submit">Submit</button>
-      <button class="btn" id="task-refresh">Refresh</button>
+<dialog id="tasks-dialog" class="task-dialog" aria-labelledby="tasks-heading">
+  <div class="dlg-head"><strong id="tasks-heading">Background tasks</strong><button class="btn" id="tasks-close-btn">Close</button></div>
+  <div class="dlg-body">
+    <p class="task-intro">Plan a request, follow its progress, and collect the result from any surface. Saved tasks retain their execution state; uncertain work requires an ownership check.</p>
+    <div class="task-composer">
+      <label for="task-prompt">What should the AI deliver?<textarea id="task-prompt" placeholder="Describe the outcome, constraints, and what a useful answer should include."></textarea></label>
+      <div class="task-fields">
+        <label for="task-kind">Provider<select id="task-kind"></select></label>
+        <label for="task-collab">Conversation ID (optional)<input id="task-collab" autocomplete="off" placeholder="Attach the result to an existing conversation"></label>
+      </div>
+      <details><summary>Model and workspace settings</summary><div class="task-fields">
+        <label for="task-model-tier">Model tier<select id="task-model-tier"><option value="">Automatic</option><option value="light">Light</option><option value="standard">Standard</option><option value="heavy">Heavy</option></select></label>
+        <label for="task-effort">Requested effort<select id="task-effort"><option value="">Provider default</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></label>
+        <label for="task-cwd">Workspace (optional)<input id="task-cwd" placeholder="Use the bridge's configured workspace" autocomplete="off"></label>
+      </div></details>
+      <div class="task-actions"><button class="btn" id="task-preview">Preview plan</button><button class="btn primary" id="task-submit">Submit task</button><span class="muted">Preview uses no model calls.</span></div>
+      <div id="task-plan" class="task-plan" role="status" hidden></div>
+      <div id="task-submit-status" role="status" class="muted"></div>
     </div>
-    <div id="tasks-stats" class="muted" style="margin-bottom:6px;"></div>
-    <div id="tasks-list">Loading…</div>
+    <div id="tasks-stats" role="status"></div><div id="tasks-breakdown"></div>
+    <div id="tasks-held" class="task-notice" hidden></div>
+    <div class="task-filter"><label for="task-search">Search recent tasks<input id="task-search" type="search" placeholder="Title, provider or task ID"></label><label for="task-filter">State<select id="task-filter"><option value="">All states</option><option value="queued">Queued</option><option value="running">Running</option><option value="done">Completed</option><option value="failed">Failed</option><option value="cancelled">Cancelled</option><option value="interrupted">Interrupted</option></select></label><button class="btn" id="task-refresh">Refresh</button></div>
+    <div id="tasks-refresh-status" role="status">Loading…</div>
+    <div id="tasks-list" class="task-table-wrap"><table class="task-table"><thead><tr><th scope="col">State</th><th scope="col">Provider</th><th scope="col">Task</th><th scope="col">Created</th><th scope="col">Actions</th></tr></thead><tbody id="tasks-rows"></tbody></table><p id="tasks-empty" class="muted" hidden>No matching tasks in the latest 40 records.</p></div>
   </div>
+</dialog>
+
+<dialog id="task-detail-dialog" class="task-dialog" aria-labelledby="task-detail-heading">
+  <div class="dlg-head"><strong id="task-detail-heading" tabindex="-1">Task details</strong><button class="btn" id="task-detail-close">Close</button></div>
+  <div class="dlg-body"><div class="task-actions"><button class="btn" id="task-detail-refresh">Refresh details</button><span id="task-detail-status" role="status"></span></div><div id="task-detail-verdict" class="task-notice"></div><dl id="task-detail-fields" class="task-detail-grid"></dl><div id="task-detail-explanation" class="task-notice" hidden></div><p id="task-detail-output-notice" class="muted"></p><pre id="task-detail-output" class="task-output" tabindex="0" aria-label="Retained task output"></pre></div>
 </dialog>
 
 <dialog id="github-dialog" style="min-width:min(860px,94vw);">
@@ -540,6 +584,7 @@
 
 <script src="/vendor/xterm/lib/xterm.js"></script>
 <script src="/vendor/xterm-addon-fit/lib/addon-fit.js"></script>
+<script src="/dashboard-state.js"></script>
 <script>
 const API = location.origin;
 const ONE_SHOT_DEFAULT_TIMEOUT_MS = __ONE_SHOT_DEFAULT_TIMEOUT_MS__;
@@ -2795,53 +2840,205 @@ $('#operator-quota-clear')?.addEventListener('click', async () => {
 
 // ---- Tasks panel ----------------------------------------------------------
 const tasksDialog = $('#tasks-dialog');
-let tasksTimer = null;
+const taskDetailDialog = $('#task-detail-dialog');
+const dashboard = window.RelayBridgeDashboardState;
+const tasksGate = dashboard.createRequestGate();
+const detailGate = dashboard.createRequestGate();
+let tasksTimer = null, taskSnapshots = new Map(), taskPreview = null;
+let detailTaskId = null, detailOpener = null;
+const taskDate = value => Number.isFinite(value) ? new Date(value).toLocaleString() : 'Unknown';
+for (const dialog of [tasksDialog, taskDetailDialog]) dialog.addEventListener('keydown', event => {
+  if (event.key !== 'Tab') return;
+  const controls = [...dialog.querySelectorAll('button, input, textarea, select, summary, [tabindex]')]
+    .filter(el => el.tabIndex >= 0 && !el.disabled && el.getClientRects().length);
+  if (!controls.length) return;
+  const index = controls.indexOf(document.activeElement);
+  if (index === -1 || event.shiftKey && index === 0 || !event.shiftKey && index === controls.length - 1) {
+    event.preventDefault(); controls[event.shiftKey ? controls.length - 1 : 0].focus();
+  }
+});
+
 function taskBadge(s){
   const c = {done:'#4ade80', failed:'#f87171', running:'#facc15', queued:'#94a3b8', cancelled:'#94a3b8', interrupted:'#fb923c'}[s] || '#94a3b8';
   return `<span style="color:${c}">●</span> ${esc(s)}`;
 }
+function renderTaskRows() {
+  const tbody = $('#tasks-rows');
+  const focusedControl = tbody.contains(document.activeElement) ? document.activeElement : null;
+  const query = $('#task-search').value.trim().toLowerCase();
+  const filter = $('#task-filter').value;
+  const selected = [...taskSnapshots.values()].map(dashboard.taskRowModel).filter(t =>
+    (!filter || t.status === filter) && (!query || [t.id,t.title,t.kind].join(' ').toLowerCase().includes(query)));
+  const existing = new Map([...tbody.children].map(row => [row.dataset.taskId, row]));
+  let cursor = tbody.firstElementChild;
+  for (const task of selected) {
+    let row = existing.get(task.id);
+    if (!row) {
+      row = document.createElement('tr'); row.dataset.taskId = task.id;
+      for (let i = 0; i < 5; i++) row.appendChild(document.createElement('td'));
+      const open = document.createElement('button'); open.className = 'btn'; open.textContent = 'View';
+      open.dataset.taskOpen = task.id;
+      open.addEventListener('click', () => openTaskDetails(task.id, open));
+      const cancel = document.createElement('button'); cancel.className = 'btn'; cancel.textContent = 'Cancel';
+      cancel.dataset.taskCancel = task.id;
+      cancel.addEventListener('click', async () => {
+        cancel.disabled = true;
+        try { await api('/api/tasks/' + encodeURIComponent(task.id) + '/cancel', { method:'POST', body:'{}' }); await refreshTasks(); }
+        catch (error) { $('#tasks-refresh-status').textContent = 'Cancel failed: ' + error.message; }
+        finally { cancel.disabled = false; }
+      });
+      row.children[4].append(open, document.createTextNode(' '), cancel);
+    }
+    const statusHtml = taskBadge(task.status) + (task.reason ? `<small>${esc(task.reason)}</small>` : '');
+    if (row.children[0].innerHTML !== statusHtml) row.children[0].innerHTML = statusHtml;
+    if (row.children[1].textContent !== task.kind) row.children[1].textContent = task.kind;
+    const titleHtml = `${esc(task.title)}<small>${esc(task.id)}</small>${task.status === 'queued' && task.nextAttemptAt ? `<small>Eligible after ${esc(taskDate(task.nextAttemptAt))}</small>` : ''}`;
+    if (row.children[2].innerHTML !== titleHtml) row.children[2].innerHTML = titleHtml;
+    const date = taskDate(task.createdAt);
+    if (row.children[3].textContent !== date) row.children[3].textContent = date;
+    const [open, cancel] = row.children[4].querySelectorAll('button');
+    open.setAttribute('aria-label', 'View ' + task.title); cancel.setAttribute('aria-label', 'Cancel ' + task.title);
+    if (!task.canCancel && document.activeElement === cancel) open.focus();
+    cancel.hidden = !task.canCancel;
+    // Do not move a focused row merely to re-append an unchanged list.
+    if (row !== cursor) tbody.insertBefore(row, cursor);
+    cursor = row.nextElementSibling; existing.delete(task.id);
+  }
+  for (const row of existing.values()) {
+    if (row.contains(document.activeElement)) $('#task-search').focus();
+    row.remove();
+  }
+  $('#tasks-empty').hidden = selected.length > 0;
+  if (focusedControl?.isConnected && document.activeElement !== focusedControl && tasksDialog.open && !taskDetailDialog.open) {
+    focusedControl.focus({ preventScroll:true });
+  }
+}
 async function refreshTasks(){
+  if (!tasksGate.isOpen() || !tasksDialog.open) return;
+  const ticket = tasksGate.begin();
   try {
     const { tasks, stats } = await api('/api/tasks?limit=40');
-    $('#tasks-stats').textContent = `${stats.active} running · ${stats.queued} queued · cap ${stats.maxConcurrent}`;
-    $('#tasks-list').innerHTML = tasks.length ? '<table style="width:100%;font-size:12px;">' +
-      '<tr class="muted"><th align="left">status</th><th align="left">seat</th><th align="left">title</th><th align="left">when</th><th></th></tr>' +
-      tasks.map(t => `<tr><td>${taskBadge(t.status)}</td><td>${esc(t.kind)}</td><td title="${esc(t.title)}">${esc((t.title||'').slice(0,60))}</td><td>${esc(new Date(t.createdAt).toLocaleTimeString())}</td>
-        <td><button class="btn" data-task-open="${esc(t.id)}">View</button>${['queued','running'].includes(t.status)?` <button class="btn" data-task-cancel="${esc(t.id)}">Cancel</button>`:''}</td></tr>`).join('') + '</table>'
-      : '<div class="muted">No tasks yet. Submit one above — it keeps running if you close this tab.</div>';
-    $('#tasks-list').querySelectorAll('[data-task-open]').forEach(b => b.addEventListener('click', async () => {
-      try { const t = await api('/api/tasks/' + encodeURIComponent(b.getAttribute('data-task-open')));
-        alert(`${t.id} — ${t.status}\nseat: ${t.kind}${t.collab?'\ncollab: '+t.collab:''}\n\n${(t.result || t.error || '(no output yet)').slice(0,3000)}`);
-      } catch (err) { alert('Could not load task: ' + err.message); }
-    }));
-    $('#tasks-list').querySelectorAll('[data-task-cancel]').forEach(b => b.addEventListener('click', async () => {
-      try { await api('/api/tasks/' + encodeURIComponent(b.getAttribute('data-task-cancel')) + '/cancel', { method:'POST', headers:{'Content-Type':'application/json'}, body:'{}' }); refreshTasks(); }
-      catch (err) { alert('Cancel failed: ' + err.message); }
-    }));
-  } catch (err) { $('#tasks-list').innerHTML = '<div class="muted">'+esc(err.message)+'</div>'; }
+    if (!tasksGate.current(ticket)) return;
+    if (!Array.isArray(tasks) || !stats || typeof stats !== 'object') throw new Error('Incomplete queue snapshot');
+    const model = dashboard.queueStatsModel(stats);
+    $('#tasks-stats').textContent = model.summary; $('#tasks-breakdown').textContent = model.detail;
+    $('#tasks-held').textContent = model.notice; $('#tasks-held').hidden = !model.notice;
+    taskSnapshots = new Map(tasks.map(task => [task.id, task])); renderTaskRows();
+    $('#tasks-refresh-status').textContent = 'Updated ' + new Date().toLocaleTimeString() + ' · latest 40 records';
+  } catch (error) {
+    if (tasksGate.current(ticket)) $('#tasks-refresh-status').textContent = 'Snapshot may be stale. Refresh failed: ' + error.message;
+  }
+}
+function closeTasksPanel() {
+  tasksGate.close();
+  if (tasksTimer) clearInterval(tasksTimer);
+  tasksTimer = null;
 }
 async function openTasksPanel(){
-  if (typeof tasksDialog.showModal === 'function') tasksDialog.showModal(); else tasksDialog.setAttribute('open','true');
-  try { const { agents } = await api('/api/agents');
-    $('#task-kind').innerHTML = (agents||[]).filter(a=>a.id!=='powershell').map(a=>`<option value="${esc(a.id)}">${esc(a.label||a.id)}</option>`).join('');
-  } catch {}
-  refreshTasks();
-  if (tasksTimer) { clearInterval(tasksTimer); tasksTimer = null; } // see openGithubPanel: a reopen must not orphan the old poller
-  tasksTimer = setInterval(refreshTasks, 4000);
+  if (tasksDialog.open) return;
+  const epoch = tasksGate.open();
+  tasksDialog.showModal();
+  refreshTasks(); tasksTimer = setInterval(refreshTasks, 4000);
+  try {
+    const { agents } = await api('/api/agents');
+    if (!tasksGate.isOpen(epoch) || !tasksDialog.open) return;
+    const selected = $('#task-kind').value;
+    $('#task-kind').innerHTML = (agents || []).filter(a => a.id !== 'powershell').map(a => `<option value="${esc(a.id)}">${esc(a.label || a.id)}</option>`).join('');
+    if ([...$('#task-kind').options].some(option => option.value === selected)) $('#task-kind').value = selected;
+    invalidateTaskPreview();
+  } catch (error) { if (tasksGate.isOpen(epoch)) $('#task-submit-status').textContent = 'Provider list unavailable: ' + error.message; }
+}
+function detailFields(model) {
+  const correlation = model.correlation && typeof model.correlation === 'object' ? model.correlation : {};
+  return [['Task ID', model.id], ['Provider / state', model.kind + ' / ' + model.status],
+    ['Execution', model.execution.label], ['Queue reason', model.reason || 'None reported'],
+    ['Eligible after', model.nextAttemptAt === null ? 'Not deferred' : taskDate(model.nextAttemptAt)],
+    ['Dependencies', model.dependsOn.join(', ') || 'None'], ['Requirements', model.requirementIds.join(', ') || 'None recorded'],
+    ['Exit code', model.exitCode === null ? 'Not reported' : String(model.exitCode)],
+    ['Receipt', model.receiptId || 'Not reported'], ['Request correlation', Object.entries(correlation).map(([key,value]) => key + ': ' + String(value)).join('\n') || 'Not reported']];
+}
+async function refreshTaskDetails() {
+  if (!detailGate.isOpen() || !detailTaskId) return;
+  const id = detailTaskId, ticket = detailGate.begin();
+  try {
+    const task = await api('/api/tasks/' + encodeURIComponent(id));
+    if (!detailGate.current(ticket) || id !== detailTaskId) return;
+    const model = dashboard.taskDetailModel(task, taskSnapshots.get(id));
+    $('#task-detail-heading').textContent = model.title;
+    $('#task-detail-fields').innerHTML = detailFields(model).map(([key,value]) => `<div><dt>${esc(key)}</dt><dd>${esc(value)}</dd></div>`).join('');
+    $('#task-detail-verdict').textContent = model.verdictNotice;
+    const explanation = [model.failureClass, model.explanation, model.error, model.nextAction].filter(Boolean).join('\n\n');
+    $('#task-detail-explanation').textContent = explanation; $('#task-detail-explanation').hidden = !explanation;
+    $('#task-detail-output').textContent = model.output || '(No retained output yet.)';
+    $('#task-detail-output-notice').textContent = model.outputNotice;
+    $('#task-detail-status').textContent = 'Updated ' + new Date().toLocaleTimeString();
+  } catch (error) { if (detailGate.current(ticket)) $('#task-detail-status').textContent = 'Details may be stale: ' + error.message; }
+}
+function openTaskDetails(id, opener) {
+  detailTaskId = id; detailOpener = opener; detailGate.open();
+  $('#task-detail-heading').textContent = 'Task details'; $('#task-detail-fields').replaceChildren();
+  $('#task-detail-output').textContent = ''; $('#task-detail-output-notice').textContent = '';
+  $('#task-detail-explanation').hidden = true; $('#task-detail-verdict').textContent = 'Loading task evidence…';
+  $('#task-detail-status').textContent = '';
+  taskDetailDialog.showModal(); $('#task-detail-heading').focus(); refreshTaskDetails();
+}
+function taskDraft() {
+  const body = { kind: $('#task-kind').value, prompt: $('#task-prompt').value.trim(), source:'dashboard', dangerous:false };
+  for (const [id, key] of [['task-collab','collab'],['task-cwd','cwd'],['task-model-tier','modelTier'],['task-effort','effort']]) {
+    const value = $('#' + id).value.trim(); if (value) body[key] = value;
+  }
+  return body;
+}
+function invalidateTaskPreview() {
+  taskPreview = null; $('#task-plan').hidden = true; $('#task-submit').textContent = 'Submit task';
 }
 $('#tasks-btn')?.addEventListener('click', openTasksPanel);
-$('#tasks-close-btn')?.addEventListener('click', () => { tasksDialog.close(); if(tasksTimer){clearInterval(tasksTimer); tasksTimer=null;} });
-tasksDialog?.addEventListener('cancel', () => { if(tasksTimer){clearInterval(tasksTimer); tasksTimer=null;} });
-$('#task-refresh')?.addEventListener('click', refreshTasks);
-$('#task-submit')?.addEventListener('click', async () => {
-  const prompt = $('#task-prompt').value.trim();
-  if (!prompt) return;
-  const body = { kind: $('#task-kind').value, prompt, source: 'dashboard' };
-  const collab = $('#task-collab').value.trim();
-  if (collab) body.collab = collab;
-  try { await api('/api/tasks', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
-    $('#task-prompt').value = ''; refreshTasks();
-  } catch (err) { alert('Submit failed: ' + err.message); }
+$('#tasks-close-btn').addEventListener('click', () => { closeTasksPanel(); tasksDialog.close(); });
+tasksDialog.addEventListener('close', closeTasksPanel);
+tasksDialog.addEventListener('cancel', closeTasksPanel);
+$('#task-refresh').addEventListener('click', refreshTasks);
+$('#task-search').addEventListener('input', renderTaskRows); $('#task-filter').addEventListener('change', renderTaskRows);
+$('#task-detail-close').addEventListener('click', () => taskDetailDialog.close());
+$('#task-detail-refresh').addEventListener('click', refreshTaskDetails);
+taskDetailDialog.addEventListener('close', () => {
+  detailGate.close(); detailTaskId = null;
+  if (tasksDialog.open) (detailOpener?.isConnected ? detailOpener : $('#task-refresh')).focus();
+  detailOpener = null;
+});
+for (const field of document.querySelectorAll('.task-composer input, .task-composer textarea, .task-composer select')) {
+  field.addEventListener('input', invalidateTaskPreview); field.addEventListener('change', invalidateTaskPreview);
+}
+$('#task-preview').addEventListener('click', async () => {
+  const body = taskDraft(), fingerprint = JSON.stringify(body);
+  if (!body.prompt || !body.kind) { $('#task-submit-status').textContent = 'Enter a task and choose a provider.'; return; }
+  const epoch = tasksGate.begin(); // invalidates an older list response, not the panel lifetime
+  const button = $('#task-preview'); button.disabled = true;
+  try {
+    const plan = await api('/api/plan', { method:'POST', body:JSON.stringify({ ...body, task:body.prompt }) });
+    if (!tasksGate.isOpen(epoch.epoch) || fingerprint !== JSON.stringify(taskDraft())) return;
+    const primary = plan.primary;
+    if (!primary?.execution || primary.blocked || primary.ready === false || primary.validation) throw new Error(primary?.validation?.reason || 'No executable provider plan is available.');
+    taskPreview = { fingerprint, execution:primary.execution, kind:primary.kind };
+    $('#task-plan').textContent = `${primary.kind} · ${primary.execution.model || 'model not reported'}\nTier: ${plan.tier || primary.execution.resolvedTaskTier} · requested effort: ${primary.execution.requestedEffort || 'automatic'} · applied effort: ${primary.execution.appliedEffort || 'not controlled'}\n${primary.execution.effortFallbackReason || 'Exact model and effort settings will be validated again on submission.'}`;
+    $('#task-plan').hidden = false; $('#task-submit').textContent = 'Submit this plan';
+    $('#task-submit-status').textContent = '';
+  } catch (error) { if (tasksGate.isOpen(epoch.epoch)) $('#task-submit-status').textContent = 'Preview failed: ' + error.message; }
+  finally { button.disabled = false; }
+});
+$('#task-submit').addEventListener('click', async () => {
+  const body = taskDraft(); if (!body.prompt || !body.kind) { $('#task-submit-status').textContent = 'Enter a task and choose a provider.'; return; }
+  const fingerprint = JSON.stringify(body), epoch = tasksGate.begin().epoch;
+  if (taskPreview && taskPreview.fingerprint === JSON.stringify(body)) { body.execution = taskPreview.execution; body.kind = taskPreview.kind; }
+  const button = $('#task-submit'); button.disabled = true;
+  try {
+    const task = await api('/api/tasks', { method:'POST', body:JSON.stringify(body) });
+    if (tasksGate.isOpen(epoch) && fingerprint === JSON.stringify(taskDraft())) {
+      $('#task-prompt').value = '';
+      invalidateTaskPreview(); $('#task-submit-status').textContent = 'Submitted ' + task.id + '. Follow its state below.';
+    }
+    refreshTasks();
+  } catch (error) { if (tasksGate.isOpen(epoch) && fingerprint === JSON.stringify(taskDraft())) $('#task-submit-status').textContent = 'Submit failed: ' + error.message; }
+  finally { button.disabled = false; }
 });
 $('#github-close-btn')?.addEventListener('click', () => { githubDialog.close(); if (githubTimer){clearInterval(githubTimer); githubTimer=null;} });
 githubDialog?.addEventListener('cancel', () => { if (githubTimer){clearInterval(githubTimer); githubTimer=null;} });
