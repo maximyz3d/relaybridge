@@ -95,3 +95,23 @@ deployment completion is claimed. Open issues are not closed by this inventory.
 Next bounded passes cover result delivery/inert status, provider failure and
 readiness accuracy, then cross-surface validation. Changes are committed in
 independently testable slices; unqualified recovery/containment remains blocked.
+
+## Pass 2: inert status and local-review routing
+
+MCP run listings now retain the recorded status and file bytes. An overdue
+progress horizon is returned only as a diagnostic with unknown execution state;
+it does not rewrite a run as interrupted or release any resource. A regression
+checks repeated list/read calls against exact bytes and mtimes for overdue,
+legacy, invalid-deadline, future and completed records.
+
+The first production-mode Astra review preflight exposed an existing routing
+false positive: local code-review prompts mentioning current source/research
+handoffs/evidence were classified as external research. Root narrowed that
+heuristic while retaining explicit web/official-document retrieval gates. The
+failed preflight invoked no model; receipt `rcpt_mtssmpo3_92f73f57`, request
+`astra-review-d27453dc-901d-496a-a6c7-3105782c744e`, reports validation failure,
+zero physical attempts and not-invoked usage. An earlier malformed planning
+request also failed before invocation. Neither is review evidence.
+
+All 18 focused router/status tests passed, including genuine external-retrieval
+negatives. Live review is still pending. The shared bridge was unchanged.

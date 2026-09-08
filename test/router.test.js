@@ -9,6 +9,28 @@ test.before(async () => {
   router = await import('../mcp/router.mjs');
 });
 
+test('local code evidence remains code review while explicit outside-source work retains retrieval gates', () => {
+  for (const task of [
+    'Audit current server.js source and cite file/line evidence.',
+    'Review the code against the research handoff and verification evidence.',
+    'Review the git diff in this worktree; record current source lines and test evidence.',
+  ]) {
+    const result = router.routeTask({ task, diagnostics: readyDiagnostics(), preferredProviders: ['codex'] });
+    assert.equal(result.primaryTag, 'code_review', task);
+    assert.equal(result.candidates.find((r) => r.kind === 'codex').eligible, true, task);
+    assert.equal(result.classification.tags.includes('research'), false, task);
+  }
+  for (const task of [
+    'Review server.js against the latest official docs; browse the web and cite sources.',
+    'Audit app.js and research the current official documentation.',
+    'Review code and find external sources for protocol compatibility.',
+  ]) {
+    const result = router.routeTask({ task, diagnostics: readyDiagnostics(), preferredProviders: ['codex'] });
+    assert.equal(result.primaryTag, 'research', task);
+    assert.equal(result.candidates.find((r) => r.kind === 'codex').eligible, false, task);
+  }
+});
+
 test('substantive short planning, collaboration and decisions do not fall to the utility tier', () => {
   for (const task of [
     'Plan a robust caching implementation with eviction correctness and testable acceptance criteria.',
