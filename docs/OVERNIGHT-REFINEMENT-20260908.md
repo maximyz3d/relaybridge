@@ -197,5 +197,127 @@ Independent native read-only re-review reported no remaining material findings.
 There is **NO VERDICT on authenticated Grok/Gemini usability or complete native
 filesystem enforcement**. No paid API or credential changes were attempted.
 
-Final suite results, reviewed SHAs and closing verdicts will be recorded here
-when obtained. No overnight completion claim yet.
+
+## Pass 4 — cross-area checks and measured limitations
+
+Short substantive planning, collaboration and constrained decisions now reach
+standard reasoning without relaxing critical/destructive or deterministic
+routing gates. Paired action/criteria checks preserve simple scheduling and
+word-definition cases. Native re-review identified and root fixed overly broad
+meeting/calendar/terms exclusions and polite-request wrapper omissions.
+The routing suite passed 16/16. Version-only authentication refreshes now say
+that authentication is unverified, or use the configured probe detail; a
+successful version probe still cannot clear a durable live auth failure.
+The existing linked-account regression verifies both presentation and authority.
+
+### Evaluation method and earlier regressions
+
+Initial exploratory samples used the older shared bridge build
+`2.0.1+c3c865c097afa2e8`, which launches Claude in plan mode. Both conditions
+included a no-tools/no-files instruction. The planner-style output complained
+about unavailable Write access; that statement is not proof of a tool attempt.
+These samples exposed verbosity and evidence-language regressions and are
+retained below, not combined with the later current-code comparison.
+
+| Case | Baseline words / receipt | Profiled words / receipt | Limit |
+| --- | --- | --- | --- |
+| cache-race | 119 / `rcpt_mts7zj0h_4fd17f33` | 172 / `rcpt_mts7znhv_4db69d89` | 140 |
+| handoff-plan | 188 / `rcpt_mts84lsy_aff3caa0` | 162 / `rcpt_mts8516t_8bb63fa0` | 160 |
+
+The profiled pseudocode answer called its deduction reproduced; the plan added
+unnecessary architecture and proposed a rollback that dropped required retry.
+Root revised the criteria and rubric. Rubric version 1 remains in Git history;
+version 2 separates word limits, evidence honesty and required behavior.
+
+The controlled comparisons below used disposable current-code RelayBridge
+instances: production identity validation, fresh private data/token/port,
+empty GitHub enrollment registry, discovery and warm probes disabled, and only
+the current Claude configuration. No task or workflow was created or replayed.
+Each instance was shut down after its own calls. The installed shared bridge
+was not restarted. Existing subscription authentication was used without
+copying or changing credentials; this is shared account usage, not a new quota.
+
+Every pair used the same original prompt, no-tools preamble, Sonnet alias,
+standard tier, medium effort, 180-second timeout and requested budgets
+(output 4,000, total 120,000, cache read 100,000, cache creation 30,000, turns 2).
+Only the optional profile differed. Calls were sequential and order alternated
+by case. The observed model was `claude-sonnet-5`; all 20 current-code calls
+exited zero without a classified failure. Transport completion is distinct from
+answer acceptance. No automatic answer truncation or rewrite concealed failures.
+Configuration SHA-256 for both runs:
+`ca56bd51319ee2317174cae803c8dc05b0943ab14b1e3c28050f33284b327907`.
+Rubric v2 canonical JSON SHA-256:
+`d71f70bd1c46a5d6d855f8f207d6c59b5de1abb89b469b547641da6d759e4cdd`.
+Private result packets preserve request/attempt tuples and prompt/output hashes;
+raw responses, credentials and runtime stores are excluded from this handoff.
+
+### Six-case comparison
+
+Head `de9000e09024f8860acda5ed5ee8dc453aaf8642`, build `2.0.1+a62b4e7477e7687f`,
+receipt store `66dd496010feb0bdc549de0a0eb2df9651aaa142c823c97253e4dad8d82a747b`.
+
+| Case | Baseline words / receipt | Profiled words / receipt |
+| --- | --- | --- |
+| cache-race | 110 / `rcpt_mts8u080_7136d820` | 122 / `rcpt_mts8u3sb_405fd361` |
+| handoff-plan | 155 / `rcpt_mts8ue9q_81944705` | 140 / `rcpt_mts8u8tg_e026b8a7` |
+| queue-design-choice | 134 / `rcpt_mts8ukbs_63c5afb5` | 160 / `rcpt_mts8uovn_6ed7190d` |
+| source-gap | 79 / `rcpt_mts8uwth_17b08881` | 80 / `rcpt_mts8utut_89cb6b7b` |
+| review-disagreement | 96 / `rcpt_mts8v01e_371c6746` | 89 / `rcpt_mts8v3rq_3d7bcd33` |
+| dialog-friction | 108 / `rcpt_mts8vb9p_36fb7fe5` | 114 / `rcpt_mts8v79c_34add25f` |
+
+### Bounded four-case recheck after criteria changes
+
+Head `aa8e6960e98216b90a13da91f86f1189455c164c`, build `2.0.1+b9f3cb20a323ea5b`,
+receipt store `90b253bd8b9f4012558e38069f95d0b5edaf55af35bf186d48f0175122d86b00`.
+
+| Case | Baseline words / receipt | Profiled words / receipt |
+| --- | --- | --- |
+| cache-race | 126 / `rcpt_mts90xcn_283c54c5` | 171 / `rcpt_mts911oi_e356763b` |
+| handoff-plan | 145 / `rcpt_mts91dc0_fb6f109f` | 163 / `rcpt_mts918dd_c642e62d` |
+| queue-design-choice | 111 / `rcpt_mts91h0z_7ea3b6d0` | 119 / `rcpt_mts91m3n_f0074e6a` |
+| dialog-friction | 105 / `rcpt_mts91sst_b3b30c91` | 85 / `rcpt_mts91ppn_02d1ad75` |
+
+The six-case outputs were assessed with condition labels blinded by a separate
+Codex call: configured `gpt-5.6-terra`, high effort; no observed model revision,
+usage or provider terminal reason was reported. Receipt
+`rcpt_mts8wovb_fefedd65`, transport receipt `rcpt_mts8xejb_77980ad6`,
+request/invocation `mcp:360430b0-ce4b-47e0-b306-ed6a7297f329`, attempt suffix
+`:attempt:1`. Exit zero, one physical invocation, nonpartial complete JSON
+covering all six cases; answer SHA-256
+`03cbfbbd7117b031bf8d8fffb2b6fcf1a007720ef4bcadd63e5c262da37f3343`.
+Requested provider budget enforcement was unavailable for this Codex adapter;
+the process timeout and read-only mode were still configured. This is an
+advisory assessment, not a closing code-review verdict.
+
+Its criterion totals were baseline 52/58 and profiled 51/58, with two accepted
+answers per condition. It preferred baseline for planning/UI, profiled for
+collaboration, and tied the other three. Root retained the scores and their
+limits: the collaboration replay distinction is an assessor interpretation,
+not proof that any execution occurred. The code samples omitted rejected-promise
+cleanup; the planning sample did not first establish the shared contract.
+The decision and UI profiled samples exceeded their explicit limits.
+
+Root tightened the decision/UI guidance and added failure-path and shared-
+contract criteria. The recheck delivered the intended cleanup and contract
+content and brought decision/UI below their limits, but coding (171/140) and
+planning (163/160) still breached explicit limits. The planning answer still
+proposed job infrastructure without establishing it was necessary. This
+recheck is root inspection, not another blinded score or a reliable gain estimate.
+No aggregate model-quality or general improvement claim follows from these
+small, adaptive samples. Profiles remain opt-in and cannot certify length,
+correctness, approval or acceptance; omit them when the original request
+already supplies sufficient criteria. Required-output checking remains an
+agent/reviewer responsibility. No automatic quality scoring store was added.
+
+## Closing validation
+
+Implementation head `aa8e6960e98216b90a13da91f86f1189455c164c` passed
+`npm test`: 1,014 tests, 1,009 passed, zero failed, five skipped (optional
+browser fixture, skill installer and three native Windows cases). A separate
+actual Chromium run passed all six dashboard tests, including the normally
+skipped browser fixture. `npm audit --omit=dev` reported zero vulnerabilities.
+Both changed/new skill manifests passed the skill validator. `git diff --check`
+passed. Native Windows acceptance belongs to the exact-head GitHub Windows job.
+Fresh Claude review evidence and final CI results will be appended when complete.
+No unattended-ready, native-provider-ready, recovery/controller/goal completion
+or deployment claim is made by this record.

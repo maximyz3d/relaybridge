@@ -5,6 +5,9 @@ and executing it. The original request still controls scope, audience and
 length. The six locally authored profiles cover coding/debugging, planning,
 research, decisions, collaboration and UI critique. They are optional; calls
 without a selection preserve their existing prompt bytes and cache behavior.
+Small paired evaluations found both useful changes and regressions, including
+breached word limits. Omit a profile when the original request already supplies
+sufficient criteria, and check the answer against its actual requirements.
 
 ## Use a profile
 
