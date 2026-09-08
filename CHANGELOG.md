@@ -1,3 +1,6 @@
+## v2.2.0 - 2026-09-08
+- #118 Kickoff integration: provider hardening and Fable-reviewed owner foundation
+
 ## v2.1.7 - 2026-09-08
 - #125 fix(integration): preserve execution contracts with durable queue delegation
 
