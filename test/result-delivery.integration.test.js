@@ -20,6 +20,16 @@ test('REST queued delivery returns before execution, retrieves exact sanitized b
     } };
   }, { env: { RELAYBRIDGE_WARM_DIAG: '0', RELAYBRIDGE_REMOTE_MCP: '0' } });
   const body = { deliveryMode: 'queued', taskId: 't_a', kind: 'codex', prompt: 'Return the fixture response.', cwd: bridge.root };
+  // Coercible IDs must fail before storage/admission. Otherwise collection can
+  // reject the original JSON type after a stringified task becomes runnable.
+  for (const taskId of [['t_schema_probe'], null, 123, {}, true]) {
+    const rejected = await bridge.request('/api/tasks', { ...body, taskId });
+    assert.equal(rejected.status, 400, JSON.stringify(rejected.body));
+    assert.equal(rejected.body.code, 'INVALID_DELIVERY');
+    assert.equal(rejected.body.model_invocation, false);
+  }
+  assert.deepEqual(fs.readdirSync(path.join(bridge.root, 'data', 'tasks')).filter(name => name.endsWith('.json')), []);
+  assert.equal(completeJsonLines(capture).length, 0);
   const submitted = await bridge.request('/api/tasks', body);
   assert.equal(submitted.status, 202, JSON.stringify(submitted.body));
   assert.equal(submitted.body.resultState, 'pending');

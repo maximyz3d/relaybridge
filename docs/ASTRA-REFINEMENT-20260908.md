@@ -257,3 +257,45 @@ classification allows bounded multiline/Markdown-list references. The new real
 REST regression proves a corrupted source record cannot redirect a retry to a
 victim result or modify either record. All 84 focused queue/delivery/router/MCP
 checks passed. A fresh closing verdict is still required after these fixes.
+
+### Strict REST task identity correction
+
+The full suite at `11da2429fd3a382116b5e22fa4d650cac1f4bb68` passed:
+1,048 tests, 1,044 passed, zero failed, four platform/optional skips, with both
+Chromium cases enabled. Its subsequent complete isolated Astra review returned
+**REVISE**, exit 0, one invocation, no failure or partial-result flag. It
+confirmed the preceding two fixes and found one additional REST admission
+defect: array task IDs were coerced into storage keys before strict collection
+rejected the original input type. Root now requires a string before admission;
+the real REST regression rejects five malformed JSON types without storing a
+task or invoking a provider. All 65 focused queue/result tests passed.
+
+- Request/invocation: `astra-review-afd15307-81a1-4c13-9be5-dc3c50e0a4f7`.
+- Attempt: `astra-review-afd15307-81a1-4c13-9be5-dc3c50e0a4f7:attempt:1`.
+- Run: `run_mtsv3yon_cd4bd2f7`; receipt: `rcpt_mtsv9uwb_93392a65`.
+- Build: `2.0.1+16f78c0a76b441f0`.
+- Receipt store: `87c0ced827094103b20c00b8130232b89e886d221495e1e08492d57a6008625b`.
+- Complete answer: 2,801 characters; SHA-256
+  `d9eb06a3ea70fc811eb232ed4076b7edb26fb3f245313227adb86712e2acf444`.
+
+Requested/outgoing model was `gpt-6-astra`, requested/applied effort `ultra`,
+with no fallback. Observed model and provider terminal reason remain unknown.
+The isolated runtime was cleaned up. Fresh closing review remains required.
+
+### Current acceptance boundary
+
+These four passes complete bounded refinements, not full R13–R16, unattended
+controller or persistent-goal acceptance. Existing queue/dependency scheduling,
+authenticated request-ledger operations, shutdown hooks and expiry protection
+are integrated as described in `TASK-QUEUE.md`; older handoffs listing those
+hooks as unwired are historical. The new result ACK is not an exactly-once
+consumption or physical-termination proof. Evidence remains attributed
+assertions until goal-level validation and invalidation are qualified.
+
+Retained OS exclusion, durable attempt/effect settlement and the managed
+two-requirement disconnect/restart episode remain open. The six legacy records
+still lack trusted historical task/attempt/host bindings, and stay blocked.
+Native Grok/Gemini usability, inherited-setting/MCP isolation and enforced
+filesystem restrictions are not established by synthetic quota tests. No
+runtime state, credentials, raw transcripts or unrelated changes are included
+in this handoff.
