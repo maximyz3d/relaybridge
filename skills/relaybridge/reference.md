@@ -64,7 +64,7 @@ Response:
 |---|---|
 | `stdout` / `stderr` | Cleaned output. |
 | `exitCode` | Process exit code; `-1` on spawn failure. |
-| `stop_reason` | `null` when the run finished normally; supervisor stops include `idle_stall`, `loop_detected`, `output_cap`, and `hard_cap`; `provider_incomplete_response` means the provider did not return a usable result (future-work narration or a recognized failed-answer sentinel). |
+| `stop_reason` | `null` means no supervisor stop was recorded; also inspect exit status, provider terminal evidence and failure flags. Supervisor stops include `idle_stall`, `loop_detected`, `output_cap`, and `hard_cap`; `provider_incomplete_response` means the provider did not return a usable result (future-work narration or a recognized failed-answer sentinel). |
 | `stop_detail` | Human-readable explanation of the stop. |
 | `progress` | Snapshot: `bytes`, `lines`, `idleMs`, `repeatPeak`, `cpuMs`, `phase`. |
 | `dropped_out` | True when the call did not produce a usable answer. |

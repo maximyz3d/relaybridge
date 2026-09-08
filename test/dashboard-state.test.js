@@ -226,10 +226,13 @@ test('task UI preserves focus, rejects late refreshes, and submits the previewed
   await page.evaluate(() => loadTaskGuidance(tasksGate.begin().epoch));
   await page.locator('#task-output-profile').selectOption(`${firstVersion.id}@1:${firstVersion.digest}`);
   assert.equal(await page.evaluate(() => taskDraft().outputProfile.version), 1);
+  await page.locator('#task-prompt').fill('Keep the exact selected criteria.');
+  await page.locator('#task-preview').click(); await page.locator('#task-plan').waitFor({ state:'visible' });
   profileCatalog = { ...profileCatalog, profiles:[secondVersion] };
   await page.evaluate(() => loadTaskGuidance(tasksGate.begin().epoch));
   assert.deepEqual(await page.evaluate(() => taskDraft().outputProfile), { id:firstVersion.id, version:1, digest:firstVersion.digest });
   assert.match(await page.locator('#task-output-description').innerText(), /no longer/);
+  assert.equal(await page.locator('#task-plan').isVisible(), false);
   await page.locator('#task-output-profile').selectOption(`${secondVersion.id}@2:${secondVersion.digest}`);
   assert.equal(await page.evaluate(() => taskDraft().outputProfile.version), 2);
   profileCatalog = originalProfiles;

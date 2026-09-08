@@ -2973,7 +2973,7 @@ async function loadTaskGuidance(epoch) {
         $('#task-output-profile').innerHTML = '<option value="">Use my request as written</option>' + [...taskOutputProfiles].map(([key,profile]) => `<option value="${esc(key)}">${esc(profile.title)} · v${profile.version}${profile.unavailable ? ' (unavailable)' : ''}</option>`).join('');
         if (taskOutputProfiles.has(selected)) $('#task-output-profile').value = selected;
         renderSelectedTaskGuidance();
-        if (before !== JSON.stringify(taskDraft())) invalidateTaskPreview();
+        if (before !== JSON.stringify(taskDraft()) || taskOutputProfiles.get(selected)?.unavailable) invalidateTaskPreview();
       } catch (error) { if (tasksGate.isOpen(epoch)) $('#task-output-description').textContent = 'Guidance catalog could not refresh. Previously loaded criteria may be stale; submission validates them again.'; }
     })(),
     (async () => {
