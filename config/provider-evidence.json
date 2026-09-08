@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "updatedAt": "2026-09-06",
+  "updatedAt": "2026-09-08",
   "qualificationPolicy": {
     "levels": [
       "discovered",
@@ -9,7 +9,7 @@
       "task_evaluated",
       "benchmark_reproduced"
     ],
-    "rule": "A provider is eligible when its CLI is ready, but capability ranking remains provisional until the exact model, scaffold, tools, and local task family have been evaluated.",
+    "rule": "Provider eligibility requires current readiness, account, filesystem, model and grounding gates. Capability ranking remains provisional until the exact model, scaffold, tools, and task family have been evaluated.",
     "noGlobalScore": true
   },
   "provenancePolicy": {
@@ -378,18 +378,31 @@
       "qualificationEvidence": {"testedAt": "2026-08-10T00:30:00.964Z", "receiptId": "rcpt_msmhvmys_2a781968", "taskFamily": "safe exact-output one-shot connectivity", "runtimeVersion": "Antigravity 1.1.11", "requestedModel": "gemini-3.1-pro-high", "result": "completed", "durationMs": 19170},
       "limitations": ["One exact-output connectivity task is not a comparative quality score", "The provider did not return a resolved remote model identity beyond the requested configured model", "Antigravity one-shot input is capped", "Vision is not an operational MCP capability until an image/path adapter is implemented and receipt-tested"]
     },
+    "gemini_cli": {
+      "autoRoute": false,
+      "family": "google",
+      "costClass": "subscription_quota",
+      "privacyBoundary": "hosted_provider",
+      "modelIdentity": "configured_model_unverified",
+      "qualification": "discovered",
+      "capabilities": ["coding", "reasoning", "general"],
+      "capabilityProvenance": {"coding": "operator_declared", "reasoning": "operator_declared", "general": "operator_declared"},
+      "evidence": [],
+      "references": [],
+      "limitations": ["Distinct native Google Gemini CLI identity; Antigravity receipts do not qualify it", "0.57.0 isolated startup and policy-engine component checks passed; OAuth was unconfigured", "No authenticated answer or enforced RelayBridge launch qualification; safe execution stays blocked", "CLI JSON does not expose an explicit terminal stop reason; telemetry is not complete provider billing or observed-model evidence"]
+    },
     "grok": {
       "family": "xai",
       "costClass": "subscription_quota",
       "privacyBoundary": "hosted_provider",
-      "modelIdentity": "grok-4.5",
-      "qualification": "task_evaluated",
+      "modelIdentity": "grok-4.6_configured_unverified",
+      "qualification": "discovered",
       "capabilities": ["coding", "code_review", "research", "reasoning", "hardware", "general"],
       "capabilityProvenance": {"coding": "operator_declared", "code_review": "operator_declared", "research": "operator_declared", "reasoning": "operator_declared", "hardware": "operator_declared", "general": "operator_declared"},
       "evidence": ["rcpt_msmhvmcx_4fa0b73e"],
       "references": ["terminal_bench", "browsecomp"],
       "qualificationEvidence": {"testedAt": "2026-08-10T00:30:00.177Z", "receiptId": "rcpt_msmhvmcx_4fa0b73e", "taskFamily": "safe exact-output one-shot connectivity", "runtimeVersion": "grok 0.2.106", "resolvedModelIdentity": "grok-4.5", "result": "completed", "durationMs": 18371},
-      "limitations": ["One exact-output connectivity task is not a comparative quality score", "Unrelated plugin warnings can appear on stderr", "No broader RelayBridge task-family score yet"]
+      "limitations": ["The retained 2026-08-10 receipt qualifies only historical grok0.2.106/grok-4.5, not the current runtime/model", "Native 1.0.13 isolated startup passed and returned signed-out JSON; no authenticated final answer was obtained", "Current safe filesystem/MCP/hook enforcement is unverified and safe execution stays blocked", "Candidate JSON success grammar is source-backed but not proven equivalent to the installed binary", "No broader RelayBridge task-family score yet"]
     },
     "perplexity": {
       "family": "perplexity",

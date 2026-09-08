@@ -19,6 +19,7 @@ const { validateProviderBudget } = require('./lib/provider-budget');
 const { promptTransportLimits, preparePrompt, renderPromptSlot } = require('./lib/prompt-transport');
 const { compileOutputProfile, listOutputProfiles, profileError } = require('./lib/output-profiles');
 const { listWorkflowLibrary } = require('./lib/workflow-library');
+const { parseNativeProviderOutput } = require('./lib/provider-output');
 const { resolveProviderControls, validateControlRequest, modelControls } = require('./lib/execution-contract');
 const { validationError } = require('./lib/validation-contract');
 const { normalizeEffort } = require('./lib/effort-controls');
@@ -1919,8 +1920,13 @@ function hasProviderInternalTimeoutDiagnostic(value) {
   return PROVIDER_INTERNAL_TIMEOUT_PATTERNS.some((pattern) => pattern.test(diagnostic));
 }
 
-function parseConfiguredOneShotOutput(entry, rawOutput, { ignoreTerminalResult = false } = {}) {
+function parseConfiguredOneShotOutput(entry, rawOutput, { ignoreTerminalResult = false, stderr = '', exitCode = null } = {}) {
   const parser = String(entry?.oneshot_output_parser || 'text');
+  if (parser === 'grok_json' || parser === 'gemini_cli_json') {
+    const parsed = parseNativeProviderOutput(parser, rawOutput, { ignoreTerminalResult, stderr, exitCode });
+    return { ...parsed, output:cleanOutput(parsed.output), retries:normalizeClaudeRetryEvents([]),
+      permissionDenials:normalizeClaudePermissionDenials([]) };
+  }
   if (parser === 'text') {
     return {
       output: cleanOutput(rawOutput), usage: null, isError: false,
@@ -4827,7 +4833,7 @@ async function executeOneShot(body, res) {
     const semanticStdout = supervisorStdout ?? stdout;
     const transportStdout = stdout + lateStdout;
     const parsedOutput = parseConfiguredOneShotOutput(entry, semanticStdout, {
-      ignoreTerminalResult: stopReason === 'token_budget',
+      ignoreTerminalResult: stopReason === 'token_budget' || ['grok_json','gemini_cli_json'].includes(entry.oneshot_output_parser), stderr,
     });
     const retainedPartial = stopReason === 'token_budget' && !!parsedOutput.partialDiagnostic;
     const checkpoint = stopReason === 'token_budget'
@@ -5028,7 +5034,7 @@ async function executeOneShot(body, res) {
     const semanticStdout = supervisorStdout ?? stdout;
     const transportStdout = stdout + lateStdout;
     let parsedOutput = parseConfiguredOneShotOutput(entry, semanticStdout, {
-      ignoreTerminalResult: stopReason === 'token_budget',
+      ignoreTerminalResult: stopReason === 'token_budget' || !!stopReason && ['grok_json','gemini_cli_json'].includes(entry.oneshot_output_parser), stderr, exitCode:code,
     });
     if (parsedOutput.usage || parsedOutput.numTurns !== null) {
       supervisor.recordProviderUsage({ ...(parsedOutput.usage || {}), turns: parsedOutput.numTurns }, { phase: 'terminal' });
@@ -5047,7 +5053,7 @@ async function executeOneShot(body, res) {
         // suppression the mid-stream same-chunk cutoff applies, so that result
         // can never surface as output, rate-limit prose, or a completed answer.
         if (stopReason === 'token_budget') {
-          parsedOutput = parseConfiguredOneShotOutput(entry, semanticStdout, { ignoreTerminalResult: true });
+          parsedOutput = parseConfiguredOneShotOutput(entry, semanticStdout, { ignoreTerminalResult: true, stderr, exitCode:code });
         }
       }
     }
@@ -5063,7 +5069,11 @@ async function executeOneShot(body, res) {
     const codexProgressTranscript = (kind === 'codex' || entry.npm_package === '@openai/codex')
       && (entry.oneshot_output_parser || 'text') === 'text' && code === 0 && !!cleanedStdout
       && !parsedOutput.isError && !parsedOutput.parseError && !parsedOutput.failureClass && !stopReason;
-    const providerStderr = codexProgressTranscript ? '' : stderr;
+    const nativeStructuredOutput = ['grok_json','gemini_cli_json'].includes(entry.oneshot_output_parser);
+    // Native JSON's diagnostic channel can contain startup/MCP noise. Only
+    // parsed provider error fields establish failure or account authority.
+    const providerStderr = codexProgressTranscript || nativeStructuredOutput ? '' : stderr;
+    const providerFailureDiagnostic = nativeStructuredOutput && !parsedOutput.diagnosticIsProviderError ? '' : parsedOutput.diagnostic;
     if (Array.isArray(parsedOutput.usage?.model_usage) && parsedOutput.usage.model_usage.length) {
       const dominant = [...parsedOutput.usage.model_usage].sort((left, right) =>
         Number(right.cost_usd || 0) - Number(left.cost_usd || 0)
@@ -5084,8 +5094,8 @@ async function executeOneShot(body, res) {
     // This prevents an audit discussing "rate limit" or HTTP 429 handling from
     // being misclassified as a provider failure.
     const failureBlob = vendorEvidenceText({
-      stderr: providerStderr, stdout: semanticStdout, diagnostic: parsedOutput.diagnostic,
-      includeStdout: code !== 0 || !cleanedStdout || parsedOutput.isError || parsedOutput.parseError,
+      stderr: providerStderr, stdout: semanticStdout, diagnostic: providerFailureDiagnostic,
+      includeStdout: !nativeStructuredOutput && (code !== 0 || !cleanedStdout || parsedOutput.isError || parsedOutput.parseError),
       supervisorStopReason: stopReason,
     }).toLowerCase();
     const rate_signals = [
@@ -5097,7 +5107,7 @@ async function executeOneShot(body, res) {
     const budget_signals = ['exceeded usd budget','exceeded the usd budget','max-budget-usd','budget exceeded','budget cap reached'];
     const authoritativeApiFailure = claudeApiStatusFailureClass(
       parsedOutput.apiErrorStatus,
-      cleanOutput([providerStderr, parsedOutput.diagnostic].filter(Boolean).join('\n')),
+      cleanOutput([providerStderr, providerFailureDiagnostic].filter(Boolean).join('\n')),
     );
     const tokenBudgetExceeded = stopReason === 'token_budget';
     const terminalQuotaEvidence = acceptedTerminalQuotaEvidence(parsedOutput, kind);
@@ -5112,7 +5122,7 @@ async function executeOneShot(body, res) {
       prompt,
       stopReason,
       stdout: cleanedStdout,
-      stderr: cleanOutput([providerStderr, parsedOutput.diagnostic].filter(Boolean).join('\n')),
+      stderr: cleanOutput([providerStderr, providerFailureDiagnostic].filter(Boolean).join('\n')),
       exitCode: code,
       modelFlagSent: !!route.model_flag_sent,
     });
@@ -5136,8 +5146,8 @@ async function executeOneShot(body, res) {
     // after the selected provider completed successfully. Only classify the
     // provider route as unauthenticated when the command failed or produced no
     // usable answer.
-    const auth_failed = authoritativeApiFailure === 'auth'
-      || ((code !== 0 || !cleanedStdout || parsedOutput.isError)
+    const auth_failed = authoritativeApiFailure === 'auth' || parsedOutput.failureClass === 'auth'
+      || (!nativeStructuredOutput && (code !== 0 || !cleanedStdout || parsedOutput.isError)
         && runClassification.kind === 'auth_failed');
     const permission_denied = authoritativeApiFailure === 'permission'
       || runClassification.kind === 'headless_command_permission_auto_denied';

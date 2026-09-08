@@ -81,7 +81,7 @@
     }
   },
   "_models": {
-    "_note": "Model selection inside a provider. Routing tiers map to weight classes: utility->light, standard->standard, complex/critical->heavy. Provider lineups change on weeks-long cycles, so prefer stable aliases (claude opus/sonnet/haiku) over versioned ids, and leave model_tiers unset where the account decides which models exist (cursor, copilot, grok) — a missing flag runs, a retired one fails every call. Discovery at boot reconciles these pins against each CLI's own model list.",
+    "_note": "Model selection inside a provider. Routing tiers map to weight classes: utility->light, standard->standard, complex/critical->heavy. Provider lineups change on weeks-long cycles, so prefer stable aliases (claude opus/sonnet/haiku) over versioned ids, and leave model_tiers unset where the account decides which models exist (cursor, copilot, grok) \u2014 a missing flag runs, a retired one fails every call. Discovery at boot reconciles these pins against each CLI's own model list.",
     "modelsCheckedAt": "2026-09-03",
     "staleAfterDays": 45,
     "discoverOnBoot": true,
@@ -98,8 +98,15 @@
   },
   "powershell": {
     "oneshot_capabilities": {
-      "safe": ["workspace_read", "tool_use"],
-      "dangerous": ["workspace_read", "workspace_write", "tool_use"]
+      "safe": [
+        "workspace_read",
+        "tool_use"
+      ],
+      "dangerous": [
+        "workspace_read",
+        "workspace_write",
+        "tool_use"
+      ]
     },
     "label": "PowerShell",
     "tags": [],
@@ -940,6 +947,81 @@
     "docs_url": "https://antigravity.google/docs/permissions",
     "_permission_note": "Antigravity CLI 1.1.19 has no per-invocation command allow-rule flag. Persistent command(prefix) rules permit trailing arguments and RelayBridge cannot prove broad git, PowerShell, or rg rules read-only. Safe headless calls therefore use a visible command-free prompt policy and surface any auto-denial without retrying. The dangerous slot remains explicit and is never selected as fallback."
   },
+  "gemini_cli": {
+    "label": "Google Gemini CLI (qualification pending)",
+    "company": "Google",
+    "color": "#8ab4f8",
+    "tags": [
+      "general",
+      "reasoning",
+      "coding"
+    ],
+    "transport": "subscription:google-gemini-cli",
+    "quota_seat": "subscription:google-gemini-cli:default",
+    "autoRoute": false,
+    "diagnostic_binary": "gemini",
+    "npm_package": "@google/gemini-cli@0.57.0",
+    "install_display": "npm install -g @google/gemini-cli@0.57.0",
+    "post_install": "Run gemini interactively in its own Linux configuration home to sign in. Authentication does not remove the pending safe-launch qualification gate. Do not copy another provider or Windows credential store.",
+    "login_command": [
+      "gemini"
+    ],
+    "safe": [],
+    "dangerous": [],
+    "oneshot_dangerous": [],
+    "oneshot_safe": [
+      "gemini",
+      "--model",
+      "gemini-2.5-flash",
+      "--approval-mode",
+      "default",
+      "--extensions",
+      "none",
+      "--output-format",
+      "json",
+      "--prompt",
+      "{prompt}"
+    ],
+    "model": "gemini-2.5-flash",
+    "oneshot_output_parser": "gemini_cli_json",
+    "workspaceAccess": false,
+    "oneshot_capabilities": {
+      "safe": [
+        "model_invocation",
+        "prompt_only"
+      ]
+    },
+    "oneshot_safe_filesystem_policy": "unverified_provider_policy",
+    "probe": [
+      "gemini",
+      "--version"
+    ],
+    "version_probe": [
+      "gemini",
+      "--version"
+    ],
+    "probe_auth_authoritative": false,
+    "probe_expect": "0.57.0",
+    "probe_success_detail": "native CLI 0.57.0 installed; authentication and safe launch are unverified",
+    "strip_env": [
+      "GEMINI_API_KEY",
+      "GOOGLE_API_KEY",
+      "GOOGLE_APPLICATION_CREDENTIALS",
+      "GOOGLE_GENAI_USE_VERTEXAI",
+      "GOOGLE_GENAI_USE_GCA",
+      "GEMINI_API_BASE_URL",
+      "GOOGLE_GEMINI_BASE_URL"
+    ],
+    "oneshot_env": {
+      "NO_BROWSER": "true"
+    },
+    "usage_capability": {
+      "tokens": "unavailable",
+      "turns": "unavailable",
+      "evidence": "Native CLI telemetry is not yet qualified as complete provider usage; missing counters may be emitted as zero."
+    },
+    "_qualification_note": "Distinct from Antigravity gemini. Native 0.57.0 isolated startup reports missing OAuth configuration (stderr JSON, exit41). Candidate settings/policy files pass component checks but are not an enforced launch boundary. Safe execution is blocked until exact executable, effective environment/cwd, loaded policy, hooks/MCP/extensions and authenticated response are qualified."
+  },
   "grok": {
     "oneshot_capabilities": {
       "safe": [
@@ -958,7 +1040,7 @@
     "oneshot_safe_filesystem_policy": "unverified_provider_policy",
     "login_command": [
       "grok",
-      "/login"
+      "login"
     ],
     "tags": [
       "search",
@@ -989,7 +1071,7 @@
       "--prompt-file",
       "{prompt_file}",
       "--output-format",
-      "plain",
+      "json",
       "--permission-mode",
       "dontAsk",
       "--sandbox",
@@ -1009,7 +1091,7 @@
       "--prompt-file",
       "{prompt_file}",
       "--output-format",
-      "plain",
+      "json",
       "--always-approve",
       "--sandbox",
       "off",
@@ -1033,15 +1115,18 @@
     ],
     "oneshot_env": {
       "GROK_CLAUDE_MCPS_ENABLED": "false",
-      "GROK_CURSOR_MCPS_ENABLED": "false"
+      "GROK_CURSOR_MCPS_ENABLED": "false",
+      "GROK_DISABLE_AUTOUPDATER": "1"
     },
     "strip_env": [
       "XAI_API_KEY",
       "XAI_BASE_URL"
     ],
-    "npm_package": "@xai-official/grok",
-    "install_display": "npm install -g @xai-official/grok",
-    "post_install": "Run grok login once to sign in."
+    "npm_package": "@xai-official/grok@1.0.13",
+    "install_display": "npm install -g @xai-official/grok@1.0.13",
+    "post_install": "Run grok login (or grok login --device-code on a headless host). Native 1.0.13 startup was qualified without credentials; authenticated safe execution still requires qualification.",
+    "oneshot_output_parser": "grok_json",
+    "_qualification_note": "Native Linux 1.0.13 version/help and signed-out JSON verified in an isolated fixture on 2026-09-08. Hidden --no-auto-update and --no-leader flags pass headless parsing; this is not proof of their enforcement. Filesystem/MCP/hook enforcement and an authenticated final answer remain unverified, so safe execution stays blocked."
   },
   "perplexity": {
     "oneshot_capabilities": {

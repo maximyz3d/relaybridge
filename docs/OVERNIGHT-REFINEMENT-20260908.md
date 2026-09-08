@@ -127,5 +127,75 @@ re-review reported no remaining material findings. This is supplementary static
 review, not the fresh Claude closing gate. Behavioral evaluation prompts are
 committed, but no measured model-output improvement is claimed yet.
 
-Final suite results, reviewed SHAs, provider qualification and closing verdicts
-will be recorded here when obtained. No overnight completion claim yet.
+## Pass 3 — native Grok and Gemini qualification
+
+Native provider JSON now has separate strict parsers, including Gemini errors
+written to stderr. Malformed, missing, contradictory, cancelled and warning-stop
+results cannot become successful answer text. Only qualified nonzero error
+envelopes supply authentication authority; answer text and auxiliary warnings
+cannot invent account failures. Diagnostics use the existing secret redactor
+before truncation. Unknown usage, observed model and Gemini terminal reason
+remain unknown. Grok's candidate `end_turn` indicates a transport result,
+not artifact approval. Unverified launch policies still block execution.
+
+Grok was qualified in a private temporary directory, not installed on PATH.
+The official Linux x64 1.0.13 archive (46,387,591 bytes) matched registry SHA-512
+`t0TpPmsEZwwS0utHq07L1oPX7tMgufAazIziccGn8IdTpo8ihqZ7KjaI6wikROXExfjvwTh83m4B0PL2ErPeiw==`.
+Only the reviewed regular binary member was extracted. Its SHA-256 is
+`edf79521581bb5e6b95abef848491a6a742e860da3e237ebe86a280d30dce4c1`;
+the actual version is `grok 1.0.13 (5e9a58528b76)`. Version, help and a headless
+negative smoke ran in a fresh bubblewrap namespace with no network, host home
+or credentials. The headless call exited 1 with the structured signed-out error.
+Hidden `--no-auto-update` and `--no-leader` flags were accepted by the headless
+parser; an invented flag was rejected. Acceptance does not prove enforcement.
+
+The positive Grok grammar is provisional, derived from the immutable upstream
+[headless documentation and emitter](https://github.com/xai-org/grok-build/blob/72a61251fcffb464bcc687aeb5a998e5a98ec0c9/crates/codegen/xai-grok-pager/docs/user-guide/14-headless-mode.md).
+That source revision differs from the package gitHead
+`5e9a58528b76b6128ee610059d79aecaa71b9b8d`; an authenticated binary result has
+not confirmed equivalence. Existing historical 0.2.106/Grok 4.5 evidence is
+preserved but explicitly does not qualify 1.0.13/Grok 4.6. Current model
+availability and authenticated invocation remain unverified.
+
+The installed native Gemini CLI reports 0.57.0. Its separate `gemini_cli`
+entry is opt-in and does not replace the existing Antigravity `gemini` entry.
+A fresh, network-isolated configuration home, explicit OAuth subscription
+requirement, native headless arguments and candidate deny policy produced exit
+41 with a structured authentication-not-configured error on stderr. No real
+credential files were read or copied and no login was started. Native Gemini
+has no qualified `--effort`, `--cwd` or Antigravity `--print` compatibility.
+
+The candidate settings and policy files are qualification fixtures, **not
+runtime-wired enforcement**. In the installed 0.57.0 components, the effective
+policy denied all seven tested tool names (shell, write, replace, exit-plan,
+skill, agent and unknown tool). The tool registry contained zero tools and a
+child-process launch trap recorded zero attempts. This is component evidence;
+it does not establish complete CLI startup isolation with inherited settings,
+MCP discovery or system policies. Local `admin.*` settings are discarded,
+empty/intersected MCP allowlists can become unrestricted, and system policy
+files can displace `--admin-policy`. The production launcher must independently
+qualify these cases before lifting the existing unverified-policy block.
+
+Qualification-file SHA-256 values:
+
+- `config/gemini-safe-policy.toml`:
+  `c90d31b6c027738350459ef9745339a2bd24ba6221eabbd41aa5ae87571278a4`
+- `config/gemini-safe-settings.json`:
+  `02828af63a5edae52090d458af7b0cb36161c7305ed7a33c35059cdc28a356f6`
+- Installed Gemini entry chunk `gemini-OYYGXMHL.js`:
+  `704ff10d3472184f689e81ed6fe6aa26be1ab9df30dfc66c04d5f69cd4c4f3f6`
+- Installed settings chunk `chunk-GAROUUGQ.js`:
+  `d71bc4ccf306f66ad0ef844137f96b60ea5132616ead94bf042325938ac71c21`
+- Installed core chunk `chunk-7HKQGPWB.js`:
+  `9cce071bd5b23596e4b7e59b278107fe92c594d852443274e04e5fa2e5d1f080`
+
+Validation: 20/20 native parser, disposable REST wiring and existing bridge
+tests passed. These include actual signed-out envelope shapes, stopped and
+mismatched authentication exits, warning/error precedence, secret redaction,
+unknown telemetry and zero invocations through an unverified provider policy.
+Independent native read-only re-review reported no remaining material findings.
+There is **NO VERDICT on authenticated Grok/Gemini usability or complete native
+filesystem enforcement**. No paid API or credential changes were attempted.
+
+Final suite results, reviewed SHAs and closing verdicts will be recorded here
+when obtained. No overnight completion claim yet.
