@@ -40,6 +40,16 @@ test('one-shot timeout policy is centralized: 20 min default, ceiling equals the
   );
 });
 
+test('shutdown stops queue dispatch and workflow timers before owned children', () => {
+  const source = fs.readFileSync(path.join(ROOT, 'server.js'), 'utf8');
+  const shutdown = source.slice(source.indexOf('function shutdown() {'));
+  const queue = shutdown.indexOf('taskQueue.shutdown()');
+  const controller = shutdown.indexOf('workflowController.shutdown()');
+  const sessions = shutdown.indexOf('for (const s of sessions.values()) s.kill()');
+  const children = shutdown.indexOf('for (const proc of activeChildren) killProcessTree(proc)');
+  assert.ok(queue >= 0 && controller > queue && sessions > controller && children > controller);
+});
+
 test('transactional installer does not mistake a stale native exit code for MCP registration failure', () => {
   const install = fs.readFileSync(path.join(ROOT, 'install.ps1'), 'utf8');
   const registrationBlock = install.match(/if \(\$RegisterMcp\) \{([\s\S]*?)\n  \}/);
@@ -2470,6 +2480,12 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   const admission = await duplicateSlow.json();
   assert.equal(admission.failureClass, 'admission_limit');
   assert.equal(admission.retryable, true);
+  const busyShutdown = await fetch(baseUrl + '/api/admin/shutdown', { method: 'POST', headers: jsonAuth });
+  assert.equal(busyShutdown.status, 409);
+  const busyShutdownResult = await busyShutdown.json();
+  assert.equal(busyShutdownResult.code, 'BRIDGE_BUSY');
+  assert.ok(busyShutdownResult.active > 0);
+  assert.equal((await fetch(baseUrl + '/api/health')).status, 200, 'busy shutdown refusal must leave the bridge running');
   firstController.abort();
   await firstSlow.catch(() => {});
   const admissionDeadline = Date.now() + 5000;
@@ -2639,6 +2655,15 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   const activity = await (await fetch(baseUrl + '/api/activity?limit=5', { headers: auth })).json();
   assert.ok(Array.isArray(activity.runs));
   assert.ok(Array.isArray(activity.receipts));
+  const idleShutdown = await fetch(baseUrl + '/api/admin/shutdown', { method: 'POST', headers: jsonAuth });
+  assert.equal(idleShutdown.status, 200);
+  assert.equal((await idleShutdown.json()).stopping, true);
+  await new Promise((resolve, reject) => {
+    if (proc.exitCode !== null) return resolve();
+    const timer = setTimeout(() => reject(new Error('idle administrative shutdown did not exit')), 7000);
+    proc.once('exit', () => { clearTimeout(timer); resolve(); });
+  });
+  assert.equal(proc.exitCode, 0);
 });
 
 test('linked provider accounts fail closed, isolate cooldowns, and refresh mutations', { timeout: 30000 }, async (t) => {

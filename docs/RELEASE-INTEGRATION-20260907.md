@@ -40,10 +40,22 @@ Do not blanket reset account cooldowns or claim provider usage availability.
 
 ## Verification
 
+Closing-review revision: Claude task `t_mtrwkf8y_sjmux0` requested explicit busy/idle
+administrative shutdown tests. Root Codex owns the bounded test/doc-only repair;
+the safe pipeline was intentionally cancelled for the documented Codex-only revision
+loop, not marked complete or escalated to a Claude writer. Existing verdicts remain.
+Added a live busy409/still-healthy assertion, idle200/process-exit assertion and a
+source-order regression guard; existing queue tests cover stopping dispatch timers.
+Fresh read-only Claude closing review follows the frozen repair commit.
+The stricter expired-lock recovery fast-follow is GitHub issue #122, satisfying the
+reviewer's alternative to enabling unproven recovery. Root acknowledges the shared
+schema/fixture/MCP scheduling scope amendment as normal coordinator integration.
+
 - Combined unmodified baseline: 679 passed, 2 skipped, 0 failed (681 tests).
 - Focused classifier/pipeline after first repair: 38 passed, 0 failed.
 - `npm audit --omit=dev`: 0 vulnerabilities.
-- Final integration suite: 680 passed, 2 skipped, 0 failed (682 tests).
+- Final integration suite after shutdown-test revision: 681 passed, 2 skipped,
+  0 failed (683 tests); `/tmp/relaybridge-shutdown-revision-20260908.log`.
 - Fresh Claude reviews: pending; see coordinator implementation/review artifacts
   bound to the final commit. This document is not approval.
 
