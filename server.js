@@ -3,6 +3,8 @@
 // falls back to child_process pipes otherwise.
 
 const express = require('express');
+const { rateLimit } = require('express-rate-limit');
+const { delegationRateLimitOptions } = require('./lib/delegation-rate-limit');
 const http = require('http');
 const path = require('path');
 const fs = require('fs');
@@ -29,6 +31,9 @@ const {
 const { buildTaskPlan, costClassFor } = require('./lib/task-plan');
 const { createWorkflowPipeline } = require('./lib/workflow-pipeline');
 const { createWorkflowController } = require('./lib/workflow-controller');
+const { createIncidentLog, taskFailureDetails } = require('./lib/incident-log');
+const { createDelegationCoordinator, delegationTaskTier } = require('./lib/delegation');
+const { buildFuelGauge } = require('./lib/fuel-gauge');
 const { buildQuotaSeatGroups } = require('./lib/quota-seat');
 const providerAccounts = require('./lib/provider-accounts');
 const { providerUsageCapability, providerUsageCapabilities } = require('./lib/provider-usage-capability');
@@ -1127,17 +1132,20 @@ function sendOneShotResult(res, payload, meta) {
   try {
     if (meta && meta.kind && typeof recordRunUsage === 'function') {
       const ok = payload.exitCode === 0 && !payload.dropped_out;
-      // Classify once and use it for BOTH accounting and cooldown, so the two
-      // can never disagree about why a run ended.
+      // Keep the local stop as the accounting cause; independently accepted
+      // vendor quota evidence can still protect the shared subscription seat.
       const localBudgetStop = payload.failureClass === 'token_budget' || payload.supervisor_stop_reason === 'token_budget';
       const acceptedQuota = payload.provider_api_error_status === 429
         && payload.quota_evidence?.source === 'claude_terminal_api_status';
-      const failureKind = localBudgetStop ? 'token_budget'
-        : payload.provider_action_required?.kind === 'usage_quota_exhausted'
-        ? 'quota_exhausted'
-        : payload.rate_limited ? 'rate_limited'
-        : payload.auth_failed ? 'auth_failed'
-        : payload.failureClass || (classified.kind !== 'ok' ? classified.kind : null);
+      const failureKind = localBudgetStop ? 'token_budget' : receiptFailureKind({
+        supervisorStopReason: payload.supervisor_stop_reason,
+        failureClass: payload.failureClass,
+        apiErrorStatus: payload.provider_api_error_status,
+        rateLimited: payload.rate_limited,
+        authFailed: payload.auth_failed,
+        actionRequiredKind: payload.provider_action_required?.kind,
+        classifiedKind: classified.kind,
+      });
       const cooldownKind = localBudgetStop ? (acceptedQuota ? 'rate_limited' : null) : failureKind;
       const effectiveQuotaSeat = payload.route?.quota_seat || meta.route?.quota_seat
         || quotaSeatForProvider(meta.kind);
@@ -1146,7 +1154,8 @@ function sendOneShotResult(res, payload, meta) {
           provider: meta.kind,
           rateLimited: payload.rate_limited,
           failureClass: payload.failureClass,
-          text: `${payload.stdout || ''}\n${payload.stderr || ''}`,
+          text: vendorEvidenceText({ stdout: payload.stdout, stderr: payload.stderr,
+            includeStdout: true, supervisorStopReason: payload.supervisor_stop_reason }),
           model: payload.route?.resolved_model_identity || payload.model || null,
         });
         if (vendorQuota) {
@@ -1193,7 +1202,8 @@ function sendOneShotResult(res, payload, meta) {
           const cooldown = cooldowns.noteFailure(cooldownSeat, cooldownKind, {
             retryAfterSec: acceptedQuota
               ? parseRetryAfter(payload.provider_error_diagnostic || '')
-              : parseRetryAfter(`${payload.stdout || ''}\n${payload.stderr || ''}`, payload.retry_after),
+              : parseRetryAfter(vendorEvidenceText({ stdout: payload.stdout, stderr: payload.stderr, includeStdout: true,
+                supervisorStopReason: payload.supervisor_stop_reason }), payload.retry_after),
             scope: payload.vendor_quota?.scope === 'model' ? 'model' : 'account',
           });
           if (cooldown?.until) {
@@ -2946,6 +2956,13 @@ app.get('/api/config', (req, res) => {
   res.json(loadConfig());
 });
 
+app.use('/api', (req, res, next) => {
+  if (shuttingDown && !['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
+    return res.status(503).json({ ok: false, code: 'BRIDGE_SHUTTING_DOWN' });
+  }
+  next();
+});
+
 // Authenticated workspace-policy discovery keeps browser defaults aligned with
 // an operator-supplied allowlist. The public health endpoint intentionally does
 // not expose local filesystem paths.
@@ -3554,97 +3571,87 @@ app.post('/api/models/refresh', async (req, res) => {
 // a CSS tweak to a frontier seat, or arithmetic to a max-effort reasoning model,
 // costs real money for no gain. This returns the cheapest capable combination
 // and says why, so callers do not have to guess.
+async function planTask({ task, requestedEffort = null, kind = null, requestedProviderBudget,
+  filesystemAuthority, intent = {}, signal, taskTierOverride = null }) {
+  kind = kind || intent.kind || intent.execution?.provider || null;
+  requestedEffort = intent.effort ?? requestedEffort;
+  validateControlRequest({ ...intent, ...(requestedEffort == null ? {} : { effort: requestedEffort }) });
+  const groundingSnapshot = captureAllowedCwdIdentity(intent.cwd);
+  checkGrounding({ ...intent, prompt: task, cwdIdentityHash: groundingSnapshot.cwdIdentityHash });
+  requestedEffort = requestedEffort == null ? null : normalizeEffort(requestedEffort);
+  requestedProviderBudget = validateProviderBudget(requestedProviderBudget === undefined
+    ? intent.providerBudget : requestedProviderBudget);
+  if (!filesystemAuthority) {
+    try { filesystemAuthority = planningFilesystemAuthority(intent); }
+    catch (error) { error.statusCode = 400; throw error; }
+  }
+  const router = await ROUTER_MODULE_PROMISE;
+  const cfg = loadConfig();
+  const generation = diagnosticGeneration(cfg);
+  let diagnostics = await completePlanningDiagnostics(cfg, lastDiagnostics?.results, 'path-only check', signal);
+  if (signal?.aborted) throw Object.assign(new Error('planning request cancelled'), { statusCode: 499 });
+  if (generation !== diagnosticGeneration(loadConfig())) {
+    throw Object.assign(new Error('diagnostic authority changed; refresh again'), {
+      statusCode: 409, code: 'diagnostic_stale',
+    });
+  }
+  const effectiveTaskTier = taskTierOverride || router.classifyTask(task).tier;
+  const gauges = usageLedger.gaugeAll(seatCostClasses());
+  const routingInputs = accountAwareRoutingInputs(cfg, diagnostics, gauges, coolingQuotaStates());
+  const fleetInput = applyCooldownsToDiagnostics(routingInputs.diagnostics, routingInputs.cooling, kind ? [kind] : []);
+  const vendorQuotaInput = applyVendorQuotaExhaustionToDiagnostics(fleetInput.diagnostics, routingInputs.gauges);
+  const filesystemInput = applyFilesystemEligibilityToDiagnostics(vendorQuotaInput.diagnostics, cfg, filesystemAuthority);
+  const groundingInput = applyGroundingEligibilityToDiagnostics(filesystemInput.diagnostics, cfg,
+    { ...intent, task, prompt: task, taskTier: effectiveTaskTier }, groundingSnapshot);
+  diagnostics = groundingInput.diagnostics;
+  if (kind && diagnostics[kind]?.grounding?.allowed === false) {
+    throw validationError('workspace_grounding', 'kind', diagnostics[kind].grounding.reason + ' ' + diagnostics[kind].grounding.remedy);
+  }
+  if (kind && diagnostics[kind]?.intentValidation) {
+    const diagnostic = diagnostics[kind].intentValidation;
+    throw validationError(diagnostic.code, diagnostic.field, diagnostic.reason, diagnostic);
+  }
+  let route = router.routeTask({ task, diagnostics, dangerous: filesystemAuthority.dangerous,
+    invocationCapabilities: invocationCapabilitiesFor(cfg, filesystemAuthority.dangerous), modelTier: intent.modelTier,
+    preferredProviders: kind ? [kind] : [] });
+  if (taskTierOverride) route = { ...route, classification: { ...route.classification, tier: taskTierOverride } };
+  route = levelRouteSelection(route, routingInputs.gauges, seatCostClassMap());
+  route.fleetState = {
+    cooldownSkipped: fleetInput.skipped,
+    vendorQuotaSkipped: vendorQuotaInput.skipped,
+    balance: fleetBalance(gauges),
+    vendorQuota: vendorQuotaFleet(gauges),
+    operatorQuota: operatorQuotaFleet(gauges),
+    quotaSeats: currentQuotaSeatGroups(),
+    accountSelection: routingInputs.accountSelection,
+    filesystemSkipped: filesystemInput.skipped,
+    groundingSkipped: groundingInput.skipped,
+    filesystemAuthority,
+  };
+  const plan = buildTaskPlan({ route, config: cfg, registry: modelRegistry,
+    requestedEffort, requestedKind: kind, requestedProviderBudget,
+    requestedModel: intent.model, requestedModelTier: intent.modelTier,
+    requestedExecution: intent.execution, requestedMaxEffortOverride: intent.maxEffortOverride,
+    requestedTimeoutMs: intent.timeoutMs, dangerous: filesystemAuthority.dangerous });
+  if (kind && plan.primary?.validation) {
+    const diagnostic = plan.primary.validation;
+    throw validationError(diagnostic.code, diagnostic.field, diagnostic.reason, diagnostic);
+  }
+  return { plan, fleetState: route.fleetState };
+}
+
 app.post('/api/plan', planningRequestLimit, async (req, res) => {
   const controller = new AbortController();
   res.once('close', () => { if (!res.writableEnded) controller.abort(); });
-  const { task, effort, kind, model, modelTier, providerBudget: rawBudget } = req.body || {};
-  if (!task || typeof task !== 'string' || !task.trim()) {
-    return res.status(400).json({ error: 'task (non-empty string) required' });
-  }
-  try { validateControlRequest(req.body || {}); }
-  catch (err) { return rejectInvalidIntent(res, { ...req.body, prompt: task }, err); }
-  let groundingSnapshot;
+  const { task } = req.body || {};
+  if (typeof task !== 'string' || !task.trim()) return res.status(400).json({ error: 'task (non-empty string) required' });
   try {
-    groundingSnapshot = captureAllowedCwdIdentity(req.body?.cwd);
-    checkGrounding({ ...req.body, prompt: task, cwdIdentityHash: groundingSnapshot.cwdIdentityHash });
-  } catch (err) { return rejectInvalidIntent(res, { ...req.body, prompt: task }, err); }
-  const requestedEffort = effort == null ? null : normalizeEffort(effort);
-  let requestedProviderBudget;
-  try {
-    requestedProviderBudget = validateProviderBudget(rawBudget);
-  } catch (err) {
-    return rejectInvalidIntent(res, { ...req.body, prompt: task }, err);
-  }
-  let filesystemAuthority;
-  try { filesystemAuthority = planningFilesystemAuthority(req.body || {}); }
-  catch (err) { return res.status(400).json({ error: err.message }); }
-  try {
-    const router = await ROUTER_MODULE_PROMISE;
-    const cfg = loadConfig();
-    const generation = diagnosticGeneration(cfg);
-    let diagnostics = await completePlanningDiagnostics(
-      cfg,
-      lastDiagnostics?.results,
-      'path-only check',
-      controller.signal,
-    );
-    if (controller.signal.aborted) return;
-    if (generation !== diagnosticGeneration(loadConfig())) {
-      return res.status(409).json({ error: 'diagnostic authority changed; refresh again', errorCode: 'diagnostic_stale' });
-    }
-    const gauges = usageLedger.gaugeAll(seatCostClasses());
-    const routingInputs = accountAwareRoutingInputs(cfg, diagnostics, gauges, coolingQuotaStates());
-    const fleetInput = applyCooldownsToDiagnostics(
-      routingInputs.diagnostics, routingInputs.cooling, kind ? [kind] : [],
-    );
-    const vendorQuotaInput = applyVendorQuotaExhaustionToDiagnostics(
-      fleetInput.diagnostics, routingInputs.gauges,
-    );
-    const filesystemInput = applyFilesystemEligibilityToDiagnostics(vendorQuotaInput.diagnostics, cfg, filesystemAuthority);
-    const groundingInput = applyGroundingEligibilityToDiagnostics(filesystemInput.diagnostics, cfg, { ...req.body, taskTier: router.classifyTask(task).tier }, groundingSnapshot);
-    diagnostics = groundingInput.diagnostics;
-    if (kind && diagnostics[kind]?.grounding?.allowed === false) {
-      return rejectInvalidIntent(res, { ...req.body, prompt: task }, validationError('workspace_grounding', 'kind', diagnostics[kind].grounding.reason + ' ' + diagnostics[kind].grounding.remedy));
-    }
-    if (kind && diagnostics[kind]?.intentValidation) {
-      const diagnostic = diagnostics[kind].intentValidation;
-      return rejectInvalidIntent(res, { ...req.body, prompt: task }, validationError(diagnostic.code, diagnostic.field, diagnostic.reason, diagnostic));
-    }
-    let route = router.routeTask({ task, diagnostics, dangerous: filesystemAuthority.dangerous,
-      invocationCapabilities: invocationCapabilitiesFor(cfg, filesystemAuthority.dangerous), modelTier,
-      preferredProviders: kind ? [kind] : [] });
-    route = levelRouteSelection(route, routingInputs.gauges, seatCostClassMap());
-    route.fleetState = {
-      cooldownSkipped: fleetInput.skipped,
-      vendorQuotaSkipped: vendorQuotaInput.skipped,
-      balance: fleetBalance(gauges),
-      vendorQuota: vendorQuotaFleet(gauges),
-      operatorQuota: operatorQuotaFleet(gauges),
-      quotaSeats: currentQuotaSeatGroups(),
-      accountSelection: routingInputs.accountSelection,
-      filesystemSkipped: filesystemInput.skipped,
-      groundingSkipped: groundingInput.skipped,
-      filesystemAuthority,
-    };
-    const plan = buildTaskPlan({
-      route,
-      config: cfg,
-      registry: modelRegistry,
-      requestedEffort,
-      requestedKind: kind || null,
-      requestedProviderBudget,
-      requestedModel: model,
-      requestedModelTier: modelTier,
-      requestedTimeoutMs: req.body?.timeoutMs,
-      dangerous: filesystemAuthority.dangerous,
-    });
-    if (kind && plan.primary?.validation) {
-      const diagnostic = plan.primary.validation;
-      return rejectInvalidIntent(res, { ...req.body, prompt: task }, validationError(diagnostic.code, diagnostic.field, diagnostic.reason, diagnostic));
-    }
-    res.json({ ok: true, task: task.slice(0, 400), ...plan, fleetState: route.fleetState });
-  } catch (err) {
-    if (!res.destroyed && !res.writableEnded) res.status(500).json({ ok: false, error: err.message });
+    const { plan, fleetState } = await planTask({ task, intent: req.body || {}, signal: controller.signal });
+    if (!res.destroyed && !res.writableEnded) res.json({ ok: true, task: task.slice(0, 400), ...plan, fleetState });
+  } catch (error) {
+    if (res.destroyed || res.writableEnded) return;
+    if (error.validation) return rejectInvalidIntent(res, { ...req.body, prompt: task }, error);
+    res.status(error.statusCode || 500).json({ ok: false, error: error.message, ...(error.code ? { errorCode: error.code } : {}) });
   }
 });
 
@@ -5047,8 +5054,11 @@ async function executeOneShot(body, res) {
     // or in stdout only when the process itself failed / returned no answer.
     // This prevents an audit discussing "rate limit" or HTTP 429 handling from
     // being misclassified as a provider failure.
-    const failureBlob = (providerStderr + ((code !== 0 || !cleanedStdout || parsedOutput.isError || parsedOutput.parseError)
-      ? ('\n' + semanticStdout) : '') + ('\n' + (parsedOutput.diagnostic || ''))).toLowerCase();
+    const failureBlob = vendorEvidenceText({
+      stderr: providerStderr, stdout: semanticStdout, diagnostic: parsedOutput.diagnostic,
+      includeStdout: code !== 0 || !cleanedStdout || parsedOutput.isError || parsedOutput.parseError,
+      supervisorStopReason: stopReason,
+    }).toLowerCase();
     const rate_signals = [
       'rate limit', 'rate-limit', 'too many requests', 'quota exceeded', 'usage limit reached',
       'hit your usage limit', 'hit your limit', "you've hit your session limit",
@@ -5064,18 +5074,18 @@ async function executeOneShot(body, res) {
     const terminalQuotaEvidence = acceptedTerminalQuotaEvidence(parsedOutput, kind);
     const copilotQuotaEvidence = tokenBudgetExceeded ? null : detectCopilotMonthlyQuota({
       provider: kind,
-      stdout: cleanedStdout,
+      stdout: stopReason ? '' : cleanedStdout,
       stderr: providerStderr,
       exitCode: code,
     });
     const runClassification = classifyRunFailure({
       provider: kind,
       prompt,
+      stopReason,
       stdout: cleanedStdout,
       stderr: cleanOutput([providerStderr, parsedOutput.diagnostic].filter(Boolean).join('\n')),
       exitCode: code,
       modelFlagSent: !!route.model_flag_sent,
-      stopReason,
     });
     const cursorActionRequired = runClassification.actionRequired || null;
     const cursorUsageQuotaExhausted = cursorActionRequired?.kind === 'usage_quota_exhausted';
@@ -5087,11 +5097,12 @@ async function executeOneShot(body, res) {
     const rate_limited = !!terminalQuotaEvidence || (parsedOutput.resultSubtype !== 'error_max_budget_usd'
       && !cursorUsageQuotaExhausted
       && (authoritativeApiFailure === 'rate_limit'
-        || (!tokenBudgetExceeded && (!!copilotQuotaEvidence || rate_signals.some(s => failureBlob.includes(s))))));
+        || !!copilotQuotaEvidence
+        || (!stopReason && rate_signals.some(s => failureBlob.includes(s)))));
     const budget_exceeded = tokenBudgetExceeded || parsedOutput.resultSubtype === 'error_max_budget_usd'
       || authoritativeApiFailure === 'budget'
       || cursorUsageQuotaExhausted
-      || budget_signals.some(s => failureBlob.includes(s));
+      || (!stopReason && budget_signals.some(s => failureBlob.includes(s)));
     // Some CLIs report unrelated MCP authentication warnings on stderr even
     // after the selected provider completed successfully. Only classify the
     // provider route as unauthenticated when the command failed or produced no
@@ -5251,10 +5262,16 @@ app.post('/api/oneshot', (req, res) => executeOneShot({
 // Submission is decoupled from collection so work outlives the surface that
 // started it: submit from a chat, collect from Cowork or the CLI later.
 const { createTaskQueue } = require('./lib/task-queue');
+// Initialize before the queue: startup reconciliation also reports failures.
+const incidentLog = createIncidentLog({
+  dataDir: path.join(DATA_DIR, 'incidents'),
+  log: (m) => console.log(m),
+});
 const taskQueue = createTaskQueue({
   dataDir: path.join(DATA_DIR, 'tasks'),
   executeOneShot, readCollab, writeCollab,
   maxConcurrent: Number(process.env.RELAYBRIDGE_MAX_TASKS) || 3,
+  onFailure: (task) => incidentLog.report(taskFailureDetails(task)),
   log: (m) => console.log(m),
 });
 
@@ -5293,16 +5310,174 @@ app.post('/api/tasks/:id/cancel', (req, res) => {
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 
+// ---- Incident inbox (lib/incident-log.js) --------------------------------
+// A phase that stops because the provider omitted its verdict marker looks
+// exactly like a crash from the outside.  This records which it was, with the
+// exact ids, sanitized and deduplicated.
+app.get('/api/incidents', (req, res) => {
+  try {
+    res.json({
+      incidents: incidentLog.list({
+        status: req.query.status, classification: req.query.classification, limit: req.query.limit,
+      }),
+      stats: incidentLog.stats(),
+    });
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+app.get('/api/incidents/:id', (req, res) => {
+  const incident = incidentLog.get(req.params.id);
+  if (!incident) return res.status(404).json({ error: 'incident not found' });
+  res.json(incident);
+});
+app.post('/api/incidents/:id/ack', (req, res) => {
+  try { res.json(incidentLog.acknowledge(req.params.id, req.body || {})); }
+  catch (err) { res.status(404).json({ error: err.message }); }
+});
+
+// ---- Delegation (lib/delegation.js) --------------------------------------
+// Accepts a batch of asks, ranks them, picks the cheapest capable provider for
+// each, and hands them to the queue above under an explicit handoff contract.
+// It owns no processes and no second queue.
+// Classification and provider selection are async (the router module and the
+// diagnostics sweep both are), while the coordinator is deliberately sync so it
+// can be tested without a bridge.  The route resolves both up front and hands
+// the results in.
+let delegationClassifier = () => ({ tier: 'standard' });
+let delegationSelection = new Map();
+
+const delegation = createDelegationCoordinator({
+  dataDir: path.join(DATA_DIR, 'delegations'),
+  taskQueue,
+  incidents: incidentLog,
+  classify: (prompt) => delegationClassifier(prompt),
+  selectProvider: ({ task }) => delegationSelection.get(task) || {
+    ready: false, reason: 'no plan was computed for this task',
+  },
+  prepareTaskBody: (body) => {
+    const snapshot = captureAllowedCwdIdentity(body.cwd);
+    if ((body.expectedCwdIdentityHash && body.expectedCwdIdentityHash !== snapshot.cwdIdentityHash)
+      || (body.expectedCwdPolicyId && body.expectedCwdPolicyId !== CWD_POLICY_IDENTITY)) {
+      throw cwdIdentityChangedError(body.expectedCwdIdentityHash, snapshot.cwdIdentityHash);
+    }
+    const controls = validateProviderIntent(body, loadConfig(), snapshot);
+    return { ...body, execution: controls.execution, cwd: snapshot.resolved,
+      expectedCwdIdentityHash: snapshot.cwdIdentityHash, expectedCwdPolicyId: CWD_POLICY_IDENTITY };
+  },
+  log: (m) => console.log(m),
+});
+
+app.post('/api/delegate', rateLimit(delegationRateLimitOptions), async (req, res) => {
+  const controller = new AbortController();
+  res.once('close', () => { if (!res.writableEnded) controller.abort(); });
+  const input = req.body || {};
+  const tasks = Array.isArray(input.tasks) ? input.tasks : [];
+  if (!tasks.length) return res.status(400).json({ error: 'tasks (non-empty array) required' });
+  if (tasks.length > 50) return res.status(400).json({ error: 'a delegation batch is limited to 50 tasks' });
+  try {
+    const { classifyTask } = await ROUTER_MODULE_PROMISE;
+    delegationClassifier = classifyTask;
+    if (tasks.some((task) => !task || typeof task !== 'object' || Array.isArray(task)
+      || typeof (task.prompt || task.objective) !== 'string' || !(task.prompt || task.objective).trim())) {
+      return res.status(400).json({ error: 'every task must be an object with a non-empty string prompt' });
+    }
+    const selection = new Map();
+    for (const task of tasks) {
+      const prompt = (task.prompt || task.objective).trim();
+      if (!prompt) continue;
+      let plan;
+      try {
+        // A task that cannot be planned is recorded as blocked with the reason,
+        // not allowed to fail the whole batch: the other asks are still valid.
+        plan = (await planTask({
+          task: prompt,
+          requestedEffort: task.effort ?? null,
+          intent: { ...task, cwd: task.cwd || input.cwd },
+          signal: controller.signal,
+          taskTierOverride: delegationTaskTier(task, classifyTask(prompt)),
+          kind: typeof task?.kind === 'string' ? task.kind : null,
+          requestedProviderBudget: validateProviderBudget(task?.providerBudget),
+          filesystemAuthority: planningFilesystemAuthority({
+            dangerous: task?.dangerous === true,
+            acknowledgeFilesystemWrites: task?.acknowledgeFilesystemWrites === true,
+          }),
+        })).plan;
+      } catch (err) {
+        selection.set(task, { ready: false, reason: err.message });
+        continue;
+      }
+      // Cheapest capable, not "the best available": the whole point of
+      // delegating is that a frontier seat is the last resort, not the default.
+      const choice = plan.cheapestCapable || plan.primary;
+      selection.set(task, choice && choice.ready !== false ? {
+        kind: choice.kind,
+        modelTier: choice.modelTier,
+        effort: choice.effort,
+        costClass: choice.costClass,
+        providerBudget: choice.providerBudget,
+        ready: true,
+        execution: choice.execution,
+        invocation: {
+          cwd: captureAllowedCwdIdentity(task.cwd || input.cwd).resolved,
+          requiresWorkspaceAccess: task.requiresWorkspaceAccess, inlineEvidence: task.inlineEvidence,
+          maxEffortOverride: task.maxEffortOverride, timeoutMs: task.timeoutMs,
+        },
+        alternates: (plan.alternates || []).map((alt) => ({ kind: alt.kind, costClass: alt.costClass })),
+      } : {
+        ready: false,
+        kind: choice?.kind || null,
+        reason: choice?.reason || plan.guidance?.[0] || 'no ready provider for this task',
+      });
+    }
+    if (controller.signal.aborted || res.destroyed) return;
+    delegationSelection = selection;
+    res.json(delegation.delegate({ ...input, actor: input.actor || req.get('X-RelayBridge-Client') || 'delegator' }));
+  } catch (err) {
+    const status = err.code === 'OWNERSHIP_CONFLICT' ? 409 : 400;
+    if (!res.destroyed && !res.writableEnded) res.status(status).json({ error: err.message, code: err.code || null });
+  } finally {
+    delegationSelection = new Map();
+  }
+});
+app.get('/api/delegations', (req, res) => {
+  try { res.json({ delegations: delegation.list({ status: req.query.status, limit: req.query.limit }), stats: delegation.stats() }); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+app.get('/api/delegations/:id', (req, res) => {
+  try {
+    const record = delegation.resume(req.params.id);
+    res.json(record);
+  } catch (err) { res.status(err.code === 'NOT_FOUND' ? 404 : 400).json({ error: err.message }); }
+});
+app.post('/api/delegations/:id/outcome', (req, res) => {
+  const { taskRef, ...outcome } = req.body || {};
+  if (!taskRef) return res.status(400).json({ error: 'taskRef required' });
+  try { res.json(delegation.recordOutcome(req.params.id, taskRef, outcome)); }
+  catch (err) { res.status(err.code === 'NOT_FOUND' ? 404 : 400).json({ error: err.message, code: err.code || null }); }
+});
+app.post('/api/delegations/:id/escalation', (req, res) => {
+  const { taskRef, ...decision } = req.body || {};
+  if (!taskRef) return res.status(400).json({ error: 'taskRef required' });
+  try { res.json(delegation.decideEscalation(req.params.id, taskRef, decision)); }
+  catch (err) {
+    const status = err.code === 'NOT_FOUND' ? 404 : err.code === 'HUMAN_GATE_REQUIRED' ? 403 : 400;
+    res.status(status).json({ error: err.message, code: err.code || null });
+  }
+});
+
 // ---- Codex -> Claude staged workflows -----------------------------------
 // The controller owns phase dispatch; the pipeline owns durable artifacts and
 // the single canonical-workspace writer lease.  Provider tasks stay in the
 // existing queue so they survive client disconnects and retain normal receipt,
 // quota, timeout, and filesystem-policy handling.
 const workflowPipeline = createWorkflowPipeline({ dataDir: DATA_DIR });
+const { createRequestLedger } = require('./lib/request-ledger');
+const requestLedger = createRequestLedger({ dataDir: path.join(DATA_DIR, 'requests') });
 const workflowController = createWorkflowController({
   pipeline: workflowPipeline,
   taskQueue,
   loadConfig,
+  incidents: incidentLog,
+  requestLedger,
   log: (message) => console.log(message),
 });
 
@@ -5314,6 +5489,7 @@ const WORKFLOW_CONFLICT_CODES = new Set([
   'REVISION_REQUIRED', 'PROVIDER_TASK_ACTIVE', 'PROVIDER_TASK_MISMATCH',
   'PROVIDER_TASK_REUSED', 'PROVIDER_RETRY_MISMATCH', 'PROVIDER_RETRY_EXHAUSTED',
   'PROVIDER_RETRY_NOT_ALLOWED', 'FULL_PERMISSION_REQUIRED',
+  'WRITER_EXECUTION_UNCERTAIN', 'EXECUTION_TERMINATION_REQUIRED',
 ]);
 
 function sendWorkflowError(res, error) {
@@ -5349,6 +5525,43 @@ function workflowCreationInput(body) {
     permissionMode,
   };
 }
+
+const requestContract = require('./lib/request-contract');
+function sendRequestError(res, error) {
+  const message = String(error?.message || '');
+  const notFound = ['request not found', 'requirement not found'].includes(message);
+  const conflict = ['request already exists', 'conflicting eventId', 'workflow link capacity reached',
+    'request ledger capacity reached; archive explicitly before adding requests',
+    'event capacity reached; evidence history was preserved',
+    'request ledger byte capacity reached; prior evidence was preserved'].includes(message);
+  const invalid = error?.name === 'ZodError' || /^(?:invalid (?:requestId|actor|requirementId|summary|eventId|evidence ref|runId|taskId|incidentId|receiptId|invocationId|attemptId)|duplicate requirementId|confirmed milestones require evidence|rejected or missing evidence requires a reason)$/.test(message);
+  if (!notFound && !conflict && !invalid) return sendWorkflowError(res, error);
+  return res.status(notFound ? 404 : conflict ? 409 : 400).json({ ok: false,
+    code: notFound ? 'REQUEST_NOT_FOUND' : conflict ? 'REQUEST_CONFLICT' : 'INVALID_REQUEST',
+    error: error?.name === 'ZodError' ? 'invalid request shape or bounds' : message });
+}
+app.get('/api/requests', (req, res) => res.json({ requests: requestLedger.list(), assertionsOnly: true }));
+app.post('/api/requests', (req, res) => {
+  try { res.status(201).json({ request: workflowController.createRequest(requestContract.create.parse(req.body)), assertionsOnly: true }); }
+  catch (error) { sendRequestError(res, error); }
+});
+app.get('/api/requests/:requestId', (req, res) => {
+  try { res.json({ request: workflowController.getRequest(requestContract.id.parse(req.params.requestId), {
+    revision: req.query.revision == null ? undefined : requestContract.revision.parse(req.query.revision),
+  }), assertionsOnly: true }); }
+  catch (error) { sendRequestError(res, error); }
+});
+app.post('/api/requests/:requestId/workflows', (req, res) => {
+  try {
+    const input = requestContract.link.parse(req.body);
+    res.json({ link: workflowController.linkRequest(input.runId, { ...input, requestId: requestContract.id.parse(req.params.requestId) }), assertionsOnly: true });
+  } catch (error) { sendRequestError(res, error); }
+});
+app.post('/api/requests/:requestId/evidence', (req, res) => {
+  try { res.json({ event: workflowController.recordRequirementEvidence(requestContract.id.parse(req.params.requestId),
+    requestContract.evidence.parse(req.body)), assertionsOnly: true }); }
+  catch (error) { sendRequestError(res, error); }
+});
 
 app.post('/api/workflows', (req, res) => {
   try {
@@ -5431,6 +5644,8 @@ const { createCooldownStore, parseRetryAfter } = require('./lib/provider-cooldow
 const { checkGrounding, prepareGroundedPrompt, verifyReferencedPaths } = require('./lib/workspace-grounding');
 const {
   classifyRunFailure,
+  vendorEvidenceText,
+  receiptFailureKind,
   classifyProviderHttpFailure,
   detectCopilotMonthlyQuota,
   isHostedApiKeyMissingError,
@@ -6200,6 +6415,33 @@ app.get('/api/usage/gauges', (req, res) => {
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
+// The fuel gauge: capacity this bridge can actually observe.  Assembled from
+// the queue, the admission counters, the usage ledger, and recognized vendor
+// signals — with everything outside that scope reported as unknown rather than
+// silently omitted.  It never claims account-wide real-time quota.
+app.get('/api/fuel', (req, res) => {
+  try {
+    const windowMs = Number(req.query.windowMs) || 86400000;
+    const gauges = usageLedger.gaugeAll(seatCostClasses(), windowMs);
+    const runtimeVersions = Object.fromEntries(Object.entries(lastDiagnostics?.results || {})
+      .map(([kind, result]) => [kind, result.runtimeVersion || '']));
+    res.json(buildFuelGauge({
+      windowMs,
+      queueStats: taskQueue.stats(),
+      activeByProvider: activeOneShots,
+      concurrency: {
+        maxActiveOneShots: MAX_ACTIVE_ONESHOTS,
+        maxActivePerProvider: MAX_ACTIVE_PER_PROVIDER,
+      },
+      gauges,
+      providerUsageCapabilities: providerUsageCapabilities(loadConfig(), runtimeVersions),
+      cooldowns: coolingQuotaStates(),
+      delegations: delegation.stats(),
+      incidents: incidentLog.stats(),
+    }));
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.get('/api/usage/operator-quota', (req, res) => {
   res.json({
     observations: usageLedger.operatorQuotaObservations(),
@@ -6776,6 +7018,10 @@ app.post('/api/projects', (req, res) => {
 // wait for the singleton bridge to release its port, and start the new build.
 // The capability-token middleware protects this destructive endpoint.
 app.post('/api/admin/shutdown', (req, res) => {
+  const active = taskQueue.stats().active + activeChildren.size + sessions.size;
+  if (active > 0 && req.body?.force !== true) {
+    return res.status(409).json({ ok: false, code: 'BRIDGE_BUSY', active });
+  }
   res.json({ ok: true, stopping: true, pid: process.pid, instanceId: INSTANCE_ID });
   setTimeout(shutdown, 100);
 });
@@ -6976,6 +7222,9 @@ let shuttingDown = false;
 function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
+  // Stop dispatch and heartbeats before terminating any worker process.
+  try { taskQueue.shutdown(); } catch (error) { console.error('[RelayBridge] queue shutdown failed:', error.message); }
+  try { workflowController.shutdown(); } catch (error) { console.error('[RelayBridge] workflow shutdown failed:', error.message); }
   console.log('\n[RelayBridge] shutting downâ€¦');
   for (const s of sessions.values()) s.kill();
   for (const proc of activeChildren) killProcessTree(proc);

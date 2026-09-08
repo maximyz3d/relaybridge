@@ -1,3 +1,6 @@
+## v2.1.6 - 2026-09-08
+- #120 fix(orchestration): truthful delegation and no-verdict incident handling
+
 ## v2.1.5 - 2026-09-06
 - #119 feat(ui): add RelayBridge control center
 

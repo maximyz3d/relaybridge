@@ -2707,6 +2707,9 @@ function quotaDateTimeValue(date){
   return shifted.toISOString().slice(0,16);
 }
 function fuelBar(pct, basis){
+  if (basis !== 'unmetered' && (basis === 'configured' || basis === 'unknown' || pct === null || pct === undefined || !Number.isFinite(Number(pct)))) {
+    return '<span class="muted" title="No current quota observation; configured budgets are not subscription capacity">unknown</span>';
+  }
   const p = Math.max(0, Math.min(100, Number(pct)||0));
   const c = basis === 'unmetered' ? '#64748b' : p > 50 ? '#4ade80' : p > 20 ? '#facc15' : '#f87171';
   return `<div style="background:#1e293b;border-radius:3px;height:14px;width:130px;display:inline-block;vertical-align:middle;overflow:hidden;"><div style="width:${p}%;height:100%;background:${c};"></div></div> <span style="font-size:11px;">${basis==='unmetered'?'∞':p+'%'}</span>`;
@@ -2726,7 +2729,9 @@ async function refreshFuel(){
     const coolBySeat = Object.fromEntries(cooling.map(c => [c.seat, c]));
     $('#fuel-balance').innerHTML = balance.advice
       ? `<span style="color:#facc15">⚠ ${esc(balance.advice)}</span>`
-      : `<span style="color:#4ade80">✓ fleet balanced${balance.seats?` (${balance.seats} metered, ${balance.spread}pt spread)`:''}</span>`;
+      : balance.balanced === null || balance.seats < 2
+      ? '<span class="muted">Insufficient observed quota data to assess fleet balance.</span>'
+      : `<span style="color:#4ade80">✓ seats with capacity evidence balanced (${balance.seats} seats, ${balance.spread}pt spread)${balance.unknownSeats?.length ? ' · other seats unknown' : ''}</span>`;
     const unenforceable = Object.entries(providerUsageCapabilities).filter(([, capability]) => capability?.budgetEnforcement === 'unenforceable');
     const usageWarning = unenforceable.length
       ? `<div style="color:#facc15;margin-bottom:8px;">⚠ Authoritative token/turn usage unavailable for ${unenforceable.map(([kind]) => esc(kind)).join(', ')}; provider budgets are unenforceable and character estimates are disabled.</div>`
@@ -2783,7 +2788,7 @@ $('#operator-quota-clear')?.addEventListener('click', async () => {
   const status = $('#operator-quota-status');
   try {
     await api('/api/usage/operator-quota', { method:'DELETE', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ quotaSeat:$('#operator-quota-seat').value }) });
-    status.textContent = 'Cleared; configured/vendor evidence applies.';
+    status.textContent = 'Cleared; vendor evidence applies if available, otherwise subscription capacity is unknown.';
     refreshFuel();
   } catch (err) { status.textContent = 'Clear failed: ' + err.message; }
 });

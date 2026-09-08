@@ -108,6 +108,76 @@ test('grounding is a zero-spend gate across plans, REST, CLI, queue, broadcast a
     const row = (await client.callTool({ name: 'get_receipt', arguments: { receiptId } })).structuredContent.receipt;
     assert.deepEqual(row.grounding, grounded.grounding);
   }
+  // The same invocation contract must survive the merged deferred queue API.
+  const call = async (name, args) => (await client.callTool({ name, arguments: args })).structuredContent;
+  const execution = admitted.body.route.execution;
+  const correlation = { requestId: 'req_grounded_deferred', runId: 'wf_grounded', invocationId: 'inv_grounded', attemptId: 'attempt_grounded' };
+  const notBefore = Date.now() + 800;
+  const priorCalls = httpCalls.length;
+  const deferred = await call('submit_task', { ...required, dangerous: undefined, execution, inlineEvidence,
+    dependsOn: [queued.id], notBefore, requirementIds: ['R13', 'R14'], correlation });
+  assert.ok(deferred.id, JSON.stringify(deferred));
+  const waiting = await call('get_task', { id: deferred.id });
+  assert.equal(waiting.status, 'queued');
+  assert.equal(waiting.execution.state, 'never_started');
+  assert.deepEqual(waiting.body.execution, execution);
+  assert.deepEqual(waiting.body.inlineEvidence, inlineEvidence);
+  assert.deepEqual(waiting.dependsOn, [queued.id]);
+  assert.deepEqual(waiting.requirementIds, ['R13', 'R14']);
+  assert.deepEqual(waiting.correlation, { ...correlation, contractId: null, delegationId: null });
+  assert.equal(waiting.nextAttemptAt, notBefore);
+  assert.equal(httpCalls.length, priorCalls, 'future task cannot dispatch during admission');
+  const deferredDone = await waitFor(async () => {
+    const row = await call('get_task', { id: deferred.id });
+    return ['done', 'failed'].includes(row.status) && row;
+  });
+  assert.equal(deferredDone.status, 'done', JSON.stringify(deferredDone));
+  assert.ok(deferredDone.startedAt >= notBefore);
+  assert.equal(httpCalls.at(-1).model, execution.model);
+  assert.equal(httpCalls.at(-1).prompt, expected);
+
+  // HTTP adapters support implicit effort: delegation must not turn a target
+  // effort into an explicit unsupported effort control on the actual request.
+  assert.equal(execution.requestedEffort, null);
+  assert.equal(execution.appliedEffort, null);
+  const delegatedTask = { kind: 'ollama_coder', prompt, cwd: bridge.root,
+    model: 'fixture', requiresWorkspaceAccess: true, inlineEvidence,
+    baseSha: 'a'.repeat(40), ownedFiles: ['src/a.js'], doneWhen: ['Report the supplied fixture analysis.'] };
+  for (const surface of ['rest', 'mcp']) {
+    const input = { cwd: path.dirname(bridge.root), tasks: [delegatedTask] };
+    const record = surface === 'rest' ? (await bridge.request('/api/delegate', input)).body : await call('delegate_tasks', input);
+    assert.ok(record.entries?.[0]?.correlation?.taskId, JSON.stringify(record));
+    const entry = record.entries[0];
+    assert.equal(entry.contract.cwd, bridge.root, 'task cwd overrides the batch cwd');
+    assert.equal(entry.executionIntent.execution.requestedEffort, null);
+    const result = await waitFor(async () => {
+      const row = await call('get_task', { id: entry.correlation.taskId });
+      return ['done', 'failed'].includes(row.status) && row;
+    });
+    assert.equal(result.status, 'done', JSON.stringify(result));
+    assert.deepEqual(result.body.execution, entry.executionIntent.execution);
+    assert.equal(Object.hasOwn(result.body, 'effort'), false);
+    assert.match(httpCalls.at(-1).prompt, /Base revision: a{40}/);
+    assert.ok(httpCalls.at(-1).prompt.includes(content));
+    assert.equal(httpCalls.at(-1).model, 'fixture');
+    const persisted = (await bridge.request('/api/delegations/' + record.delegationId)).body;
+    assert.deepEqual(persisted.entries[0].executionIntent, entry.executionIntent);
+  }
+  // Classify the actual original prompt before ranking a prompt-only seat.
+  const groundedSelection = (await bridge.request('/api/delegate', { cwd: bridge.root,
+    tasks: [{ prompt: 'Review src/a.js.', baseSha: 'a'.repeat(40), ownedFiles: ['src/a.js'], doneWhen: ['Return concrete findings.'] }] })).body;
+  assert.equal(groundedSelection.entries?.[0]?.provider, 'claude', JSON.stringify(groundedSelection));
+  assert.ok(groundedSelection.entries[0].correlation.taskId);
+  await waitFor(async () => (await call('get_task', { id: groundedSelection.entries[0].correlation.taskId })).status === 'done');
+  const beforeBadBatch = httpCalls.length;
+  const invalidBatch = await bridge.request('/api/delegate', { cwd: bridge.root, tasks: [delegatedTask, null] });
+  assert.equal(invalidBatch.status, 400); assert.equal(httpCalls.length, beforeBadBatch);
+  // Each original task fits the HTTP transport; its complete handoff can still
+  // exceed the bound. Validate the whole batch before submitting either task.
+  const oversizedBatch = await bridge.request('/api/delegate', { cwd: bridge.root,
+    tasks: [delegatedTask, { ...delegatedTask, nonGoals: Array.from({ length: 13 }, (_, i) => `${i}:` + 'x'.repeat(1900)), ownedFiles: ['src/b.js'] }] });
+  assert.equal(oversizedBatch.status, 400, JSON.stringify(oversizedBatch.body));
+  assert.equal(httpCalls.length, beforeBadBatch);
   const badCwd = await ask({ requiresWorkspaceAccess: true, inlineEvidence, cwd: path.dirname(bridge.root) });
   assert.equal(badCwd.modelInvocation, false); assert.equal(badCwd.errorCode, 'cwd_outside_allowed_roots');
   const padding = 'x'.repeat(24000 - expected.length);

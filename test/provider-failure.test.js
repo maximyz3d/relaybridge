@@ -8,6 +8,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
   classifyRunFailure, classifyProviderHttpFailure, detectCopilotMonthlyQuota,
+  vendorEvidenceText, receiptFailureKind,
   detectCursorActionRequired, detectPerplexityNoAnswerSentinel,
   isHeadlessCommandPermissionDenial, isHostedApiKeyMissingError,
   isNarrationOnlyResponse, seatToleratesLongRuns, HOSTED_API_KEY_MISSING_CODE,
@@ -15,6 +16,18 @@ const {
 
 const CURSOR_NAMED_MODELS = 'ActionRequiredError: Named models unavailable Free plans can only use Auto. Switch to Auto or upgrade plans to continue.';
 const CURSOR_USAGE_LIMIT = "ActionRequiredError: You've hit your usage limit Get Cursor Pro for more Agent usage, unlimited Tab, and more.";
+
+test('local supervisor stops cannot convert partial task prose into account cooldowns', () => {
+  for (const prose of ['rate limit', 'HTTP 429', "you've hit your usage limit"]) {
+    assert.equal(vendorEvidenceText({ stdout: prose, includeStdout: true, supervisorStopReason: 'token_budget' }), '');
+    assert.equal(vendorEvidenceText({ stdout: prose, includeStdout: true }), prose);
+    assert.equal(receiptFailureKind({ supervisorStopReason: 'token_budget', failureClass: 'token_budget', rateLimited: true }), 'token_budget');
+  }
+  assert.equal(receiptFailureKind({ supervisorStopReason: 'token_budget', failureClass: 'token_budget', apiErrorStatus: 429 }), 'rate_limited');
+  assert.equal(receiptFailureKind({ rateLimited: true }), 'rate_limited');
+  assert.equal(receiptFailureKind({ actionRequiredKind: 'usage_quota_exhausted' }), 'quota_exhausted');
+  assert.equal(receiptFailureKind({ authFailed: true }), 'auth_failed');
+});
 
 test('Cursor exact named-model rejection is a plan restriction only when a model flag was sent', () => {
   const attributed = classifyRunFailure({

@@ -17,6 +17,7 @@ test('semantic evidence cannot overwrite an authoritative isolation cleanup fail
   for (const stdout of [refusal, progress]) {
     const recorded = []; let response;
     const context = { classifyRunFailure: require('../lib/provider-failure').classifyRunFailure,
+      receiptFailureKind: require('../lib/provider-failure').receiptFailureKind,
       cleanOutput: (value) => String(value || '').trim(), recordRunUsage: (row) => recorded.push(row),
       quotaSeatForProvider: (kind) => kind, cooldowns: { noteFailure: () => null },
       appendBridgeProviderReceipt: () => ({ receiptId: 'rcpt_fixture' }), parseRetryAfter: () => null, Date };

@@ -1,5 +1,5 @@
 {
-  "_comment": "Fuel-gauge budgets. Subscription plans publish no token quota, so these are YOUR estimates of a reasonable daily draw — the gauge reports basis:'configured' so an estimate is never shown as a vendor number. Tune them from observed usage; getting them wrong changes advice, not correctness.",
+  "_comment": "Local planning budgets, not provider subscription allowances. Subscription estimates remain under configuredEstimate; top-level capacity stays unknown without current vendor/operator evidence. These estimates do not gate, deprioritize, or downgrade subscription seats. Metered budgets still inform spending advice.",
   "budgets": {
     "subscription:anthropic:default": { "tokensPerDay": 8000000 },
     "codex":        { "tokensPerDay": 6000000 },

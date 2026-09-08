@@ -108,7 +108,10 @@ test('the gauge labels a configured budget as configured, never as a vendor quot
   l.record({ seat: 'claude', model: 'claude-sonnet-4-6', costClass: 'subscription', inputTokens: 200000, outputTokens: 300000 });
   const g = l.gauge('claude', { costClass: 'subscription' });
   assert.equal(g.basis, 'configured');
-  assert.equal(g.percentRemaining, 50);
+  assert.equal(g.percentRemaining, null);
+  assert.equal(g.remaining, null);
+  assert.equal(g.capacity, null);
+  assert.equal(g.configuredEstimate.percentRemaining, 50);
   assert.match(g.note, /not a vendor-published quota/);
   fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -130,9 +133,11 @@ test('burn rate projects time-to-empty from actual usage', () => {
   for (let i = 0; i < 5; i++) l.record({ seat: 'claude', model: 'claude-sonnet-4-6', costClass: 'subscription', inputTokens: 2000, outputTokens: 2000 });
   const g = l.gauge('claude', { costClass: 'subscription' });
   assert.equal(g.used.totalTokens, 20000);
-  assert.equal(g.percentRemaining, 80);
+  assert.equal(g.percentRemaining, null);
+  assert.equal(g.configuredEstimate.percentRemaining, 80);
   assert.ok(g.burn.tokensPerHour > 0, 'burn rate must be measured');
-  assert.ok(g.hoursToEmpty > 0, 'a projection must exist when burning against a budget');
+  assert.equal(g.hoursToEmpty, null);
+  assert.ok(g.configuredEstimate.hoursToEmpty > 0, 'a budget projection is not subscription capacity');
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -154,7 +159,8 @@ test('linked-account quota seats retain usage, burn rate, and explicit quota evi
   });
   assert.equal(gauge.used.totalTokens, 100);
   assert.ok(gauge.burn.tokensPerHour > 0, 'burn rate must use the selected account quota seat');
-  assert.ok(gauge.hoursToEmpty > 0);
+  assert.equal(gauge.hoursToEmpty, null);
+  assert.ok(gauge.configuredEstimate.hoursToEmpty > 0);
 
   const observedAt = new Date();
   const operator = ledger.observeOperatorQuota({
@@ -224,7 +230,8 @@ test('active vendor quota overrides configured fuel while preserving the estimat
   clock += 86400001;
   const expired = restarted.gauge('grok', { costClass: 'subscription' });
   assert.equal(expired.basis, 'configured');
-  assert.equal(expired.percentRemaining, 100);
+  assert.equal(expired.percentRemaining, null);
+  assert.equal(expired.configuredEstimate.percentRemaining, 100);
   assert.equal(expired.vendorQuota, null);
   fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -281,7 +288,8 @@ test('an expiring operator observation overrides a configured estimate and persi
   clock += 5 * 3600000 + 1;
   gauge = restarted.gauge('claude', { costClass: 'subscription' });
   assert.equal(gauge.basis, 'configured', 'expired human evidence stops affecting routing automatically');
-  assert.equal(gauge.percentRemaining, 96);
+  assert.equal(gauge.percentRemaining, null);
+  assert.equal(gauge.configuredEstimate.percentRemaining, 96);
   assert.equal(gauge.operatorQuota, null);
   fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -313,10 +321,81 @@ test('operator quota validation rejects unsafe scope, percentages, provenance an
 
 // ---- levelling -------------------------------------------------------------
 
+test('exhausted subscription estimates remain unknown and cannot steer routing', () => {
+  const dir = tmp();
+  try {
+    const ledger = createUsageLedger({ dataDir: dir, budgets: { claude: { tokensPerDay: 100 } } });
+    ledger.record({ seat: 'claude', costClass: 'subscription', inputTokens: 1000, cacheReadTokens: 50000 });
+    const gauge = ledger.gauge('claude', { costClass: 'subscription' });
+    assert.equal(gauge.configuredEstimate.percentRemaining, 0);
+    for (const field of ['capacity', 'remaining', 'percentRemaining', 'hoursToEmpty']) assert.equal(gauge[field], null);
+    assert.match(gauge.note, /unknown/);
+    // Guard against old clients or fixtures still passing a numeric estimate.
+    const legacy = { ...gauge, percentRemaining: 0, hoursToEmpty: 0 };
+    assert.equal(stressOf(legacy), 0);
+    const adjustment = suggestTierAdjustment({ tier: 'complex', gauge: legacy });
+    assert.equal(adjustment.changed, false);
+    assert.match(adjustment.reason, /unknown/);
+    const ranked = levelCandidates([
+      { seat: 'claude', rank: 0, costClass: 'subscription' },
+      { seat: 'codex', rank: 1, costClass: 'subscription' },
+    ], { claude: legacy, codex: { basis: 'configured', percentRemaining: 100 } });
+    assert.equal(ranked[0].seat, 'claude');
+    assert.match(ranked[0].why, /unknown/);
+    assert.doesNotMatch(ranked[0].why, /0%|empty/);
+    const balance = fleetBalance({ claude: legacy, fable: { ...legacy, seat: 'fable' } });
+    assert.equal(balance.balanced, null);
+    assert.equal(balance.advice, null);
+    assert.equal(balance.seats, 0);
+    assert.equal(balance.unknownSeats.length, 1, 'aliases share one quota seat');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('subscriptions without budgets are unknown, and dollar budgets are only estimates', () => {
+  const dir = tmp();
+  try {
+    const ledger = createUsageLedger({ dataDir: dir, budgets: { claude: { usdPerDay: 5 } } });
+    const dollar = ledger.gauge('claude', { costClass: 'subscription' });
+    assert.equal(dollar.basis, 'configured');
+    assert.equal(dollar.percentRemaining, null);
+    assert.equal(dollar.configuredEstimate.capacity, 5);
+    const missing = ledger.gauge('gemini', { costClass: 'subscription' });
+    assert.equal(missing.basis, 'unknown');
+    assert.equal(missing.percentRemaining, null);
+    assert.equal(missing.configuredEstimate, null);
+    assert.doesNotMatch(missing.note, /free|unmetered/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('operator observations still advise routing with provenance, never a hard gate', () => {
+  const gauges = {
+    claude: { seat: 'claude', basis: 'operator_observed', percentRemaining: 0 },
+    codex: { seat: 'codex', basis: 'operator_observed', percentRemaining: 90 },
+  };
+  assert.equal(stressOf(gauges.claude), 1);
+  const balance = fleetBalance(gauges);
+  assert.equal(balance.balanced, false);
+  assert.equal(balance.quotaSeats[0].basis, 'operator_observed');
+});
+
+test('fuel UI renders unknown capacity neutrally, never as zero percent', () => {
+  const html = fs.readFileSync(path.join(__dirname, '../public/index.html'), 'utf8');
+  const source = html.match(/function fuelBar\(pct, basis\)\{[\s\S]*?\n\}/)?.[0];
+  assert.ok(source, 'exercise the actual dashboard renderer');
+  const fuelBar = require('node:vm').runInNewContext(`(${source})`);
+  for (const [pct, basis] of [[null, 'vendor_observed'], [undefined, 'unknown'], [0, 'configured'], [NaN, 'metered']]) {
+    const rendered = fuelBar(pct, basis);
+    assert.match(rendered, /unknown/);
+    assert.doesNotMatch(rendered, /0%|#f87171/);
+  }
+  assert.match(fuelBar(0, 'vendor_observed'), /0%/);
+  assert.match(fuelBar(100, 'unmetered'), /∞/);
+});
+
 test('a drained seat is deprioritised but a capable order is still respected', () => {
   const gauges = {
-    claude: { seat: 'claude', basis: 'configured', percentRemaining: 8, hoursToEmpty: 0.5 },
-    codex:  { seat: 'codex',  basis: 'configured', percentRemaining: 95, hoursToEmpty: 40 },
+    claude: { seat: 'claude', basis: 'metered', percentRemaining: 8, hoursToEmpty: 0.5 },
+    codex:  { seat: 'codex',  basis: 'metered', percentRemaining: 95, hoursToEmpty: 40 },
   };
   const ranked = levelCandidates(
     [{ seat: 'claude', rank: 0, costClass: 'subscription' }, { seat: 'codex', rank: 1, costClass: 'subscription' }],
@@ -330,22 +409,22 @@ test('free local seats sort forward — using them is how metered seats are save
   const ranked = levelCandidates([
     { seat: 'claude', rank: 0, costClass: 'subscription' },
     { seat: 'ollama_coder', rank: 1, costClass: 'local' },
-  ], { claude: { seat: 'claude', basis: 'configured', percentRemaining: 20, hoursToEmpty: 2 } });
+  ], { claude: { seat: 'claude', basis: 'metered', percentRemaining: 20, hoursToEmpty: 2 } });
   assert.equal(ranked[0].seat, 'ollama_coder');
   assert.equal(ranked[0].stress, 0, 'a free seat carries no stress penalty');
 });
 
 test('levelling nudges rather than scrambles: a healthy fleet keeps router order', () => {
   const gauges = {
-    a: { seat: 'a', basis: 'configured', percentRemaining: 90, hoursToEmpty: 30 },
-    b: { seat: 'b', basis: 'configured', percentRemaining: 85, hoursToEmpty: 28 },
+    a: { seat: 'a', basis: 'metered', percentRemaining: 90, hoursToEmpty: 30 },
+    b: { seat: 'b', basis: 'metered', percentRemaining: 85, hoursToEmpty: 28 },
   };
   const ranked = levelCandidates([{ seat: 'a', rank: 0, costClass: 'subscription' }, { seat: 'b', rank: 1, costClass: 'subscription' }], gauges);
   assert.equal(ranked[0].seat, 'a', 'a small fuel difference must not override the router');
 });
 
 test('a stressed seat downgrades one tier — never more, never below utility', () => {
-  const stressed = { seat: 'claude', basis: 'configured', percentRemaining: 10, hoursToEmpty: 0.5 };
+  const stressed = { seat: 'claude', basis: 'metered', percentRemaining: 10, hoursToEmpty: 0.5 };
   const r = suggestTierAdjustment({ tier: 'complex', gauge: stressed });
   assert.equal(r.tier, 'standard');
   assert.equal(r.changed, true);
@@ -356,7 +435,7 @@ test('a stressed seat downgrades one tier — never more, never below utility', 
 });
 
 test('high-stakes and explicitly requested work are never downgraded to save budget', () => {
-  const empty = { seat: 'claude', basis: 'configured', percentRemaining: 2, hoursToEmpty: 0.1 };
+  const empty = { seat: 'claude', basis: 'metered', percentRemaining: 2, hoursToEmpty: 0.1 };
   assert.equal(suggestTierAdjustment({ tier: 'critical', gauge: empty }).changed, false);
   assert.equal(suggestTierAdjustment({ tier: 'complex', gauge: empty, highStakes: true }).changed, false);
   const explicit = suggestTierAdjustment({ tier: 'complex', gauge: empty, explicitProvider: true });
@@ -365,14 +444,14 @@ test('high-stakes and explicitly requested work are never downgraded to save bud
 });
 
 test('a comfortable seat is not downgraded', () => {
-  const healthy = { seat: 'claude', basis: 'configured', percentRemaining: 80, hoursToEmpty: 20 };
+  const healthy = { seat: 'claude', basis: 'metered', percentRemaining: 80, hoursToEmpty: 20 };
   assert.equal(suggestTierAdjustment({ tier: 'complex', gauge: healthy }).changed, false);
 });
 
 test('fleet balance names which seat to shift work away from', () => {
   const uneven = fleetBalance({
-    claude: { seat: 'claude', basis: 'configured', percentRemaining: 10 },
-    codex:  { seat: 'codex',  basis: 'configured', percentRemaining: 90 },
+    claude: { seat: 'claude', basis: 'metered', percentRemaining: 10 },
+    codex:  { seat: 'codex',  basis: 'metered', percentRemaining: 90 },
   });
   assert.equal(uneven.balanced, false);
   assert.equal(uneven.spread, 80);
@@ -381,8 +460,8 @@ test('fleet balance names which seat to shift work away from', () => {
   assert.match(uneven.advice, /shift work from claude/);
 
   const even = fleetBalance({
-    a: { seat: 'a', basis: 'configured', percentRemaining: 70 },
-    b: { seat: 'b', basis: 'configured', percentRemaining: 62 },
+    a: { seat: 'a', basis: 'metered', percentRemaining: 70 },
+    b: { seat: 'b', basis: 'metered', percentRemaining: 62 },
   });
   assert.equal(even.balanced, true);
   assert.equal(even.advice, null);
@@ -391,14 +470,14 @@ test('fleet balance names which seat to shift work away from', () => {
 test('unmetered seats are excluded from balance — they cannot be drained', () => {
   const b = fleetBalance({
     ollama: { seat: 'ollama', basis: 'unmetered', percentRemaining: 100 },
-    claude: { seat: 'claude', basis: 'configured', percentRemaining: 20 },
+    claude: { seat: 'claude', basis: 'metered', percentRemaining: 20 },
   });
   assert.equal(b.seats, 1, 'only metered seats count toward balance');
-  assert.equal(b.balanced, true, 'a single metered seat cannot be unbalanced against itself');
+  assert.equal(b.balanced, null, 'a single observed seat cannot establish fleet balance');
 });
 
 test('stress rises on low fuel OR fast burn, not only on low fuel', () => {
-  assert.ok(stressOf({ basis: 'configured', percentRemaining: 95, hoursToEmpty: 0.5 }) >= 0.9,
+  assert.ok(stressOf({ basis: 'metered', percentRemaining: 95, hoursToEmpty: 0.5 }) >= 0.9,
     'emptying within the hour is stressful even at 95%');
   assert.equal(stressOf({ basis: 'unmetered', percentRemaining: 0 }), 0, 'free seats are never stressed');
 });
@@ -426,8 +505,8 @@ test('an explicitly requested cooling seat remains available', () => {
 test('normal route selections are reordered by fuel without widening capability', () => {
   const route = { selected: [{ kind: 'claude', policyScore: 100 }, { kind: 'codex', policyScore: 90 }] };
   const levelled = levelRouteSelection(route, {
-    claude: { basis: 'configured', percentRemaining: 2, hoursToEmpty: 0.2 },
-    codex: { basis: 'configured', percentRemaining: 95, hoursToEmpty: 30 },
+    claude: { basis: 'metered', percentRemaining: 2, hoursToEmpty: 0.2 },
+    codex: { basis: 'metered', percentRemaining: 95, hoursToEmpty: 30 },
   }, { claude: 'subscription', codex: 'subscription' });
   assert.deepEqual(levelled.selected.map((pick) => pick.kind), ['codex', 'claude']);
   assert.equal(levelled.selected.length, 2, 'levelling must not add providers');
@@ -437,11 +516,11 @@ test('normal route selections are reordered by fuel without widening capability'
 test('a nearly empty capable seat may move several ranks to preserve remaining quota', () => {
   const candidates = ['a', 'b', 'c', 'd', 'e'].map((seat, rank) => ({ seat, rank, costClass: 'subscription' }));
   const gauges = {
-    a: { basis: 'configured', percentRemaining: 1, hoursToEmpty: 0.1 },
-    b: { basis: 'configured', percentRemaining: 95, hoursToEmpty: 30 },
-    c: { basis: 'configured', percentRemaining: 95, hoursToEmpty: 30 },
-    d: { basis: 'configured', percentRemaining: 95, hoursToEmpty: 30 },
-    e: { basis: 'configured', percentRemaining: 95, hoursToEmpty: 30 },
+    a: { basis: 'metered', percentRemaining: 1, hoursToEmpty: 0.1 },
+    b: { basis: 'metered', percentRemaining: 95, hoursToEmpty: 30 },
+    c: { basis: 'metered', percentRemaining: 95, hoursToEmpty: 30 },
+    d: { basis: 'metered', percentRemaining: 95, hoursToEmpty: 30 },
+    e: { basis: 'metered', percentRemaining: 95, hoursToEmpty: 30 },
   };
   const ranked = levelCandidates(candidates, gauges);
   assert.ok(ranked.find((item) => item.seat === 'a').levelledRank >= 3,

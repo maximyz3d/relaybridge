@@ -350,7 +350,7 @@ test('one canonical cwd has one writer; expiry never authorizes takeover, includ
   clock.value += 1;
   for (const instance of [pipeline, restart(), restart()]) {
     assert.throws(() => instance.startImplementation(secondId, { actor: 'codex-b' }), (error) => {
-      assert.equal(error.code, 'WRITER_LEASE_HELD_EXPIRED');
+      assert.equal(error.code, 'WRITER_EXECUTION_UNCERTAIN');
       assert.equal(error.details.runId, firstId);
       assert.equal(error.details.expired, true);
       assert.equal(error.details.recovery, 'unavailable_unbound_owner');
@@ -382,7 +382,7 @@ test('concurrent restarted processes cannot replace expired workspace ownership'
     ['-e', script, require.resolve('../lib/workflow-pipeline'), dataDir, String(clock.value), id],
     { timeout: 10000, maxBuffer: 8192 })));
   for (const result of results) assert.deepEqual(JSON.parse(result.stdout), {
-    code: 'WRITER_LEASE_HELD_EXPIRED', phase: 'plan_ready',
+    code: 'WRITER_EXECUTION_UNCERTAIN', phase: 'plan_ready',
   });
   assert.equal(fs.readFileSync(lockPath, 'utf8'), originalLock);
 });
@@ -482,6 +482,9 @@ test('bound writer recovery survives restart and releases only its own expired l
   clock.value += 101;
 
   const recovered = restart();
+  const contender = 'wf_contender_999999999991';
+  advanceToPlanReady(recovered, cwd, contender);
+  throwsCode(() => recovered.startImplementation(contender), 'WRITER_EXECUTION_UNCERTAIN');
   throwsCode(() => recovered.failBoundWriterTask(runId, {
     actor: 'claude-reviser', taskId: 't_someone_else', reason: 'No.',
   }), 'PROVIDER_TASK_MISMATCH');

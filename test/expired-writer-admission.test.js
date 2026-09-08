@@ -35,7 +35,7 @@ test('REST restart preserves an expired writer lock and reports actionable confl
   for (let attempt = 0; attempt < 2; attempt++) {
     const claim = await bridge.request(`/api/workflows/${contenderId}/implementation/claim`, {});
     assert.equal(claim.status, 409, JSON.stringify(claim.body));
-    assert.equal(claim.body.code, 'WRITER_LEASE_HELD_EXPIRED');
+    assert.equal(claim.body.code, 'WRITER_EXECUTION_UNCERTAIN');
     assert.equal(claim.body.details.runId, ownerId);
     assert.equal(claim.body.details.actor, 'codex');
     assert.equal(claim.body.details.expired, true);
