@@ -1,3 +1,6 @@
+## v2.2.2 - 2026-09-08
+- #126 feat: refine task UI, optional output guidance and native provider diagnostics
+
 ## v2.2.1 - 2026-09-08
 - #123 docs(coordination): preserve owner/storage history and issue122 recovery plan
 
