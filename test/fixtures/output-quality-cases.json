@@ -1,42 +1,77 @@
 {
-  "version": 1,
-  "scoring": "Score each criterion 0 absent or contradicted, 1 partial, 2 satisfied. Judge the original request first. Preserve ties and regressions; no model-quality ranking follows from this small sample.",
+  "version": 2,
+  "scoring": "Score each criterion 0 absent or contradicted, 1 partial, 2 satisfied. Judge the original request first. Record actual whitespace-separated word count separately. Breached explicit limits, fabricated execution evidence and omitted required behavior are acceptance failures regardless of total score. Headings are not a failure when useful. Preserve ties and regressions; no model-quality ranking follows from this small sample. Version 1 remains in Git history; do not rewrite historical results.",
   "cases": [
     {
       "id": "cache-race",
       "profile": "code-debug",
       "prompt": "A cache uses this pseudocode: if key is absent: await fetch(key); cache[key] = response; return cache[key]. Two callers request the same missing key; the log shows two fetches. Explain the likely cause and a focused correction in at most 140 words. This is supplied pseudocode only; no repository or tests are available.",
-      "criteria": ["Connect duplicate fetches to a non-atomic check across await", "Describe sharing an in-flight promise and handling rejection cleanup", "Distinguish proposed verification from tests actually run", "Respect the supplied evidence and 140-word limit"]
+      "criteria": [
+        "Connect duplicate fetches to a non-atomic check across await",
+        "Describe sharing an in-flight promise and handling rejection cleanup",
+        "Treat pseudocode analysis as inference; do not claim reproduction or executed tests without supplied execution evidence",
+        "Respect the 140-word limit"
+      ]
     },
     {
       "id": "handoff-plan",
       "profile": "implementation-plan",
       "prompt": "Plan adding an export button to an existing reporting app. CSV generation already exists; the frontend and backend have separate owners. Requirements: visible progress, keyboard access, retry on failure, no duplicate export on double-click. Give a plan in at most 160 words; implementation has not started.",
-      "criteria": ["Put the request/response contract before dependent UI work", "Assign frontend/backend responsibilities without inventing a new team", "Include observable acceptance for progress, keyboard, retry and duplicate prevention", "Keep planned work distinct from completed work and respect 160 words"]
+      "criteria": [
+        "Put the request/response contract before dependent UI work",
+        "Assign frontend/backend responsibilities without inventing a new team or replacing existing CSV generation",
+        "Include observable acceptance for progress and keyboard access",
+        "Include retry after failure and duplicate prevention during an outstanding export; disabling export or rollback does not satisfy retry",
+        "Keep planned work distinct from completed work",
+        "Respect the 160-word limit"
+      ]
     },
     {
       "id": "queue-design-choice",
       "profile": "decision-analysis",
       "prompt": "Choose between a 100-item and a 1000-item in-memory queue for a small service. Both use the same worker concurrency. Traffic is bursty; each queued item holds 200 KB; memory available to the queue is 40 MB. Processing rate and acceptable wait time have not been measured. Recommend a next step in at most 130 words.",
-      "criteria": ["Recognize 1000 items exceed the stated memory budget", "Do not claim a larger queue increases worker throughput", "Name processing rate or acceptable wait as missing evidence", "Recommend a bounded measurement or reversible next step within 130 words"]
+      "criteria": [
+        "Recognize 1000 items exceed the stated memory budget",
+        "Do not claim a larger queue increases worker throughput",
+        "Name processing rate or acceptable wait as missing evidence",
+        "Recommend a bounded measurement or reversible next step",
+        "Respect the 130-word limit"
+      ]
     },
     {
       "id": "source-gap",
       "profile": "research-synthesis",
       "prompt": "An internal note dated January says Tool A exports CSV. A supplied vendor release note dated March says CSV export was removed in version 4. We have version 4 installed. Summarize what we can conclude in at most 100 words. No browsing or additional sources are available.",
-      "criteria": ["Use the newer version-specific evidence for the current installation", "Attribute claims to supplied notes without invented links", "Distinguish documentary conclusion from a live test", "Respect 100 words"]
+      "criteria": [
+        "Use the newer version-specific evidence for the current installation",
+        "Attribute claims to supplied notes without invented links",
+        "Distinguish documentary conclusion from a live test",
+        "Respect 100 words"
+      ]
     },
     {
       "id": "review-disagreement",
       "profile": "collaboration-synthesis",
       "prompt": "Reviewer A says approve, citing 12 unit tests. Reviewer B says block: restart recovery was not tested. Requirement R2 explicitly requires restart recovery. Task t_example is marked done; receipt rcpt_example contains only a plan. Synthesize the evidence and next action in at most 110 words.",
-      "criteria": ["Do not infer approval from the plan receipt or done task", "Explain why R2 remains unverified despite passing unit tests", "Preserve the disagreement and relevant IDs", "Request the missing restart evidence without authorizing replay and respect 110 words"]
+      "criteria": [
+        "Do not infer approval from the plan receipt or done task",
+        "Explain why R2 remains unverified despite passing unit tests",
+        "Preserve the disagreement and relevant IDs",
+        "Request the missing restart evidence without authorizing replay",
+        "Respect the 110-word limit"
+      ]
     },
     {
       "id": "dialog-friction",
       "profile": "design-critique",
       "prompt": "A supplied UI description says: a modal contains an unlabeled icon-only Save button; saving takes 8 seconds with no progress; success closes the modal and resets keyboard focus to the page body. Suggest the three most useful refinements in at most 110 words. No screenshot, browser or screen reader is available.",
-      "criteria": ["Address accessible naming", "Provide progress and prevent duplicate submission while saving", "Restore focus to a meaningful initiating control", "Do not claim visual/browser/accessibility testing and respect 110 words"]
+      "criteria": [
+        "Address accessible naming",
+        "Provide progress and prevent duplicate submission while saving",
+        "Restore focus to a meaningful initiating control",
+        "Do not claim visual/browser/accessibility testing",
+        "Respect the 110-word limit"
+      ]
     }
   ]
 }
