@@ -299,3 +299,39 @@ Native Grok/Gemini usability, inherited-setting/MCP isolation and enforced
 filesystem restrictions are not established by synthetic quota tests. No
 runtime state, credentials, raw transcripts or unrelated changes are included
 in this handoff.
+
+### Remote workflow surface correction
+
+Code head `658dc8f07cca567e26e588398658d6ccaf84022b` passed the full local
+suite (1,048 tests, 1,044 passed, zero failed, four platform/optional skips,
+both Chromium tests enabled), production dependency audit and skill validation.
+The native Astra publication audit found no runtime artifacts, credentials,
+private logs or raw transcripts in its 42 changed files.
+
+A complete fresh isolated review returned **REVISE** for one additional
+cross-surface omission: the two new external revision tools were not in the
+existing remote MCP exclusion list. Root added both; real authenticated MCP
+HTTP tests now prove they are absent and uncallable in both safe and full
+remote profiles. All 35 focused remote MCP, local MCP and controller tests
+passed. Existing local workflow authority is preserved.
+
+- Reviewed head: `658dc8f07cca567e26e588398658d6ccaf84022b`.
+- Request/invocation: `astra-review-78975708-33e6-4bbf-ac3d-226b1b67d0a7`.
+- Attempt: `astra-review-78975708-33e6-4bbf-ac3d-226b1b67d0a7:attempt:1`.
+- Run: `run_mtsvkaou_328cb077`; receipt: `rcpt_mtsvqh3d_6200de29`.
+- Build: `2.0.1+f677d05d76dcda72`.
+- Receipt store: `eae5fab51fd1b78bebec4e72af0a6df504db5f22b2e93a61edeaebdcaf319476`.
+- Complete answer: 2,826 characters; SHA-256
+  `136592df3c8c8b1b16d02342e6105c40f1770ca2236c8971f7fb629a1edb5c3f`.
+
+This was exit 0, one invocation, no failure or partial-result flag, with exact
+requested/outgoing Astra and applied ultra controls and no fallback. Observed
+model remains unavailable. The isolated runtime was cleaned up. A fresh closing
+review must assess the correction before this PR is ready.
+
+The bounded native submission audit also identified a pre-existing retry guard
+that checks camelCase physical-attempt counts but not contradictory snake_case
+counts. No current production producer of that contradiction was found: the
+only admission-limit rejection explicitly writes zero attempts before dispatch.
+It is a follow-up hardening item, not a demonstrated production replay, and was
+not changed in this release.
