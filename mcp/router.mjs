@@ -57,7 +57,7 @@ export function classifyTask(task) {
   // Keep the retrieval gate for mixed tasks that actually request outside
   // sources; merely naming a research handoff must not disqualify code seats.
   const externalResearch = hasAny(text, [
-    /\b(?:retrieve|fetch|open|read|visit|look up|download|browse|search)\b[^\n]{0,120}https?:\/\//,
+    /\b(?:retrieve|fetch|open|read|visit|look up|download|browse|search)\b[\s\S]{0,180}https?:\/\//,
     /\b(?:browse|search the web|web search|internet|online sources?|external sources?|compare products?|github projects?)\b/,
     /\b(?:research|find|look up|search|retrieve)\b[^.\n]{0,80}\b(?:official|external|online|web|internet|public sources?)\b/,
     /\b(?:latest|current|official)\b[^.\n]{0,60}\b(?:news|prices|products?|releases?|documentation|docs|standards?|regulations?)\b/,

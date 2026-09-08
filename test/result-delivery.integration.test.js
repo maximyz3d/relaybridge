@@ -53,4 +53,20 @@ test('REST queued delivery returns before execution, retrieves exact sanitized b
   assert.equal((await bridge.request('/api/tasks', { ...body, taskId: 't_large', prompt: 'x'.repeat(100001) })).status, 400);
   assert.equal((await bridge.request('/api/tasks', { ...body, taskId: 't_bad', requestId: 'short' })).status, 400);
   assert.equal(completeJsonLines(capture).length, 1);
+
+  // Repeating a caller-known submission must validate its filename identity
+  // before using anything from the stored record as a new lookup target.
+  const victimInput = { ...body, taskId: 't_victim', prompt: 'A different fixture request.' };
+  assert.equal((await bridge.request('/api/tasks', victimInput)).status, 202);
+  await waitFor(async () => (await bridge.request('/api/tasks/t_victim/result')).body.resultPersisted);
+  const stored = JSON.parse(fs.readFileSync(filename, 'utf8'));
+  stored.id = 't_victim'; fs.writeFileSync(filename, JSON.stringify(stored));
+  const victimFile = path.join(bridge.root, 'data', 'tasks', 't_victim.json');
+  const unchanged = [fs.readFileSync(filename), fs.readFileSync(victimFile)];
+  const corruptRetry = await bridge.request('/api/tasks', body);
+  assert.equal(corruptRetry.status, 503);
+  assert.equal(corruptRetry.body.code, 'DELIVERY_UNAVAILABLE');
+  assert.equal(corruptRetry.body.taskId, undefined);
+  assert.deepEqual([fs.readFileSync(filename), fs.readFileSync(victimFile)], unchanged);
+  assert.equal(completeJsonLines(capture).length, 2);
 });

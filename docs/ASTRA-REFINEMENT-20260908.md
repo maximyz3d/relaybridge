@@ -224,3 +224,36 @@ eight Chromium/state checks passed. New integration exercises real isolated
 REST/queue-adjacent admission and receipts with synthetic CLI failures. No live
 Gemini, Grok or Claude calls occurred. Interactive quota ingestion, native seat
 qualification and pre-reset recovery proof remain separate acceptance work.
+
+## Closing review at the complete feature head
+
+Frozen code head `e0cbaf48fe383bade49c60837706d9e159ab6936` passed the full
+local suite: 1,048 tests, 1,044 passed, zero failed, four platform/optional skips,
+including both Chromium browser cases. Audit reported zero vulnerabilities;
+skill validation passed. GitHub Linux and CodeQL passed; Windows was pending.
+
+A fresh read-only Codex review through an isolated production-mode RelayBridge
+returned a complete **REVISE** verdict, exit 0, one model invocation, no failure
+or partial-result flag. Requested/outgoing model was `gpt-6-astra`, requested and
+applied effort `ultra`, no effort fallback. Observed model and provider terminal
+reason were unavailable. The receipt labels token accounting `chars_div_4`, so
+no authoritative provider token usage is claimed.
+
+- Request/invocation: `astra-review-38c42924-730b-44a1-a1a3-72f88d41cdc1`.
+- Attempt: `astra-review-38c42924-730b-44a1-a1a3-72f88d41cdc1:attempt:1`.
+- Run: `run_mtsurpy8_3b3b83d3`; receipt: `rcpt_mtsuxrmk_3fac1bbd`.
+- Build: `2.0.1+98d079639595859f`.
+- Receipt store: `12b10926143631c3f6aefcfb04b740ec6c0c746cb44fa1ba073e10ae1be9f869`.
+- Complete answer: 3,942 characters; SHA-256
+  `6b620a1f6051940899bf11a5b63cb728f281ffe5812fb672e21dc3bf034a79fd`.
+
+The isolated runtime was cleaned up; its receipt envelope and identity were
+retained privately. These identifiers do not refer to the shared bridge. No
+raw transcript, runtime data or credential is published here.
+
+Two findings were corrected: idempotent submission now validates the loaded
+record against the caller's ID and collects using that caller ID; URL retrieval
+classification allows bounded multiline/Markdown-list references. The new real
+REST regression proves a corrupted source record cannot redirect a retry to a
+victim result or modify either record. All 84 focused queue/delivery/router/MCP
+checks passed. A fresh closing verdict is still required after these fixes.

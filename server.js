@@ -5358,8 +5358,8 @@ app.post('/api/tasks', async (req, res) => {
       intent.expectedCwdIdentityHash = snapshot.cwdIdentityHash;
       intent.expectedCwdPolicyId = CWD_POLICY_IDENTITY;
       intent.expectedPromptHash = controls.promptEvidence.effectiveHash;
-      const task = taskQueue.submitDurable(taskId, intent);
-      return res.status(202).json(taskQueue.getResult(task.id));
+      taskQueue.submitDurable(taskId, intent);
+      return res.status(202).json(taskQueue.getResult(taskId));
     }
     res.json(taskQueue.submit(submitted));
   }
