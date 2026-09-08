@@ -175,3 +175,21 @@ Delivery validation checkpoint: all 77 focused queue, result contract,
 redaction, REST and MCP tests passed with zero skips. Those fixtures exercise
 real bridge/queue wiring with local stand-in CLIs, not live provider accounts.
 Fresh independent review of the final combined head remains required.
+
+## Pass 3: browser workflow controls
+
+The existing Tasks dialog now exposes a staged-workflow panel for the persisted
+Astra policy and external revisions. It verifies policy, uses server next
+actions, keeps GET refresh distinct from dispatch/reconciliation, and retains
+lease tokens only in memory with explicit copy/paste controls. Other profiles
+remain inspectable without accidentally dispatching a legacy advisor.
+
+Native Astra `astra_workflow` identified response/selection races, permanent
+blocking after confirmed token rejection, missing returned-policy verification,
+and mismatched scope caps. Root corrected those findings. All eight focused
+state/browser checks passed with headless Chromium, including real page scripts
+under CSP, late list and claim responses, wrong-token correction, unsupported
+profile rejection, four-hour renewal, final-review gating, and 390/640-pixel
+layouts. Provider responses were local fixtures; this is browser acceptance,
+not installed runtime or live provider qualification. Screenshots were inspected
+locally and contain only fixtures. Full-suite and closing review remain pending.

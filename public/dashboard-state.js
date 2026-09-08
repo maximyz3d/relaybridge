@@ -73,6 +73,43 @@
     };
   }
 
+  const workflowActions = {
+    submit_pipeline_research: { path:'research', label:'Submit research and run planner', evidence:true },
+    claim_pipeline_implementation: { path:'implementation/claim', label:'Claim implementation lease', claim:true },
+    complete_pipeline_implementation: { path:'implementation/complete', label:'Complete implementation and run review', evidence:true, token:true },
+    reconcile_pipeline: { path:'reconcile', label:'Reconcile finished advisor task' },
+    claim_pipeline_revision: { path:'revision/claim', label:'Claim external revision lease', claim:true, full:true },
+    complete_pipeline_revision: { path:'revision/complete', label:'Store completed revision evidence', evidence:true, token:true },
+    renew_pipeline_writer_lease: { path:'lease/renew', label:'Renew writer lease for 4 hours', token:true, renew:true },
+    start_pipeline_final_review: { path:'final-review/start', label:'Run final review' },
+  };
+  function workflowDetailModel(snapshot = {}) {
+    const workflow = snapshot.workflow || {}, lease = workflow.writerLease;
+    const policy = workflow.phasePolicy;
+    const astraPolicy = workflow.profile === 'codex-astra-ultra' && policy?.version === 1
+      && ['planning', 'review', 'finalReview'].every(phase => policy[phase]?.provider === 'codex'
+        && policy[phase].model === 'gpt-6-astra' && policy[phase].effort === 'ultra' && policy[phase].maxEffortOverride === true)
+      && ['implementation', 'revision'].every(phase => policy[phase]?.provider === 'codex' && policy[phase].mode === 'external');
+    return { runId:text(workflow.runId), phase:text(workflow.phase) || 'unknown',
+      astraPolicy,
+      profile:text(workflow.profile) || 'legacy', cwd:text(workflow.cwd), permissionMode:text(workflow.permissionMode),
+      objective:text(snapshot.artifactContents?.objective),
+      review:text(snapshot.artifactContents?.['final-review']) || text(snapshot.artifactContents?.review),
+      writer:lease ? `${text(lease.actor) || 'unknown actor'} · ${text(lease.mode) || 'unknown ownership'}` : 'No recorded writer',
+      expiresAt:count(lease?.expiresAt),
+      notice:!astraPolicy ? 'This panel acts only on workflows with a verified Astra/ultra external-writer policy. Other workflows remain inspectable through their existing clients.'
+        : workflow.phase === 'complete' ? 'Workflow review stages complete. Merge and deployment are separate.'
+        : workflow.phase === 'revision_ready' ? 'Corrective evidence saved. A fresh final review is required.'
+          : 'Planning, implementation evidence and review verdicts are separate stages.',
+      blocked:Array.isArray(snapshot.blockedActions) ? snapshot.blockedActions.map(item => text(item.code)).filter(Boolean) : [],
+      unsupportedActions:(Array.isArray(snapshot.nextActions) ? snapshot.nextActions : []).filter(name => typeof name === 'string' && !Object.hasOwn(workflowActions, name)),
+      actions:(astraPolicy && Array.isArray(snapshot.nextActions) ? [...new Set(snapshot.nextActions)] : [])
+        .filter(name => Object.hasOwn(workflowActions, name)).map(name => ({ name, ...workflowActions[name],
+          blocked:workflowActions[name].full && workflow.permissionMode !== 'full'
+            ? 'This workflow was created without filesystem-write acknowledgement.' : null })),
+    };
+  }
+
   // Epochs reject late responses after close/reopen; requests reject older
   // refreshes. These are UI identities only, never execution or lease proof.
   function createRequestGate() {
@@ -85,5 +122,5 @@
       isOpen(expected) { return open && (expected === undefined || expected === epoch); },
     };
   }
-  return { queueStatsModel, queueReasonModel, executionStateModel, taskRowModel, taskDetailModel, createRequestGate };
+  return { queueStatsModel, queueReasonModel, executionStateModel, taskRowModel, taskDetailModel, workflowDetailModel, createRequestGate };
 });

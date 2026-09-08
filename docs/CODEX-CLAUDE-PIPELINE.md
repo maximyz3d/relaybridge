@@ -410,3 +410,19 @@ The MCP installers configure Codex's tool timeout to cover the maximum provider
 run plus transport grace. Re-run the applicable installer after changing
 `config/timeout-policy.json`. See [Codex MCP configuration](https://learn.chatgpt.com/docs/extend/mcp.md)
 and [Claude MCP configuration](https://code.claude.com/docs/en/mcp).
+
+## Browser workflow controls
+
+The Tasks dialog includes a lazily loaded Staged workflows panel. Creation uses
+Astra/ultra with an explicit per-workflow filesystem acknowledgement. The panel
+verifies the returned complete advisor/writer policy before enabling actions;
+legacy and incompatible workflows remain inspectable through existing clients.
+Saved state refresh performs GETs only. Reconciliation and provider-dispatching
+stages have separate, explicitly labeled action buttons.
+
+External implementation/revision claims retain the returned token in page
+memory, even if the dialog closes before the response arrives. Copy the token
+with its explicit button before reloading when continuing in another client;
+it is never placed in browser storage or review text. A masked field accepts a
+token obtained elsewhere. Renewal explicitly requests four hours. Failed or
+expired ownership stays held; a missing task is not release evidence.

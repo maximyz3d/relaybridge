@@ -471,6 +471,31 @@
       <div id="task-submit-status" role="status" class="muted"></div>
     </div>
     <details id="task-workflow-library"><summary>Skills and tools to explore</summary><p class="muted">Curated references with original sources and licenses. These tools are available to explore; listing them does not install or connect them.</p><p id="task-library-status" class="muted" role="status"></p><div id="task-library-entries">Loading references…</div></details>
+    <details id="staged-workflows"><summary>Staged workflows · plan, implement and review</summary>
+      <div class="task-composer">
+        <p class="muted">Keep the plan, external writer lease and independent reviews together across sessions. Each stage starts only when you choose its action.</p>
+        <details><summary>Create a workflow</summary>
+          <label for="workflow-cwd">Workspace<input id="workflow-cwd" autocomplete="off" placeholder="Absolute repository path"></label>
+          <label for="workflow-objective">Objective<textarea id="workflow-objective" maxlength="12000"></textarea></label>
+          <label for="workflow-acceptance">Acceptance criteria<textarea id="workflow-acceptance" maxlength="12000"></textarea></label>
+          <label for="workflow-profile">Advisor profile<select id="workflow-profile"><option value="codex-astra-ultra">Codex · Astra / ultra · external implementation and revisions</option></select></label>
+          <p><label><span><input type="checkbox" id="workflow-write-consent" style="width:auto"> I authorize filesystem writes for this workflow.</span></label></p>
+          <button class="btn primary" id="workflow-create">Create workflow record</button>
+        </details>
+        <div class="task-fields"><label for="workflow-select">Saved workflow<select id="workflow-select"><option value="">Select a saved workflow</option></select></label><div class="task-actions"><button class="btn" id="workflow-refresh">Refresh saved state</button></div></div>
+        <p id="workflow-status" role="status" class="muted"></p>
+        <div id="workflow-detail" hidden>
+          <p id="workflow-phase"></p><p id="workflow-workspace" class="muted"></p><p id="workflow-objective-view"></p>
+          <p id="workflow-writer" class="muted"></p><p id="workflow-notice" class="task-notice"></p>
+          <details><summary>Latest saved review</summary><pre id="workflow-review" class="task-output" tabindex="0"></pre></details>
+          <label for="workflow-evidence">Evidence for the next stage<textarea id="workflow-evidence" maxlength="24000" placeholder="Research, implementation validation, or corrective evidence"></textarea></label>
+          <label for="workflow-token">Writer token from another client (optional)<input id="workflow-token" type="password" autocomplete="off" spellcheck="false"></label>
+          <button class="btn" id="workflow-copy-token" disabled>Copy writer token</button>
+          <p class="muted">Lease tokens stay in this page's memory. Copy yours before closing the page if you will continue from another client. A refresh is read-only; reconciliation can advance an advisor task.</p>
+          <div id="workflow-actions" class="task-actions"></div>
+        </div>
+      </div>
+    </details>
     <div id="tasks-stats" role="status"></div><div id="tasks-breakdown"></div>
     <div id="tasks-held" class="task-notice" hidden></div>
     <div class="task-filter"><label for="task-search">Search recent tasks<input id="task-search" type="search" placeholder="Title, provider or task ID"></label><label for="task-filter">State<select id="task-filter"><option value="">All states</option><option value="queued">Queued</option><option value="running">Running</option><option value="done">Completed</option><option value="failed">Failed</option><option value="cancelled">Cancelled</option><option value="interrupted">Interrupted</option></select></label><button class="btn" id="task-refresh">Refresh</button></div>
@@ -589,6 +614,7 @@
 <script src="/vendor/xterm/lib/xterm.js"></script>
 <script src="/vendor/xterm-addon-fit/lib/addon-fit.js"></script>
 <script src="/dashboard-state.js"></script>
+<script src="/workflow-panel.js"></script>
 <script>
 const API = location.origin;
 const ONE_SHOT_DEFAULT_TIMEOUT_MS = __ONE_SHOT_DEFAULT_TIMEOUT_MS__;
@@ -701,7 +727,7 @@ async function api(path, opts = {}) {
       const parsed = raw ? JSON.parse(raw) : {};
       detail = parsed.error || parsed.detail || raw;
     } catch {}
-    throw new Error(`${res.status} ${res.statusText}${detail ? ': ' + String(detail).slice(0, 1000) : ''}`);
+    throw Object.assign(new Error(`${res.status} ${res.statusText}${detail ? ': ' + String(detail).slice(0, 1000) : ''}`), { status:res.status });
   }
   return res.json();
 }
@@ -2846,6 +2872,7 @@ $('#operator-quota-clear')?.addEventListener('click', async () => {
 const tasksDialog = $('#tasks-dialog');
 const taskDetailDialog = $('#task-detail-dialog');
 const dashboard = window.RelayBridgeDashboardState;
+const workflowPanel = window.createRelayBridgeWorkflowPanel({ api, dashboard, document });
 const tasksGate = dashboard.createRequestGate();
 const detailGate = dashboard.createRequestGate();
 let tasksTimer = null, taskSnapshots = new Map(), taskPreview = null, taskOutputProfiles = new Map(), taskLibrarySnapshot = null;
@@ -2935,6 +2962,7 @@ async function refreshTasks(){
   }
 }
 function closeTasksPanel() {
+  workflowPanel.close();
   tasksGate.close();
   if (tasksTimer) clearInterval(tasksTimer);
   tasksTimer = null;
@@ -2943,6 +2971,7 @@ async function openTasksPanel(){
   if (tasksDialog.open) return;
   const epoch = tasksGate.open();
   tasksDialog.showModal();
+  workflowPanel.reopen();
   refreshTasks(); tasksTimer = setInterval(refreshTasks, 4000);
   void loadTaskGuidance(epoch);
   try {
