@@ -61,7 +61,7 @@ test('checkout identity checks exact root and both fetch/push origins without ch
   write(path.join(root, 'file'), 'dirty bytes');
   const before = run('status', '--porcelain=v1');
   const identity = await validateCheckoutIdentity({ requestedRepo: 'OWNER/REPO', checkoutPath: root, gitRun: git });
-  assert.equal(identity.canonicalRoot, fs.realpathSync(root));
+  assert.equal(identity.canonicalRoot, fs.realpathSync.native ? fs.realpathSync.native(root) : fs.realpathSync(root));
   assert.equal(identity.canonicalRepo, 'owner/repo');
   assert.equal(run('status', '--porcelain=v1'), before);
   assert.equal(fs.readFileSync(path.join(root, 'file'), 'utf8'), 'dirty bytes');

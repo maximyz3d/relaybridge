@@ -85,7 +85,7 @@ test('onboarding uses a private clone, preserves dirty caller and enrolls only v
   };
   const result = await onboardRepo({ name: 'acme/project', path: source }, deps);
   assert.equal(result.prNumber, 1);
-  assert.equal(state.registry.repos[0].path, fs.realpathSync(source));
+  assert.equal(state.registry.repos[0].path, fs.realpathSync.native ? fs.realpathSync.native(source) : fs.realpathSync(source));
   assert.equal(state.saves, 1); assert.equal(state.fleets, 1);
   assert.equal(git(source, ['status', '--porcelain=v1', '-z', '-uall']), before);
   assert.equal(git(source, ['rev-parse', '--abbrev-ref', 'HEAD']), branch);

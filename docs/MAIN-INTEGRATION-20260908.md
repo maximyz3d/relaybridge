@@ -48,3 +48,9 @@ Earlier failed provider calls remain **NO VERDICT**: Codex model-unavailable `rc
 6. The separate five-file no-HEAD review-packet lane remains unmodified. There is no installed smoke claim for this candidate: installation and shared restart are outside this operation.
 
 Merge is conditional on the final Linux suite, Windows checks, CodeQL and a complete fresh Claude closing verdict. Deployment remains separate.
+
+## CI correction after the initial approval
+
+The upstream delivery is now [PR125](https://github.com/maximyz3d/relaybridge/pull/125), at the same initially reviewed SHA as PR124; PR124 is closed with a link and its fork branch preserved. Linux CI passed. Windows found 13 failures (12 checkout-root identity checks and one CRLF fixture). CodeQL analysis completed but its result check failed with 30 alerts; their exact source-to-sink assessment is in [the CodeQL integration review](CODEQL-INTEGRATION-REVIEW-20260908.md). Neither failed gate is bypassed.
+
+Windows correction plan: fresh Sonnet/medium `PLAN_STATUS: READY`, result `rcpt_mts4febj_88c6cf3e`, transport `rcpt_mts4i21y_cab52a3e`, invocation `mcp:5aef8521-33b0-4837-a01d-dd397a6a6cb8`, attempt suffix `:attempt:1`, observed `claude-sonnet-5`, complete exit0/nonpartial. `lib/onboard-safety.js` now uses native realpath when available to equate Windows short/long path aliases; root/origin/identity/traversal guards are unchanged. Two canonical-path test assertions follow that same convention. The shim fixture converts LF or CRLF exactly once; production shim qualification is unchanged. Focused Linux correction tests: 36 total, 35 passed, one native-Windows skip, zero failed. The subsequent exact-head Windows/CodeQL checks and fresh closing review are recorded in the PR before merge.

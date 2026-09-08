@@ -43,7 +43,7 @@ test('known npm package shim decodes to direct Node argv without interpreting an
   assert.deepEqual(result.args, [script, ...ADVERSARIAL_ARGS]);
   assert.equal(result.templateHash.length, 64);
   const original = fs.readFileSync(shim, 'utf8');
-  write(shim, '\ufeff' + original.replace(/\n/g, '\r\n'));
+  write(shim, '\ufeff' + original.replace(/\r?\n/g, '\r\n'));
   assert.deepEqual(resolve(), result, 'LF and CRLF templates have identical qualification');
 });
 
