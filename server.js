@@ -10,26 +10,37 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
-const { RunSupervisor, resolveSupervisorOptions, normalizeProviderBudget } = require('./lib/run-supervisor');
+const { RunSupervisor, normalizeProviderBudget } = require('./lib/run-supervisor');
+const { createAttemptLifecycle } = require('./lib/attempt-lifecycle');
+const { readOllamaStream, readProviderBody, LIMITS: HTTP_PROVIDER_LIMITS } = require('./lib/http-provider-stream');
+const { parseHostedTerminal, classifyHttpTerminal } = require('./lib/http-provider-terminal');
+const { resolveAttemptTiming, renderCliDeadline } = require('./lib/cli-deadline');
 const { validateProviderBudget } = require('./lib/provider-budget');
+const { promptTransportLimits, preparePrompt, renderPromptSlot } = require('./lib/prompt-transport');
+const { resolveProviderControls, validateControlRequest, modelControls } = require('./lib/execution-contract');
+const { validationError } = require('./lib/validation-contract');
+const { normalizeEffort } = require('./lib/effort-controls');
+const { modelConfigStaleness, modelTierForTaskTier } = require('./lib/model-tiers');
+const { buildRegistry, parseModelList } = require('./lib/model-registry');
 const { extractClaudeAssistantCheckpoint, redactCheckpointSecrets } = require('./lib/partial-checkpoint');
 const { guardProviderInput } = require('./lib/provider-input-guard');
 const {
   captureWriterWorkspaceSnapshot,
   summarizeWriterWorkspaceDiff,
 } = require('./lib/writer-diff-summary');
-const { resolveModelArgs, applyModelArgs, modelConfigStaleness, modelTierForTaskTier } = require('./lib/model-tiers');
-const { buildRegistry, parseModelList, pinIsRetired } = require('./lib/model-registry');
 const { buildTaskPlan, costClassFor } = require('./lib/task-plan');
 const { createWorkflowPipeline } = require('./lib/workflow-pipeline');
 const { createWorkflowController } = require('./lib/workflow-controller');
 const { createIncidentLog, taskFailureDetails } = require('./lib/incident-log');
-const { createDelegationCoordinator } = require('./lib/delegation');
+const { createDelegationCoordinator, delegationTaskTier } = require('./lib/delegation');
 const { buildFuelGauge } = require('./lib/fuel-gauge');
 const { buildQuotaSeatGroups } = require('./lib/quota-seat');
 const providerAccounts = require('./lib/provider-accounts');
 const { providerUsageCapability, providerUsageCapabilities } = require('./lib/provider-usage-capability');
 const platform = require('./lib/platform');
+const { resolveWindowsLaunch } = require('./lib/win-shim-launch');
+const { createRequestLimiter, createOperationSlots, createReadOperationPool } = require('./lib/operation-admission');
+const { readBoundedJson } = require('./lib/bounded-json-read');
 const { validateBrowserUrl, browserOpeners } = require('./lib/browser-launch');
 const { receiptStoreIdentity } = require('./lib/receipt-store-identity.cjs');
 const { loadBuildIdentity } = require('./lib/build-identity.cjs');
@@ -66,15 +77,6 @@ const MCP_SERVER_MODULE_PROMISE = import('./mcp/server.mjs');
 // `xhigh`, while other providers may expose a literal `max` flag.  The adapter
 // below resolves the intent through provider-declared controls and records the
 // value that was actually sent.
-const SUPPORTED_EFFORTS = Object.freeze(['minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
-const EXTREME_EFFORTS = new Set(['xhigh', 'max']);
-const EFFORT_BY_TASK_TIER = Object.freeze({
-  deterministic: 'minimal',
-  utility: 'low',
-  standard: 'medium',
-  complex: 'high',
-  critical: 'high',
-});
 
 // ---- config ----
 const PORT = parseInt(process.env.PORT || '8787', 10);
@@ -514,11 +516,13 @@ let state = loadState();
 
 // ---- Persistent collabs (group chats) + projects -----------------------
 const DATA_DIR = path.resolve(envFirst('RELAYBRIDGE_DATA_DIR', 'PS_BRIDGE_DATA_DIR') || path.join(ROOT, 'data'));
+const GITHUB_REGISTRY_FILE = path.resolve(envFirst('RELAYBRIDGE_GITHUB_REPOS') || path.join(DATA_DIR, 'github-repos.json'));
 const WSL_NATIVE_RUNTIME = platform.wslNativeRuntimeStatus({
   checkout: ROOT,
   data: DATA_DIR,
   token: TOKEN_FILE,
   config: CONFIG_FILE,
+  githubRegistry: GITHUB_REGISTRY_FILE,
   node: process.execPath,
 });
 if (!WSL_NATIVE_RUNTIME.ok) {
@@ -681,8 +685,8 @@ function appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt }
     ? safeTokenSum([
         actualInputTokens,
         actualOutputTokens,
-        actualCacheReadTokens || 0,
-        actualCacheCreationTokens || 0,
+        usage?.cache_input_included === true ? 0 : actualCacheReadTokens || 0,
+        usage?.cache_input_included === true ? 0 : actualCacheCreationTokens || 0,
       ])
     : null;
   const actualTotalTokens = computedTotalTokens ?? reportedTotalTokens;
@@ -714,6 +718,7 @@ function appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt }
     actualOutputTokens,
     actualCacheReadInputTokens: actualCacheReadTokens,
     actualCacheCreationInputTokens: actualCacheCreationTokens,
+    cacheInputIncluded: usage?.cache_input_included === true,
     actualTotalTokens,
     actualThinkingTokens: nonnegativeUsageNumber(usage?.thinking_tokens),
     provider_reported_cost_usd: nonnegativeCostNumber(usage?.cost_usd),
@@ -724,11 +729,17 @@ function appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt }
     requestId,
     invocationId,
     attemptId,
-    physicalAttemptCount: modelInvocation === false ? 0 : 1,
+    physicalAttemptCount: Number.isSafeInteger(payload.physical_attempt_count) ? payload.physical_attempt_count : modelInvocation === false ? 0 : 1,
+    runId: payload.runId || route?.run_id || null,
+    transportLifecycle: payload.transport_lifecycle || null,
     outerReceiptId: route?.outer_receipt_id || null,
     modelUsage: Array.isArray(usage?.model_usage) ? usage.model_usage : [],
     vendorQuota: payload.vendor_quota || null,
     quotaEvidence: payload.quota_evidence || null,
+    grounding: payload.grounding || null,
+    cooldown: payload.cooldown || null,
+    retryAt: nonnegativeUsageNumber(payload.retry_at),
+    retryAfterSec: nonnegativeUsageNumber(payload.retry_after),
     providerActionRequired: payload.provider_action_required || null,
     providerRetryCount: nonnegativeUsageNumber(payload.provider_retries?.count),
     providerRetryDelayMs: nonnegativeUsageNumber(payload.provider_retries?.total_delay_ms),
@@ -742,8 +753,11 @@ function appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt }
     providerRetryInvalidEvents: nonnegativeUsageNumber(payload.provider_retries?.invalid_events),
     providerRetryDuplicateEvents: nonnegativeUsageNumber(payload.provider_retries?.duplicate_events),
     resultSubtype: normalizeClaudeResultString(payload.result_subtype),
+    outputDetector: payload.output_detector || null,
     resultSchemaDisagreement: payload.result_schema_disagreement === true,
     providerStopReason: normalizeClaudeResultString(payload.provider_stop_reason),
+    providerTerminalCompatibility: payload.provider_terminal_compatibility === 'ollama_done_without_reason_v1' ? payload.provider_terminal_compatibility : null,
+    transportDiagnosticCode: normalizeClaudeResultString(payload.transport_diagnostic_code),
     providerTerminalReason: normalizeClaudeResultString(payload.provider_terminal_reason),
     providerApiErrorStatus: nonnegativeUsageNumber(payload.provider_api_error_status),
     providerNumTurns: nonnegativeUsageNumber(payload.provider_num_turns),
@@ -753,6 +767,9 @@ function appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt }
     providerErrorObserved: nonnegativeUsageNumber(payload.provider_error_observed),
     providerErrorInvalid: nonnegativeUsageNumber(payload.provider_error_invalid),
     providerErrorDiagnosticTruncated: payload.provider_error_diagnostic_truncated === true,
+    providerDiagnosticChars: nonnegativeUsageNumber(payload.provider_diagnostic_chars),
+    providerDiagnosticHash: typeof payload.provider_diagnostic_hash === 'string' && /^[a-f0-9]{64}$/.test(payload.provider_diagnostic_hash)
+      ? payload.provider_diagnostic_hash : null,
     providerErrorHash: payload.provider_error_diagnostic
       ? crypto.createHash('sha256').update(String(payload.provider_error_diagnostic)).digest('hex') : null,
     partialResult: payload.partial_result === true,
@@ -1000,6 +1017,7 @@ function sendOneShotPreAdmissionRejection(res, {
 }) {
   const accounting = {
     model_invocation: false,
+    physical_attempt_count: 0,
     token_usage_source: 'not_invoked',
     transportReceiptId: null,
     transport_retry_count: 0,
@@ -1050,14 +1068,16 @@ function sendOneShotPreAdmissionRejection(res, {
 }
 
 function sendOneShotResult(res, payload, meta) {
-  if (res.writableEnded || res.destroyed) return;
+  const canDeliver = !res.writableEnded && !res.destroyed;
+  if ((!canDeliver && meta?.persistAfterDisconnect !== true) || res._relayReceiptPersisted) return;
   const requestId = meta?.route?.request_id || null;
   payload = {
     ...payload,
+    grounding: meta?.route?.grounding || null,
     requestId,
     invocationId: meta?.route?.invocation_id || requestId,
     attemptId: meta?.route?.attempt_id || (requestId ? `${requestId}:attempt:1` : null),
-    physical_attempt_count: payload.model_invocation === false ? 0 : 1,
+    physical_attempt_count: Number.isSafeInteger(payload.physical_attempt_count) ? payload.physical_attempt_count : payload.model_invocation === false ? 0 : 1,
   };
   const classified = classifyRunFailure({
     provider: meta?.kind,
@@ -1085,14 +1105,17 @@ function sendOneShotResult(res, payload, meta) {
     payload = {
       ...payload,
       stdout: '',
-      failureClass: 'incomplete_response',
+      failureClass: payload.failureClass || classified.kind,
+      result_subtype: classified.resultSubtype || payload.result_subtype,
+      output_detector: classified.outputDetector || null,
       dropped_out: true,
       partial_result: true,
       failure_sentinel: classified.failureSentinel,
       failure_sentinel_source: classified.failureSentinelSource,
       partial_diagnostic: cleanOutput(classified.partialDiagnostic),
-      stop_reason: 'provider_incomplete_response',
-      stop_detail: classified.detail,
+      stop_reason: payload.failureClass ? payload.stop_reason
+        : classified.kind === 'provider_refusal' ? 'provider_refusal' : 'provider_incomplete_response',
+      stop_detail: payload.failureClass ? payload.stop_detail : classified.detail,
     };
   } else if (classified.kind === 'incomplete_response' && !payload.dropped_out) {
     payload = {
@@ -1109,14 +1132,21 @@ function sendOneShotResult(res, payload, meta) {
   try {
     if (meta && meta.kind && typeof recordRunUsage === 'function') {
       const ok = payload.exitCode === 0 && !payload.dropped_out;
-      // Classify once and use it for BOTH accounting and cooldown, so the two
-      // can never disagree about why a run ended.
-      const failureKind = receiptFailureKind({
+      // Keep the local stop as the accounting cause; independently accepted
+      // vendor quota evidence can still protect the shared subscription seat.
+      const localBudgetStop = payload.failureClass === 'token_budget' || payload.supervisor_stop_reason === 'token_budget';
+      const acceptedQuota = payload.provider_api_error_status === 429
+        && payload.quota_evidence?.source === 'claude_terminal_api_status';
+      const failureKind = localBudgetStop ? 'token_budget' : receiptFailureKind({
         supervisorStopReason: payload.supervisor_stop_reason,
-        failureClass: payload.failureClass, apiErrorStatus: payload.provider_api_error_status,
-        rateLimited: payload.rate_limited, authFailed: payload.auth_failed,
-        actionRequiredKind: payload.provider_action_required?.kind, classifiedKind: classified.kind,
+        failureClass: payload.failureClass,
+        apiErrorStatus: payload.provider_api_error_status,
+        rateLimited: payload.rate_limited,
+        authFailed: payload.auth_failed,
+        actionRequiredKind: payload.provider_action_required?.kind,
+        classifiedKind: classified.kind,
       });
+      const cooldownKind = localBudgetStop ? (acceptedQuota ? 'rate_limited' : null) : failureKind;
       const effectiveQuotaSeat = payload.route?.quota_seat || meta.route?.quota_seat
         || quotaSeatForProvider(meta.kind);
       if (failureKind === 'rate_limited') {
@@ -1149,7 +1179,7 @@ function sendOneShotResult(res, payload, meta) {
           const v = verifyReferencedPaths(payload.stdout, meta.cwd);
           if (v.checked && (v.confidence === 'likely-fabricated' || v.confidence === 'suspect')) {
             payload.grounding_warning = v.note;
-            payload.grounding = { confidence: v.confidence, missing: v.missing.slice(0, 10), present: v.present.slice(0, 10) };
+            payload.grounding_citations = { confidence: v.confidence, missing: v.missing.slice(0, 10), present: v.present.slice(0, 10), citations: v.citations.slice(0, 20) };
           }
         }
       } catch { /* verification is advisory; never fail a run over it */ }
@@ -1164,14 +1194,16 @@ function sendOneShotResult(res, payload, meta) {
           if (effectiveQuotaSeat !== meta.kind && providerCooldown.cooling
             && providerCooldown.scope === 'model') cooldowns.noteSuccess(meta.kind);
         }
-        else if (failureKind) {
+        else if (cooldownKind) {
           // An explicitly model-scoped vendor observation must not cool every
           // model on the account. Generic 429/overload evidence has no narrower
           // scope, so it conservatively applies to the shared quota seat.
           const cooldownSeat = payload.vendor_quota?.scope === 'model' ? meta.kind : effectiveQuotaSeat;
-          const cooldown = cooldowns.noteFailure(cooldownSeat, failureKind, {
-            retryAfterSec: parseRetryAfter(vendorEvidenceText({ stdout: payload.stdout, stderr: payload.stderr,
-              includeStdout: true, supervisorStopReason: payload.supervisor_stop_reason }), payload.retry_after),
+          const cooldown = cooldowns.noteFailure(cooldownSeat, cooldownKind, {
+            retryAfterSec: acceptedQuota
+              ? parseRetryAfter(payload.provider_error_diagnostic || '')
+              : parseRetryAfter(vendorEvidenceText({ stdout: payload.stdout, stderr: payload.stderr, includeStdout: true,
+                supervisorStopReason: payload.supervisor_stop_reason }), payload.retry_after),
             scope: payload.vendor_quota?.scope === 'model' ? 'model' : 'account',
           });
           if (cooldown?.until) {
@@ -1186,6 +1218,7 @@ function sendOneShotResult(res, payload, meta) {
               reason: cooldown.reason,
               source: cooldown.source,
               offences: cooldown.offences,
+              scope: cooldown.scope,
             };
           }
         }
@@ -1212,10 +1245,10 @@ function sendOneShotResult(res, payload, meta) {
   try {
     const receipt = appendBridgeProviderReceipt({ ...meta, payload });
     res._relayReceiptPersisted = receipt.receiptId;
-    res.json({ ...payload, receiptId: receipt.receiptId, receiptPersisted: true });
+    if (canDeliver) res.json({ ...payload, receiptId: receipt.receiptId, receiptPersisted: true });
     return payload;
   } catch (error) {
-    res.json({ ...payload, receiptId: `rcpt_unpersisted_${Date.now().toString(36)}`, receiptPersisted: false, receiptPersistenceError: error.message });
+    if (canDeliver) res.json({ ...payload, receiptId: `rcpt_unpersisted_${Date.now().toString(36)}`, receiptPersisted: false, receiptPersistenceError: error.message });
     return payload;
   }
 }
@@ -1243,236 +1276,6 @@ function resolveSlot(slot) {
   });
 }
 
-function normalizeEffort(value) {
-  const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
-  return SUPPORTED_EFFORTS.includes(normalized) ? normalized : null;
-}
-
-function parseReasoningEffortAssignment(value) {
-  const match = /^(model_reasoning_effort|reasoning_effort)\s*=\s*(.+)$/i.exec(String(value || '').trim());
-  if (!match) return null;
-  const rawValue = match[2].trim().replace(/^(["'])(.*)\1$/, '$2').toLowerCase();
-  const effort = normalizeEffort(rawValue);
-  return effort ? { key: match[1], effort } : null;
-}
-
-// Inspect only the explicit, documented effort forms RelayBridge knows how to
-// reason about.  Unknown config assignments are left alone rather than being
-// guessed at and then reported as an applied control.
-function findEffortControl(args) {
-  if (!Array.isArray(args)) return null;
-  for (let index = 0; index < args.length; index++) {
-    const arg = args[index];
-    if ((arg === '--effort' || arg === '--reasoning-effort') && index + 1 < args.length) {
-      const effort = normalizeEffort(String(args[index + 1]));
-      if (effort) return { index, width: 2, effort, flag: arg, method: 'flag' };
-    }
-    if ((arg === '--config' || arg === '-c') && index + 1 < args.length) {
-      const assignment = parseReasoningEffortAssignment(args[index + 1]);
-      if (assignment) {
-        return {
-          index, width: 2, effort: assignment.effort, flag: arg,
-          configKey: assignment.key, method: 'config',
-        };
-      }
-    }
-    const inlineConfig = /^--config=(.*)$/i.exec(String(arg || ''));
-    const assignment = inlineConfig ? parseReasoningEffortAssignment(inlineConfig[1]) : null;
-    if (assignment) {
-      return {
-        index, width: 1, effort: assignment.effort, flag: '--config',
-        configKey: assignment.key, method: 'config',
-      };
-    }
-  }
-  return null;
-}
-
-function stripEffortControls(args) {
-  const out = [];
-  let firstRemovedAt = null;
-  for (let index = 0; index < args.length;) {
-    const control = findEffortControl(args.slice(index));
-    if (!control) {
-      out.push(...args.slice(index));
-      break;
-    }
-    const absoluteIndex = index + control.index;
-    out.push(...args.slice(index, absoluteIndex));
-    if (firstRemovedAt == null) firstRemovedAt = out.length;
-    index = absoluteIndex + control.width;
-  }
-  return { args: out, firstRemovedAt };
-}
-
-function effortArgsInsertIndex(slot, entry = {}, preferredIndex = null) {
-  if (Number.isInteger(preferredIndex)) return Math.max(1, Math.min(preferredIndex, slot.length));
-  if (Number.isInteger(entry.effort_arg_index)) {
-    return Math.max(1, Math.min(entry.effort_arg_index, slot.length));
-  }
-  const promptFileAt = slot.findIndex((arg) => typeof arg === 'string' && arg.includes('{prompt_file}'));
-  if (promptFileAt >= 0) {
-    // Keep `--prompt-file {prompt_file}` together.  This also leaves a script
-    // path immediately after `node`, which makes deterministic CLI fixtures a
-    // faithful stand-in for real providers.
-    return promptFileAt > 0 && String(slot[promptFileAt - 1]).startsWith('-')
-      ? promptFileAt - 1 : promptFileAt;
-  }
-  const inlinePromptAt = slot.findIndex((arg) => typeof arg === 'string' && arg.includes('{prompt}'));
-  if (inlinePromptAt >= 0) return inlinePromptAt;
-  if (slot.length > 1 && slot.at(-1) === '-') return slot.length - 1;
-  return slot.length;
-}
-
-function insertEffortArgs(slot, effortArgs, entry = {}, preferredIndex = null) {
-  const out = slot.slice();
-  const at = effortArgsInsertIndex(out, entry, preferredIndex);
-  out.splice(at, 0, ...effortArgs);
-  return out;
-}
-
-function configuredEffortArgs(entry, requestedEffort) {
-  const configured = entry?.effort_flags?.[requestedEffort];
-  if (!Array.isArray(configured) || !configured.length || configured.some((arg) => typeof arg !== 'string')) {
-    return null;
-  }
-  return configured.slice();
-}
-
-function configuredReasoningEffortFamily(entry) {
-  const values = entry?.effort_flags && typeof entry.effort_flags === 'object'
-    ? Object.values(entry.effort_flags) : [];
-  for (const args of values) {
-    const control = findEffortControl(args);
-    if (control?.method === 'config' && control.configKey) {
-      return { flag: control.flag === '-c' ? '-c' : '--config', key: control.configKey };
-    }
-  }
-  return null;
-}
-
-function modelImpliedEffort(modelChoice, entry = {}) {
-  if (!modelChoice?.model) return null;
-  const suffix = /(?:^|-)(minimal|low|medium|high|xhigh|max)$/i.exec(String(modelChoice.model));
-  if (suffix) return suffix[1].toLowerCase();
-  // A configured weight class is the only effort expression for several local
-  // providers.  Do not make this claim for Codex-style seats, where model size
-  // and reasoning effort are independent controls.
-  if (entry.effort_flags && Object.keys(entry.effort_flags).length) return null;
-  return { light: 'low', standard: 'medium', heavy: 'high' }[modelChoice.modelTier] || null;
-}
-
-function applyProviderEffort({ slot, entry = {}, modelChoice = {}, requestedEffort = null }) {
-  const existing = findEffortControl(slot);
-  if (!requestedEffort) {
-    if (existing) {
-      return {
-        slot, appliedEffort: existing.effort,
-        method: existing.method === 'config' ? 'effort_flags' : 'flag',
-        control: existing.configKey ? `${existing.flag} ${existing.configKey}` : existing.flag,
-      };
-    }
-    const implied = modelImpliedEffort(modelChoice, entry);
-    return {
-      slot, appliedEffort: implied,
-      method: implied ? 'model_choice' : 'account_default',
-      control: implied ? 'model' : null,
-    };
-  }
-
-  let effortArgs = configuredEffortArgs(entry, requestedEffort);
-  let method = effortArgs ? 'effort_flags' : null;
-
-  // Current Codex accepts xhigh through model_reasoning_effort, but older
-  // configurations may predate an explicit xhigh row.  Seeing that exact
-  // configuration family is enough to construct xhigh safely.  Never perform
-  // the same synthesis for max: Codex does not accept a literal max and must
-  // use the provider's declared max fallback instead.
-  const configFamily = configuredReasoningEffortFamily(entry)
-    || (existing?.method === 'config' && existing.configKey
-      ? { flag: existing.flag, key: existing.configKey } : null);
-  if (!effortArgs && requestedEffort === 'xhigh' && configFamily) {
-    effortArgs = [configFamily.flag, `${configFamily.key}=xhigh`];
-    method = 'effort_flags';
-  }
-
-  if (!effortArgs && existing?.method === 'flag') {
-    effortArgs = [existing.flag, requestedEffort];
-    method = 'flag';
-  }
-  if (!effortArgs && existing?.method === 'config' && requestedEffort !== 'max') {
-    effortArgs = [existing.flag, `${existing.configKey}=${requestedEffort}`];
-    method = 'effort_flags';
-  }
-
-  if (effortArgs) {
-    const actual = findEffortControl(effortArgs);
-    if (!actual) {
-      return { error: 'configured effort_flags do not contain a recognized effort control' };
-    }
-    const stripped = stripEffortControls(slot);
-    return {
-      slot: insertEffortArgs(stripped.args, effortArgs, entry, stripped.firstRemovedAt),
-      appliedEffort: actual.effort,
-      method,
-      control: actual.configKey ? `${actual.flag} ${actual.configKey}` : actual.flag,
-    };
-  }
-
-  const implied = modelImpliedEffort(modelChoice, entry);
-  if (implied === requestedEffort) {
-    return { slot, appliedEffort: implied, method: 'model_choice', control: 'model' };
-  }
-  return {
-    error: `provider cannot express requested effort=${requestedEffort}`
-      + (implied ? `; selected model tier applies ${implied}` : ''),
-  };
-}
-
-function annotateRequestedPlanEffort(plan, config, requestedEffort) {
-  plan.effort = requestedEffort;
-  const candidates = new Set([
-    plan.primary,
-    ...(Array.isArray(plan.alternates) ? plan.alternates : []),
-    plan.cheapestCapable,
-  ].filter(Boolean));
-  for (const candidate of candidates) {
-    candidate.effort = requestedEffort;
-    const entry = config?.[candidate.kind] || {};
-    let effortArgs = configuredEffortArgs(entry, requestedEffort);
-    const family = configuredReasoningEffortFamily(entry);
-    if (!effortArgs && requestedEffort === 'xhigh' && family) {
-      effortArgs = [family.flag, `${family.key}=xhigh`];
-    }
-    const baseSlot = Array.isArray(entry.oneshot_safe) ? entry.oneshot_safe : [];
-    const baseControl = findEffortControl(baseSlot);
-    if (!effortArgs && baseControl?.method === 'flag') {
-      effortArgs = [baseControl.flag, requestedEffort];
-    }
-    if (!effortArgs && baseControl?.method === 'config' && requestedEffort !== 'max') {
-      effortArgs = [baseControl.flag, `${baseControl.configKey}=${requestedEffort}`];
-    }
-    const actual = findEffortControl(effortArgs || []);
-    if (actual) {
-      candidate.args = stripEffortControls(Array.isArray(candidate.args) ? candidate.args : []).args
-        .concat(effortArgs);
-      candidate.effortMethod = actual.method === 'config' ? 'effort_flags' : 'flag';
-      candidate.appliedEffort = actual.effort;
-      candidate.effortSupported = true;
-      continue;
-    }
-    const implied = modelImpliedEffort({ model: candidate.model, modelTier: candidate.modelTier }, entry);
-    candidate.appliedEffort = implied;
-    candidate.effortSupported = implied === requestedEffort;
-    if (candidate.effortSupported) candidate.effortMethod = 'model_choice';
-  }
-  if (plan.primary?.effortSupported === false) {
-    plan.guidance = [
-      ...(Array.isArray(plan.guidance) ? plan.guidance : []),
-      `${plan.primary.label || plan.primary.kind} cannot express effort=${requestedEffort} with its selected model/control; execution will reject before spending provider quota.`,
-    ];
-  }
-}
 
 function buildEnv(extras = {}, stripNames = []) {
   const env = { ...process.env, ...extras };
@@ -1626,20 +1429,15 @@ function resolveExecutableWin32(command, env, pathKey) {
   return command;
 }
 
-function quoteCmdArg(value) {
-  const s = String(value);
-  return /[\s"&|<>^()%!]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
-}
-
-function capPrompt(prompt, maxChars) {
-  if (!maxChars || prompt.length <= maxChars) return { text: prompt, truncated: false };
-  const headChars = Math.min(1800, Math.floor(maxChars / 4));
-  const marker = '\n\n...[earlier conversation trimmed by RelayBridge to fit this CLI]...\n\n';
-  const tailChars = Math.max(0, maxChars - headChars - marker.length);
-  return {
-    text: prompt.slice(0, headChars) + marker + prompt.slice(-tailChars),
-    truncated: true,
-  };
+function qualifiedProviderLaunch(file, args, env) {
+  const launch = resolveWindowsLaunch({ file, args, env });
+  if (launch.mode === 'unsupported') {
+    throw Object.assign(new Error(launch.reason), {
+      code: launch.code,
+      validation: { code: launch.code, field: 'provider', reason: launch.reason },
+    });
+  }
+  return { ...launch, env: { ...env, ...launch.envPatch } };
 }
 
 // Strip terminal noise from a CLI's captured output so Collab Mode shows clean
@@ -1791,7 +1589,9 @@ function normalizeClaudeJsonUsage(document) {
 // complete model census. Other providers remain explicitly terminal-only or
 // unavailable rather than being policed with character-count guesses.
 function createProviderUsageObserver(parserName, supervisor, { onTerminal = null } = {}) {
-  if (parserName !== 'claude_json') return { record() {}, flush() {} };
+  if (parserName !== 'claude_json') {
+    return { record(chunk) { return String(chunk || '').length; }, flush() {} };
+  }
   let partial = '';
   const seen = new Set();
   const cumulative = {
@@ -1799,43 +1599,61 @@ function createProviderUsageObserver(parserName, supervisor, { onTerminal = null
     cache_creation_input_tokens: 0, total_tokens: 0, turns: 0,
   };
   const consume = (line) => {
+    if (supervisor.evaluate().action === 'kill') return false;
     let event;
-    try { event = JSON.parse(line); } catch { return; }
+    try { event = JSON.parse(line); } catch { return true; }
     if (event?.type === 'result') {
       const usage = normalizeClaudeJsonUsage(event);
       const turns = nonnegativeUsageNumber(event.num_turns);
       if (usage) supervisor.recordProviderUsage({ ...usage, turns }, { phase: 'terminal' });
       else if (turns !== null) supervisor.recordProviderUsage({ turns }, { phase: 'terminal' });
-      if (typeof onTerminal === 'function') onTerminal(event);
-      return;
+      if (typeof onTerminal === 'function'
+          && !parseConfiguredOneShotOutput({ oneshot_output_parser: 'claude_json' }, line).parseError) {
+        onTerminal(event);
+      }
+      return supervisor.evaluate().action !== 'kill';
     }
-    if (event?.type !== 'assistant' || !event.message || typeof event.message !== 'object') return;
+    if (event?.type !== 'assistant' || !event.message || typeof event.message !== 'object') return true;
     const id = typeof event.message.id === 'string' ? event.message.id.trim() : '';
-    if (!id || seen.has(id)) return;
+    if (!id || seen.has(id)) return true;
     const usage = event.message.usage;
-    if (!usage || typeof usage !== 'object' || Array.isArray(usage)) return;
+    if (!usage || typeof usage !== 'object' || Array.isArray(usage)) return true;
     const values = {
       input_tokens: nonnegativeUsageNumber(usage.input_tokens),
       output_tokens: nonnegativeUsageNumber(usage.output_tokens),
       cache_read_input_tokens: nonnegativeUsageNumber(usage.cache_read_input_tokens ?? 0),
       cache_creation_input_tokens: nonnegativeUsageNumber(usage.cache_creation_input_tokens ?? 0),
     };
-    if (Object.values(values).some((value) => value === null)) return;
+    if (Object.values(values).some((value) => value === null)) return true;
     const total = safeTokenSum(Object.values(values));
-    if (total === null) return;
+    if (total === null) return true;
     seen.add(id);
     for (const [key, value] of Object.entries(values)) cumulative[key] += value;
     cumulative.total_tokens += total;
     cumulative.turns += 1;
     supervisor.recordProviderUsage(cumulative, { phase: 'incremental' });
+    return supervisor.evaluate().action !== 'kill';
   };
   return {
     record(chunk) {
-      const lines = (partial + String(chunk || '')).split(/\r?\n/);
-      partial = lines.pop() || '';
-      for (const line of lines) consume(line);
+      const text = String(chunk || '');
+      const priorPartialLength = partial.length;
+      const combined = partial + text;
+      const separator = /\r?\n/g;
+      let lineStart = 0;
+      let match;
+      while ((match = separator.exec(combined)) !== null) {
+        const line = combined.slice(lineStart, match.index);
+        lineStart = separator.lastIndex;
+        if (consume(line) === false) {
+          partial = '';
+          return Math.max(0, Math.min(text.length, lineStart - priorPartialLength));
+        }
+      }
+      partial = combined.slice(lineStart);
+      return text.length;
     },
-    flush() { if (partial.trim()) consume(partial); partial = ''; },
+    flush() { if (partial.trim() && supervisor.evaluate().action !== 'kill') consume(partial); partial = ''; },
   };
 }
 
@@ -2099,7 +1917,7 @@ function hasProviderInternalTimeoutDiagnostic(value) {
   return PROVIDER_INTERNAL_TIMEOUT_PATTERNS.some((pattern) => pattern.test(diagnostic));
 }
 
-function parseConfiguredOneShotOutput(entry, rawOutput) {
+function parseConfiguredOneShotOutput(entry, rawOutput, { ignoreTerminalResult = false } = {}) {
   const parser = String(entry?.oneshot_output_parser || 'text');
   if (parser === 'text') {
     return {
@@ -2142,8 +1960,19 @@ function parseConfiguredOneShotOutput(entry, rawOutput) {
         }).filter((value) => value && typeof value === 'object' && !Array.isArray(value));
       document = [...events].reverse().find((value) => value.type === 'result') || null;
     }
+    // rawOutput is already the supervisor's accepted semantic prefix. A valid
+    // terminal document may itself trigger the budget stop; retain its usage
+    // and API status while suppressing its answer. Post-cutoff documents never
+    // enter this parser, even when they share a transport chunk with the stop.
     if (!document || typeof document !== 'object' || Array.isArray(document)) throw new Error('result is not an object');
     if (document.type !== 'result') throw new Error('document type is not result');
+    // A finalization message can queue another turn after an earlier result.
+    // That result no longer describes the accepted semantic prefix. Treat it
+    // as incomplete, preserving the newer observer usage/checkpoint instead
+    // of overwriting them (or quota/duration provenance) at close/disconnect.
+    if (events.slice(events.lastIndexOf(document) + 1).some((event) => event.type === 'assistant')) {
+      throw new Error('result precedes newer assistant output');
+    }
     const subtype = (normalizeClaudeResultString(document.subtype) || '').toLowerCase();
     if (subtype !== 'success' && !/^error_/.test(subtype)) throw new Error('result subtype is unsupported');
     if (typeof document.is_error !== 'boolean') throw new Error('result is_error is not boolean');
@@ -2168,8 +1997,9 @@ function parseConfiguredOneShotOutput(entry, rawOutput) {
     const isError = subtypeIndicatesError || document.is_error === true;
     const errors = normalizeClaudeResultErrors(document.errors);
     const permissionDenials = normalizeClaudePermissionDenials(document.permission_denials);
+    const partial = ignoreTerminalResult ? extractClaudeAssistantDiagnostic(events) : null;
     return {
-      output: cleanOutput(!isError && typeof document.result === 'string' ? document.result : ''),
+      output: cleanOutput(!ignoreTerminalResult && !isError && typeof document.result === 'string' ? document.result : ''),
       usage: normalizeClaudeJsonUsage(document),
       isError,
       resultSubtype: subtype || null,
@@ -2193,7 +2023,8 @@ function parseConfiguredOneShotOutput(entry, rawOutput) {
       providerDurationMs: nonnegativeUsageNumber(document.duration_ms),
       providerApiDurationMs: nonnegativeUsageNumber(document.duration_api_ms),
       resultSchemaDisagreement,
-      partialDiagnostic: '', partialDiagnosticTruncated: false,
+      partialDiagnostic: partial?.text || '', partialDiagnosticTruncated: partial?.truncated === true,
+      partialCheckpoint: ignoreTerminalResult ? extractClaudeAssistantCheckpoint(events) : null,
       parseError: null,
     };
   } catch (error) {
@@ -2215,6 +2046,25 @@ function parseConfiguredOneShotOutput(entry, rawOutput) {
       parseError: `claude_json parse failed: ${error.message}`,
     };
   }
+}
+
+function acceptedProviderUsage(parsed, supervisedUsage) {
+  return parsed.usage || (supervisedUsage ? {
+    input_tokens: supervisedUsage.input_tokens ?? 0,
+    output_tokens: supervisedUsage.output_tokens ?? 0,
+    cache_read_input_tokens: supervisedUsage.cache_read_input_tokens ?? 0,
+    cache_creation_input_tokens: supervisedUsage.cache_creation_input_tokens ?? 0,
+    total_tokens: supervisedUsage.total_tokens ?? null,
+    token_source: 'provider_reported',
+    model_usage: [],
+  } : null);
+}
+
+function acceptedTerminalQuotaEvidence(parsed, provider) {
+  if (parsed.apiErrorStatus !== 429 || parsed.parseError) return null;
+  return { provider, scope: 'account', kind: 'rate_limit', source: 'claude_terminal_api_status',
+    status: 429, errorCount: parsed.errorCount,
+    errorDiagnosticHash: crypto.createHash('sha256').update(parsed.diagnostic || '').digest('hex') };
 }
 
 function claudeStreamUserMessage(text) {
@@ -2312,301 +2162,171 @@ function isUpstreamTimeoutStatus(status) {
   return Number(status) === 408 || Number(status) === 504;
 }
 
-function terminalProviderBudgetOutcome(usage, providerBudget, turns = null) {
-  const supervisor = new RunSupervisor({ providerBudget });
-  supervisor.recordProviderUsage({ ...(usage || {}), turns }, { phase: 'terminal' });
-  const verdict = supervisor.evaluate();
-  return verdict.action === 'kill' && verdict.reason === 'token_budget'
-    ? { exceeded: true, detail: verdict.detail, budget: supervisor.snapshot().providerBudget }
-    : { exceeded: false, detail: '', budget: supervisor.snapshot().providerBudget };
-}
-
-async function runOpenAIChatOneShot({ entry, prompt, timeoutMs, res, route, startedAt, providerBudget, accountId }) {
-  const bounded = capPrompt(prompt, Number(entry.prompt_max_chars || 12000));
-  route.prompt_transport = 'hosted_openai_compatible';
-  route.prompt_truncated = bounded.truncated;
-  route.allow_paid_fallback = entry.allow_paid_fallback === true;
-  route.hosting_region = entry.hosting_region || null;
-  route.requires_explicit_preference = entry.autoRoute === false || null;
-
+async function runHttpProviderOneShot({ entry, prompt, effectivePrompt, res, route, startedAt,
+  supervisorOptions, accountId, releaseAdmission, cleanupResources, cwd }) {
+  const hosted = entry.oneshot_adapter === 'openai_chat_api';
+  const supervisor = new RunSupervisor(supervisorOptions);
+  const runId = `run_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 8)}`;
   const controller = new AbortController();
-  let timedOut = false;
-  let clientGone = false;
-  let requestStarted = false;
-  res._relayCancellationPayload = () => ({
-    kind: route.provider,
-    route,
-    exitCode: -1,
-    stdout: '',
-    stderr: '',
-    failureClass: timedOut ? 'timeout' : disconnectFailureClass({
-      client: route.client_surface, deadlineAt: route.client_deadline_at,
-    }),
-    stop_reason: timedOut ? 'hard_cap' : disconnectFailureClass({
-      client: route.client_surface, deadlineAt: route.client_deadline_at,
-    }),
-    cancelled: !timedOut,
-    timed_out: timedOut,
-    dropped_out: true,
-    model_invocation: requestStarted ? null : false,
-  });
-  const timer = setTimeout(() => {
-    timedOut = true;
-    controller.abort(new Error('hosted provider request timed out'));
-  }, TIMEOUT_POLICY.normalizeOneShotTimeoutMs(timeoutMs));
-  res.on('close', () => {
-    if (!res.writableEnded) {
-      clientGone = true;
-      controller.abort(new Error('bridge client disconnected'));
-    }
-  });
-
-  try {
-    const url = hostedChatUrl(entry);
-    const key = hostedApiKey(entry);
-    route.endpoint_host = url.hostname;
-    route.api_key_env = key.name;
-    requestStarted = true;
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${key.value}`,
-        ...(entry.http_referer ? { 'HTTP-Referer': String(entry.http_referer) } : {}),
-        ...(entry.x_title ? { 'X-Title': String(entry.x_title) } : {}),
-      },
-      body: JSON.stringify({
-        model: entry.model,
-        messages: [
-          ...(entry.system_prompt ? [{ role: 'system', content: String(entry.system_prompt) }] : []),
-          { role: 'user', content: bounded.text },
-        ],
-        temperature: Number.isFinite(Number(entry.temperature)) ? Number(entry.temperature) : 0.2,
-        max_tokens: Math.max(64, Math.min(Number(entry.max_output_tokens || 1024), 4096)),
-        stream: false,
-      }),
-      signal: controller.signal,
-    });
-    const responseText = await response.text();
-    let payload = {};
-    try { payload = responseText ? JSON.parse(responseText) : {}; } catch {}
-    if (!response.ok) {
-      const detail = cleanOutput(payload.error?.message || payload.error || responseText || `hosted provider HTTP ${response.status}`);
-      const httpFailure = classifyProviderHttpFailure(response.status, detail);
-      if (!clientGone && !res.writableEnded) {
-        sendOneShotResult(res, {
-          kind: route.provider,
-          route,
-          exitCode: response.status,
-          stdout: '',
-          stderr: detail,
-          failureClass: httpFailure,
-          rate_limited: httpFailure === 'rate_limit',
-          budget_exceeded: httpFailure === 'budget',
-          auth_failed: httpFailure === 'auth',
-          permission_denied: httpFailure === 'permission',
-          timed_out: isUpstreamTimeoutStatus(response.status),
-          dropped_out: true,
-          model_invocation: rejectedHttpModelInvocation(response.status),
-        }, { kind: route.provider, prompt, route, startedAt, accountId });
-      }
-      return;
-    }
-    const stdout = cleanOutput(payload.choices?.[0]?.message?.content || payload.output_text || '');
-    const providerModel = typeof payload.model === 'string' ? payload.model.trim().slice(0, 160) : '';
-    const configuredModel = typeof entry.model === 'string' ? entry.model.trim().slice(0, 160) : '';
-    const existingIdentity = typeof route.resolved_model_identity === 'string'
-      ? route.resolved_model_identity.trim().slice(0, 160) : '';
-    route.resolved_model = providerModel || configuredModel || null;
-    route.resolved_model_identity = providerModel || existingIdentity || configuredModel || null;
-    route.resolved_model_source = providerModel ? 'provider_response'
-      : existingIdentity ? route.resolved_model_source : configuredModel ? 'configured_model' : null;
-    const usage = payload.usage ? (() => {
-      const inputTokens = nonnegativeUsageNumber(payload.usage.prompt_tokens);
-      const outputTokens = nonnegativeUsageNumber(payload.usage.completion_tokens);
-      const computedTotal = inputTokens !== null && outputTokens !== null
-        ? safeTokenSum([inputTokens, outputTokens]) : null;
-      return {
-        input_tokens: inputTokens,
-        output_tokens: outputTokens,
-        total_tokens: computedTotal ?? nonnegativeUsageNumber(payload.usage.total_tokens),
-      };
-    })() : null;
-    const budgetOutcome = terminalProviderBudgetOutcome(usage, providerBudget);
-    if (!clientGone && !res.writableEnded) {
-      sendOneShotResult(res, {
-        kind: route.provider,
-        route,
-        exitCode: 0,
-        stdout,
-        stderr: '',
-        usage,
-        failureClass: budgetOutcome.exceeded ? 'token_budget' : null,
-        stop_reason: budgetOutcome.exceeded ? 'token_budget' : null,
-        supervisor_stop_reason: budgetOutcome.exceeded ? 'token_budget' : null,
-        stop_detail: budgetOutcome.detail,
-        provider_budget: budgetOutcome.budget,
-        provider_budget_enforcement: usage ? 'terminal' : 'unavailable',
-        rate_limited: false,
-        budget_exceeded: false,
-        auth_failed: false,
-        permission_denied: false,
-        timed_out: false,
-        dropped_out: budgetOutcome.exceeded || !stdout,
-        model_invocation: true,
-      }, { kind: route.provider, prompt, route, startedAt, accountId });
-    }
-  } catch (error) {
-    if (!clientGone && !res.writableEnded) {
-      sendOneShotResult(res, {
-        kind: route.provider,
-        route,
-        exitCode: -1,
-        stdout: '',
-        stderr: cleanOutput(error?.message || String(error)),
-        auth_failed: isHostedApiKeyMissingError(error),
-        timed_out: timedOut,
-        dropped_out: true,
-        model_invocation: requestStarted ? null : false,
-      }, { kind: route.provider, prompt, route, startedAt, accountId });
-    }
-  } finally {
-    clearTimeout(timer);
+  route.run_id = runId;
+  route.prompt_transport = hosted ? 'hosted_openai_compatible' : 'local_http';
+  route.prompt_truncated = false;
+  route.effective_timeout_ms = supervisor.opts.hardCapMs;
+  route.transport_wire_bytes = 0;
+  if (hosted) {
+    route.allow_paid_fallback = entry.allow_paid_fallback === true;
+    route.hosting_region = entry.hosting_region || null;
+    route.requires_explicit_preference = entry.autoRoute === false || null;
   }
-}
-
-async function runOllamaApiOneShot({ entry, prompt, timeoutMs, res, route, startedAt, providerBudget, accountId }) {
-  const bounded = capPrompt(prompt, Number(entry.prompt_max_chars || 24000));
-  route.prompt_transport = 'local_http';
-  route.prompt_truncated = bounded.truncated;
-  const controller = new AbortController();
-  let timedOut = false;
-  let clientGone = false;
-  let requestStarted = false;
-  res._relayCancellationPayload = () => ({
-    kind: route.provider,
-    route,
-    exitCode: -1,
-    stdout: '',
-    stderr: '',
-    failureClass: timedOut ? 'timeout' : disconnectFailureClass({
+  const lifecycle = createAttemptLifecycle({ runId, kind: route.provider, route, supervisor,
+    registry: activeRuns, releaseAdmission, tickMs: 1000 });
+  res._relayLifecycle = lifecycle;
+  lifecycle.bindTransport({ type: 'http', requestStop: () => controller.abort() });
+  const detach = () => {
+    if (!res.writableEnded) lifecycle.clientDetached({ reason: disconnectFailureClass({
       client: route.client_surface, deadlineAt: route.client_deadline_at,
-    }),
-    stop_reason: timedOut ? 'hard_cap' : disconnectFailureClass({
-      client: route.client_surface, deadlineAt: route.client_deadline_at,
-    }),
-    cancelled: !timedOut,
-    timed_out: timedOut,
-    dropped_out: true,
-    model_invocation: requestStarted ? null : false,
-  });
-  const timer = setTimeout(() => {
-    timedOut = true;
-    controller.abort(new Error('local Ollama request timed out'));
-  }, TIMEOUT_POLICY.normalizeOneShotTimeoutMs(timeoutMs));
-  res.on('close', () => {
-    if (!res.writableEnded) {
-      clientGone = true;
-      controller.abort(new Error('bridge client disconnected'));
+    }) });
+  };
+  res.once('close', detach);
+  if (res.destroyed) detach();
+  let requestStarted = false, responseStatus = null, semanticOutput = '', terminal = null, payload;
+  let acceptedUsage = null, sealedPayload = null, transportDiagnostic = null;
+  const wireProgress = (bytes) => { route.transport_wire_bytes += bytes; };
+  const meta = { kind: route.provider, prompt, route, startedAt, accountId, cwd, persistAfterDisconnect: true };
+  const usageFromTerminal = (value) => {
+    const input = nonnegativeUsageNumber(value.prompt_eval_count);
+    const output = nonnegativeUsageNumber(value.eval_count);
+    return { input_tokens: input, output_tokens: output,
+      total_tokens: input !== null && output !== null ? safeTokenSum([input, output]) : null,
+      cache_input_included: true,
+      ...(value.prompt_eval_cached_count !== null && value.prompt_eval_cached_count !== undefined
+        ? { cache_read_input_tokens: value.prompt_eval_cached_count } : {}) };
+  };
+  const acceptTerminal = (value, usage) => {
+    terminal = value;
+    if (value.model) {
+      route.observed_model = value.model; route.resolved_model = value.model;
+      route.resolved_model_identity = value.model; route.resolved_model_source = 'provider_response';
     }
-  });
-
+    if (usage) lifecycle.observeUsage(usage, 'terminal', (accepted) => { acceptedUsage = { ...accepted }; });
+    return !lifecycle.snapshot().stop;
+  };
+  const sealTerminal = () => {
+    if (lifecycle.snapshot().stop) return false;
+    const outcome = classifyHttpTerminal({ ...terminal, reason: hosted ? terminal.reason : terminal.done_reason });
+    let answer = semanticOutput;
+    if (entry.strip_thinking) {
+      const closeTag = answer.lastIndexOf('</think>');
+      if (closeTag >= 0) answer = answer.slice(closeTag + '</think>'.length);
+    }
+    answer = cleanOutput(answer);
+    const failureClass = outcome.failureClass || (!answer ? 'incomplete_response' : null);
+    sealedPayload = { exitCode: failureClass ? -1 : 0, stdout: failureClass ? '' : answer, stderr: '',
+      usage: acceptedUsage, failureClass, dropped_out: !!failureClass, model_invocation: true,
+      supervisor_stop_reason: null, stop_reason: outcome.stopReason,
+      provider_stop_reason: hosted ? terminal.reason : terminal.done_reason,
+      provider_terminal_compatibility: terminal.compatibility || null,
+      ...(failureClass && answer ? { partial_result: true, partial_diagnostic: answer.slice(0, 4000),
+        partial_diagnostic_truncated: answer.length > 4000 } : {}) };
+    lifecycle.sealOutcome(sealedPayload);
+    return !lifecycle.snapshot().stop;
+  };
   try {
-    const url = localOllamaUrl();
+    const url = hosted ? hostedChatUrl(entry) : localOllamaUrl();
+    const key = hosted ? hostedApiKey(entry) : null;
+    if (hosted) { route.endpoint_host = url.hostname; route.api_key_env = key.name; }
+    if (!lifecycle.markDispatched()) throw Object.assign(new Error('Request cancelled before dispatch.'), { name: 'AbortError' });
     requestStarted = true;
     const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+      method: 'POST', redirect: 'manual', signal: controller.signal,
+      headers: { 'Content-Type': 'application/json',
+        ...(hosted ? { Authorization: `Bearer ${key.value}`,
+          ...(entry.http_referer ? { 'HTTP-Referer': String(entry.http_referer) } : {}),
+          ...(entry.x_title ? { 'X-Title': String(entry.x_title) } : {}) } : {}) },
+      body: JSON.stringify(hosted ? {
         model: entry.model,
-        prompt: bounded.text,
-        stream: false,
-        think: false,
-        options: {
-          num_predict: Math.max(64, Math.min(Number(entry.max_output_tokens || 1024), 4096)),
-        },
-      }),
-      signal: controller.signal,
+        messages: [...(entry.system_prompt ? [{ role: 'system', content: String(entry.system_prompt) }] : []),
+          { role: 'user', content: effectivePrompt }],
+        temperature: Number.isFinite(Number(entry.temperature)) ? Number(entry.temperature) : 0.2,
+        max_tokens: Math.max(64, Math.min(Number(entry.max_output_tokens || 1024), 4096)), stream: false,
+      } : { model: entry.model, prompt: effectivePrompt, stream: true, think: false,
+        options: { num_predict: Math.max(64, Math.min(Number(entry.max_output_tokens || 1024), 4096)) } }),
     });
-    const responseText = await response.text();
-    let payload = {};
-    try { payload = responseText ? JSON.parse(responseText) : {}; } catch {}
+    responseStatus = response.status;
     if (!response.ok) {
-      const detail = cleanOutput(payload.error || responseText || `Ollama HTTP ${response.status}`);
-      if (!clientGone && !res.writableEnded) {
-        sendOneShotResult(res, {
-          kind: route.provider,
-          route,
-          exitCode: response.status,
-          stdout: '',
-          stderr: detail,
-          timed_out: isUpstreamTimeoutStatus(response.status),
-          dropped_out: true,
-          model_invocation: rejectedHttpModelInvocation(response.status),
-        }, { kind: route.provider, prompt, route, startedAt, accountId });
+      let text = '', diagnosticCode = null;
+      try { text = await readProviderBody(response, { signal: controller.signal, maxBytes: 65536, onWireBytes: wireProgress }); }
+      catch (error) { diagnosticCode = typeof error.code === 'string' ? error.code : (error.name === 'AbortError' ? 'http_body_aborted' : 'http_body_read_failed'); }
+      let errorBody; try { errorBody = JSON.parse(text); } catch {}
+      const detail = cleanOutput(typeof errorBody?.error?.message === 'string' ? errorBody.error.message
+        : typeof errorBody?.error === 'string' ? errorBody.error : text || `Provider HTTP ${response.status}`);
+      const failureClass = classifyProviderHttpFailure(response.status, detail);
+      payload = { exitCode: response.status, stdout: '', stderr: detail, failureClass,
+        rate_limited: failureClass === 'rate_limit', budget_exceeded: failureClass === 'budget',
+        auth_failed: failureClass === 'auth', permission_denied: failureClass === 'permission',
+        timed_out: isUpstreamTimeoutStatus(response.status), dropped_out: true,
+        provider_timeout_source: isUpstreamTimeoutStatus(response.status) ? 'provider_api_status' : null,
+        model_invocation: rejectedHttpModelInvocation(response.status), provider_api_error_status: response.status,
+        ...(diagnosticCode ? { transport_diagnostic_code: diagnosticCode } : {}) };
+    } else {
+      if (hosted) {
+        const text = await readProviderBody(response, { signal: controller.signal,
+          maxBytes: Math.min(supervisor.opts.maxOutputBytes, HTTP_PROVIDER_LIMITS.maxWireBytes), onWireBytes: wireProgress });
+        let document;
+        try { document = JSON.parse(text); } catch { throw Object.assign(new Error('Provider body contains malformed JSON.'), { failureClass: 'provider_protocol_error' }); }
+        const parsed = parseHostedTerminal(document);
+        if (acceptTerminal(parsed, parsed.usage)) lifecycle.observeOutput(parsed.output, (accepted) => { semanticOutput = accepted; });
+        sealTerminal();
+      } else {
+        await readOllamaStream(response, { signal: controller.signal,
+          maxOutputBytes: Math.min(supervisor.opts.maxOutputBytes, HTTP_PROVIDER_LIMITS.maxOutputBytes),
+          onWireBytes: wireProgress,
+          onTerminal: (value) => acceptTerminal(value, usageFromTerminal(value)),
+          onDelta: (delta) => {
+            lifecycle.observeOutput(delta, (accepted) => { semanticOutput += accepted; });
+            return !lifecycle.snapshot().stop;
+          }, onTerminalAccepted: sealTerminal });
       }
-      return;
-    }
-
-    let rawOutput = payload.response || payload.message?.content || '';
-    if (entry.strip_thinking) {
-      const closeTag = String(rawOutput).lastIndexOf('</think>');
-      if (closeTag >= 0) rawOutput = String(rawOutput).slice(closeTag + '</think>'.length);
-    }
-    const stdout = cleanOutput(rawOutput);
-    const providerModel = typeof payload.model === 'string' ? payload.model.trim().slice(0, 160) : '';
-    const configuredModel = typeof entry.model === 'string' ? entry.model.trim().slice(0, 160) : '';
-    route.resolved_model = providerModel || configuredModel || null;
-    const inputTokens = nonnegativeUsageNumber(payload.prompt_eval_count);
-    const outputTokens = nonnegativeUsageNumber(payload.eval_count);
-    const usage = {
-      input_tokens: inputTokens,
-      output_tokens: outputTokens,
-      total_tokens: inputTokens !== null && outputTokens !== null
-        ? safeTokenSum([inputTokens, outputTokens]) : null,
-      total_duration_ns: Number.isFinite(Number(payload.total_duration)) ? Number(payload.total_duration) : null,
-      load_duration_ns: Number.isFinite(Number(payload.load_duration)) ? Number(payload.load_duration) : null,
-      done_reason: payload.done_reason || null,
-    };
-    const budgetOutcome = terminalProviderBudgetOutcome(usage, providerBudget);
-    if (!clientGone && !res.writableEnded) {
-      sendOneShotResult(res, {
-        kind: route.provider,
-        route,
-        exitCode: 0,
-        stdout,
-        stderr: '',
-        usage,
-        failureClass: budgetOutcome.exceeded ? 'token_budget' : null,
-        stop_reason: budgetOutcome.exceeded ? 'token_budget' : null,
-        supervisor_stop_reason: budgetOutcome.exceeded ? 'token_budget' : null,
-        stop_detail: budgetOutcome.detail,
-        provider_budget: budgetOutcome.budget,
-        provider_budget_enforcement: inputTokens !== null || outputTokens !== null ? 'terminal' : 'unavailable',
-        rate_limited: false,
-        budget_exceeded: false,
-        auth_failed: false,
-        permission_denied: false,
-        timed_out: false,
-        dropped_out: budgetOutcome.exceeded || !stdout,
-        model_invocation: true,
-      }, { kind: route.provider, prompt, route, startedAt, accountId });
+      payload = sealedPayload || { exitCode: -1, stdout: '', stderr: '', dropped_out: true };
     }
   } catch (error) {
-    if (!clientGone && !res.writableEnded) {
-      sendOneShotResult(res, {
-        kind: route.provider,
-        route,
-        exitCode: -1,
-        stdout: '',
-        stderr: cleanOutput(error?.message || String(error)),
-        timed_out: timedOut,
-        dropped_out: true,
-        model_invocation: requestStarted ? null : false,
-      }, { kind: route.provider, prompt, route, startedAt, accountId });
-    }
+    if (sealedPayload) {
+      payload = sealedPayload;
+      transportDiagnostic = typeof error.code === 'string' ? error.code : (error.name === 'AbortError' ? 'http_drain_aborted' : 'http_drain_failed');
+    } else payload = { exitCode: -1, stdout: '', stderr: cleanOutput(error?.message || String(error)),
+      failureClass: error.failureClass || (isHostedApiKeyMissingError(error) ? 'auth' : 'provider_error'),
+      errorCode: error.code || null, auth_failed: isHostedApiKeyMissingError(error),
+      dropped_out: true, model_invocation: requestStarted ? (responseStatus && responseStatus >= 200 && responseStatus < 300 ? true : null) : false };
   } finally {
-    clearTimeout(timer);
+    res.removeListener('close', detach);
+    lifecycle.sealOutcome(payload);
+    const state = lifecycle.snapshot();
+    const progress = supervisor.snapshot();
+    const stop = state.stop;
+    if (stop) {
+      const clientStop = stop.source === 'client';
+      payload = { ...payload, stdout: '', failureClass: stop.reason === 'token_budget' ? 'token_budget'
+        : clientStop ? stop.reason : stop.reason === 'output_cap' ? 'output_cap' : 'timeout',
+        stop_reason: stop.reason, supervisor_stop_reason: stop.source === 'supervisor' ? stop.reason : null,
+        stop_detail: stop.detail, cancelled: clientStop, timed_out: !clientStop && stop.reason !== 'token_budget' && stop.reason !== 'output_cap',
+        provider_timeout_source: stop.source === 'supervisor' && !['token_budget', 'output_cap'].includes(stop.reason) ? 'relay_supervisor' : null,
+        budget_exceeded: stop.reason === 'token_budget', dropped_out: true,
+        usage: acceptedUsage || payload?.usage || null };
+    }
+    payload = { ...payload, kind: route.provider, route, runId, progress,
+      usage: acceptedUsage || payload?.usage || null,
+      provider_stop_reason: payload?.provider_stop_reason || (hosted ? terminal?.reason : terminal?.done_reason) || null,
+      provider_terminal_compatibility: terminal?.compatibility || null,
+      ...(transportDiagnostic ? { transport_diagnostic_code: transportDiagnostic } : {}),
+      physical_attempt_count: state.dispatched ? 1 : 0,
+      provider_budget: progress.providerBudget, provider_budget_enforcement: progress.providerUsagePhase,
+      transport_lifecycle: { ...state, physicalEvidence: state.dispatched ? 'http_transport_settled' : 'not_dispatched' } };
+    await lifecycle.settlePhysical({ evidence: state.dispatched ? 'http_transport_settled' : 'not_dispatched',
+      cleanup: cleanupResources,
+      persist: ({ snapshot, cleanup }) => sendOneShotResult(res, {
+        ...payload, transport_lifecycle: snapshot,
+        ...(cleanup?.ok === false ? { failureClass: 'isolation_cleanup', dropped_out: true } : {}),
+      }, meta) });
   }
 }
 
@@ -2616,7 +2336,7 @@ const MAX_ACTIVE_ONESHOTS = Math.max(1, Math.min(Number(envFirst('RELAYBRIDGE_MA
 const MAX_ACTIVE_PER_PROVIDER = Math.max(1, Math.min(Number(envFirst('RELAYBRIDGE_MAX_ACTIVE_PER_PROVIDER', 'PS_BRIDGE_MAX_ACTIVE_PER_PROVIDER') || 1), 4));
 let activeOneShotCount = 0;
 
-function acquireOneShot(kind, res) {
+function acquireOneShot(kind) {
   const providerCount = activeOneShots.get(kind) || 0;
   if (activeOneShotCount >= MAX_ACTIVE_ONESHOTS || providerCount >= MAX_ACTIVE_PER_PROVIDER) return null;
   activeOneShotCount++;
@@ -2629,8 +2349,6 @@ function acquireOneShot(kind, res) {
     const next = Math.max(0, (activeOneShots.get(kind) || 1) - 1);
     if (next) activeOneShots.set(kind, next); else activeOneShots.delete(kind);
   };
-  res.once('finish', release);
-  res.once('close', release);
   return release;
 }
 function trackChild(proc) {
@@ -2700,7 +2418,7 @@ async function discoverModels() {
           const models = parseModelList(result.stdout, entry);
           probeResults[kind] = models.length ? { models } : { error: 'probe returned no recognizable model ids' };
         } else {
-          probeResults[kind] = { error: (result.stderr || 'probe failed').split('\n')[0].slice(0, 200) };
+          probeResults[kind] = { error: [result.code, (result.stderr || 'probe failed').split('\n')[0]].filter(Boolean).join(': ').slice(0, 200) };
         }
       } catch (err) {
         probeResults[kind] = { error: err.message };
@@ -2751,24 +2469,17 @@ class Session {
   _spawn() {
     const env = buildEnv({ TERM: 'xterm-256color' });
     const resolvedCommand = resolveExecutable(this.command, env);
+    // Qualification is outside the PTY fallback: unsupported shims cannot
+    // escape rejection by retrying through another transport.
+    const launch = qualifiedProviderLaunch(resolvedCommand, this.args, env);
     if (pty) {
       try {
-        // On Windows, ConPTY (used by node-pty) can't resolve .cmd / .bat / .ps1
-        // shims directly â€” pty.spawn('claude', ...) fails because the shim isn't
-        // a real .exe. Wrap any non-.exe command with `cmd.exe /c` so the shim
-        // resolves through cmd.exe's path search. PowerShell.exe etc. skip this.
-        let spawnCmd = resolvedCommand;
-        let spawnArgs = this.args;
-        if (process.platform === 'win32' && !/\.exe$/i.test(resolvedCommand)) {
-          spawnCmd = process.env.ComSpec || 'cmd.exe';
-          spawnArgs = ['/d', '/s', '/c', [resolvedCommand, ...this.args].map(quoteCmdArg).join(' ')];
-        }
-        this.proc = pty.spawn(spawnCmd, spawnArgs, {
+        this.proc = pty.spawn(launch.file, launch.args, {
           name: 'xterm-256color',
           cols: 120,
           rows: 30,
           cwd: this.cwd,
-          env,
+          env: launch.env,
         });
         this._mode = 'pty';
         this.proc.onData((data) => this._onData(data));
@@ -2778,20 +2489,10 @@ class Session {
         console.warn(`[session ${this.id}] PTY spawn failed: ${err.message}, falling back to pipe`);
       }
     }
-    // pipe fallback
-    // On Windows, npm-installed CLIs are usually .cmd shims (claude.cmd,
-    // codex.cmd, gemini.cmd). spawn('claude', ...) with shell:false won't
-    // resolve those â€” you get ENOENT. Setting shell:true lets cmd.exe
-    // look up the command and find the shim. (Localhost-only server with
-    // user-controlled cli-config.json, so no injection surface.)
-    const isWindowsShim = process.platform === 'win32' && !/\.exe$/i.test(resolvedCommand);
-    const pipeCommand = isWindowsShim ? (process.env.ComSpec || 'cmd.exe') : resolvedCommand;
-    const pipeArgs = isWindowsShim
-      ? ['/d', '/s', '/c', [resolvedCommand, ...this.args].map(quoteCmdArg).join(' ')]
-      : this.args;
-    this.proc = spawn(pipeCommand, pipeArgs, {
+    // Pipe fallback uses the exact same qualified native executable and argv.
+    this.proc = spawn(launch.file, launch.args, {
       cwd: this.cwd,
-      env,
+      env: launch.env,
       windowsHide: true,
       // Same reason as the one-shot spawn: killProcessTree can only take out
       // the whole tree with a single signal when the child leads its own
@@ -2977,6 +2678,28 @@ function createSessionFromKind(kind, opts = {}) {
 
 // ---- HTTP / WS server ----
 const app = express();
+const diagnosticRequestLimit = createRequestLimiter({ family: 'diagnostics', limit: 120 });
+const planningRequestLimit = createRequestLimiter({ family: 'planning', limit: 120 });
+const execRequestLimit = createRequestLimiter({ family: 'host_exec', limit: 60 });
+const accountMutationLimit = createRequestLimiter({ family: 'account_mutation', limit: 60 });
+const usageAdviceLimit = createRequestLimiter({ family: 'usage_advice', limit: 120 });
+const installRequestLimit = createRequestLimiter({ family: 'provider_install', limit: 12 });
+const hostExecSlots = createOperationSlots({ limit: 4 });
+const installSlots = createOperationSlots({ limit: 1 });
+const probePool = createReadOperationPool({ maxActive: 4, maxQueued: 64, maxSubscribers: 64 });
+let authGeneration = 0;
+
+function rejectOperationAdmission(res, error) {
+  res.set('Retry-After', '1');
+  return res.status(429).json({ ok: false, success: false, failureClass: 'admission_limit',
+    error: error.message, errorCode: error.code, retryable: true,
+    validation: { code: error.code, field: 'request', reason: error.message },
+    model_invocation: false, physical_attempt_count: 0, token_usage_source: 'not_invoked' });
+}
+
+function diagnosticGeneration(cfg) {
+  return `${authGeneration}:${crypto.createHash('sha256').update(JSON.stringify(cfg)).digest('hex')}`;
+}
 app.disable('x-powered-by');
 app.use(express.json({ limit: '1mb' }));
 
@@ -3251,6 +2974,39 @@ app.get('/api/workspace', (req, res) => {
 // cached provider result.  This endpoint performs the same startup-pinned cwd
 // validation as /api/oneshot without invoking a provider or exposing a host
 // path.  Rejections receive the normal durable zero-invocation receipt.
+function validateProviderIntent(body, cfg = loadConfig(), snapshot = captureAllowedCwdIdentity(body.cwd), phase = 'execute') {
+  if (!providerAccounts.validProviderKey(body.kind) || !Object.prototype.hasOwnProperty.call(cfg, body.kind)) {
+    throw validationError('unknown_provider', 'kind', 'Provider is not configured.');
+  }
+  const entry = cfg[body.kind];
+  validateProviderBudget(body.providerBudget);
+  const useDanger = body.dangerous === true;
+  const filesystem = providerFilesystemEligibility(runtimeFilesystemPolicyEntry(entry), { dangerous: useDanger });
+  if (!filesystem.eligible) throw validationError('workspace_grounding', 'dangerous', filesystem.blockedReason || 'Provider filesystem policy does not admit this execution.');
+  const controls = resolveProviderControls({ kind: body.kind, entry, registry: modelRegistry,
+    slot: useDanger ? entry.oneshot_dangerous : entry.oneshot_safe,
+    taskTier: body.taskTier, modelTier: body.modelTier, model: body.model,
+    effort: body.effort, maxEffortOverride: body.maxEffortOverride,
+    execution: body.execution, dangerous: useDanger, phase });
+  const timing = resolveAttemptTiming({ entry, globals: cfg._supervisor || {}, timeoutMs: body.timeoutMs,
+    providerBudget: body.providerBudget, taskTier: body.budgetTaskTier || controls.execution.resolvedTaskTier });
+  const deadline = renderCliDeadline({ entry, slot: controls.slot, supervisorOptions: timing });
+  const grounded = prepareGroundedPrompt({ ...body, cwd: snapshot.resolved, cwdIdentityHash: snapshot.cwdIdentityHash,
+    seat: body.kind, seatConfig: entry, dangerous: useDanger });
+  if (body.prompt !== undefined) preparePrompt(grounded.prompt, {
+    ...promptTransportLimits(entry, deadline.slot),
+    policyPrefix: !useDanger && typeof entry.oneshot_safe_prompt_prefix === 'string' ? entry.oneshot_safe_prompt_prefix.trim() : '',
+  });
+  revalidateAllowedCwdIdentity(snapshot);
+  return { ...controls, grounding: grounded.grounding };
+}
+function rejectInvalidIntent(res, body, error) {
+  return sendOneShotPreAdmissionRejection(res, { statusCode: 400,
+    payload: { error: error.validation?.reason || error.message, errorCode: error.code || null, validation: error.validation || null },
+    kind: typeof body.kind === 'string' ? body.kind : null,
+    prompt: typeof body.prompt === 'string' ? body.prompt : '',
+    requestId: normalizeOneShotRequestId(body), failureClass: error.code === 'workspace_grounding' ? 'workspace_grounding' : 'validation', startedAt: Date.now() });
+}
 app.post('/api/workspace/validate', (req, res) => {
   const startedAt = Date.now();
   const body = req.body || {};
@@ -3258,8 +3014,14 @@ app.post('/api/workspace/validate', (req, res) => {
   try {
     const snapshot = captureAllowedCwdIdentity(body.cwd);
     revalidateAllowedCwdIdentity(snapshot);
+    let execution = null, grounding = null;
+    if (body.kind !== undefined) {
+      ({ execution, grounding } = validateProviderIntent(body, loadConfig(), snapshot));
+    }
     return res.json({
       ok: true,
+      execution,
+      grounding,
       cwdIdentityHash: snapshot.cwdIdentityHash,
       cwdPolicyId: CWD_POLICY_IDENTITY,
       model_invocation: false,
@@ -3281,33 +3043,50 @@ app.post('/api/workspace/validate', (req, res) => {
       kind: typeof body.kind === 'string' ? body.kind : null,
       prompt: typeof body.prompt === 'string' ? body.prompt : '',
       requestId,
-      failureClass: 'validation',
+      failureClass: err.code === 'workspace_grounding' ? 'workspace_grounding' : 'validation',
       startedAt,
       route: { provider: typeof body.kind === 'string' ? body.kind : null, request_id: requestId },
     });
   }
 });
 
-function runProbe(slotRaw, timeoutMs = 15000, stripEnv = [], signal) {
+async function runProbe(slotRaw, timeoutMs = 15000, stripEnv = [], signal) {
+  const notRun = (error, extra = {}) => ({ exitCode: -1, stdout: '', stderr: error.message,
+    code: error.code || null, validation: error.validation || null, timedOut: false,
+    model_invocation: false, ...extra });
+  if (signal?.aborted) return notRun(new Error('diagnostic cancelled'), { aborted: true });
+  const env = buildEnv({}, stripEnv);
+  const [configuredBinary, ...args] = resolveSlot(slotRaw);
+  let launch;
+  try { launch = qualifiedProviderLaunch(resolveExecutable(configuredBinary, env), args, env); }
+  catch (error) { return notRun(error); }
+  const key = crypto.createHash('sha256').update(JSON.stringify({ file: launch.file, args: launch.args,
+    env: launch.env, adapter: launch.adapter, template: launch.templateHash, cwd: ROOT, timeoutMs, authGeneration })).digest('hex');
+  const deadline = new AbortController();
+  const callerSignal = signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal;
+  const deadlineTimer = setTimeout(() => deadline.abort(), timeoutMs + 2000);
+  deadlineTimer.unref?.();
+  try {
+    return await probePool.run(key, (workerSignal) => runPhysicalProbe(launch, timeoutMs, workerSignal), { signal: callerSignal });
+  } catch (error) {
+    return notRun(error, { timedOut: deadline.signal.aborted && !signal?.aborted,
+      aborted: !!signal?.aborted, admissionRejected: error.code === 'operation_admission_limit' });
+  } finally { clearTimeout(deadlineTimer); }
+}
+
+// This promise represents PHYSICAL lifetime, not the HTTP caller's patience.
+// Only actual close or a confirmed no-child startup failure frees admission.
+function runPhysicalProbe(launch, timeoutMs, signal) {
   return new Promise((resolve) => {
-    if (signal?.aborted) return resolve({ exitCode: -1, stdout: '', stderr: 'diagnostic cancelled', timedOut: false, aborted: true });
-    const slot = resolveSlot(slotRaw);
-    const env = buildEnv({}, stripEnv);
-    const [configuredBinary, ...args] = slot;
-    const resolvedBinary = resolveExecutable(configuredBinary, env);
-    const isWindowsShim = process.platform === 'win32' && !/\.exe$/i.test(resolvedBinary);
-    const spawnBinary = isWindowsShim ? (process.env.ComSpec || 'cmd.exe') : resolvedBinary;
-    const spawnArgs = isWindowsShim
-      ? ['/d', '/s', '/c', [resolvedBinary, ...args].map(quoteCmdArg).join(' ')]
-      : args;
+    if (signal.aborted) return resolve({ exitCode: -1, stdout: '', stderr: 'diagnostic cancelled', timedOut: false, aborted: true, model_invocation: false });
     let proc;
     try {
       // detached on POSIX so the timeout kill signals the probe's whole group
       // instead of orphaning whatever it spawned — see the one-shot spawnOpts
       // for why killTree's ps-walk fallback is not equivalent.
-      proc = trackChild(spawn(spawnBinary, spawnArgs, { cwd: ROOT, env, windowsHide: true, detached: process.platform !== 'win32' }));
+      proc = trackChild(spawn(launch.file, launch.args, { cwd: ROOT, env: launch.env, windowsHide: true, detached: process.platform !== 'win32' }));
     } catch (err) {
-      return resolve({ exitCode: -1, stdout: '', stderr: err.message, timedOut: false });
+      return resolve({ exitCode: -1, stdout: '', stderr: err.message, timedOut: false, model_invocation: false });
     }
     let stdout = '';
     let stderr = '';
@@ -3325,27 +3104,24 @@ function runProbe(slotRaw, timeoutMs = 15000, stripEnv = [], signal) {
       // /api/auth/status). The most common failure on a fresh box, "that CLI is
       // not installed under this name", was therefore recorded as no error at
       // all: model-registry rows landed with error:null and no warning.
-      resolve({ exitCode, stdout, stderr: [stderr, error && error.message].filter(Boolean).join('\n'), timedOut, aborted: !!signal?.aborted });
+      resolve({ exitCode, stdout, stderr: [stderr, error && error.message].filter(Boolean).join('\n'), timedOut, aborted: !!signal?.aborted, model_invocation: !!proc.pid });
     };
     const timer = setTimeout(() => {
       timedOut = true;
       killProcessTree(proc);
-      // Resolve on a grace delay even if the child never emits close: killing
-      // the tree is not a guarantee of an exit event, and a pending probe would
-      // otherwise wedge readiness checks and model discovery forever.
-      const graceful = setTimeout(() => finish(-1, new Error('probe timed out and did not exit')), 2000);
-      if (typeof graceful.unref === 'function') graceful.unref();
+      // The subscriber deadline can stop waiting; physical capacity remains
+      // occupied while process termination/pipe cleanup is still in progress.
     }, timeoutMs);
     abortHandler = () => {
       killProcessTree(proc);
-      finish(-1, new Error('diagnostic cancelled'));
     };
     signal?.addEventListener('abort', abortHandler, { once: true });
+    if (signal.aborted) abortHandler();
     proc.stdout.setEncoding('utf8');
     proc.stderr.setEncoding('utf8');
-    proc.stdout.on('data', (d) => { if (stdout.length < 32768) stdout += d; });
-    proc.stderr.on('data', (d) => { if (stderr.length < 32768) stderr += d; });
-    proc.on('error', (err) => finish(-1, err));
+    proc.stdout.on('data', (d) => { stdout = (stdout + d).slice(0, 32768); });
+    proc.stderr.on('data', (d) => { stderr = (stderr + d).slice(0, 32768); });
+    proc.on('error', (err) => { if (!proc.pid) finish(-1, err); else killProcessTree(proc); });
     proc.on('close', (code) => finish(code));
     try { proc.stdin.end(); } catch {}
   });
@@ -3356,6 +3132,7 @@ function runProbe(slotRaw, timeoutMs = 15000, stripEnv = [], signal) {
 let lastDiagnostics = null;
 
 function updateDefaultAccountRuntimeAuth(kind, authenticated) {
+  authGeneration += 1;
   if (!kind) return;
   const priorResults = lastDiagnostics?.results && typeof lastDiagnostics.results === 'object'
     ? lastDiagnostics.results : {};
@@ -3367,6 +3144,8 @@ function updateDefaultAccountRuntimeAuth(kind, authenticated) {
       ...priorResults,
       [kind]: {
         ...prior,
+        transientProbeFailure: false,
+        qualificationFailure: null,
         found: true,
         ready: authenticated,
         authFailed: !authenticated,
@@ -3380,6 +3159,7 @@ function updateDefaultAccountRuntimeAuth(kind, authenticated) {
 }
 
 function armDefaultAccountRuntimeAuthRetry(kind) {
+  authGeneration += 1;
   const priorResults = lastDiagnostics?.results && typeof lastDiagnostics.results === 'object'
     ? lastDiagnostics.results : {};
   const prior = priorResults[kind] && typeof priorResults[kind] === 'object'
@@ -3392,6 +3172,8 @@ function armDefaultAccountRuntimeAuthRetry(kind) {
       ...priorResults,
       [kind]: {
         ...prior,
+        transientProbeFailure: false,
+        qualificationFailure: null,
         ready: null,
         authFailed: false,
         authAuthoritative: false,
@@ -3409,7 +3191,7 @@ function reconcileManagedDefaultAuth(cfg, results) {
   for (const [kind, result] of Object.entries(results || {})) {
     const entry = cfg?.[kind];
     if (!entry || !providerAccounts.credentialEnvFor(entry) || !result?.found
-      || entry.probe_auth_authoritative !== true) continue;
+      || entry.probe_auth_authoritative !== true || result.authAuthoritative !== true || result.transientProbeFailure) continue;
     try {
       const mutation = result.ready === true
         ? providerAccounts.clearAccountAuthFailure(
@@ -3484,6 +3266,32 @@ function applyFilesystemEligibilityToDiagnostics(diagnostics = {}, cfg = {}, { d
   return { diagnostics: out, skipped, dangerous };
 }
 
+function applyGroundingEligibilityToDiagnostics(diagnostics, cfg, body, snapshot) {
+  const out = {}, skipped = [];
+  for (const [kind, prior] of Object.entries(diagnostics)) {
+    const grounding = checkGrounding({ ...body, prompt: body.task, cwd: snapshot.resolved,
+      cwdIdentityHash: snapshot.cwdIdentityHash, seat: kind, seatConfig: cfg[kind] || {}, dangerous: body.dangerous === true });
+    out[kind] = grounding.allowed ? { ...prior, grounding }
+      : { ...prior, grounding, executionReady: false, executionDetail: grounding.reason, ready: false };
+    if (!grounding.allowed) skipped.push({ kind, reason: grounding.reason, remedy: grounding.remedy });
+    else if (prior.executionReady !== false && isAiProviderEntry(kind, cfg[kind])) {
+      try {
+        validateProviderIntent({ ...body, kind, prompt: body.task, dangerous: body.dangerous === true }, cfg, snapshot, 'plan');
+      } catch (error) {
+        const validation = error.validation || { code: 'invalid_provider_controls', field: 'provider', reason: error.message, retryable: false };
+        out[kind] = { ...out[kind], executionReady: false, ready: false, executionDetail: validation.reason, intentValidation: validation };
+        skipped.push({ kind, reason: validation.reason, validation });
+      }
+    }
+  }
+  return { diagnostics: out, skipped };
+}
+
+function invocationCapabilitiesFor(cfg, dangerous) {
+  return Object.fromEntries(Object.entries(cfg).filter(([kind]) => !kind.startsWith('_'))
+    .map(([kind, entry]) => [kind, entry?.oneshot_capabilities?.[dangerous ? 'dangerous' : 'safe'] || []]));
+}
+
 function agentSummary(kind, entry) {
   const diag = lastDiagnostics?.results?.[kind] || null;
   const safeFilesystem = diag?.safeFilesystem || providerFilesystemEligibility(runtimeFilesystemPolicyEntry(entry));
@@ -3508,22 +3316,43 @@ function agentSummary(kind, entry) {
   };
 }
 
-async function probeOllamaReadiness(entry) {
+async function readOllamaTags(tagsUrl, signal) {
+  const key = crypto.createHash('sha256').update(JSON.stringify({
+    type: 'ollama_tags', url: tagsUrl.href, timeoutMs: 4000, maxBytes: 1048576, redirect: 'manual',
+  })).digest('hex');
+  const deadline = new AbortController();
+  const timer = setTimeout(() => deadline.abort(), 6000);
+  timer.unref?.();
+  try {
+    return await probePool.run(key, (workerSignal) => readBoundedJson(tagsUrl, { signal: workerSignal }),
+      { signal: signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal });
+  } catch (error) {
+    return { completed: false, error: error.message, aborted: !!signal?.aborted,
+      timedOut: deadline.signal.aborted && !signal?.aborted,
+      admissionRejected: error.code === 'operation_admission_limit' };
+  } finally { clearTimeout(timer); }
+}
+
+async function probeOllamaReadiness(entry, signal) {
   let found = false;
   let ready = false;
   let detail = '';
   let runtimeVersion = '';
+  let transientProbeFailure = false;
   const model = entry.model || entry.oneshot_model
     || (Array.isArray(entry.safe) ? entry.safe[2] : '') || '';
   try {
     const base = localOllamaUrl();
     const tagsUrl = new URL('/api/tags', base.origin);
-    const resp = await fetch(tagsUrl, { signal: AbortSignal.timeout(4000) });
-    found = true;
-    if (!resp.ok) {
+    const resp = await readOllamaTags(tagsUrl, signal);
+    found = !!resp.status;
+    transientProbeFailure = !resp.completed;
+    if (!resp.completed) {
+      detail = resp.timedOut ? 'ollama metadata read timed out' : resp.error || 'ollama metadata read cancelled';
+    } else if (resp.status !== 200) {
       detail = `ollama daemon at ${base.origin} returned HTTP ${resp.status}`;
     } else {
-      const body = await resp.json();
+      const body = resp.body;
       const names = Array.isArray(body?.models) ? body.models.map((item) => String(item?.name || '')) : [];
       runtimeVersion = `${names.length} model(s) loaded`;
       ready = !model || names.some((name) => name === model
@@ -3533,6 +3362,7 @@ async function probeOllamaReadiness(entry) {
         : `daemon up at ${base.origin} but ${model} is not pulled (have: ${names.slice(0, 4).join(', ') || 'none'})`;
     }
   } catch (err) {
+    transientProbeFailure = true;
     detail = err.name === 'TimeoutError'
       ? `no ollama daemon answering at ${String(envFirst('RELAYBRIDGE_OLLAMA_URL', 'PS_BRIDGE_OLLAMA_URL') || 'http://127.0.0.1:11434')} (timed out)`
       : `no ollama daemon reachable: ${err.message}`;
@@ -3546,16 +3376,19 @@ async function probeOllamaReadiness(entry) {
     detail,
     probeExitCode: null,
     runtimeVersion,
+    transientProbeFailure,
+    authFailed: false,
+    authAuthoritative: false,
     usageCapability: providerUsageCapability(entry, { runtimeVersion }),
   };
 }
 
-async function coldPlanningDiagnostics(cfg, pathDetail) {
+async function coldPlanningDiagnostics(cfg, pathDetail, signal) {
   const env = buildEnv();
   const pairs = await Promise.all(Object.keys(cfg).filter((kind) => !kind.startsWith('_')).map(async (kind) => {
     const entry = cfg[kind];
     if (entry.oneshot_adapter === 'ollama_api') {
-      return [kind, await probeOllamaReadiness(entry)];
+      return [kind, await probeOllamaReadiness(entry, signal)];
     }
     let found = false;
     try {
@@ -3574,14 +3407,14 @@ async function coldPlanningDiagnostics(cfg, pathDetail) {
 // readiness sweep has ever run. Such a partial snapshot must not make every
 // absent provider look eligible. Fill only missing configured keys with cheap
 // path/transport evidence and preserve every live result already observed.
-async function completePlanningDiagnostics(cfg, existing, pathDetail) {
+async function completePlanningDiagnostics(cfg, existing, pathDetail, signal) {
   const preserved = existing && typeof existing === 'object' && !Array.isArray(existing)
     ? existing : {};
   const missingKinds = Object.keys(cfg).filter((kind) => !kind.startsWith('_')
     && !Object.prototype.hasOwnProperty.call(preserved, kind));
   if (!missingKinds.length) return preserved;
   const missingConfig = Object.fromEntries(missingKinds.map((kind) => [kind, cfg[kind]]));
-  const missing = await coldPlanningDiagnostics(missingConfig, pathDetail);
+  const missing = await coldPlanningDiagnostics(missingConfig, pathDetail, signal);
   return { ...missing, ...preserved };
 }
 
@@ -3707,6 +3540,7 @@ app.get('/api/runs/active', (req, res) => {
       runId: run.runId, kind: run.kind, route: run.route, pid: run.pid,
       startedAt: new Date(run.startedAt).toISOString(),
       ...snap,
+      ...(run.lifecycle ? { transportLifecycle: run.lifecycle.snapshot() } : {}),
       assessment: snap.phase === 'streaming' ? 'producing output right now â€” leave it alone'
         : snap.phase === 'working' ? 'recently active â€” still working'
           : snap.phase === 'suspect_loop' ? 'repeating itself â€” watch this one'
@@ -3737,29 +3571,50 @@ app.post('/api/models/refresh', async (req, res) => {
 // a CSS tweak to a frontier seat, or arithmetic to a max-effort reasoning model,
 // costs real money for no gain. This returns the cheapest capable combination
 // and says why, so callers do not have to guess.
-//
-// Shared with delegation, so delegated work is routed through exactly the same
-// cheapest-capable logic an operator sees in a preview. A second copy here
-// would be a second routing policy, and the two would drift.
-async function planTask({ task, requestedEffort = null, kind = null, requestedProviderBudget, filesystemAuthority }) {
+async function planTask({ task, requestedEffort = null, kind = null, requestedProviderBudget,
+  filesystemAuthority, intent = {}, signal, taskTierOverride = null }) {
+  kind = kind || intent.kind || intent.execution?.provider || null;
+  requestedEffort = intent.effort ?? requestedEffort;
+  validateControlRequest({ ...intent, ...(requestedEffort == null ? {} : { effort: requestedEffort }) });
+  const groundingSnapshot = captureAllowedCwdIdentity(intent.cwd);
+  checkGrounding({ ...intent, prompt: task, cwdIdentityHash: groundingSnapshot.cwdIdentityHash });
+  requestedEffort = requestedEffort == null ? null : normalizeEffort(requestedEffort);
+  requestedProviderBudget = validateProviderBudget(requestedProviderBudget === undefined
+    ? intent.providerBudget : requestedProviderBudget);
+  if (!filesystemAuthority) {
+    try { filesystemAuthority = planningFilesystemAuthority(intent); }
+    catch (error) { error.statusCode = 400; throw error; }
+  }
   const router = await ROUTER_MODULE_PROMISE;
   const cfg = loadConfig();
-  let diagnostics = await completePlanningDiagnostics(
-    cfg,
-    lastDiagnostics?.results,
-    'path-only check',
-  );
+  const generation = diagnosticGeneration(cfg);
+  let diagnostics = await completePlanningDiagnostics(cfg, lastDiagnostics?.results, 'path-only check', signal);
+  if (signal?.aborted) throw Object.assign(new Error('planning request cancelled'), { statusCode: 499 });
+  if (generation !== diagnosticGeneration(loadConfig())) {
+    throw Object.assign(new Error('diagnostic authority changed; refresh again'), {
+      statusCode: 409, code: 'diagnostic_stale',
+    });
+  }
+  const effectiveTaskTier = taskTierOverride || router.classifyTask(task).tier;
   const gauges = usageLedger.gaugeAll(seatCostClasses());
   const routingInputs = accountAwareRoutingInputs(cfg, diagnostics, gauges, coolingQuotaStates());
-  const fleetInput = applyCooldownsToDiagnostics(
-    routingInputs.diagnostics, routingInputs.cooling, kind ? [kind] : [],
-  );
-  const vendorQuotaInput = applyVendorQuotaExhaustionToDiagnostics(
-    fleetInput.diagnostics, routingInputs.gauges,
-  );
+  const fleetInput = applyCooldownsToDiagnostics(routingInputs.diagnostics, routingInputs.cooling, kind ? [kind] : []);
+  const vendorQuotaInput = applyVendorQuotaExhaustionToDiagnostics(fleetInput.diagnostics, routingInputs.gauges);
   const filesystemInput = applyFilesystemEligibilityToDiagnostics(vendorQuotaInput.diagnostics, cfg, filesystemAuthority);
-  diagnostics = filesystemInput.diagnostics;
-  let route = router.routeTask({ task, diagnostics, dangerous: filesystemAuthority.dangerous });
+  const groundingInput = applyGroundingEligibilityToDiagnostics(filesystemInput.diagnostics, cfg,
+    { ...intent, task, prompt: task, taskTier: effectiveTaskTier }, groundingSnapshot);
+  diagnostics = groundingInput.diagnostics;
+  if (kind && diagnostics[kind]?.grounding?.allowed === false) {
+    throw validationError('workspace_grounding', 'kind', diagnostics[kind].grounding.reason + ' ' + diagnostics[kind].grounding.remedy);
+  }
+  if (kind && diagnostics[kind]?.intentValidation) {
+    const diagnostic = diagnostics[kind].intentValidation;
+    throw validationError(diagnostic.code, diagnostic.field, diagnostic.reason, diagnostic);
+  }
+  let route = router.routeTask({ task, diagnostics, dangerous: filesystemAuthority.dangerous,
+    invocationCapabilities: invocationCapabilitiesFor(cfg, filesystemAuthority.dangerous), modelTier: intent.modelTier,
+    preferredProviders: kind ? [kind] : [] });
+  if (taskTierOverride) route = { ...route, classification: { ...route.classification, tier: taskTierOverride } };
   route = levelRouteSelection(route, routingInputs.gauges, seatCostClassMap());
   route.fleetState = {
     cooldownSkipped: fleetInput.skipped,
@@ -3770,55 +3625,41 @@ async function planTask({ task, requestedEffort = null, kind = null, requestedPr
     quotaSeats: currentQuotaSeatGroups(),
     accountSelection: routingInputs.accountSelection,
     filesystemSkipped: filesystemInput.skipped,
+    groundingSkipped: groundingInput.skipped,
     filesystemAuthority,
   };
-  const plan = buildTaskPlan({
-    route,
-    config: cfg,
-    registry: modelRegistry,
-    resolveModelArgs,
-    // lib/task-plan predates xhigh.  Use its conservative high mechanics to
-    // choose the same provider/model, then restore the caller's explicit
-    // xhigh intent below; execution performs the provider capability check.
-    requestedEffort: requestedEffort === 'xhigh' ? 'high' : requestedEffort,
-    requestedKind: kind || null,
-    requestedProviderBudget,
-  });
-  if (requestedEffort) annotateRequestedPlanEffort(plan, cfg, requestedEffort);
+  const plan = buildTaskPlan({ route, config: cfg, registry: modelRegistry,
+    requestedEffort, requestedKind: kind, requestedProviderBudget,
+    requestedModel: intent.model, requestedModelTier: intent.modelTier,
+    requestedExecution: intent.execution, requestedMaxEffortOverride: intent.maxEffortOverride,
+    requestedTimeoutMs: intent.timeoutMs, dangerous: filesystemAuthority.dangerous });
+  if (kind && plan.primary?.validation) {
+    const diagnostic = plan.primary.validation;
+    throw validationError(diagnostic.code, diagnostic.field, diagnostic.reason, diagnostic);
+  }
   return { plan, fleetState: route.fleetState };
 }
 
-app.post('/api/plan', async (req, res) => {
-  const { task, effort, kind, providerBudget: rawBudget } = req.body || {};
-  if (!task || typeof task !== 'string' || !task.trim()) {
-    return res.status(400).json({ error: 'task (non-empty string) required' });
-  }
-  const requestedEffort = effort ? normalizeEffort(String(effort)) : null;
-  if (effort && !requestedEffort) {
-    return res.status(400).json({ error: `effort must be one of: ${SUPPORTED_EFFORTS.join(', ')}` });
-  }
-  let requestedProviderBudget;
+app.post('/api/plan', planningRequestLimit, async (req, res) => {
+  const controller = new AbortController();
+  res.once('close', () => { if (!res.writableEnded) controller.abort(); });
+  const { task } = req.body || {};
+  if (typeof task !== 'string' || !task.trim()) return res.status(400).json({ error: 'task (non-empty string) required' });
   try {
-    requestedProviderBudget = validateProviderBudget(rawBudget);
-  } catch (err) {
-    return res.status(400).json({ error: err.message });
-  }
-  let filesystemAuthority;
-  try { filesystemAuthority = planningFilesystemAuthority(req.body || {}); }
-  catch (err) { return res.status(400).json({ error: err.message }); }
-  try {
-    const { plan, fleetState } = await planTask({
-      task, requestedEffort, kind: kind || null, requestedProviderBudget, filesystemAuthority,
-    });
-    res.json({ ok: true, task: task.slice(0, 400), ...plan, fleetState });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
+    const { plan, fleetState } = await planTask({ task, intent: req.body || {}, signal: controller.signal });
+    if (!res.destroyed && !res.writableEnded) res.json({ ok: true, task: task.slice(0, 400), ...plan, fleetState });
+  } catch (error) {
+    if (res.destroyed || res.writableEnded) return;
+    if (error.validation) return rejectInvalidIntent(res, { ...req.body, prompt: task }, error);
+    res.status(error.statusCode || 500).json({ ok: false, error: error.message, ...(error.code ? { errorCode: error.code } : {}) });
   }
 });
 
 // Delegation: classify a task, rank providers by tier, and pick the model
 // weight class inside each. Advisory — it returns a plan, it does not dispatch.
-app.post('/api/route', async (req, res) => {
+app.post('/api/route', planningRequestLimit, async (req, res) => {
+  const controller = new AbortController();
+  res.once('close', () => { if (!res.writableEnded) controller.abort(); });
   const {
     task, diagnostics: supplied, preferKinds, excludeKinds, providerBudget: rawBudget,
     localOnly = false, maxProviders, committeeMode = 'advisory',
@@ -3833,11 +3674,18 @@ app.post('/api/route', async (req, res) => {
   if (!['advisory', 'consensus'].includes(committeeMode)) {
     return res.status(400).json({ error: 'committeeMode must be advisory or consensus' });
   }
+  try { validateControlRequest(req.body || {}); }
+  catch (err) { return rejectInvalidIntent(res, { ...req.body, prompt: task }, err); }
+  let groundingSnapshot;
+  try {
+    groundingSnapshot = captureAllowedCwdIdentity(req.body?.cwd);
+    checkGrounding({ ...req.body, prompt: task, cwdIdentityHash: groundingSnapshot.cwdIdentityHash });
+  } catch (err) { return rejectInvalidIntent(res, { ...req.body, prompt: task }, err); }
   let requestedProviderBudget;
   try {
     requestedProviderBudget = validateProviderBudget(rawBudget);
   } catch (err) {
-    return res.status(400).json({ error: err.message });
+    return rejectInvalidIntent(res, { ...req.body, prompt: task }, err);
   }
   let filesystemAuthority;
   try { filesystemAuthority = planningFilesystemAuthority(req.body || {}); }
@@ -3845,11 +3693,17 @@ app.post('/api/route', async (req, res) => {
   try {
     const router = await ROUTER_MODULE_PROMISE;
     const cfg = loadConfig();
+    const generation = diagnosticGeneration(cfg);
     let diagnostics = await completePlanningDiagnostics(
       cfg,
       supplied && typeof supplied === 'object' ? supplied : lastDiagnostics?.results,
       'path-only check; run /api/diag for auth status',
+      controller.signal,
     );
+    if (controller.signal.aborted) return;
+    if (generation !== diagnosticGeneration(loadConfig())) {
+      return res.status(409).json({ error: 'diagnostic authority changed; refresh again', errorCode: 'diagnostic_stale' });
+    }
     const explicitKinds = Array.isArray(preferKinds) ? preferKinds : [];
     const gauges = usageLedger.gaugeAll(seatCostClasses());
     const routingInputs = accountAwareRoutingInputs(cfg, diagnostics, gauges, coolingQuotaStates());
@@ -3860,9 +3714,11 @@ app.post('/api/route', async (req, res) => {
       fleetInput.diagnostics, routingInputs.gauges,
     );
     const filesystemInput = applyFilesystemEligibilityToDiagnostics(vendorQuotaInput.diagnostics, cfg, filesystemAuthority);
-    diagnostics = filesystemInput.diagnostics;
+    const groundingInput = applyGroundingEligibilityToDiagnostics(filesystemInput.diagnostics, cfg, { ...req.body, taskTier: router.classifyTask(task).tier }, groundingSnapshot);
+    diagnostics = groundingInput.diagnostics;
     let route = router.routeTask({
       task, diagnostics,
+      invocationCapabilities: invocationCapabilitiesFor(cfg, filesystemAuthority.dangerous), modelTier: req.body?.modelTier,
       dangerous: filesystemAuthority.dangerous,
       preferredProviders: explicitKinds.length ? explicitKinds : undefined,
       excludedProviders: Array.isArray(excludeKinds) ? excludeKinds : undefined,
@@ -3880,32 +3736,34 @@ app.post('/api/route', async (req, res) => {
       quotaSeats: currentQuotaSeatGroups(),
       accountSelection: routingInputs.accountSelection,
       filesystemSkipped: filesystemInput.skipped,
+      groundingSkipped: groundingInput.skipped,
       filesystemAuthority,
     };
     const taskTier = route.classification?.tier;
-    const selected = (route.selected || []).map((pick) => {
-      const entry = cfg[pick.kind] || {};
-      const resolved = resolveModelArgs({ entry, taskTier });
-      const retired = resolved.model ? pinIsRetired(modelRegistry, pick.kind, resolved.model) : false;
-      const budget = resolveSupervisorOptions({
-        entry,
-        globals: cfg._supervisor || {},
-        providerBudget: requestedProviderBudget,
-        taskTier,
-      }).providerBudget;
+    const planCandidate = (pick) => {
+      const planned = buildTaskPlan({ route: { ...route, selected: [pick] }, config: cfg,
+        registry: modelRegistry, requestedProviderBudget, requestedEffort: req.body?.effort,
+        requestedModel: req.body?.model, requestedModelTier: req.body?.modelTier,
+        requestedTimeoutMs: req.body?.timeoutMs,
+        dangerous: filesystemAuthority.dangerous }).primary;
       return {
         ...pick,
-        modelTier: resolved.modelTier,
-        model: retired ? null : resolved.model,
-        modelArgs: retired ? [] : resolved.args,
-        modelSource: retired ? 'account_default_retired_pin' : resolved.source,
-        modelNote: retired ? `configured model "${resolved.model}" is no longer offered by this account` : resolved.note,
-        providerBudget: budget,
+        modelTier: planned.modelTier, model: planned.model, modelArgs: planned.args,
+        modelSource: planned.execution ? 'execution_contract' : null,
+        modelNote: planned.validation?.reason || null, execution: planned.execution,
+        effort: planned.effort, appliedEffort: planned.appliedEffort,
+        effortMethod: planned.effortMethod, effortFallbackReason: planned.effortFallbackReason,
+        validation: planned.validation, blocked: planned.blocked, ready: planned.ready,
+        eligible: pick.eligible && planned.eligible, ineligibilityReasons: [...new Set([...(pick.ineligibilityReasons || []), ...planned.ineligibilityReasons])],
+        providerBudget: planned.providerBudget,
+        effectiveTimeoutMs: planned.effectiveTimeoutMs, cliDeadline: planned.cliDeadline,
       };
-    });
-    res.json({ ok: true, ...route, selected, modelTier: modelTierForTaskTier(taskTier), modelConfig: modelConfigStaleness(cfg._models || {}) });
+    };
+    const selected = (route.selected || []).map(planCandidate);
+    const candidates = (route.candidates || []).map(planCandidate);
+    res.json({ ok: true, ...route, selected, candidates, modelTier: modelTierForTaskTier(taskTier), modelConfig: modelConfigStaleness(cfg._models || {}) });
   } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
+    if (!res.destroyed && !res.writableEnded) res.status(500).json({ ok: false, error: err.message });
   }
 });
 
@@ -3917,7 +3775,7 @@ function signedOutProviders(diagnostics, cfg) {
   const results = diagnostics?.results || diagnostics || {};
   const out = [];
   for (const [kind, info] of Object.entries(results)) {
-    if (!info || !info.found || info.ready || info.authFailed !== true) continue;
+    if (!info || !info.found || info.ready || info.authFailed !== true || info.transientProbeFailure) continue;
     const entry = cfg[kind];
     if (!entry) continue;
     out.push({
@@ -3936,8 +3794,11 @@ function probeIndicatesAuthFailure(text) {
   return AUTH_FAILURE_RE.test(String(text || ''));
 }
 
-app.get('/api/auth/status', async (req, res) => {
+app.get('/api/auth/status', diagnosticRequestLimit, async (req, res) => {
   const cfg = loadConfig();
+  const generation = diagnosticGeneration(cfg);
+  const controller = new AbortController();
+  res.once('close', () => { if (!res.writableEnded) controller.abort(); });
   let diagnostics = lastDiagnostics;
   // Only probe when asked or when nothing has been checked yet: a readiness
   // sweep spawns one process per provider and should not run on every poll.
@@ -3948,7 +3809,7 @@ app.get('/api/auth/status', async (req, res) => {
       const pairs = await Promise.all(kinds.map(async (kind) => {
         const entry = cfg[kind];
         if (entry?.oneshot_adapter === 'ollama_api') {
-          return [kind, await probeOllamaReadiness(entry)];
+          return [kind, await probeOllamaReadiness(entry, controller.signal)];
         }
         if (!entry || !Array.isArray(entry.probe) || !entry.probe.length) return [kind, null];
         let found = false;
@@ -3963,18 +3824,31 @@ app.get('/api/auth/status', async (req, res) => {
           found = !!probeBin && (resolvedProbe !== probeBin || path.isAbsolute(resolvedProbe));
         } catch { found = false; }
         if (!found) return [kind, { found: false, ready: false, detail: 'not installed' }];
-        const result = await runProbe(entry.probe, Number(entry.probe_timeout_ms || 30000), entry.strip_env || []);
+        const result = await runProbe(entry.probe, Number(entry.probe_timeout_ms || 30000), entry.strip_env || [], controller.signal);
         const probeText = cleanOutput([result.stdout, result.stderr].filter(Boolean).join('\n'));
+        const completed = result.model_invocation !== false && !result.timedOut && !result.aborted && !result.admissionRejected;
         return [kind, {
           found: true,
-          ready: result.exitCode === 0,
-          authFailed: result.exitCode !== 0 && probeIndicatesAuthFailure(probeText),
-          authAuthoritative: entry.probe_auth_authoritative === true,
+          ready: completed && result.exitCode === 0,
+          authFailed: completed && result.exitCode !== 0 && probeIndicatesAuthFailure(probeText),
+          authAuthoritative: completed && entry.probe_auth_authoritative === true,
+          qualificationFailure: result.validation || null,
+          transientProbeFailure: result.admissionRejected || result.aborted || result.timedOut || result.model_invocation === false,
           detail: result.exitCode === 0 ? 'authenticated' : probeText.split('\n')[0].slice(0, 160),
         }];
       }));
       const refreshedResults = Object.fromEntries(pairs.filter(([, v]) => v));
-      reconcileManagedDefaultAuth(cfg, refreshedResults);
+      if (controller.signal.aborted) return;
+      if (generation !== diagnosticGeneration(loadConfig())) {
+        return res.status(409).json({ error: 'diagnostic authority changed; refresh again', errorCode: 'diagnostic_stale' });
+      }
+      const authoritativeRefresh = Object.fromEntries(Object.entries(refreshedResults).filter(([, value]) => !value.transientProbeFailure));
+      for (const [kind, value] of Object.entries(refreshedResults)) {
+        if (value.transientProbeFailure && lastDiagnostics?.results?.[kind]) {
+          refreshedResults[kind] = lastDiagnostics.results[kind];
+        }
+      }
+      reconcileManagedDefaultAuth(cfg, authoritativeRefresh);
       diagnostics = { at: Date.now(), results: refreshedResults };
       lastDiagnostics = diagnostics;
     } catch (err) {
@@ -4015,7 +3889,7 @@ app.get('/api/auth/status', async (req, res) => {
   });
 });
 
-app.get('/api/diag', async (req, res) => {
+app.get('/api/diag', diagnosticRequestLimit, async (req, res) => {
   const controller = new AbortController();
   let clientGone = false;
   res.on('close', () => {
@@ -4025,6 +3899,7 @@ app.get('/api/diag', async (req, res) => {
     }
   });
   const cfg = loadConfig();
+  const generation = diagnosticGeneration(cfg);
   const env = buildEnv();
   const kinds = Object.keys(cfg).filter((k) => !k.startsWith('_'));
   const pairs = await Promise.all(kinds.map(async (kind) => {
@@ -4061,7 +3936,7 @@ app.get('/api/diag', async (req, res) => {
     // routing-policy scores local seats +30 and a "live diagnostic ready" seat
     // +20, so those dead seats won the default utility route.
     if (entry.oneshot_adapter === 'ollama_api') {
-      return [kind, await probeOllamaReadiness(entry)];
+      return [kind, await probeOllamaReadiness(entry, controller.signal)];
     }
     const binary = entry.diagnostic_binary ||
       (entry.safe && entry.safe[0]) || (entry.dangerous && entry.dangerous[0]);
@@ -4093,17 +3968,19 @@ app.get('/api/diag', async (req, res) => {
     ]);
     if (probe) {
       probeExitCode = probe.exitCode;
-      ready = !probe.timedOut && probe.exitCode === 0;
+      ready = !probe.timedOut && !probe.aborted && probe.exitCode === 0;
       const probeText = cleanOutput([probe.stdout, probe.stderr].filter(Boolean).join('\n'));
       if (entry.probe_expect && !probeText.toLowerCase().includes(String(entry.probe_expect).toLowerCase())) ready = false;
       const probeReject = Array.isArray(entry.probe_reject) ? entry.probe_reject : [];
       if (probeReject.some((value) => probeText.toLowerCase().includes(String(value).toLowerCase()))) ready = false;
-      authFailed = !ready && probeIndicatesAuthFailure(probeText);
+      authFailed = probe.model_invocation !== false && !probe.timedOut && !probe.aborted && !probe.admissionRejected
+        && !ready && probeIndicatesAuthFailure(probeText);
       detail = ready && entry.probe_success_detail
         ? String(entry.probe_success_detail).slice(0, 300)
         : (entry.probe_redact ? (ready ? 'readiness check passed' : 'readiness check failed') : probeText.split('\n')[0].slice(0, 300));
       if (probe.timedOut) detail = 'readiness check timed out';
       if (probe.aborted) detail = 'readiness check cancelled';
+      if (probe.validation) detail = `${probe.code}: ${probe.validation.reason}`;
     }
     let runtimeVersion = '';
     if (versionProbe) {
@@ -4120,16 +3997,23 @@ app.get('/api/diag', async (req, res) => {
       detail,
       probeExitCode,
       authFailed,
-      authAuthoritative: entry.probe_auth_authoritative === true,
+      authAuthoritative: !!probe && probe.model_invocation !== false && !probe.timedOut && !probe.aborted && !probe.admissionRejected
+        && entry.probe_auth_authoritative === true,
+      qualificationFailure: probe?.validation || versionProbe?.validation || null,
+      transientProbeFailure: probe?.admissionRejected || probe?.aborted || probe?.timedOut || probe?.model_invocation === false,
       runtimeVersion,
       usageCapability: providerUsageCapability(entry, { runtimeVersion }),
     }];
   }));
   const rawResults = Object.fromEntries(pairs);
   const results = applyFilesystemEligibilityToDiagnostics(rawResults, cfg).diagnostics;
-  if (!controller.signal.aborted) {
+  if (!clientGone && generation !== diagnosticGeneration(loadConfig())) {
+    return res.status(409).json({ error: 'diagnostic authority changed; refresh again', errorCode: 'diagnostic_stale' });
+  }
+  if (!controller.signal.aborted && generation === diagnosticGeneration(loadConfig())) {
     reconcileManagedDefaultAuth(cfg, results);
-    lastDiagnostics = { at: Date.now(), results };
+    lastDiagnostics = { at: Date.now(), results: Object.fromEntries(Object.entries(results).map(([kind, value]) => [kind,
+      value.transientProbeFailure && lastDiagnostics?.results?.[kind] ? lastDiagnostics.results[kind] : value])) };
   }
   if (!clientGone && !res.writableEnded) {
     let routing = null;
@@ -4182,7 +4066,8 @@ app.post('/api/sessions', (req, res) => {
     const s = createSessionFromKind(kind, { label, cwd, dangerous, mode });
     res.json(s.meta());
   } catch (err) {
-    res.status(400).json({ error: err.message });
+    res.status(400).json({ error: err.message, errorCode: err.code || null, validation: err.validation || null,
+      model_invocation: false, physical_attempt_count: 0, token_usage_source: 'not_invoked' });
   }
 });
 
@@ -4213,7 +4098,7 @@ app.get('/api/sessions/:id/buffer', (req, res) => {
 
 // One-shot exec â€” for Cowork to run a PowerShell command and get output back.
 const EXEC_OUTPUT_MAX = 1048576;
-app.post('/api/exec', (req, res) => {
+app.post('/api/exec', execRequestLimit, (req, res) => {
   if (!isDirectLoopbackRequest(req)) {
     return res.status(403).json({ error: 'command execution is loopback-only' });
   }
@@ -4234,7 +4119,18 @@ app.post('/api/exec', (req, res) => {
     cwd: execCwd,
     env: buildEnv(),
   });
-  const proc = trackChild(spawn(built.exe, built.args, built.options));
+  let release;
+  try { release = hostExecSlots.acquire(); }
+  catch (error) { return rejectOperationAdmission(res, error); }
+  let proc;
+  try { proc = trackChild(spawn(built.exe, built.args, built.options)); }
+  catch (error) {
+    release();
+    return res.status(500).json({ error: 'command spawn failed', model_invocation: false,
+      physical_attempt_count: 0, token_usage_source: 'not_invoked' });
+  }
+  proc.once('close', release);
+  proc.once('error', () => { if (!proc.pid) release(); });
   let stdout = '';
   let stderr = '';
   // 'error' and 'close' can both fire for one spawn (ENOENT emits error, then
@@ -4253,17 +4149,17 @@ app.post('/api/exec', (req, res) => {
   // ceiling; this route had neither. `truncated` tells the caller the output
   // is short rather than the command being quiet.
   let truncated = false;
-  proc.stdout.on('data', (d) => { if (stdout.length < EXEC_OUTPUT_MAX) stdout += d; else truncated = true; });
-  proc.stderr.on('data', (d) => { if (stderr.length < EXEC_OUTPUT_MAX) stderr += d; else truncated = true; });
+  proc.stdout.on('data', (d) => { if (stdout.length + d.length > EXEC_OUTPUT_MAX) truncated = true; stdout = (stdout + d).slice(0, EXEC_OUTPUT_MAX); });
+  proc.stderr.on('data', (d) => { if (stderr.length + d.length > EXEC_OUTPUT_MAX) truncated = true; stderr = (stderr + d).slice(0, EXEC_OUTPUT_MAX); });
   proc.on('close', (code) => {
     clearTimeout(t);
-    if (settled) return;
+    if (settled || res.destroyed) return;
     settled = true;
     res.json({ stdout, stderr, exitCode: code, truncated: truncated || undefined, shell: built.shellKind, shellNote: built.fallbackNote || undefined });
   });
   proc.on('error', (err) => {
     clearTimeout(t);
-    if (settled) return;
+    if (settled || res.destroyed) return;
     settled = true;
     res.status(500).json({ error: err.message, stdout, stderr });
   });
@@ -4285,34 +4181,8 @@ app.post('/api/exec', (req, res) => {
 const ONESHOT_CLOSE_GRACE_MS = 2000;
 async function executeOneShot(body, res) {
   const startedAt = Date.now();
+  let releaseAdmission = null;
   const { kind, prompt, timeoutMs, cwd, dangerous } = body || {};
-
-  // Issue #16: a workspace-inspection task sent to a seat with no filesystem
-  // access produces a confident, fabricated answer that records as a success.
-  // Refuse BEFORE dispatch — the tokens are wasted either way, but a refusal
-  // is visible and a fabricated audit is not. `groundingOverride` exists for
-  // the caller who genuinely wants an ungrounded opinion; it is flagged.
-  try {
-    const cfgAll = loadConfig();
-    const grounding = checkGrounding({
-      prompt, cwd, seat: kind, seatConfig: cfgAll?.[kind] || {},
-      override: body?.groundingOverride === true,
-    });
-    if (!grounding.allowed) {
-      return sendOneShotResult(res, {
-        ok: false, exitCode: null, stdout: '', stderr: grounding.reason,
-        error: grounding.reason, remedy: grounding.remedy,
-        failure_class: 'workspace_grounding',
-        model_invocation: false, dropped_out: true,
-        usage: { input_tokens: 0, output_tokens: 0 },
-      }, { kind, prompt, startedAt });
-    }
-    if (grounding.overridden) body = { ...body, _groundingOverridden: true, _groundingOverrideReason: grounding.reason };
-  } catch (err) {
-    // The gate is advisory when it cannot evaluate, but losing it must be
-    // visible rather than silently disabling a safety layer.
-    console.warn(`[RelayBridge] workspace grounding check unavailable: ${err.message}`);
-  }
 
   // Run association for the GitHub tracker: who did this, and any
   // explicit intent. Falls back to the OS account so checkpoint commits
@@ -4326,8 +4196,9 @@ async function executeOneShot(body, res) {
   const requestId = normalizeOneShotRequestId(body);
   const { invocationId, attemptId } = canonicalAttemptIdentity(requestId);
   const outerReceiptId = normalizeOuterReceiptId(body);
-  const rejectBeforeAdmission = (statusCode, failureClass, payload, route = null) =>
-    sendOneShotPreAdmissionRejection(res, {
+  const rejectBeforeAdmission = (statusCode, failureClass, payload, route = null) => {
+    releaseAdmission?.();
+    return sendOneShotPreAdmissionRejection(res, {
       statusCode,
       payload,
       kind,
@@ -4337,17 +4208,17 @@ async function executeOneShot(body, res) {
       startedAt,
       route,
     });
+  };
   // Two timeout regimes compose here. The timeout policy bounds any EXPLICIT
   // caller timeout, so a caller can neither starve a run nor exceed the
   // transport ceiling the MCP client allows. When the caller sends nothing, no
-  // clock is armed for CLI runs at all â€” the progress-based supervisor decides
-  // when a run is actually stuck (lib/run-supervisor.js). The hosted adapter
-  // paths (Ollama/OpenAI-compatible HTTP) are not supervised and keep a fixed
-  // clock: the caller's bounded value, or the policy default.
+  // separate caller timer is armed; the supervisor still enforces its finite
+  // hard cap and liveness limits (lib/run-supervisor.js). HTTP adapters now
+  // share that supervisor and own their physical reader lifetime independently
+  // of the requesting socket; they never claim process CPU evidence.
   const explicitTimeout = Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
     ? TIMEOUT_POLICY.normalizeOneShotTimeoutMs(timeoutMs)
     : null;
-  const adapterTimeoutMs = explicitTimeout ?? TIMEOUT_POLICY.oneShotDefaultMs;
   if (!kind || typeof prompt !== 'string' || !prompt.trim()) {
     return rejectBeforeAdmission(400, 'validation', { error: 'kind + non-empty prompt required' });
   }
@@ -4363,34 +4234,15 @@ async function executeOneShot(body, res) {
   try {
     requestedProviderBudget = validateProviderBudget(body?.providerBudget);
   } catch (err) {
-    return rejectBeforeAdmission(400, 'validation', { error: err.message });
+    return rejectBeforeAdmission(400, 'validation', { error: err.message, errorCode: err.code, validation: err.validation });
   }
-  const requestedEffort = typeof body?.effort === 'string' ? body.effort.trim().toLowerCase() : null;
-  if (requestedEffort && !SUPPORTED_EFFORTS.includes(requestedEffort)) {
-    return rejectBeforeAdmission(400, 'validation', {
-      error: `effort must be one of: ${SUPPORTED_EFFORTS.join(', ')}`,
-    });
-  }
-  if (EXTREME_EFFORTS.has(requestedEffort) && body?.maxEffortOverride !== true) {
-    return rejectBeforeAdmission(400, 'validation', {
-      error: `effort=${requestedEffort} requires maxEffortOverride=true; RelayBridge never infers xhigh/max effort`,
-    });
-  }
-  if (body?.maxEffortOverride === true && !EXTREME_EFFORTS.has(requestedEffort)) {
-    return rejectBeforeAdmission(400, 'validation', {
-      error: 'maxEffortOverride is valid only with effort=xhigh or effort=max',
-    });
-  }
-  const tierEffort = !requestedEffort && typeof body?.taskTier === 'string'
-    ? EFFORT_BY_TASK_TIER[body.taskTier.trim().toLowerCase()] || null
-    : null;
-  const effectiveEffort = requestedEffort || tierEffort;
   // A provider-wide readiness probe describes the operator's implicit/default
   // login. Linked credential directories are separate authority domains, so a
   // positive signed-out result excludes only that implicit account; account
   // selection below may still choose a provisioned linked login.
   const readiness = lastDiagnostics?.results?.[kind];
   const defaultAccountSignedOut = !!(readiness && readiness.found
+    && !readiness.transientProbeFailure
     && readiness.ready === false && readiness.authFailed === true
     && readiness.authAuthoritative === true
     && Array.isArray(entry.login_command));
@@ -4435,70 +4287,31 @@ async function executeOneShot(body, res) {
   if (!slotRaw || !slotRaw.length) {
     return rejectBeforeAdmission(400, 'configuration', { error: 'no oneshot config for ' + kind });
   }
-  // Model selection inside the provider: taskTier/modelTier picks the weight
-  // class. A pin discovery proved is retired is dropped rather than sent â€” a
-  // missing flag runs on the account default, a dead id fails every call.
-  let modelChoice = resolveModelArgs({
-    entry,
-    taskTier: typeof body?.taskTier === 'string' ? body.taskTier : undefined,
-    modelTier: typeof body?.modelTier === 'string' ? body.modelTier : undefined,
-  });
-  if (modelChoice.model && pinIsRetired(modelRegistry, kind, modelChoice.model)) {
-    console.warn(`[RelayBridge] ${kind}: pinned model "${modelChoice.model}" is not in this account's model list â€” falling back to the account default`);
-    modelChoice = { ...modelChoice, args: [], model: null, source: 'account_default_retired_pin' };
+  let controls;
+  try {
+    controls = resolveProviderControls({ kind, entry, registry: modelRegistry, slot: slotRaw,
+      taskTier: body?.taskTier, modelTier: body?.modelTier, model: body?.model,
+      effort: body?.effort, maxEffortOverride: body?.maxEffortOverride,
+      execution: body?.execution, dangerous: useDanger });
+  } catch (error) {
+    return rejectBeforeAdmission(400, 'validation', { error: error.message,
+      errorCode: error.code || null, validation: error.validation || null });
   }
-  let slot = applyModelArgs(
-    resolveSlot(slotRaw),
-    modelChoice.args,
-    entry,
-    modelChoice.suppressArgs,
-  );
-  let effortResolution = applyProviderEffort({
-    slot, entry, modelChoice, requestedEffort: effectiveEffort,
-  });
-  let effortFallbackReason = null;
-  // A task tier is a routing preference, not an assertion that every custom
-  // provider exposes an effort knob. Apply the inferred value when the
-  // provider can express it; otherwise run on its honest account default.
-  // An explicit caller request remains strict and still fails before launch.
-  if (effortResolution.error && !requestedEffort && tierEffort) {
-    effortFallbackReason = effortResolution.error;
-    effortResolution = applyProviderEffort({
-      slot, entry, modelChoice, requestedEffort: null,
-    });
-  }
-  if (effortResolution.error) {
-    return rejectBeforeAdmission(400, 'validation', {
-      error: `${kind} ${effortResolution.error}`,
-      requestedEffort: effectiveEffort,
-      appliedEffort: null,
-    }, {
-      provider: kind,
-      task_tier: typeof body?.taskTier === 'string' ? body.taskTier : null,
-      model_tier: modelChoice.modelTier,
-      requested_effort: requestedEffort,
-      target_effort: effectiveEffort,
-      applied_effort: null,
-      effort_explicit: !!requestedEffort,
-      effort_source: requestedEffort ? 'request' : (tierEffort ? 'task_tier' : 'provider_default'),
-      max_effort_override: EXTREME_EFFORTS.has(requestedEffort) && body?.maxEffortOverride === true,
-      effort_method: 'unsupported',
-      request_id: requestId,
-    });
-  }
-  slot = effortResolution.slot;
+  const { modelChoice, effortResolution, execution } = controls;
+  const supervisorOptions = resolveAttemptTiming({ entry, globals: cfg._supervisor || {},
+    providerBudget: requestedProviderBudget, timeoutMs, startedAt,
+    taskTier: typeof body?.budgetTaskTier === 'string' ? body.budgetTaskTier : execution.resolvedTaskTier });
+  let cliDeadline;
+  try { cliDeadline = renderCliDeadline({ entry, slot: controls.slot, supervisorOptions }); }
+  catch (error) { return rejectBeforeAdmission(400, 'validation', { error: error.message, errorCode: error.code, validation: error.validation }); }
+  const requestedEffort = execution.requestedEffort;
+  const tierEffort = execution.effortSource === 'task_tier' ? execution.targetEffort : null;
+  const effectiveEffort = execution.targetEffort;
+  const effortFallbackReason = execution.effortFallbackReason;
+  let slot = resolveSlot(cliDeadline.slot);
   const safePromptPrefix = !useDanger && typeof entry.oneshot_safe_prompt_prefix === 'string'
     ? entry.oneshot_safe_prompt_prefix.trim() : '';
-  if (safePromptPrefix.length > 4096) {
-    return rejectBeforeAdmission(400, 'configuration', {
-      error: 'oneshot_safe_prompt_prefix exceeds the 4096-character safety limit',
-    });
-  }
-  const hasInlinePrompt = slot.some((a) => typeof a === 'string' && a.includes('{prompt}'));
-  const hasPromptFile = slot.some((a) => typeof a === 'string' && a.includes('{prompt_file}'));
-  if (hasInlinePrompt && hasPromptFile) {
-    return rejectBeforeAdmission(400, 'configuration', { error: 'oneshot config cannot mix {prompt} and {prompt_file}' });
-  }
+  let preparedPrompt, grounding;
   let resolvedCwd;
   let resolvedCwdIdentity;
   const expectedCwdIdentityHash = body?.expectedCwdIdentityHash;
@@ -4529,6 +4342,17 @@ async function executeOneShot(body, res) {
       validation: err.validation || null,
     });
   }
+  try {
+    const grounded = prepareGroundedPrompt({ ...body, cwd: resolvedCwd, cwdIdentityHash: resolvedCwdIdentity.cwdIdentityHash,
+      seat: kind, seatConfig: entry, dangerous: useDanger });
+    grounding = grounded.grounding;
+    preparedPrompt = preparePrompt(grounded.prompt, { ...promptTransportLimits(entry, slot), policyPrefix: safePromptPrefix });
+  } catch (err) {
+    return rejectBeforeAdmission(400, err.code === 'workspace_grounding' ? 'workspace_grounding' : 'validation', {
+      error: err.message, errorCode: err.code, validation: err.validation,
+    });
+  }
+  const hasPromptFile = preparedPrompt.evidence.transport === 'file';
   // Account selection is part of admission, not spawn setup. If every linked
   // account is disabled, unsigned, or cooling, an empty env would silently run
   // against the operator's default credentials and misattribute the receipt.
@@ -4601,7 +4425,8 @@ async function executeOneShot(body, res) {
       });
     }
   }
-  if (!acquireOneShot(kind, res)) {
+  releaseAdmission = acquireOneShot(kind);
+  if (!releaseAdmission) {
     return rejectBeforeAdmission(429, 'admission_limit', {
       error: 'provider concurrency limit reached; retry with backoff',
       kind,
@@ -4627,18 +4452,7 @@ async function executeOneShot(body, res) {
     }
   }
   let promptFile = '';
-  let userPromptForProvider = prompt;
-  let promptTruncated = false;
-  if (hasInlinePrompt) {
-    // Preserve the established user-prompt allowance. The policy prefix is a
-    // separate bounded transport envelope, not text that silently consumes
-    // the tail of a request which previously fit prompt_max_chars.
-    const capped = capPrompt(prompt, Number(entry.prompt_max_chars || 6000));
-    userPromptForProvider = capped.text;
-    promptTruncated = capped.truncated;
-  }
-  const effectivePrompt = safePromptPrefix
-    ? `${safePromptPrefix}\n\nUser request:\n${userPromptForProvider}` : userPromptForProvider;
+  const effectivePrompt = preparedPrompt.text;
   const promptForArgs = effectivePrompt;
   if (hasPromptFile) {
     try {
@@ -4661,19 +4475,12 @@ async function executeOneShot(body, res) {
       });
     }
   }
-  const slotResolved = slot.map((arg) => {
-    if (typeof arg !== 'string') return arg;
-    return arg
-      .replace('{prompt_file}', promptFile)
-      .replace('{prompt}', promptForArgs)
-      .replace('{cwd}', resolvedCwd);
-  });
+  const slotResolved = renderPromptSlot(slot, { prompt_file: promptFile, prompt: promptForArgs, cwd: resolvedCwd });
   const supportsClaudeStreamFinalization = entry.oneshot_graceful_finalize === 'claude_stream_json'
-    && !hasPromptFile && !hasInlinePrompt
+    && preparedPrompt.evidence.transport === 'stdin'
     && slotResolved.some((arg, index) => arg === '--input-format' && slotResolved[index + 1] === 'stream-json');
-  const promptTransport = hasPromptFile ? 'file'
-    : hasInlinePrompt ? 'argument'
-      : supportsClaudeStreamFinalization ? 'stdin_stream_json' : 'stdin';
+  const promptTransport = supportsClaudeStreamFinalization ? 'stdin_stream_json' : preparedPrompt.evidence.transport;
+  const initialStreamFrame = supportsClaudeStreamFinalization ? claudeStreamUserMessage(effectivePrompt) : null;
   const cleanupPromptFile = () => {
     if (!promptFileDir) return;
     try { fs.rmSync(promptFileDir, { recursive: true, force: true }); } catch {}
@@ -4694,12 +4501,7 @@ async function executeOneShot(body, res) {
   // strippable.
   Object.assign(childEnv, dispatchAccount.env);
   const resolvedBin = resolveExecutable(bin, childEnv);
-  const flagValue = (name) => {
-    const index = args.indexOf(name);
-    return index >= 0 && index + 1 < args.length ? args[index + 1] : null;
-  };
-  const modelFlagSent = ['--model', '-m', '--model-id', '--llm', '--model-name']
-    .find((flag) => args.includes(flag)) || null;
+  const modelFlagSent = modelControls(slot, entry)[0]?.flag || null;
   // Return non-secret route metadata with every one-shot response.  This lets
   // committee callers prove which model/effort was requested instead of
   // guessing from a generic "Claude" label.
@@ -4714,20 +4516,24 @@ async function executeOneShot(body, res) {
     transport: entry.transport || 'cli',
     configured_binary: bin,
     resolved_binary: resolvedBin,
-    task_tier: typeof body?.taskTier === 'string' ? body.taskTier : null,
-    requested_model_tier: typeof body?.modelTier === 'string' ? body.modelTier : null,
+    task_tier: execution.requestedTaskTier,
+    requested_model_tier: execution.requestedModelTier,
     model_tier: modelChoice.modelTier,
-    requested_model: (modelFlagSent ? flagValue(modelFlagSent) : null) || entry.model || null,
+    caller_requested_model: typeof body?.model === 'string' ? body.model : null,
+    planned_model: body?.execution?.model ?? null,
+    requested_model: execution.model,
+    execution,
+    resolved_outgoing_model: execution.model,
+    model_identity_source: modelChoice.source,
+    observed_model: null,
     model_flag_sent: modelFlagSent,
-    resolved_model_identity: entry.model
-      ? `${entry.model}${ollamaManifestIdentity(entry) ? `@${ollamaManifestIdentity(entry)}` : ''}`
-      : null,
+    resolved_model_identity: execution.model,
     requested_effort: requestedEffort,
     target_effort: effectiveEffort,
     applied_effort: effortResolution.appliedEffort,
     effort_explicit: !!requestedEffort,
     effort_source: requestedEffort ? 'request' : (tierEffort ? 'task_tier' : 'provider_default'),
-    max_effort_override: EXTREME_EFFORTS.has(requestedEffort) && body?.maxEffortOverride === true,
+    max_effort_override: body?.maxEffortOverride === true,
     effort_method: effortResolution.method,
     effort_control: effortResolution.control,
     effort_fallback_reason: effortFallbackReason,
@@ -4739,16 +4545,19 @@ async function executeOneShot(body, res) {
     isolated_home_id: isolatedProviderHome?.id || null,
     isolated_home_cleanup: isolatedProviderHome ? 'pending' : 'not_applicable',
     prompt_transport: promptTransport,
-    prompt_truncated: promptTruncated,
+    prompt_truncated: false,
+    prompt_evidence: preparedPrompt.evidence,
+    prompt_wire_input: initialStreamFrame === null ? null : {
+      transport: 'stdin_stream_json', bytes: Buffer.byteLength(initialStreamFrame, 'utf8'),
+      sha256: crypto.createHash('sha256').update(initialStreamFrame).digest('hex'),
+    },
     prompt_policy: safePromptPrefix
       ? (entry.oneshot_safe_prompt_policy || 'configured_safe_prompt_prefix') : null,
     prompt_policy_chars: safePromptPrefix.length,
     transport_prompt_chars: effectivePrompt.length,
     requested_timeout_ms: Number.isFinite(Number(timeoutMs)) ? Math.trunc(Number(timeoutMs)) : null,
-    // With no explicit timeout the CLI path is governed by supervision, so the
-    // effective ceiling is resolved after the supervisor is constructed below;
-    // this records the caller-facing view.
-    effective_timeout_ms: explicitTimeout,
+    effective_timeout_ms: supervisorOptions.hardCapMs,
+    cli_deadline: cliDeadline.deadline,
     timeout_clamped: explicitTimeout != null && Math.trunc(Number(timeoutMs)) !== explicitTimeout,
     environment_overrides: Object.keys({ ...oneShotEnv, ...(isolatedProviderHome?.env || {}) }).sort(),
     request_id: requestId,
@@ -4760,8 +4569,7 @@ async function executeOneShot(body, res) {
       && body?._relayClientDeadlineAt !== ''
       && Number.isFinite(Number(body._relayClientDeadlineAt))
       ? Number(body._relayClientDeadlineAt) : null,
-    grounding_override: body?._groundingOverridden === true || null,
-    grounding_note: body?._groundingOverridden ? body._groundingOverrideReason : null,
+    grounding,
   };
   const cleanupProviderHome = () => {
     if (!isolatedProviderHome || route.isolated_home_cleanup !== 'pending') {
@@ -4773,6 +4581,20 @@ async function executeOneShot(body, res) {
     isolatedProviderHome = null;
     return result;
   };
+  // HTTP adapters have no executable. Every CLI path qualifies BEFORE
+  // cancellation receipts/listeners or child admission can record an attempt.
+  let launch = null;
+  if (!['ollama_api', 'openai_chat_api'].includes(entry.oneshot_adapter)) {
+    try { launch = qualifiedProviderLaunch(resolvedBin, args, childEnv); }
+    catch (err) {
+      cleanupPromptFile();
+      const cleanup = cleanupProviderHome();
+      return rejectBeforeAdmission(400, cleanup.ok ? 'validation' : 'isolation_cleanup', {
+        error: err.message, errorCode: err.code || null, validation: err.validation || null,
+      }, route);
+    }
+    route.launch_adapter = launch.adapter;
+  }
   const persistCancellationReceipt = () => {
     if (res._relayReceiptPersisted) return;
     const payload = typeof res._relayCancellationPayload === 'function'
@@ -4809,6 +4631,7 @@ async function executeOneShot(body, res) {
   // process could recreate state after deletion. Defer that receipt until the
   // child close/error path has confirmed termination and terminal cleanup.
   res.once('close', () => {
+    if (res._relayLifecycle) return;
     if (res.writableEnded || res._relayReceiptPersisted) return;
     if (route.isolated_home_cleanup === 'pending') {
       res._relayIsolationReceiptDeferred = true;
@@ -4816,31 +4639,14 @@ async function executeOneShot(body, res) {
     }
     persistCancellationReceipt();
   });
-  const resolvedProviderBudget = resolveSupervisorOptions({
-    entry,
-    globals: cfg._supervisor || {},
-    providerBudget: requestedProviderBudget,
-    taskTier: typeof body?.budgetTaskTier === 'string'
-      ? body.budgetTaskTier
-      : (typeof body?.taskTier === 'string' ? body.taskTier : null),
-  }).providerBudget;
-  if (entry.oneshot_adapter === 'ollama_api') {
-    cleanupPromptFile();
-    return runOllamaApiOneShot({
-      entry, prompt, timeoutMs: adapterTimeoutMs, res, route, startedAt,
-      providerBudget: resolvedProviderBudget,
-      accountId: dispatchAccount.account?.id || null,
+  if (['ollama_api', 'openai_chat_api'].includes(entry.oneshot_adapter)) {
+    return runHttpProviderOneShot({
+      entry: { ...entry, model: execution.model }, prompt, effectivePrompt, res, route, startedAt, cwd: resolvedCwd,
+      supervisorOptions,
+      accountId: dispatchAccount.account?.id || null, releaseAdmission,
+      cleanupResources: () => { cleanupPromptFile(); return cleanupProviderHome(); },
     });
   }
-  if (entry.oneshot_adapter === 'openai_chat_api') {
-    cleanupPromptFile();
-    return runOpenAIChatOneShot({
-      entry, prompt, timeoutMs: adapterTimeoutMs, res, route, startedAt,
-      providerBudget: resolvedProviderBudget,
-      accountId: dispatchAccount.account?.id || null,
-    });
-  }
-  const isWindows = process.platform === 'win32';
   let proc;
   let writerWorkspaceBaseline = null;
   let providerInputWriteError = false;
@@ -4860,15 +4666,9 @@ async function executeOneShot(body, res) {
     }
     resolvedCwd = spawnCwdIdentity.resolved;
     if (useDanger) writerWorkspaceBaseline = captureWriterWorkspaceSnapshot(resolvedCwd);
-    // Build the actual spawn target. On Windows, wrap non-.exe (npm shims like
-    // claude.cmd) with cmd.exe /c so the shim resolves. Use single-string form
-    // for cmd.exe so arg quoting is preserved (shell:true would split prompts
-    // containing spaces into separate args, breaking gemini -p "my prompt").
-    let spawnBin = resolvedBin;
-    let spawnArgs = args;
-    let spawnOpts = {
+    const spawnOpts = {
       cwd: resolvedCwd,
-      env: childEnv,
+      env: launch.env,
       windowsHide: true,
       // NOTE: this spawn deliberately does NOT set `detached`, even though
       // killProcessTree's fast path (process.kill(-pid)) needs a process group
@@ -4879,12 +4679,7 @@ async function executeOneShot(body, res) {
       // exitCode null (signal death) — the kill paths around a normal run have
       // to be audited before the group can be created. Tracked separately.
     };
-    if (isWindows && !/\.exe$/i.test(resolvedBin)) {
-      spawnBin = process.env.ComSpec || 'cmd.exe';
-      spawnArgs = ['/d', '/s', '/c', [resolvedBin, ...args].map(quoteCmdArg).join(' ')];
-      spawnOpts.windowsVerbatimArguments = true;
-    }
-    proc = trackChild(spawn(spawnBin, spawnArgs, spawnOpts));
+    proc = trackChild(spawn(launch.file, launch.args, spawnOpts));
     // ChildProcess stdin errors are emitted asynchronously and are not caught
     // by try/catch around write(). Always consume them so an early provider
     // exit (EPIPE) cannot crash the bridge process.
@@ -4902,6 +4697,7 @@ async function executeOneShot(body, res) {
   } catch (err) {
     cleanupPromptFile();
     cleanupProviderHome();
+    releaseAdmission();
     if (err.validation) {
       return rejectBeforeAdmission(400, 'validation', {
         error: err.validation.reason,
@@ -4916,6 +4712,12 @@ async function executeOneShot(body, res) {
   }
   let stdout = '';
   let stderr = '';
+  let supervisorStdout = null;
+  let lateStdout = '';
+  const retainLateStdout = (chunk) => {
+    const remaining = Math.max(0, 65536 - lateStdout.length);
+    if (remaining) lateStdout += String(chunk || '').slice(0, remaining);
+  };
   let timedOut = false;
   let clientGone = false;
   let settled = false;
@@ -4938,6 +4740,7 @@ async function executeOneShot(body, res) {
     if (gracefulFinalization.requested) return;
     gracefulFinalization.requested = true;
     gracefulFinalization.reserve = verdict?.reserve || null;
+    supervisor.acknowledgeFinalization(gracefulFinalization.reserve);
     if (!supportsClaudeStreamFinalization || providerInputClosed
       || providerInputWriteError
       || proc.stdin.destroyed || proc.stdin.writableEnded) {
@@ -4954,14 +4757,19 @@ async function executeOneShot(body, res) {
     ].join(' ');
     try {
       proc.stdin.write(claudeStreamUserMessage(message), (error) => {
-        if (!error) return;
-        providerInputWriteError = true;
-        gracefulFinalization.sent = false;
-        gracefulFinalization.reason = 'provider_input_write_failed';
+        if (settled) return;
+        if (error) {
+          providerInputWriteError = true;
+          gracefulFinalization.sent = false;
+          gracefulFinalization.reason = 'provider_input_write_failed';
+        } else if (!providerInputWriteError) {
+          gracefulFinalization.sent = true;
+          gracefulFinalization.reason = null;
+        }
       });
-      gracefulFinalization.sent = true;
-      gracefulFinalization.reason = null;
     } catch (error) {
+      providerInputWriteError = true;
+      gracefulFinalization.sent = false;
       gracefulFinalization.reason = 'provider_input_write_failed';
     }
   };
@@ -4971,7 +4779,9 @@ async function executeOneShot(body, res) {
       return {
         available: false,
         reason: 'provider_still_running',
-        changedFileCount: 0,
+        changedFileCount: null,
+        changedFileCountLowerBound: 0,
+        changeCountComplete: false,
         files: [],
         filesTruncated: false,
       };
@@ -4985,9 +4795,13 @@ async function executeOneShot(body, res) {
     return writerDiffSummary;
   };
   res._relayCancellationPayload = () => {
-    const parsedOutput = parseConfiguredOneShotOutput(entry, stdout);
-    const retainedPartial = stopReason === 'token_budget' && !!parsedOutput.parseError;
-    const checkpoint = stopReason === 'token_budget' && parsedOutput.parseError
+    const semanticStdout = supervisorStdout ?? stdout;
+    const transportStdout = stdout + lateStdout;
+    const parsedOutput = parseConfiguredOneShotOutput(entry, semanticStdout, {
+      ignoreTerminalResult: stopReason === 'token_budget',
+    });
+    const retainedPartial = stopReason === 'token_budget' && !!parsedOutput.partialDiagnostic;
+    const checkpoint = stopReason === 'token_budget'
       ? parsedOutput.partialCheckpoint : null;
     const cancellationState = resolveCancellationTerminalState({
       stopReason,
@@ -5003,7 +4817,7 @@ async function executeOneShot(body, res) {
       exitCode: -1,
       stdout: parsedOutput.output,
       stderr: cleanOutput([stderr, parsedOutput.diagnostic, parsedOutput.parseError].filter(Boolean).join('\n')),
-      usage: parsedOutput.usage,
+      usage: acceptedProviderUsage(parsedOutput, progress.providerUsage),
       failureClass: cancellationState.failureClass,
       result_subtype: parsedOutput.resultSubtype,
       result_schema_disagreement: parsedOutput.resultSchemaDisagreement,
@@ -5011,8 +4825,11 @@ async function executeOneShot(body, res) {
       provider_stop_reason: parsedOutput.providerStopReason,
       provider_terminal_reason: parsedOutput.terminalReason,
       provider_api_error_status: parsedOutput.apiErrorStatus,
+      quota_evidence: acceptedTerminalQuotaEvidence(parsedOutput, kind),
+      rate_limited: parsedOutput.apiErrorStatus === 429,
+      budget_exceeded: stopReason === 'token_budget',
       provider_permission_denials: parsedOutput.permissionDenials,
-      provider_num_turns: parsedOutput.numTurns,
+      provider_num_turns: parsedOutput.numTurns ?? progress.providerUsage?.turns ?? null,
       provider_duration_ms: parsedOutput.providerDurationMs,
       provider_api_duration_ms: parsedOutput.providerApiDurationMs,
       provider_error_count: parsedOutput.errorCount,
@@ -5043,8 +4860,8 @@ async function executeOneShot(body, res) {
           graceful_finalization: { ...gracefulFinalization },
           writer_diff_summary: collectWriterDiffSummary(),
         } : {}),
-      transport_output_chars: String(stdout).length,
-      transport_output_hash: crypto.createHash('sha256').update(String(stdout)).digest('hex'),
+      transport_output_chars: String(transportStdout).length,
+      transport_output_hash: crypto.createHash('sha256').update(String(transportStdout)).digest('hex'),
       stop_reason: cancellationState.stopReason,
       supervisor_stop_reason: cancellationState.supervisorStopReason,
       stop_detail: stopReason ? stopDetail : 'the caller disconnected before the provider returned a usable result',
@@ -5060,13 +4877,8 @@ async function executeOneShot(body, res) {
   // emitting new content is left alone to finish; one that goes silent or
   // starts repeating itself is stopped early with a reason, so tokens are not
   // spent on a wedged or looping stage. See lib/run-supervisor.js.
-  const supervisor = new RunSupervisor(resolveSupervisorOptions({
-    entry,
-    globals: cfg._supervisor || {},
-    providerBudget: resolvedProviderBudget,
-    hardCapMs: explicitTimeout,
-    startedAt,
-  }));
+  const supervisor = new RunSupervisor({ ...supervisorOptions,
+    finalizationSupported: supportsClaudeStreamFinalization });
   const runId = `run_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 8)}`;
   activeRuns.set(runId, { runId, kind, route, startedAt, supervisor, pid: proc.pid });
   let stopReason = null;
@@ -5078,6 +4890,17 @@ async function executeOneShot(body, res) {
       if (supportsClaudeStreamFinalization) closeProviderInput();
     },
   });
+  const latchSupervisorVerdict = (verdict) => {
+    if (verdict.action !== 'kill' || stopReason) return false;
+    stopReason = verdict.reason;
+    stopDetail = verdict.detail;
+    supervisorStdout = stdout;
+    if (verdict.reason === 'token_budget') {
+      stopBudgetEnforcement = supervisor.snapshot().providerUsagePhase;
+    }
+    timedOut = verdict.reason !== 'token_budget';
+    return true;
+  };
 
   const finishSupervision = () => {
     clearInterval(tick);
@@ -5091,12 +4914,7 @@ async function executeOneShot(body, res) {
         requestGracefulFinalization(verdict);
         return;
       }
-      if (verdict.action !== 'kill') return;
-      stopReason = verdict.reason;
-      stopDetail = verdict.detail;
-      if (verdict.reason === 'token_budget') stopBudgetEnforcement = supervisor.snapshot().providerUsagePhase;
-      timedOut = verdict.reason !== 'token_budget';
-      killProcessTree(proc);
+      if (latchSupervisorVerdict(verdict)) killProcessTree(proc);
     };
     // CPU is only sampled once a run has gone quiet, so healthy runs never pay
     // for the probe. It is what distinguishes a model thinking in silence from
@@ -5127,20 +4945,27 @@ async function executeOneShot(body, res) {
   // recordOutput returns false once the output cap is reached, which stops the
   // buffer growing before the kill lands â€” a runaway CLI cannot OOM the bridge.
   proc.stdout.on('data', (d) => {
-    usageObserver.record(d);
-    if (supervisor.recordOutput(d)) stdout += d;
+    if (stopReason) {
+      // Retain a bounded tail solely for transport byte/hash evidence. It is
+      // never re-fed into parsing, usage, failure, cooldown, or receipt status.
+      retainLateStdout(d);
+      return;
+    }
+    const chunk = String(d);
+    const semanticChars = usageObserver.record(chunk);
+    const semanticChunk = chunk.slice(0, semanticChars);
+    const lateChunk = chunk.slice(semanticChars);
+    if (semanticChunk && supervisor.recordOutput(semanticChunk)) stdout += semanticChunk;
     const verdict = supervisor.evaluate();
-    if (verdict.action === 'finalize') {
-      requestGracefulFinalization(verdict);
-    } else if (verdict.action === 'kill' && !stopReason) {
-      stopReason = verdict.reason;
-      stopDetail = verdict.detail;
-      if (verdict.reason === 'token_budget') stopBudgetEnforcement = supervisor.snapshot().providerUsagePhase;
-      timedOut = verdict.reason !== 'token_budget';
+    if (verdict.action === 'finalize') requestGracefulFinalization(verdict);
+    else if (latchSupervisorVerdict(verdict)) {
+      retainLateStdout(lateChunk);
       killProcessTree(proc);
     }
   });
-  proc.stderr.on('data', (d) => { if (supervisor.recordOutput(d)) stderr += d; });
+  proc.stderr.on('data', (d) => {
+    if (!stopReason && supervisor.recordOutput(d)) stderr += d;
+  });
   proc.on('error', (err) => {
     if (settled) return;
     providerExited = true;
@@ -5148,6 +4973,7 @@ async function executeOneShot(body, res) {
     finishSupervision();
     cleanupPromptFile();
     const isolationCleanup = cleanupProviderHome();
+    releaseAdmission();
     if (clientGone || res.writableEnded) {
       if (res._relayIsolationReceiptDeferred) persistCancellationReceipt();
       return;
@@ -5164,32 +4990,51 @@ async function executeOneShot(body, res) {
     finishSupervision();
     cleanupPromptFile();
     const isolationCleanup = cleanupProviderHome();
+    releaseAdmission();
     if (clientGone || res.writableEnded) {
       if (res._relayIsolationReceiptDeferred) persistCancellationReceipt();
       return;
     }
     usageObserver.flush();
-    const parsedOutput = parseConfiguredOneShotOutput(entry, stdout);
+    const semanticStdout = supervisorStdout ?? stdout;
+    const transportStdout = stdout + lateStdout;
+    let parsedOutput = parseConfiguredOneShotOutput(entry, semanticStdout, {
+      ignoreTerminalResult: stopReason === 'token_budget',
+    });
     if (parsedOutput.usage || parsedOutput.numTurns !== null) {
       supervisor.recordProviderUsage({ ...(parsedOutput.usage || {}), turns: parsedOutput.numTurns }, { phase: 'terminal' });
+    }
+    // flush() can accept usage from a final non-newline envelope whose other
+    // terminal fields fail parsing. The independently validated usage must
+    // still latch the local budget stop before any free-text classification.
+    if (supervisor.snapshot().providerUsage) {
       const terminalVerdict = supervisor.evaluate();
       if (terminalVerdict.action === 'kill' && !stopReason) {
         stopReason = terminalVerdict.reason;
         stopDetail = terminalVerdict.detail;
         if (terminalVerdict.reason === 'token_budget') stopBudgetEnforcement = 'terminal';
+        // The kill was only discoverable from the terminal result itself, so it
+        // was parsed as authoritative content above. Re-parse with the same
+        // suppression the mid-stream same-chunk cutoff applies, so that result
+        // can never surface as output, rate-limit prose, or a completed answer.
+        if (stopReason === 'token_budget') {
+          parsedOutput = parseConfiguredOneShotOutput(entry, semanticStdout, { ignoreTerminalResult: true });
+        }
       }
     }
     const supervisedUsage = supervisor.snapshot().providerUsage;
-    const authoritativeUsage = parsedOutput.usage || (supervisedUsage ? {
-      input_tokens: supervisedUsage.input_tokens ?? 0,
-      output_tokens: supervisedUsage.output_tokens ?? 0,
-      cache_read_input_tokens: supervisedUsage.cache_read_input_tokens ?? 0,
-      cache_creation_input_tokens: supervisedUsage.cache_creation_input_tokens ?? 0,
-      total_tokens: supervisedUsage.total_tokens ?? null,
-      token_source: 'provider_reported',
-      model_usage: [],
-    } : null);
+    const authoritativeUsage = acceptedProviderUsage(parsedOutput, supervisedUsage);
     const cleanedStdout = parsedOutput.output;
+    // Codex exec's text mode puts the final answer on stdout and its progress
+    // transcript (including tool output and echoed prompts) on stderr. An
+    // exit-zero final answer cannot acquire quota/budget/auth failure from a
+    // source file that the agent read. Keep count/hash, not that large private
+    // transcript. Failed/no-answer runs still use their diagnostic channel.
+    // https://learn.chatgpt.com/docs/non-interactive-mode
+    const codexProgressTranscript = (kind === 'codex' || entry.npm_package === '@openai/codex')
+      && (entry.oneshot_output_parser || 'text') === 'text' && code === 0 && !!cleanedStdout
+      && !parsedOutput.isError && !parsedOutput.parseError && !parsedOutput.failureClass && !stopReason;
+    const providerStderr = codexProgressTranscript ? '' : stderr;
     if (Array.isArray(parsedOutput.usage?.model_usage) && parsedOutput.usage.model_usage.length) {
       const dominant = [...parsedOutput.usage.model_usage].sort((left, right) =>
         Number(right.cost_usd || 0) - Number(left.cost_usd || 0)
@@ -5199,6 +5044,7 @@ async function executeOneShot(body, res) {
             + Number(left.cache_read_input_tokens || 0) + Number(left.cache_creation_input_tokens || 0))
       )[0];
       if (dominant?.model) {
+        route.observed_model = dominant.model;
         route.resolved_model_identity = dominant.model;
         route.resolved_model_source = 'provider_reported_model_usage';
       }
@@ -5208,9 +5054,11 @@ async function executeOneShot(body, res) {
     // or in stdout only when the process itself failed / returned no answer.
     // This prevents an audit discussing "rate limit" or HTTP 429 handling from
     // being misclassified as a provider failure.
-    const failureBlob = vendorEvidenceText({ stderr, stdout, diagnostic: parsedOutput.diagnostic,
+    const failureBlob = vendorEvidenceText({
+      stderr: providerStderr, stdout: semanticStdout, diagnostic: parsedOutput.diagnostic,
       includeStdout: code !== 0 || !cleanedStdout || parsedOutput.isError || parsedOutput.parseError,
-      supervisorStopReason: stopReason }).toLowerCase();
+      supervisorStopReason: stopReason,
+    }).toLowerCase();
     const rate_signals = [
       'rate limit', 'rate-limit', 'too many requests', 'quota exceeded', 'usage limit reached',
       'hit your usage limit', 'hit your limit', "you've hit your session limit",
@@ -5220,12 +5068,14 @@ async function executeOneShot(body, res) {
     const budget_signals = ['exceeded usd budget','exceeded the usd budget','max-budget-usd','budget exceeded','budget cap reached'];
     const authoritativeApiFailure = claudeApiStatusFailureClass(
       parsedOutput.apiErrorStatus,
-      cleanOutput([stderr, parsedOutput.diagnostic].filter(Boolean).join('\n')),
+      cleanOutput([providerStderr, parsedOutput.diagnostic].filter(Boolean).join('\n')),
     );
-    const copilotQuotaEvidence = detectCopilotMonthlyQuota({
+    const tokenBudgetExceeded = stopReason === 'token_budget';
+    const terminalQuotaEvidence = acceptedTerminalQuotaEvidence(parsedOutput, kind);
+    const copilotQuotaEvidence = tokenBudgetExceeded ? null : detectCopilotMonthlyQuota({
       provider: kind,
       stdout: stopReason ? '' : cleanedStdout,
-      stderr,
+      stderr: providerStderr,
       exitCode: code,
     });
     const runClassification = classifyRunFailure({
@@ -5233,17 +5083,23 @@ async function executeOneShot(body, res) {
       prompt,
       stopReason,
       stdout: cleanedStdout,
-      stderr: cleanOutput([stderr, parsedOutput.diagnostic].filter(Boolean).join('\n')),
+      stderr: cleanOutput([providerStderr, parsedOutput.diagnostic].filter(Boolean).join('\n')),
       exitCode: code,
       modelFlagSent: !!route.model_flag_sent,
     });
     const cursorActionRequired = runClassification.actionRequired || null;
     const cursorUsageQuotaExhausted = cursorActionRequired?.kind === 'usage_quota_exhausted';
-    const rate_limited = parsedOutput.resultSubtype !== 'error_max_budget_usd'
+    // A token-budget kill must never be recolored as a rate limit by ordinary
+    // prose (stderr or model text discussing limits) once the budget has
+    // already tripped. An authoritative provider API 429 status still counts,
+    // since it reflects evidence that preceded/caused the cutoff rather than
+    // free text caught in the failure blob.
+    const rate_limited = !!terminalQuotaEvidence || (parsedOutput.resultSubtype !== 'error_max_budget_usd'
       && !cursorUsageQuotaExhausted
-      && (authoritativeApiFailure === 'rate_limit' || !!copilotQuotaEvidence
-        || (!stopReason && rate_signals.some(s => failureBlob.includes(s))));
-    const budget_exceeded = parsedOutput.resultSubtype === 'error_max_budget_usd'
+      && (authoritativeApiFailure === 'rate_limit'
+        || !!copilotQuotaEvidence
+        || (!stopReason && rate_signals.some(s => failureBlob.includes(s)))));
+    const budget_exceeded = tokenBudgetExceeded || parsedOutput.resultSubtype === 'error_max_budget_usd'
       || authoritativeApiFailure === 'budget'
       || cursorUsageQuotaExhausted
       || (!stopReason && budget_signals.some(s => failureBlob.includes(s)));
@@ -5256,15 +5112,14 @@ async function executeOneShot(body, res) {
         && runClassification.kind === 'auth_failed');
     const permission_denied = authoritativeApiFailure === 'permission'
       || runClassification.kind === 'headless_command_permission_auto_denied';
-    // Provider CLIs can enforce their own request deadline before RelayBridge's
-    // progress supervisor fires. Promote only authoritative failed/no-answer
-    // diagnostics; healthy model prose that discusses timeouts must remain a
-    // successful response.
+    // This is a CLI-reported timeout, not proof of which timer expired.
+    // Antigravity emits identical text for local context errors and trajectory
+    // errors. Preserve uncertainty unless Relay or structured API status gives
+    // the cause; healthy model prose discussing timeouts remains successful.
     const providerInternalTimedOut = (code !== 0 || !cleanedStdout || parsedOutput.isError)
       && hasProviderInternalTimeoutDiagnostic(failureBlob);
     const providerTimedOut = timedOut || authoritativeApiFailure === 'timeout' || providerInternalTimedOut;
-    const tokenBudgetExceeded = stopReason === 'token_budget';
-    const retainedPartial = tokenBudgetExceeded && !!parsedOutput.parseError;
+    const retainedPartial = tokenBudgetExceeded && !!parsedOutput.partialDiagnostic;
     const checkpoint = retainedPartial ? parsedOutput.partialCheckpoint : null;
     const finalFailureClass = !isolationCleanup.ok ? 'isolation_cleanup'
       : tokenBudgetExceeded ? 'token_budget'
@@ -5274,7 +5129,8 @@ async function executeOneShot(body, res) {
       : authoritativeApiFailure || (rate_limited ? 'rate_limit'
         : budget_exceeded ? 'budget'
           : auth_failed ? 'auth'
-            : providerTimedOut ? 'timeout'
+            : timedOut ? 'timeout'
+              : providerInternalTimedOut ? 'provider_timeout_unclassified'
               : permission_denied ? 'policy'
                 : parsedOutput.failureClass || (code !== 0 ? runClassification.kind : null));
     const dropped_out = !isolationCleanup.ok || tokenBudgetExceeded || providerTimedOut || code !== 0 || permission_denied || rate_limited || budget_exceeded
@@ -5285,7 +5141,9 @@ async function executeOneShot(body, res) {
       route,
       exitCode: code,
       stdout: cleanedStdout,
-      stderr: cleanOutput([stderr, parsedOutput.diagnostic, parsedOutput.parseError].filter(Boolean).join('\n')),
+      stderr: cleanOutput([providerStderr, parsedOutput.diagnostic, parsedOutput.parseError].filter(Boolean).join('\n')),
+      ...(codexProgressTranscript ? { provider_diagnostic_chars: stderr.length,
+        provider_diagnostic_hash: crypto.createHash('sha256').update(stderr).digest('hex') } : {}),
       usage: authoritativeUsage,
       failureClass: finalFailureClass,
       result_subtype: parsedOutput.resultSubtype,
@@ -5326,10 +5184,10 @@ async function executeOneShot(body, res) {
       } : {}),
       graceful_finalization: tokenBudgetExceeded || gracefulFinalization.requested
         ? { ...gracefulFinalization } : null,
-      quota_evidence: copilotQuotaEvidence,
+      quota_evidence: terminalQuotaEvidence || copilotQuotaEvidence,
       provider_action_required: cursorActionRequired,
-      transport_output_chars: String(stdout).length,
-      transport_output_hash: crypto.createHash('sha256').update(String(stdout)).digest('hex'),
+      transport_output_chars: String(transportStdout).length,
+      transport_output_hash: crypto.createHash('sha256').update(String(transportStdout)).digest('hex'),
       rate_limited,
       budget_exceeded,
       auth_failed,
@@ -5338,7 +5196,7 @@ async function executeOneShot(body, res) {
       policy_detail: permission_denied ? runClassification.detail : null,
       model: modelChoice.model,
       model_tier: modelChoice.modelTier,
-      stop_reason: stopReason || (providerInternalTimedOut ? 'provider_internal_timeout' : null),
+      stop_reason: stopReason || (providerInternalTimedOut ? 'provider_timeout_unclassified' : null),
       supervisor_stop_reason: stopReason,
       provider_timeout_source: timedOut ? 'relay_supervisor'
         : authoritativeApiFailure === 'timeout' ? 'provider_api_status'
@@ -5352,7 +5210,7 @@ async function executeOneShot(body, res) {
       dropped_out,
       model_invocation: true,
     }, {
-      kind, prompt, route, startedAt, cwd: resolvedCwd, transportStdout: stdout,
+      kind, prompt, route, startedAt, cwd: resolvedCwd, transportStdout: semanticStdout,
       accountId: dispatchAccount.account?.id || null,
     });
     // GitHub middleware: only successful runs checkpoint — a dropped-out run
@@ -5378,7 +5236,7 @@ async function executeOneShot(body, res) {
   // stdin. Antigravity consumes {prompt}; Grok consumes {prompt_file}.
   if (promptTransport === 'stdin_stream_json') {
     try {
-      proc.stdin.write(claudeStreamUserMessage(effectivePrompt), (error) => {
+      proc.stdin.write(initialStreamFrame, (error) => {
         if (!error) return;
         providerInputWriteError = true;
         closeProviderInput();
@@ -5424,15 +5282,17 @@ app.post('/api/tasks', async (req, res) => {
     const { classifyTask } = await ROUTER_MODULE_PROMISE;
     const classifiedTaskTier = typeof input.prompt === 'string'
       ? classifyTask(input.prompt).tier : undefined;
-    const taskTier = typeof input.taskTier === 'string' ? input.taskTier : classifiedTaskTier;
-    const modelTier = typeof input.modelTier === 'string'
-      ? input.modelTier : modelTierForTaskTier(taskTier);
+    const taskTier = input.taskTier !== undefined ? input.taskTier : input.execution != null ? undefined : classifiedTaskTier;
+    const modelTier = input.modelTier !== undefined
+      ? input.modelTier : input.execution != null ? undefined : modelTierForTaskTier(taskTier);
     const budgetTaskTier = typeof input.budgetTaskTier === 'string'
       ? input.budgetTaskTier
-      : taskTier;
-    res.json(taskQueue.submit({ ...input, providerBudget, budgetTaskTier, taskTier, modelTier }));
+      : input.execution?.resolvedTaskTier || taskTier || classifiedTaskTier;
+    const prepared = { ...input, dangerous: input.dangerous === true, providerBudget, budgetTaskTier, taskTier, modelTier };
+    const controls = validateProviderIntent({ ...prepared, dangerous: input.dangerous === true });
+    res.json(taskQueue.submit({ ...prepared, execution: controls.execution }));
   }
-  catch (err) { res.status(400).json({ error: err.message }); }
+  catch (err) { return rejectInvalidIntent(res, req.body || {}, err); }
 });
 app.get('/api/tasks', (req, res) => {
   try { res.json({ tasks: taskQueue.list({ collab: req.query.collab, status: req.query.status, limit: req.query.limit }), stats: taskQueue.stats() }); }
@@ -5493,10 +5353,22 @@ const delegation = createDelegationCoordinator({
   selectProvider: ({ task }) => delegationSelection.get(task) || {
     ready: false, reason: 'no plan was computed for this task',
   },
+  prepareTaskBody: (body) => {
+    const snapshot = captureAllowedCwdIdentity(body.cwd);
+    if ((body.expectedCwdIdentityHash && body.expectedCwdIdentityHash !== snapshot.cwdIdentityHash)
+      || (body.expectedCwdPolicyId && body.expectedCwdPolicyId !== CWD_POLICY_IDENTITY)) {
+      throw cwdIdentityChangedError(body.expectedCwdIdentityHash, snapshot.cwdIdentityHash);
+    }
+    const controls = validateProviderIntent(body, loadConfig(), snapshot);
+    return { ...body, execution: controls.execution, cwd: snapshot.resolved,
+      expectedCwdIdentityHash: snapshot.cwdIdentityHash, expectedCwdPolicyId: CWD_POLICY_IDENTITY };
+  },
   log: (m) => console.log(m),
 });
 
 app.post('/api/delegate', rateLimit(delegationRateLimitOptions), async (req, res) => {
+  const controller = new AbortController();
+  res.once('close', () => { if (!res.writableEnded) controller.abort(); });
   const input = req.body || {};
   const tasks = Array.isArray(input.tasks) ? input.tasks : [];
   if (!tasks.length) return res.status(400).json({ error: 'tasks (non-empty array) required' });
@@ -5504,9 +5376,13 @@ app.post('/api/delegate', rateLimit(delegationRateLimitOptions), async (req, res
   try {
     const { classifyTask } = await ROUTER_MODULE_PROMISE;
     delegationClassifier = classifyTask;
+    if (tasks.some((task) => !task || typeof task !== 'object' || Array.isArray(task)
+      || typeof (task.prompt || task.objective) !== 'string' || !(task.prompt || task.objective).trim())) {
+      return res.status(400).json({ error: 'every task must be an object with a non-empty string prompt' });
+    }
     const selection = new Map();
     for (const task of tasks) {
-      const prompt = String(task?.prompt || task?.objective || '').trim();
+      const prompt = (task.prompt || task.objective).trim();
       if (!prompt) continue;
       let plan;
       try {
@@ -5514,7 +5390,10 @@ app.post('/api/delegate', rateLimit(delegationRateLimitOptions), async (req, res
         // not allowed to fail the whole batch: the other asks are still valid.
         plan = (await planTask({
           task: prompt,
-          requestedEffort: task?.effort ? normalizeEffort(String(task.effort)) : null,
+          requestedEffort: task.effort ?? null,
+          intent: { ...task, cwd: task.cwd || input.cwd },
+          signal: controller.signal,
+          taskTierOverride: delegationTaskTier(task, classifyTask(prompt)),
           kind: typeof task?.kind === 'string' ? task.kind : null,
           requestedProviderBudget: validateProviderBudget(task?.providerBudget),
           filesystemAuthority: planningFilesystemAuthority({
@@ -5536,6 +5415,12 @@ app.post('/api/delegate', rateLimit(delegationRateLimitOptions), async (req, res
         costClass: choice.costClass,
         providerBudget: choice.providerBudget,
         ready: true,
+        execution: choice.execution,
+        invocation: {
+          cwd: captureAllowedCwdIdentity(task.cwd || input.cwd).resolved,
+          requiresWorkspaceAccess: task.requiresWorkspaceAccess, inlineEvidence: task.inlineEvidence,
+          maxEffortOverride: task.maxEffortOverride, timeoutMs: task.timeoutMs,
+        },
         alternates: (plan.alternates || []).map((alt) => ({ kind: alt.kind, costClass: alt.costClass })),
       } : {
         ready: false,
@@ -5543,11 +5428,12 @@ app.post('/api/delegate', rateLimit(delegationRateLimitOptions), async (req, res
         reason: choice?.reason || plan.guidance?.[0] || 'no ready provider for this task',
       });
     }
+    if (controller.signal.aborted || res.destroyed) return;
     delegationSelection = selection;
     res.json(delegation.delegate({ ...input, actor: input.actor || req.get('X-RelayBridge-Client') || 'delegator' }));
   } catch (err) {
     const status = err.code === 'OWNERSHIP_CONFLICT' ? 409 : 400;
-    res.status(status).json({ error: err.message, code: err.code || null });
+    if (!res.destroyed && !res.writableEnded) res.status(status).json({ error: err.message, code: err.code || null });
   } finally {
     delegationSelection = new Map();
   }
@@ -5598,7 +5484,7 @@ const workflowController = createWorkflowController({
 const WORKFLOW_NOT_FOUND_CODES = new Set(['WORKFLOW_NOT_FOUND', 'NOT_FOUND']);
 const WORKFLOW_CONFLICT_CODES = new Set([
   'WORKFLOW_EXISTS', 'WORKFLOW_TERMINAL', 'INVALID_TRANSITION',
-  'WRITER_CONFLICT', 'WRITER_TASK_RUNNING', 'LEASE_MISMATCH', 'LEASE_MISSING',
+  'WRITER_CONFLICT', 'WRITER_LEASE_HELD_EXPIRED', 'WRITER_TASK_RUNNING', 'LEASE_MISMATCH', 'LEASE_MISSING',
   'LEASE_EXPIRED', 'LEASE_NOT_REQUIRED', 'REVISION_NOT_REQUESTED',
   'REVISION_REQUIRED', 'PROVIDER_TASK_ACTIVE', 'PROVIDER_TASK_MISMATCH',
   'PROVIDER_TASK_REUSED', 'PROVIDER_RETRY_MISMATCH', 'PROVIDER_RETRY_EXHAUSTED',
@@ -5755,7 +5641,7 @@ app.post('/api/workflows/:runId/cancel', (req, res) => {
 // evenly and "what would this cost on metered pricing" is answerable while on
 // subscription plans.
 const { createCooldownStore, parseRetryAfter } = require('./lib/provider-cooldown');
-const { checkGrounding, verifyReferencedPaths } = require('./lib/workspace-grounding');
+const { checkGrounding, prepareGroundedPrompt, verifyReferencedPaths } = require('./lib/workspace-grounding');
 const {
   classifyRunFailure,
   vendorEvidenceText,
@@ -5972,6 +5858,7 @@ function accountRegistry() {
 }
 
 function invalidateAccountRegistry() {
+  authGeneration += 1;
   _accountRegistryCache = { at: 0, value: { providers: {} } };
 }
 
@@ -6129,6 +6016,7 @@ function accountAwareRoutingInputs(config, diagnostics, gauges, coolingStates) {
     }
     const readiness = adjustedDiagnostics[kind];
     const defaultSignedOut = !!(readiness && readiness.found && readiness.ready === false
+      && !readiness.transientProbeFailure
       && readiness.authFailed === true && readiness.authAuthoritative === true
       && Array.isArray(entry.login_command));
     const unavailableAccountIds = defaultSignedOut
@@ -6332,6 +6220,7 @@ app.get('/api/accounts', (req, res) => {
     catch { supportsMultipleAccounts = false; }
     const accounts = providerAccounts.accountsFor(kind, entry, registry).map((a) => {
       const runtimeAuthUnavailable = a.implicit
+        && !lastDiagnostics?.results?.[kind]?.transientProbeFailure
         && lastDiagnostics?.results?.[kind]?.ready === false
         && lastDiagnostics?.results?.[kind]?.authFailed === true
         && lastDiagnostics?.results?.[kind]?.authAuthoritative === true;
@@ -6374,7 +6263,7 @@ app.get('/api/accounts', (req, res) => {
   res.json({ providers: out, dataDir: path.join(DATA_DIR, 'accounts') });
 });
 
-app.post('/api/accounts/:kind', (req, res) => {
+app.post('/api/accounts/:kind', accountMutationLimit, (req, res) => {
   const kind = String(req.params.kind);
   const entry = loadConfig()[kind];
   if (!entry || kind.startsWith('_')) return res.status(404).json({ error: `unknown provider '${kind}'` });
@@ -6414,7 +6303,7 @@ app.post('/api/accounts/:kind', (req, res) => {
   });
 });
 
-app.post('/api/accounts/:kind/:id/enabled', (req, res) => {
+app.post('/api/accounts/:kind/:id/enabled', accountMutationLimit, (req, res) => {
   const kind = String(req.params.kind);
   const entry = loadConfig()[kind];
   if (!entry || kind.startsWith('_')) return res.status(404).json({ error: `unknown provider '${kind}'` });
@@ -6436,7 +6325,7 @@ app.post('/api/accounts/:kind/:id/enabled', (req, res) => {
 // version-only probe. Give the operator one explicit, typed way to arm a single
 // retry. If the credentials are still bad, normal dispatch accounting writes
 // the quarantine marker straight back.
-app.post('/api/accounts/:kind/:id/auth/retry', (req, res) => {
+app.post('/api/accounts/:kind/:id/auth/retry', accountMutationLimit, (req, res) => {
   const kind = String(req.params.kind);
   const id = String(req.params.id);
   const entry = loadConfig()[kind];
@@ -6469,7 +6358,7 @@ app.post('/api/accounts/:kind/:id/auth/retry', (req, res) => {
   }
 });
 
-app.delete('/api/accounts/:kind/:id', (req, res) => {
+app.delete('/api/accounts/:kind/:id', accountMutationLimit, (req, res) => {
   const kind = String(req.params.kind);
   const id = String(req.params.id);
   const entry = loadConfig()[kind];
@@ -6611,10 +6500,17 @@ app.get('/api/usage/totals', (req, res) => {
   try { res.json(usageLedger.totals(Number(req.query.windowMs) || 86400000)); }
   catch (err) { res.status(500).json({ error: err.message }); }
 });
-app.post('/api/usage/advise', (req, res) => {
+app.post('/api/usage/advise', usageAdviceLimit, (req, res) => {
   try {
     const filesystemAuthority = planningFilesystemAuthority(req.body || {});
     const { tier = 'standard', candidates = [], highStakes = false, explicitProvider = false } = req.body || {};
+    if (!Array.isArray(candidates) || candidates.length > 64 || candidates.some((item) => {
+      const seat = typeof item === 'string' ? item : item?.seat;
+      return !providerAccounts.validProviderKey(seat);
+    })) {
+      return res.status(400).json({ error: 'candidates must contain at most 64 valid provider entries',
+        validation: { code: 'invalid_candidates', field: 'candidates', reason: 'expected at most 64 valid provider entries' } });
+    }
     const gauges = usageLedger.gaugeAll(seatCostClasses());
     const cfg = loadConfig();
     const filesystemUsable = [];
@@ -6680,11 +6576,23 @@ app.post('/api/usage/advise', (req, res) => {
 
 // ---- GitHub integration (lib/github-tracker.js) --------------------------
 // Fire-and-forget middleware on the run-completion path. Activates only for
-// runs whose cwd sits inside an enrolled repo (config/github-repos.json);
+// runs whose cwd sits inside an enrolled repo (data/github-repos.json by
+// default, or RELAYBRIDGE_GITHUB_REPOS when explicitly configured);
 // strict no-op otherwise. It commits/documents/labels as side effects of a
 // run — the provider response is never delayed or failed by tracking.
 const githubTracker = require('./lib/github-tracker');
 const githubOnboard = require('./lib/github-onboard');
+if (path.resolve(githubTracker.REGISTRY_FILE) !== GITHUB_REGISTRY_FILE) {
+  throw new Error('GitHub registry path resolution drifted between server and tracker');
+}
+const githubRegistryMigration = githubTracker.migrateLegacyRegistry();
+// Validate eagerly. A malformed authority file must stop startup instead of
+// letting the bridge look healthy while every completed run silently fails to
+// checkpoint.
+githubTracker.loadRegistry();
+if (githubRegistryMigration.status === 'migrated') {
+  console.log(`[RelayBridge] migrated legacy GitHub enrollment to ${githubRegistryMigration.runtimeFile}`);
+}
 githubTracker.setActivityFile(path.join(DATA_DIR, 'github-activity.jsonl'));
 
 function trackRunAfterResponse(meta) {
@@ -6736,7 +6644,7 @@ app.post('/api/github/track', async (req, res) => {
 // Provision the full automation stack into a repo in one action (draft PR).
 app.post('/api/github/onboard', async (req, res) => {
   try { res.json(await githubOnboard.onboardRepo({ name: req.body?.name, path: req.body?.path })); }
-  catch (err) { res.status(400).json({ error: err.message }); }
+  catch (err) { res.status(400).json({ error: err.message, errorCode: err.code || null, cleanupFailure: err.cleanupFailure || null }); }
 });
 
 app.post('/api/github/upgrade-repos', async (req, res) => {
@@ -6784,7 +6692,8 @@ app.post('/api/agents/:id/tags', (req, res) => {
 app.post('/api/broadcast', async (req, res) => {
   const {
     prompt, tag, providers, all, dangerous, timeoutMs = TIMEOUT_POLICY.oneShotDefaultMs, cwd,
-    providerBudget, effort, maxEffortOverride,
+    providerBudget, effort, maxEffortOverride, model, execution, taskTier, modelTier,
+    requiresWorkspaceAccess, inlineEvidence,
   } = req.body || {};
   const effectiveTimeoutMs = TIMEOUT_POLICY.normalizeOneShotTimeoutMs(timeoutMs);
   if (typeof prompt !== 'string' || !prompt.trim()) {
@@ -6794,7 +6703,7 @@ app.post('/api/broadcast', async (req, res) => {
   try {
     validatedProviderBudget = validateProviderBudget(providerBudget);
   } catch (err) {
-    return res.status(400).json({ error: err.message });
+    return rejectInvalidIntent(res, req.body || {}, err);
   }
   const { classifyTask } = await ROUTER_MODULE_PROMISE;
   const cfg = loadConfig();
@@ -6810,6 +6719,18 @@ app.post('/api/broadcast', async (req, res) => {
       tag: typeof tag === 'string' ? tag : null,
     });
   }
+  const resolvedTaskTier = taskTier !== undefined ? taskTier : execution != null ? undefined : classifyTask(prompt).tier;
+  const resolvedModelTier = modelTier !== undefined ? modelTier : execution != null ? undefined : modelTierForTaskTier(resolvedTaskTier);
+  const intents = new Map();
+  try {
+    // Validate every member before the first provider can consume quota. A
+    // planned tuple is provider-bound and cannot be broadcast to other seats.
+    for (const kind of targets) intents.set(kind, validateProviderIntent({
+      kind, prompt, cwd, requiresWorkspaceAccess, inlineEvidence, providerBudget: validatedProviderBudget, model, execution,
+      taskTier: resolvedTaskTier, modelTier: resolvedModelTier, effort, maxEffortOverride,
+      dangerous: dangerous === true,
+    }, cfg).execution);
+  } catch (err) { return rejectInvalidIntent(res, req.body || {}, err); }
   const startedAt = Date.now();
   const budgetTaskTier = classifyTask(prompt).tier;
   const deadlineAt = startedAt + effectiveTimeoutMs;
@@ -6843,9 +6764,10 @@ app.post('/api/broadcast', async (req, res) => {
     const captured = new CapturedOneShotResponse();
     activeCaptured.add(captured);
     executeOneShot({
-      kind, prompt, timeoutMs: remainingMs, cwd, dangerous,
+      kind, prompt, timeoutMs: remainingMs, cwd, dangerous: dangerous === true,
+      requiresWorkspaceAccess, inlineEvidence,
       providerBudget: validatedProviderBudget, budgetTaskTier,
-      taskTier: budgetTaskTier, modelTier: modelTierForTaskTier(budgetTaskTier),
+      taskTier: resolvedTaskTier, modelTier: resolvedModelTier, model, execution: intents.get(kind),
       effort, maxEffortOverride,
     }, captured)
       .catch((err) => captured.status(500).json({ error: err.message, dropped_out: true }));
@@ -6904,7 +6826,7 @@ app.post('/api/broadcast', async (req, res) => {
 // Install one CLI by its kind. Providers may use npm, Python/pip, or an exact
 // vendor-supplied command (Antigravity). Nothing runs until the user confirms
 // the Install dialog in the local UI.
-app.post('/api/install', (req, res) => {
+app.post('/api/install', installRequestLimit, (req, res) => {
   const { kind } = req.body || {};
   if (!kind) return res.status(400).json({ error: 'kind required' });
   const cfg = loadConfig();
@@ -6926,46 +6848,58 @@ app.post('/api/install', (req, res) => {
   const env = buildEnv();
   const [configuredBinary, ...configuredArgs] = slot;
   const resolvedBinary = resolveExecutable(configuredBinary, env);
-  const isWindowsShim = process.platform === 'win32' && !/\.exe$/i.test(resolvedBinary);
-  const spawnBinary = isWindowsShim ? (process.env.ComSpec || 'cmd.exe') : resolvedBinary;
-  const spawnArgs = isWindowsShim
-    ? ['/d', '/s', '/c', [resolvedBinary, ...configuredArgs].map(quoteCmdArg).join(' ')]
-    : configuredArgs;
+  let launch;
+  try { launch = qualifiedProviderLaunch(resolvedBinary, configuredArgs, env); }
+  catch (err) {
+    return res.status(400).json({ kind, success: false, error: err.message,
+      errorCode: err.code || null, validation: err.validation || null,
+      model_invocation: false, physical_attempt_count: 0, token_usage_source: 'not_invoked' });
+  }
   let installCwd;
   try { installCwd = defaultAllowedCwd(); }
   catch (err) { return res.status(400).json({ error: err.message }); }
-  const proc = trackChild(spawn(spawnBinary, spawnArgs, {
-    cwd: installCwd,
-    env,
-    windowsHide: true,
-    // npm/pip fan out into their own children; group-kill them when the
-    // 5-minute cap fires instead of leaving a half-finished install running.
-    detached: process.platform !== 'win32',
-  }));
+  let release;
+  try { release = installSlots.acquire(); }
+  catch (error) { return rejectOperationAdmission(res, error); }
+  let proc;
+  try {
+    proc = trackChild(spawn(launch.file, launch.args, {
+      cwd: installCwd, env: launch.env, windowsHide: true,
+      // Installers fan out; cancellation targets the owned process group.
+      detached: process.platform !== 'win32',
+    }));
+  } catch (err) {
+    release();
+    return res.status(400).json({ kind, success: false, error: 'installer spawn failed',
+      model_invocation: false, physical_attempt_count: 0, token_usage_source: 'not_invoked' });
+  }
+  proc.once('close', release);
+  proc.once('error', () => { if (!proc.pid) release(); });
   let stdout = '';
   let stderr = '';
+  let truncated = false;
   let settled = false;
   const t = setTimeout(() => killProcessTree(proc), 300000); // 5 min cap
   res.on('close', () => { if (!res.writableEnded) killProcessTree(proc); });
   proc.stdout.setEncoding('utf8');
   proc.stderr.setEncoding('utf8');
-  proc.stdout.on('data', (d) => { stdout += d; });
-  proc.stderr.on('data', (d) => { stderr += d; });
+  proc.stdout.on('data', (d) => { if (stdout.length + d.length > EXEC_OUTPUT_MAX) truncated = true; stdout = (stdout + d).slice(0, EXEC_OUTPUT_MAX); });
+  proc.stderr.on('data', (d) => { if (stderr.length + d.length > EXEC_OUTPUT_MAX) truncated = true; stderr = (stderr + d).slice(0, EXEC_OUTPUT_MAX); });
   proc.on('error', (err) => {
-    if (settled) return;
+    if (settled || res.destroyed) return;
     settled = true;
     clearTimeout(t);
-    res.json({ kind, package: pkg, installer: entry.install_display, success: false, exitCode: -1, stdout, stderr: stderr + '\n' + err.message });
+    res.json({ kind, package: pkg, installer: entry.install_display, success: false, exitCode: -1, stdout, stderr: stderr + '\n' + err.message, truncated });
   });
   proc.on('close', (code) => {
-    if (settled) return;
-    settled = true;
     clearTimeout(t);
     // An install is the one event that makes a PATH lookup stale on purpose:
     // the seat the caller just installed must not stay "not installed" for the
     // rest of the memo's TTL.
     executableCache.clear();
-    res.json({ kind, package: pkg, installer: entry.install_display, success: code === 0, exitCode: code, stdout, stderr });
+    if (settled || res.destroyed) return;
+    settled = true;
+    res.json({ kind, package: pkg, installer: entry.install_display, success: code === 0, exitCode: code, stdout, stderr, truncated });
   });
 });
 

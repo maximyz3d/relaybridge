@@ -84,15 +84,13 @@ function checkSubscription() {
 
 // pwm takes the prompt as a command-line argument; Windows caps a process
 // command line near 32k chars, and a long group-chat transcript can exceed
-// that (spawn ENAMETOOLONG). Keep the instruction head + the most recent
-// tail — the part Perplexity actually needs to answer the latest message.
+// that (spawn ENAMETOOLONG). Reject, never remove constraints from the input.
 function capForArgv(p) {
   const MAX = 12000;
   if (!p || p.length <= MAX) return p;
-  const head = 1600;
-  return p.slice(0, head) +
-    '\n\n...[earlier conversation trimmed to fit Perplexity\'s input limit]...\n\n' +
-    p.slice(p.length - (MAX - head));
+  throw Object.assign(new Error('prompt_too_large: pwm accepts at most 12000 characters; shorten the complete request'), {
+    code: 'prompt_too_large',
+  });
 }
 
 function cleanPwmOutput(value) {
@@ -216,10 +214,15 @@ function askApi(prompt) {
 
 // ---- unified ask: subscription first, API fallback ----------------------
 async function ask(prompt) {
+  // Conservative wrapper contract, checked before discovery or any fallback.
+  // The bridge declares the same complete-input ceiling before wrapper spawn.
+  capForArgv(prompt);
   if (findPwm()) {
     try {
       return await askPwm(prompt);
     } catch (subscriptionError) {
+      // Invalid complete input must not trigger even an opted-in paid fallback.
+      if (subscriptionError.code === 'prompt_too_large') throw subscriptionError;
       if (API_KEY && ALLOW_PAID_API_FALLBACK) {
         try {
           return await askApi(prompt);
@@ -264,8 +267,8 @@ if (CHECK) {
   process.stdin.setEncoding('utf8');
   process.stdin.on('data', (d) => { stdin += d; });
   process.stdin.on('end', async () => {
-    const prompt = stdin.trim();
-    if (!prompt) fail('Error: empty prompt on stdin');
+    const prompt = stdin;
+    if (!prompt.trim()) fail('Error: empty prompt on stdin');
     try {
       process.stdout.write((await ask(prompt)) + '\n');
     } catch (e) {

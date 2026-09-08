@@ -124,7 +124,7 @@ test('ask transports a long stdin prompt in request bodies, never argv', async (
   assert.equal(requests[1].body.prompt, prompt);
   assert.equal(requests[1].body.taskTier, 'standard');
   assert.equal(requests[1].body.modelTier, 'standard');
-  assert.equal(requests[1].body.effort, 'medium');
+  assert.equal(requests[1].body.effort, undefined, 'inferred effort remains inferred, not a strict explicit request');
   assert.equal(requests[1].body.maxEffortOverride, undefined);
   assert.match(requests[1].body.requestId, /^cli:[0-9a-f-]{36}$/);
   assert.match(result.stderr, new RegExp(`# request ${requests[1].body.requestId}`));
@@ -134,6 +134,21 @@ test('ask transports a long stdin prompt in request bodies, never argv', async (
   );
   assert.ok(Buffer.byteLength(prompt, 'utf8') > 32767);
   assert.ok(!result.spawnArgs.some((arg) => arg.includes('const value')));
+});
+
+test('blocked exact model without an explicit provider cannot fall through to a default invocation', async (t) => {
+  const requests = [];
+  const server = await startBridgeStub(t, requests, null, {
+    model: null, execution: null, blocked: true, ready: false,
+    validation: { code: 'model_unavailable', field: 'model', reason: 'Exact model unavailable.' },
+  });
+  const result = await runCli(['ask', '--model', 'unavailable', '--stdin', '--json'], 'Explain a cache.', server.port);
+  assert.notEqual(result.code, 0);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].url, '/api/plan');
+  assert.equal(requests[0].body.model, 'unavailable');
+  assert.equal(requests[0].body.kind, undefined);
+  assert.match(result.stderr, /Exact model unavailable/);
 });
 
 test('plan reads a long Unicode prompt file without placing its body in argv', async (t) => {
@@ -207,7 +222,7 @@ test('empty and conflicting CLI input fails before any bridge request', async (t
   assert.equal(requests.length, 0);
 });
 
-async function startBridgeStub(t, requests, oneShotResult = null) {
+async function startBridgeStub(t, requests, oneShotResult = null, primaryOverride = {}) {
   let receiptCounter = 0;
   const server = http.createServer(async (req, res) => {
     const chunks = [];
@@ -221,6 +236,7 @@ async function startBridgeStub(t, requests, oneShotResult = null) {
         primary: {
           kind: 'fake', company: 'Fake', label: 'Fake Provider', model: null,
           modelTier: 'standard', costNote: 'test', args: [],
+          ...primaryOverride,
         },
         alternates: [], guidance: [],
       }));

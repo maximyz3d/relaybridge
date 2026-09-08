@@ -33,8 +33,13 @@ if (markerIndex >= 0 && process.argv[markerIndex + 1]) {
 }
 const delayIndex = process.argv.indexOf('--delay');
 const delayMs = delayIndex >= 0 ? Math.max(0, Number(process.argv[delayIndex + 1] || 0)) : 0;
+const pidMarkerIndex = process.argv.indexOf('--pid-marker');
+if (pidMarkerIndex >= 0 && process.argv[pidMarkerIndex + 1]) {
+  fs.writeFileSync(process.argv[pidMarkerIndex + 1], `${process.pid}\n`, 'utf8');
+}
 
-if (process.argv.includes('--claude-json-multiturn')) {
+if (process.argv.includes('--claude-json-multiturn')
+    || process.argv.includes('--claude-json-multiturn-late-final')) {
   const events = [1, 2, 3].map((turn) => ({
     type: 'assistant',
     message: {
@@ -85,21 +90,29 @@ if (process.argv.includes('--claude-json-multiturn')) {
       content: [],
     },
   });
+  const sameChunkLateFinal = process.argv.includes('--claude-json-multiturn-late-final');
+  const result = {
+    type: 'result', is_error: false, subtype: 'success',
+    result: sameChunkLateFinal ? 'LATE RATE LIMIT 429 MUST NOT CHANGE THE VERDICT' : 'MULTITURN_OK',
+    num_turns: 3,
+    usage: {
+      input_tokens: 300, output_tokens: 120,
+      cache_read_input_tokens: 1500, cache_creation_input_tokens: 75,
+    },
+  };
   let index = 0;
   const interval = setInterval(() => {
     if (index < events.length) {
+      if (sameChunkLateFinal && index === events.length - 1) {
+        clearInterval(interval);
+        process.stdout.write(`${JSON.stringify(events[index++])}\n${JSON.stringify(result)}`);
+        return;
+      }
       process.stdout.write(JSON.stringify(events[index++]) + '\n');
       return;
     }
     clearInterval(interval);
-    setTimeout(() => process.stdout.write(JSON.stringify({
-      type: 'result', is_error: false, subtype: 'success', result: 'MULTITURN_OK',
-      num_turns: 3,
-      usage: {
-        input_tokens: 300, output_tokens: 120,
-        cache_read_input_tokens: 1500, cache_creation_input_tokens: 75,
-      },
-    })), 500);
+    setTimeout(() => process.stdout.write(JSON.stringify(result)), 500);
   }, 30);
   return;
 }
@@ -141,6 +154,22 @@ if (process.argv.includes('--claude-json-longrun')) {
       },
     })), 500);
   }, 30);
+  return;
+}
+
+if (process.argv.includes('--claude-json-older-terminal-budget')) {
+  const events = [
+    { type: 'assistant', message: { id: 'older-assistant', usage: { input_tokens: 1, output_tokens: 1 },
+      content: [{ type: 'text', text: 'OLDER_ASSISTANT' }] } },
+    { type: 'result', is_error: false, subtype: 'success', result: 'OLDER_TERMINAL_MUST_NOT_WIN',
+      num_turns: 7, terminal_reason: 'completed', stop_reason: 'end_turn', duration_ms: 123, duration_api_ms: 100,
+      usage: { input_tokens: 1, output_tokens: 1 } },
+    { type: 'assistant', message: { id: 'newer-accepted-checkpoint',
+      usage: { input_tokens: 600, output_tokens: 600, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+      content: [{ type: 'text', text: 'NEWER_ACCEPTED_CHECKPOINT' }] } },
+  ];
+  process.stdout.write(events.map((event) => JSON.stringify(event) + '\n').join(''));
+  setInterval(() => {}, 1000);
   return;
 }
 
@@ -490,6 +519,29 @@ setTimeout(() => {
       num_turns: 1, duration_ms: 25, duration_api_ms: 20,
       usage: { input_tokens: 3, output_tokens: 1 },
     }));
+    return;
+  }
+  if (process.argv.includes('--claude-json-terminal-only-budget')) {
+    process.stdout.write(JSON.stringify({
+      type: 'assistant',
+      message: {
+        id: 'terminal-only-turn-1',
+        usage: { input_tokens: 50, output_tokens: 20, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+        content: [{ type: 'text', text: 'turn 1' }],
+      },
+    }) + '\n');
+    setTimeout(() => {
+      // Deliberately no trailing newline: this is the CLI's last write, and
+      // the only place the budget overage is discoverable. The terminal
+      // result text also carries a rate-limit-flavored phrase that must not
+      // be allowed to recolor the run once the budget trips.
+      process.stdout.write(JSON.stringify({
+        type: 'result', is_error: false, subtype: 'success',
+        result: 'you are near your rate limit, but here is the answer',
+        num_turns: 2,
+        usage: { input_tokens: 5000, output_tokens: 5000, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+      }));
+    }, 30);
     return;
   }
   if (process.argv.includes('--claude-json-retry-hang')) {

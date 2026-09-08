@@ -38,7 +38,7 @@ function fakeQueue({ maxConcurrent = 3, active = 0, queued = 0 } = {}) {
   };
 }
 
-function coordinator({ queue = fakeQueue(), classify, selectProvider, incidents } = {}) {
+function coordinator({ queue = fakeQueue(), classify, selectProvider, incidents, prepareTaskBody } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rb-delegation-'));
   return {
     dir,
@@ -46,7 +46,7 @@ function coordinator({ queue = fakeQueue(), classify, selectProvider, incidents 
     delegation: createDelegationCoordinator({
       dataDir: dir,
       taskQueue: queue,
-      incidents,
+      incidents, prepareTaskBody,
       classify: classify || ((prompt) => ({ tier: /migration/i.test(prompt) ? 'critical' : 'standard' })),
       selectProvider: selectProvider || (({ tier }) => (tier === 'critical'
         ? { kind: 'claude', modelTier: 'heavy', effort: 'high', costClass: 'subscription' }
@@ -629,4 +629,67 @@ test('repeated normal atomic writes retain one complete record without temporary
     const persisted = JSON.parse(fs.readFileSync(path.join(dir, `${record.delegationId}.json`), 'utf8'));
     assert.equal(persisted.entries[0].status, status);
   }
+});
+
+
+test('preparing a later complete handoff fails the batch before any durable submission', () => {
+  const { delegation, queue, dir } = coordinator({ prepareTaskBody(body) {
+    assert.match(body.prompt, /Base revision/);
+    if (body.prompt.includes('second task')) throw new Error('complete prompt does not fit');
+    return body;
+  } });
+  assert.throws(() => delegation.delegate({ cwd: CWD, tasks: [task(), task({ prompt: 'second task', ownedFiles: ['lib/b.js'] })] }), /complete prompt does not fit/);
+  assert.equal(queue.submitted.length, 0);
+  assert.equal(fs.readdirSync(dir).filter(name => name.endsWith('.json')).length, 0);
+});
+
+test('persisted execution intent survives reopen and budget approval; model changes stay pending without revalidation', () => {
+  const execution = { version: 1, provider: 'gemini', model: 'fixture', resolvedTaskTier: 'standard',
+    resolvedModelTier: 'light', requestedEffort: null, targetEffort: 'low', appliedEffort: null };
+  const { delegation, queue, dir } = coordinator({ selectProvider: () => ({ kind: 'gemini', modelTier: 'light', effort: 'low',
+    execution, invocation: { cwd: CWD, requiresWorkspaceAccess: true }, costClass: 'local' }) });
+  const record = delegation.delegate({ cwd: CWD, tasks: [task({ providerBudget: { maxTotalTokens: 900 } })] });
+  const ref = record.entries[0].taskRef;
+  execution.model = 'mutated-after-submission';
+  const reopened = createDelegationCoordinator({ dataDir: dir, taskQueue: queue,
+    classify: () => ({ tier: 'standard' }), selectProvider: () => null });
+  assert.equal(reopened.get(record.delegationId).entries[0].executionIntent.execution.model, 'fixture');
+  assert.equal(Object.hasOwn(queue.submitted[0].body, 'effort'), false);
+  finishTask(queue, record);
+  reopened.recordOutcome(record.delegationId, ref, { classification: 'partial_result', observed: 'token limit reached',
+    kinds: ['budget'], requested: { budget: { maxTokens: 1800 } } });
+  const approved = reopened.decideEscalation(record.delegationId, ref, { approved: true, approver: 'operator', approverKind: 'human' });
+  assert.deepEqual(queue.submitted[1].body.execution, queue.submitted[0].body.execution);
+  assert.equal(queue.submitted[1].body.providerBudget.maxTotalTokens, 1800);
+  finishTask(queue, approved.delegation);
+  reopened.recordOutcome(record.delegationId, ref, { classification: 'wrong_result', observed: 'result contradicts supplied fixture',
+    kinds: ['model_tier'], requested: { modelTier: 'heavy', effort: 'high' } });
+  assert.throws(() => reopened.decideEscalation(record.delegationId, ref, { approved: true, approver: 'operator', approverKind: 'human' }), { code: 'PROVIDER_REPLAN_REQUIRED' });
+  assert.equal(reopened.get(record.delegationId).entries[0].escalation.status, 'pending');
+  assert.equal(queue.submitted.length, 2);
+});
+
+test('model-tier-only approval keeps implicit effort while validating the replacement tuple', () => {
+  const execution = { version: 1, provider: 'gemini', model: 'small', resolvedTaskTier: 'standard',
+    resolvedModelTier: 'light', requestedEffort: null, targetEffort: 'low', appliedEffort: null };
+  let replans = 0;
+  const { delegation, queue } = coordinator({
+    selectProvider: () => ({ kind: 'gemini', modelTier: 'light', effort: 'low', execution, costClass: 'local' }),
+    prepareTaskBody(body) {
+      if (body.execution) return body;
+      replans++;
+      assert.equal(Object.hasOwn(body, 'effort'), false, 'model approval is not an explicit effort request');
+      return { ...body, execution: { ...execution, model: 'large', resolvedModelTier: body.modelTier } };
+    },
+  });
+  const record = delegation.delegate({ cwd: CWD, tasks: [task()] });
+  finishTask(queue, record);
+  delegation.recordOutcome(record.delegationId, record.entries[0].taskRef, { classification: 'wrong_result',
+    observed: 'the output contradicts the supplied fixture', kinds: ['model_tier'], requested: { modelTier: 'heavy' } });
+  delegation.decideEscalation(record.delegationId, record.entries[0].taskRef,
+    { approved: true, approver: 'operator', approverKind: 'human' });
+  assert.equal(replans, 1);
+  assert.equal(queue.submitted[1].body.execution.model, 'large');
+  assert.equal(queue.submitted[1].body.execution.requestedEffort, null);
+  assert.equal(Object.hasOwn(queue.submitted[1].body, 'effort'), false);
 });

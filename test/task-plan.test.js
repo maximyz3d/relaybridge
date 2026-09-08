@@ -11,6 +11,18 @@ const config = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'cli-config
 
 const route = (tier, kinds) => ({ classification: { tier }, selected: kinds.map((kind) => ({ kind })) });
 
+test('explicit-kind planning and cheapest guidance cannot resurrect a semantically incapable shell or undersized model', () => {
+  const classification = { tier: 'complex', tags: ['coding'], signals: { whollyDeterministic: false } };
+  for (const kind of ['powershell', 'ollama_fast', 'copilot']) {
+    const plan = buildTaskPlan({ route: { classification, selected: [{ kind: 'claude' }] }, config, requestedKind: kind, requestedModelTier: 'heavy' });
+    assert.equal(plan.primary.kind, kind); assert.equal(plan.primary.blocked, true); assert.equal(plan.primary.ready, false);
+    assert.equal(plan.primary.validation.code, 'ineligible_provider'); assert.equal(plan.cheapestCapable, null);
+  }
+  const plan = buildTaskPlan({ route: { classification, selected: [{ kind: 'claude' }, { kind: 'powershell' }, { kind: 'ollama_coder' }] }, config });
+  assert.equal(plan.primary.kind, 'claude'); assert.equal(plan.cheapestCapable.kind, 'claude');
+  assert.equal(plan.alternates.every((row) => row.blocked), true);
+});
+
 test('plan preserves classifier tags for CLI and MCP consumers', () => {
   const classifiedRoute = route('standard', ['perplexity']);
   classifiedRoute.classification.tags = ['research', 'hardware'];
@@ -190,17 +202,19 @@ test('the CLI ask payload preserves the caller working directory', () => {
   assert.equal(body.requestId, 'cli:test-request-0001');
 });
 
-test('the CLI ask payload propagates the planned model tier and effort', () => {
+test('the CLI ask payload propagates the planned exact intent without promoting inferred effort to explicit', () => {
   const { buildAskBody } = require('../bin/relaybridge.js');
   const plan = {
-    primary: { kind: 'codex', modelTier: 'heavy' },
+    primary: { kind: 'codex', modelTier: 'heavy', model: 'planned-model', execution: { provider: 'codex', model: 'planned-model' } },
     tier: 'complex',
     effort: 'high',
   };
   const body = buildAskBody(plan, 'debug the architecture', '/repo', 'cli:test-controls-1');
   assert.equal(body.taskTier, 'complex');
   assert.equal(body.modelTier, 'heavy');
-  assert.equal(body.effort, 'high');
+  assert.equal(body.effort, undefined);
+  assert.equal(body.model, 'planned-model');
+  assert.deepEqual(body.execution, plan.primary.execution);
   assert.equal(body.maxEffortOverride, undefined);
 });
 
@@ -212,7 +226,7 @@ test('the CLI extreme-effort gate reflects explicit user intent, not a returned 
     effort: 'max',
   };
   const inferred = buildAskBody(plan, 'hard task', '/repo', 'cli:test-controls-2');
-  assert.equal(inferred.effort, 'max');
+  assert.equal(inferred.effort, undefined);
   assert.equal(inferred.maxEffortOverride, undefined, 'a plan cannot silently authorize maximum effort');
 
   for (const effort of ['xhigh', 'max']) {

@@ -791,7 +791,13 @@ function Merge-OperatorConfiguration([string]$StageRoot, [string]$ExistingRoot) 
   Get-ChildItem -LiteralPath $existingConfig -File -Recurse | ForEach-Object {
     $relative = $_.FullName.Substring($existingConfig.Length).TrimStart('\', '/')
     $target = Join-Path (Join-Path $StageRoot 'config') $relative
-    if ($_.Extension -ieq '.json') { Merge-JsonFile $target $_.FullName }
+    # This pre-2.1 file contains machine paths and is runtime enrollment, not
+    # release configuration. It is migrated into data/ transactionally after
+    # preserved runtime has moved; copying it into config would ship it again.
+    if ($relative.Replace('\', '/') -ieq 'github-repos.json') {
+      Write-Host '[RelayBridge] Deferring legacy GitHub registry to runtime-data migration.' -ForegroundColor DarkGray
+    }
+    elseif ($_.Extension -ieq '.json') { Merge-JsonFile $target $_.FullName }
     elseif (-not (Test-Path -LiteralPath $target)) {
       New-Item -ItemType Directory -Path (Split-Path -Parent $target) -Force | Out-Null
       Copy-Item -LiteralPath $_.FullName -Destination $target -Force
@@ -803,6 +809,10 @@ function Test-ReleasePathExcluded([string]$RelativePath, [string]$LeafName, [boo
   $portable = $RelativePath.Replace('\', '/')
   $topLevel = ($portable -split '/', 2)[0]
   if ($topLevel -in @('.git', 'node_modules', 'data', 'migration-backups')) { return $true }
+  # Pre-2.1 enrollment contains machine-specific checkout paths. It is runtime
+  # authority state and must reach a release only through the descriptor-safe
+  # post-cutover migration, never through source staging or build identity.
+  if (-not $IsContainer -and $portable -ieq 'config/github-repos.json') { return $true }
   if ($IsContainer -and $LeafName -in @('.git', 'node_modules')) { return $true }
   if ($LeafName -in @(
     '.bridge-token', '.state.json', '.mcp-start.lock', '.mcp-install.lock', 'build-info.json',
@@ -884,6 +894,30 @@ function Get-ReleaseIdentityFiles([string]$StageRoot) {
   return @($files)
 }
 
+function Migrate-LegacyGitHubRegistry([string]$StageRoot, [string]$LegacyFile) {
+  $tool = Join-Path $StageRoot 'tools\migrate-github-registry.cjs'
+  if (-not (Test-Path -LiteralPath $tool -PathType Leaf)) {
+    throw "GitHub registry migration helper is missing from staged release: $tool"
+  }
+  $args = @($tool, '--root', $StageRoot)
+  # Do not preflight or copy this authority file in PowerShell. The Node helper
+  # performs the no-follow descriptor validation and alone decides whether the
+  # source is missing, regular, or unsafe.
+  if ($LegacyFile) { $args += @('--legacy-file', $LegacyFile) }
+  $result = & node.exe @args
+  if ($LASTEXITCODE -ne 0) { throw 'Legacy GitHub registry migration failed; runtime state was not promoted.' }
+  if ($result) {
+    try {
+      $migration = ($result | Out-String) | ConvertFrom-Json
+      if ($migration.status -eq 'migrated') {
+        Write-Host "[RelayBridge] Migrated legacy GitHub enrollment to $($migration.runtimeFile)" -ForegroundColor Yellow
+      }
+    } catch {
+      throw "GitHub registry migration helper returned invalid output: $result"
+    }
+  }
+}
+
 function Get-ReleaseBuildInfo([string]$StageRoot, [string]$SourceLabel) {
   $package = [IO.File]::ReadAllText((Join-Path $StageRoot 'package.json'), [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
   $parts = @()
@@ -921,42 +955,88 @@ function Test-LocalPortInUse([int]$BridgePort) {
   finally { $client.Dispose() }
 }
 
-function Stop-BridgeForCutover([string]$RuntimeRoot, [int]$BridgePort) {
+function Get-BridgeShutdownProcessHandle([int]$ProcessId) {
+  # Capture a handle before requesting shutdown: waiting on that handle never
+  # follows a recycled PID, and does not terminate any client or unrelated PID.
+  $process = $null
+  try {
+    $process = [Diagnostics.Process]::GetProcessById($ProcessId)
+    $null = $process.Handle
+    return $process
+  } catch {
+    if ($process) { $process.Dispose() }
+    return $null
+  }
+}
+
+function Stop-BridgeForCutover([string]$RuntimeRoot, [int]$BridgePort, [ref]$StoppedHealth) {
   $health = Get-BridgeHealth $BridgePort
   if (-not $health) {
     if (Test-LocalPortInUse $BridgePort) { throw "Port $BridgePort is occupied by a service that is not a compatible RelayBridge; cutover was not attempted." }
     return $null
   }
   if (-not $health.capabilityAuth) { throw "Port $BridgePort is serving an unrecognized RelayBridge-compatible process; cutover was not attempted." }
-  $reportedPid = try { [int64]$health.pid } catch { 0 }
-  if ($reportedPid -le 0) {
-    throw "RelayBridge on port $BridgePort did not report a valid process identity; cutover was not attempted."
-  }
   $tokenPath = Join-Path $RuntimeRoot '.bridge-token'
   if (-not (Test-Path -LiteralPath $tokenPath -PathType Leaf)) {
     throw "A RelayBridge is already running on port $BridgePort, but $RuntimeRoot has no capability token. Stop it explicitly or select the matching -MigrateFrom root."
   }
   $token = (Get-Content -LiteralPath $tokenPath -Raw).Trim()
   if ($token -notmatch '^[A-Fa-f0-9]{64}$') { throw "The capability token in $tokenPath is invalid; cutover was not attempted." }
-  try { $oldProcess = Get-Process -Id $reportedPid -ErrorAction Stop }
-  catch { throw "RelayBridge on port $BridgePort reported PID '$reportedPid', but that process could not be pinned; cutover was not attempted." }
+  $shutdownProcess = $null
+  $shutdownPid = 0
   try {
-    try { $null = $oldProcess.Handle }
-    catch { throw "RelayBridge on port $BridgePort reported PID '$reportedPid', but its process handle could not be opened; cutover was not attempted." }
+    if (-not [int]::TryParse([string]$health.pid, [ref]$shutdownPid) -or $shutdownPid -le 0) {
+      throw "RelayBridge on port $BridgePort did not report a valid process identity; cutover was not attempted."
+    }
+    $shutdownProcess = Get-BridgeShutdownProcessHandle $shutdownPid
+    if (-not $shutdownProcess) {
+      throw "RelayBridge on port $BridgePort reported PID '$shutdownPid', but that process could not be pinned; cutover was not attempted."
+    }
     try {
       Invoke-RestMethod -Uri "http://127.0.0.1:$BridgePort/api/admin/shutdown" -Method Post -Headers @{ 'X-RelayBridge-Token' = $token } -ContentType 'application/json' -Body '{}' -TimeoutSec 5 -UseBasicParsing | Out-Null
     } catch {
       throw "Could not stop the RelayBridge on port $BridgePort with the token from $RuntimeRoot. This usually means another install root owns the live bridge. Cutover was not attempted."
     }
-    # server.js permits a five-second graceful drain before its forced-exit
-    # backstop. Keep the cutover barrier beyond that window.
+    # Preserve restart evidence even if draining subsequently times out.
+    if ($StoppedHealth) { $StoppedHealth.Value = $health }
     for ($attempt = 0; $attempt -lt 100; $attempt++) {
-      if ($oldProcess.HasExited -and -not (Test-LocalPortInUse $BridgePort)) { return $health }
+      if (-not (Test-LocalPortInUse $BridgePort)) {
+        # Node can close its listener immediately but hold its cwd while an
+        # HTTP keep-alive connection drains (~6s on supported Windows builds).
+        if ($shutdownProcess -and -not $shutdownProcess.WaitForExit(10000)) {
+          throw "RelayBridge process $shutdownPid did not exit after authenticated shutdown; cutover was not attempted."
+        }
+        if (Test-LocalPortInUse $BridgePort) {
+          throw "Port $BridgePort was occupied again after shutdown; cutover was not attempted."
+        }
+        return $health
+      }
       Start-Sleep -Milliseconds 100
     }
-    throw "RelayBridge PID $reportedPid on port $BridgePort did not fully exit before cutover."
+    throw "RelayBridge on port $BridgePort did not stop before cutover."
   } finally {
-    $oldProcess.Dispose()
+    if ($shutdownProcess) { $shutdownProcess.Dispose() }
+  }
+}
+
+function Move-InstallDirectoryOnce([string]$FromRoot, [string]$ToRoot) {
+  # Unlike Move-Item, this primitive never nests into an appearing destination.
+  [IO.Directory]::Move($FromRoot, $ToRoot)
+}
+
+function Move-InstallRootForCutover([string]$FromRoot, [string]$ToRoot) {
+  # Closing the listening socket does not mean Windows has released the
+  # process's cwd handle. Retry only sharing/lock violations on this exact
+  # transaction target; never delete a destination or terminate other clients.
+  for ($attempt = 0; $attempt -lt 50; $attempt++) {
+    try {
+      Move-InstallDirectoryOnce $FromRoot $ToRoot
+      return
+    } catch {
+      $nativeCode = $_.Exception.GetBaseException().HResult -band 0xffff
+      if ($nativeCode -notin @(32, 33) -or $attempt -eq 49) { throw }
+      Start-Sleep -Milliseconds 100
+    }
   }
 }
 
@@ -1053,6 +1133,7 @@ $failedRoot = Join-Path $installParent ($installLeaf + '.failed.' + [Guid]::NewG
 $sourceRootPath = ''
 $sourceLabel = ''
 $runtimeSource = ''
+$legacyRegistrySource = ''
 $movedRuntime = @()
 $hadExistingInstall = Test-Path -LiteralPath $InstallDir -PathType Container
 $promoted = $false
@@ -1070,6 +1151,19 @@ if ($MigrateFrom) {
   }
 }
 $runtimeSource = if ($hadExistingInstall) { $InstallDir } elseif ($MigrateFrom) { $MigrateFrom } else { '' }
+$legacyRegistrySource = if ($hadExistingInstall) {
+  # Cutover renames the old release to backupRoot. Read its legacy enrollment
+  # there only after promotion, through the hardened Node migration helper.
+  Join-Path $backupRoot 'config\github-repos.json'
+} elseif ($MigrateFrom) {
+  # Move-PreservedRuntime does not move release config, so an explicit source
+  # remains at this unchanged path throughout cutover.
+  Join-Path $MigrateFrom 'config\github-repos.json'
+} else {
+  # Passing the absent default explicitly keeps missing-file classification in
+  # the hardened helper rather than reintroducing a PowerShell path preflight.
+  Join-Path $InstallDir 'config\github-repos.json'
+}
 
 New-Item -ItemType Directory -Path $tempRoot, $extractRoot -Force | Out-Null
 try {
@@ -1117,7 +1211,7 @@ try {
   Assert-NoInjectedInstallFailure 'after-stage'
 
   if ($runtimeSource) {
-    $oldHealth = Stop-BridgeForCutover $runtimeSource $Port
+    $oldHealth = Stop-BridgeForCutover $runtimeSource $Port ([ref]$oldHealth)
     # Capture any operator edits made while staging, after the old process has
     # drained and immediately before the atomic promotion.
     Merge-OperatorConfiguration $stageRoot $runtimeSource
@@ -1131,13 +1225,19 @@ try {
   }
 
   if ($hadExistingInstall) {
-    Move-Item -LiteralPath $InstallDir -Destination $backupRoot
+    Move-InstallRootForCutover $InstallDir $backupRoot
     $oldRenamed = $true
   }
   Assert-NoInjectedInstallFailure 'after-old-rename'
-  Move-Item -LiteralPath $stageRoot -Destination $InstallDir
+  Move-InstallRootForCutover $stageRoot $InstallDir
   $promoted = $true
   Assert-NoInjectedInstallFailure 'after-promote'
+
+  # Runtime data wins over the legacy config file. Migrate immediately after
+  # promotion, before any candidate can listen and observe incomplete runtime
+  # enrollment. The helper atomically creates an absent target and can never
+  # replace an existing registry; any rejection enters the normal rollback.
+  Migrate-LegacyGitHubRegistry $InstallDir $legacyRegistrySource
 
   if (-not $NoStart) {
     $candidate = Start-StagedBridge $InstallDir $Port $buildInfo.buildId
@@ -1204,13 +1304,13 @@ try {
   }
   try {
     if ($promoted -and (Test-Path -LiteralPath $InstallDir)) {
-      Move-Item -LiteralPath $InstallDir -Destination $failedRoot
-      if ($hadExistingInstall -and (Test-Path -LiteralPath $backupRoot)) { Move-Item -LiteralPath $backupRoot -Destination $InstallDir }
+      Move-InstallRootForCutover $InstallDir $failedRoot
+      if ($hadExistingInstall -and (Test-Path -LiteralPath $backupRoot)) { Move-InstallRootForCutover $backupRoot $InstallDir }
       if ($runtimeSource -and $movedRuntime.Count -gt 0) {
         Restore-PreservedRuntime $failedRoot $runtimeSource $movedRuntime
       }
     } elseif (-not $promoted) {
-      if ($oldRenamed -and (Test-Path -LiteralPath $backupRoot)) { Move-Item -LiteralPath $backupRoot -Destination $InstallDir }
+      if ($oldRenamed -and (Test-Path -LiteralPath $backupRoot)) { Move-InstallRootForCutover $backupRoot $InstallDir }
       if ($runtimeSource -and $movedRuntime.Count -gt 0 -and (Test-Path -LiteralPath $stageRoot)) {
         Restore-PreservedRuntime $stageRoot $runtimeSource $movedRuntime
       }

@@ -53,3 +53,21 @@ test('MCP gates checkpoint metadata when the response is not explicitly partial'
   assert.equal(sanitized.partialCheckpointSha256, null);
   assert.equal(sanitized.partialCheckpointEventType, null);
 });
+
+test('writer hashes must be scalar strings and incomplete counts stay unknown', async () => {
+  const { sanitizeProviderResponse } = await import('../mcp/server.mjs');
+  const summary = sanitizeProviderResponse({ writer_diff_summary: {
+    available: true, beforeHead: ['a'.repeat(40)], afterHead: ['b'.repeat(40)],
+    statusHash: ['c'.repeat(64)], changedFileCount: null, changedFileCountLowerBound: 2,
+    unverifiedFileCount: 30, changeCountComplete: false,
+    files: [{ path: 'file.txt', pathHash: ['d'.repeat(64)] }],
+  } }).writerDiffSummary;
+  assert.equal(summary.beforeHead, null);
+  assert.equal(summary.afterHead, null);
+  assert.equal(summary.statusHash, null);
+  assert.equal(summary.files[0].pathHash, null);
+  assert.equal(summary.changedFileCount, null);
+  assert.equal(summary.changedFileCountLowerBound, 2);
+  assert.equal(summary.unverifiedFileCount, 30);
+  assert.equal(summary.changeCountComplete, false);
+});

@@ -2,7 +2,9 @@
 param()
 
 $ErrorActionPreference = 'Stop'
-$repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
+$repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).ProviderPath
+$releaseVersion = [string](([IO.File]::ReadAllText((Join-Path $repoRoot 'package.json')) | ConvertFrom-Json).version)
+$releaseBuildIdPattern = '^' + [regex]::Escape($releaseVersion) + '\+[a-f0-9]{16}$'
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ('relaybridge-mcp-install-test-' + [Guid]::NewGuid().ToString('N'))
 $bridgeRoot = Join-Path $testRoot 'RelayBridge'
 $bridgeRootB = Join-Path $testRoot 'RelayBridge-B'
@@ -110,6 +112,7 @@ try {
   Copy-Item -LiteralPath (Join-Path $repoRoot 'config\timeout-policy.json') -Destination (Join-Path $bridgeRoot 'config\timeout-policy.json')
   Copy-Item -LiteralPath (Join-Path $repoRoot 'lib\build-identity.cjs') -Destination (Join-Path $bridgeRoot 'lib\build-identity.cjs')
   Copy-Item -LiteralPath (Join-Path $repoRoot 'lib\github-tracker.js') -Destination (Join-Path $bridgeRoot 'lib\github-tracker.js')
+  Copy-Item -LiteralPath (Join-Path $repoRoot 'lib\platform.js') -Destination (Join-Path $bridgeRoot 'lib\platform.js')
   Copy-Item -LiteralPath (Join-Path $repoRoot 'tools\prepare-build-info.cjs') -Destination (Join-Path $bridgeRoot 'tools\prepare-build-info.cjs')
   Copy-Item -LiteralPath (Join-Path $repoRoot 'package.json') -Destination (Join-Path $bridgeRoot 'package.json')
   [IO.File]::WriteAllText((Join-Path $bridgeRoot 'mcp\server.mjs'), "// fake MCP entrypoint`n", [Text.UTF8Encoding]::new($false))
@@ -338,7 +341,7 @@ require('./fake-mcp-client.js');
     Assert-True (([IO.File]::GetAccessControl($tokenFileB)).GetOwner([Security.Principal.SecurityIdentifier]).Value -eq $foreignCheckoutTokenOwner) 'a later checkout A registration must preserve checkout B token ownership'
 
     $preparedBuild = [IO.File]::ReadAllText((Join-Path $bridgeRoot 'build-info.json'), [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
-    Assert-True ([string]$preparedBuild.buildId -match '^2\.0\.1\+[a-f0-9]{16}$') 'Windows MCP registration must prepare an exact source build identity'
+    Assert-True ([string]$preparedBuild.buildId -match $releaseBuildIdPattern) 'Windows MCP registration must prepare an exact source build identity'
     $codexAfter = [IO.File]::ReadAllText($codexConfig, [Text.UTF8Encoding]::new($false))
     $claudeAfter = [IO.File]::ReadAllText($claudeConfig, [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
     Assert-True ($codexAfter -match '\[mcp_servers\.relaybridge\]') 'Codex canonical registration must be created'
@@ -467,7 +470,7 @@ server.listen(Number(process.env.PORT), '127.0.0.1');
         $raceWinnerHealth = Invoke-RestMethod -Uri "http://127.0.0.1:$racePort/api/health" -TimeoutSec 2 -UseBasicParsing
         $raceWinnerHealthMatched = $raceWinnerPid -gt 0 -and
           [int64]$raceWinnerHealth.pid -eq [int64]$raceWinnerPid -and
-          $raceExpectedBuildId -match '^2\.0\.1\+[a-f0-9]{16}$' -and
+          $raceExpectedBuildId -match $releaseBuildIdPattern -and
           [string]$raceWinnerHealth.buildId -eq $raceExpectedBuildId -and
           $raceWinnerPid -ne $raceCandidatePid
       } catch { $raceWinnerHealthMatched = $false }

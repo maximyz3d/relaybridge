@@ -114,6 +114,53 @@ test('Perplexity sentinel detector rejects quoted content, later mentions, and e
   }), null, 'non-zero exits keep their existing terminal classification');
 });
 
+test('Gemini exact refusal and present-progress-only terminals are unusable with versioned evidence', () => {
+  const outputs = [
+    ['Sorry, I cannot fulfill your request. I am unable to perform adversarial reviews, vulnerability scanning, or security analysis on user-provided codebases.', 'provider_refusal', 'gemini_explicit_refusal'],
+    ['I am downloading the datasheets. This should just take a moment.', 'incomplete_response', 'gemini_progress_only'],
+    ['I am downloading the datasheets ... This should just take a moment.', 'incomplete_response', 'gemini_progress_only'],
+    ["I'll inspect the repository now.", 'incomplete_response', 'gemini_progress_only'],
+    ['I am reviewing the results.', 'incomplete_response', 'gemini_progress_only'],
+  ];
+  for (const [stdout, kind, detector] of outputs) {
+    const result = classifyRunFailure({ provider: 'gemini', prompt: 'Return concrete findings.', stdout, exitCode: 0 });
+    assert.equal(result.kind, kind, stdout);
+    assert.equal(result.partialResult, true); assert.equal(result.partialDiagnostic, stdout);
+    assert.equal(result.retryable, false); assert.equal(result.failUp, true);
+    assert.equal(result.outputDetector.id, detector); assert.equal(result.outputDetector.version, 1);
+    assert.equal(result.outputDetector.outputChars, stdout.length);
+    assert.match(result.outputDetector.outputHash, /^[0-9a-f]{64}$/);
+  }
+});
+
+test('literal transformations and requested plans retain their content across both narration detectors', () => {
+  for (const [prompt, stdout] of [
+    ['Please provide a detailed implementation plan.', "I'll inspect the repository now."],
+    ['Translate into English: Estoy descargando las hojas de datos.', 'I am downloading the datasheets.'],
+    ['Translate into English: Lo siento, no puedo cumplir con su solicitud.', 'Sorry, I cannot fulfill your request.'],
+    ['Repeat verbatim: I will inspect the repository.\nNext I will review the tests.', 'I will inspect the repository.\nNext I will review the tests.'],
+    ['Return findings.', 'I am reviewing the results: the cache has two unbounded maps.'],
+    ['Return findings.', 'I am reviewing the tests and found a cache race.'],
+  ]) assert.equal(classifyRunFailure({ provider: 'gemini', prompt, stdout, exitCode: 0 }).kind, 'ok', prompt);
+  assert.equal(classifyRunFailure({ provider: 'gemini', prompt: 'Plan then implement the fix.',
+    stdout: "I'll inspect the repository now.", exitCode: 0 }).kind, 'incomplete_response');
+});
+
+test('Gemini terminal detectors reject quoted examples, mixed results and unsupported provider identities', () => {
+  const progress = 'I am downloading the datasheets. This should just take a moment.';
+  const refusal = 'Sorry, I cannot fulfill your request.';
+  for (const stdout of [
+    progress + '\nVerdict: Part A supports 3.3 V; Part B does not.',
+    refusal + '\nHowever, here is the completed review: no material findings.',
+    'I cannot verify fabrication readiness, but the schema validation has a race at line 12.',
+    '"' + progress + '"', '> ' + refusal, '```text\n' + refusal + '\n```',
+    '| Example |\n| ' + progress + ' |', JSON.stringify({ example: refusal }),
+  ]) assert.equal(classifyRunFailure({ provider: 'gemini', stdout, exitCode: 0 }).kind, 'ok', stdout);
+  assert.equal(classifyRunFailure({ provider: 'gemini', prompt: 'Repeat verbatim: ' + progress, stdout: progress, exitCode: 0 }).kind, 'ok');
+  assert.equal(classifyRunFailure({ provider: 'unrelated', stdout: progress, exitCode: 0 }).kind, 'ok');
+  assert.equal(classifyRunFailure({ provider: 'gemini', stdout: refusal, exitCode: 0, stopReason: 'token_budget' }).kind, 'supervisor_token_budget');
+});
+
 test('Grok future-tense process narration is incomplete, preserved, and never retried on the same seat', () => {
   const stdout = 'I will inspect the repository and trace the relevant pipeline.\nNext I will review the tests and report any defects.';
   assert.equal(isNarrationOnlyResponse({ prompt: 'Audit this repository and return concrete findings.', stdout }), true);

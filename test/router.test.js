@@ -9,11 +9,92 @@ test.before(async () => {
   router = await import('../mcp/router.mjs');
 });
 
+test('deterministic preference cannot replace architecture or mixed semantic work', () => {
+  for (const task of ['Design the architecture and migration for this repository.',
+    'Compute SHA256 then review architecture safety.', 'Compute SHA256 then explain how collision resistance works.',
+    "List files and summarize each file's purpose.", 'Compute SHA256 then draft a poem.', 'Is SHA256 secure?',
+    'Compute SHA256 plus draft a short poem.', 'Show git status followed by a short poem.',
+    'Compute SHA256 while drafting a short poem.', 'Show git status with a short poem.']) {
+    const route = router.routeTask({ task, diagnostics: readyDiagnostics(), preferredProviders: ['powershell'] });
+    assert.equal(route.classification.signals.whollyDeterministic, false);
+    assert.notEqual(route.primaryTag, 'deterministic');
+    assert.equal(route.selected.some((row) => row.kind === 'powershell'), false);
+    const shell = route.candidates.find((row) => row.kind === 'powershell');
+    assert.equal(shell.eligible, false); assert.ok(shell.policyScore > 0, 'hard gate wins despite boosted positive preference');
+    assert.match(shell.ineligibilityReasons.join(' '), /model invocation/);
+  }
+  for (const task of ['Compute the SHA256 hash.', 'Show git status.', 'Count lines in the text.', 'Compute SHA256 of "input file.txt".']) {
+    const route = router.routeTask({ task, diagnostics: readyDiagnostics() });
+    assert.equal(route.classification.signals.whollyDeterministic, true, task);
+    assert.equal(route.selected[0].kind, 'powershell', task);
+  }
+  const heavy = router.routeTask({ task: 'Compute SHA256.', diagnostics: readyDiagnostics(), modelTier: 'heavy', preferredProviders: ['powershell'] });
+  assert.equal(heavy.selected.some((row) => row.kind === 'powershell'), false);
+});
+
+test('software scanner/render and terse security engineering receive semantic coding classification', () => {
+  for (const task of ['Repair the placeholder scanner and binder calls; add mutation tests for render calls.',
+    'Fix fail-closed gates and races; add regression tests.', 'Hostile audit of CLI isolation and schema validation.',
+    'Repair the image placeholder scanner and update render calls.', 'Implement OCR error handling in scanner.js.']) {
+    const classification = router.classifyTask(task);
+    assert.notEqual(classification.tier, 'utility', task); assert.ok(classification.tags.includes('coding'), task);
+    assert.equal(classification.tags.includes('vision'), false, task);
+  }
+  assert.ok(router.classifyTask('Implement scanner.js after inspecting the screenshot; describe the image.').tags.includes('vision'));
+  for (const task of ['Review the screenshot then fix app.js.', 'Check this screenshot and implement the UI fix.']) {
+    const route = router.routeTask({ task, diagnostics: readyDiagnostics() });
+    assert.ok(route.classification.tags.includes('vision'), task);
+    assert.equal(route.noEligibleRoute, true, 'no shipped vision-qualified seat may claim this task');
+  }
+});
+
+test('undersized and unavailable providers cannot re-enter through preference or fallback', () => {
+  const diagnostics = readyDiagnostics();
+  for (const kind of ['claude', 'claude_fable', 'codex', 'gemini', 'grok', 'perplexity']) diagnostics[kind] = { found: true, ready: false };
+  const route = router.routeTask({ task: 'Design the architecture and migration for this repository.', diagnostics,
+    preferredProviders: ['copilot', 'ollama_fast', 'powershell'] });
+  assert.equal(route.noEligibleRoute, true); assert.deepEqual(route.selected, []);
+  for (const kind of ['copilot', 'ollama_fast', 'ollama_llama', 'ollama_coder']) {
+    const row = route.candidates.find((candidate) => candidate.kind === kind);
+    assert.equal(row.eligible, false); assert.match(row.ineligibilityReasons.join(' '), /tier ceiling/);
+  }
+});
+
+test('vision and invocation-mode declarations are explicit capabilities, not provider-name guesses', () => {
+  const routingData = router.loadRoutingData();
+  routingData.evidence.providers.gemini.capabilities.push('vision'); // Fixture-only qualification.
+  const args = { task: 'Inspect this screenshot and perform OCR on the image.', diagnostics: readyDiagnostics(), routingData,
+    invocationCapabilities: { gemini: ['model_invocation'] } };
+  assert.equal(router.routeTask(args).selected[0].kind, 'gemini');
+  assert.equal(router.routeTask({ ...args, dangerous: true, invocationCapabilities: {} }).noEligibleRoute, true);
+  assert.equal(router.routeTask({ ...args, invocationCapabilities: { gemini: ['tool_use', 'workspace_read'] } }).noEligibleRoute, true);
+});
+
 function readyDiagnostics() {
   return Object.fromEntries([
     'powershell', 'ollama_fast', 'ollama_llama', 'ollama', 'ollama_coder', 'claude', 'codex', 'copilot', 'gemini', 'grok', 'perplexity', 'groq_llama_fast',
   ].map((kind) => [kind, { found: true, ready: true, detail: 'test ready' }]));
 }
+
+test('Fable critical planning qualification retains exact observed evidence and no writer slot', () => {
+  const evidence = router.loadRoutingData().evidence.providers.claude_fable;
+  assert.equal(evidence.maxRecommendedTier, 'critical');
+  assert.equal(evidence.qualificationEvidence.receiptId, 'rcpt_mtnq79ny_eaa8acc5');
+  assert.equal(evidence.qualificationEvidence.resolvedModelIdentity, 'claude-fable-5');
+  assert.equal(evidence.qualificationEvidence.result, 'completed_plan_ready');
+  const config = require('../cli-config.json');
+  assert.ok(!config.claude_fable.oneshot_dangerous?.length);
+  const route = router.routeTask({ task: 'Critical security architecture planning for fail-closed native process ownership and crash recovery.',
+    diagnostics: { ...readyDiagnostics(), claude_fable: { found: true, ready: true } }, preferredProviders: ['claude_fable'] });
+  assert.equal(route.candidates.find((row) => row.kind === 'claude_fable').eligible, true);
+  const { buildTaskPlan } = require('../lib/task-plan');
+  const safe = buildTaskPlan({ route, config, requestedKind: 'claude_fable', requestedModelTier: 'heavy' });
+  assert.equal(safe.primary.execution.model, 'fable');
+  assert.equal(safe.primary.execution.authorityMode, 'safe');
+  const writer = buildTaskPlan({ route, config, requestedKind: 'claude_fable', requestedModelTier: 'heavy', dangerous: true });
+  assert.equal(writer.primary.blocked, true);
+  assert.equal(writer.primary.execution, null);
+});
 
 test('utility lookup is local-first and a complex coding task fails up', () => {
   const utility = router.routeTask({

@@ -320,6 +320,39 @@ Writer-capable route/plan previews require both `dangerous:true` and
 `acknowledgeFilesystemWrites:true`; neither field changes execution authority
 by itself.
 
+Workspace grounding is a separate pre-invocation requirement. Supplying a
+`cwd` does not give an HTTP or prompt-only provider access to local files.
+Each provider declares `oneshot_capabilities.safe` and, separately,
+`oneshot_capabilities.dangerous`; `model_invocation`, `workspace_read`,
+`workspace_write`, and `tool_use` describe the actual configured invocation.
+These declarations do not qualify an unverified filesystem boundary. Routing
+enforces task-family capabilities and approved complexity ceilings before
+applying cost, preference, or diversity scores. A deterministic shell cannot
+replace a model for architecture, reasoning, or mixed semantic work.
+
+REST and MCP planning/execution accept `requiresWorkspaceAccess:true` and an
+optional `inlineEvidence` object containing `content`, its UTF-8 `sha256`, and
+the admitted workspace's `cwdIdentityHash`. The CLI exposes these as
+`--requires-workspace-access` and `--inline-evidence '<json>'`. A validated
+bundle is appended exactly once and may support a prompt-only answer, but
+never authorizes writes. The digest proves transport integrity, not that the
+content is accurate or complete. Setting the requirement to `false` does not
+bypass detected file-dependent work. Unsupported grounding and oversized
+composed prompts fail before any invocation, including committee members;
+receipts identify zero attempts and the reason. Grounding admission is
+rechecked before cache lookup. File citations outside the workspace or on a
+foreign platform are reported as uncheckable, not fabricated merely because a
+local basename is absent.
+
+An exit-zero provider response is not necessarily completed work. Narrow,
+whole-response refusal and unfinished-progress detectors preserve diagnostic
+text but exclude it from successful answers and caches. Receipts record the
+detector version and output digest. A local token-budget stop remains a
+`token_budget` failure even when an accepted Claude terminal result also
+reports HTTP 429; that independent provider signal may establish its scoped
+cooldown. Assistant prose, discarded late output, and local budget stops alone
+cannot establish a provider quota reset.
+
 The global `_supervisor.providerBudget` sets provider-reported ceilings for
 output tokens, total tokens (including cache traffic), cache reads, cache
 creation, and turns. Provider entries may override them generally with
@@ -351,10 +384,24 @@ are carried with the capability so a future CLI upgrade can be re-evaluated.
 Standard Claude planning defaults to Sonnet/medium; complex plans route to
 Opus/high and the hardest plans can use Fable's explicit heavy tier. Fable has
 no dangerous slot. Bounded Claude revisions use the `claude` provider's
-Sonnet/medium writer slot. Maximum effort is never inferred: a caller must send
-both `effort: "max"` and `maxEffortOverride: true`. Claude accepts max directly;
+Sonnet/medium writer slot. Extreme effort requires explicit intent and
+`maxEffortOverride: true`, including an exact xhigh/max model variant. Claude accepts max directly;
 Codex maps that cross-provider request to `xhigh`, its highest supported normal
 CLI configuration value, rather than silently reducing it to high.
+
+Planning returns a versioned `primary.execution` intent tuple. Pass it unchanged
+to REST `/api/oneshot`, `/api/tasks`, or MCP `ask_provider`/`submit_task` with the
+same provider. The CLI and routed/committee tools forward it automatically.
+The tuple binds the exact model, requested and applied effort, and provider
+configuration fingerprint; it grants no permissions and contains no executable
+arguments. Replays rebuild controls from live configuration and reject model,
+effort, authority, or catalog mismatches before invocation—even on cache hits.
+A broadcast may use one tuple only when targeting its single bound provider.
+Unsupported explicit effort is rejected; inferred effort may fall back with an
+explanation. HTTP adapters currently expose no reasoning-effort control.
+`resolved_outgoing_model` records requested transport identity, while
+`observed_model` is populated only when the provider reports one. Unknown final
+model revisions remain unknown.
 
 Provider prompts default to a 20-minute deadline and accept an explicit
 `timeoutMs` up to 45 minutes. The liveness supervisor also grants buffered
@@ -369,6 +416,18 @@ tree. Rerun `install-mcp.ps1` or `install-mcp.sh` after changing this policy so
 Codex receives a host-side tool timeout long enough to cover the provider cap and transport
 grace. These longer deadlines do not change `dangerous:false`, advisory-only
 committee behavior, or any human gate.
+
+Gemini/Antigravity print slots use `print_timeout_policy: supervisor_margin_v1`
+and the server-owned `{supervisor_print_timeout}` placeholder. Preview and
+dispatch derive its finite wait from the effective supervisor hard cap plus
+30–31 seconds; no fixed 15-minute or unlimited override is used. Both safe and
+writer slots follow this rule, and linked-account flags cannot override it.
+`primary.cliDeadline` and `route.cli_deadline` report the rendered value;
+changing the runtime timeout does not change the bound model/effort tuple.
+The CLI forwards the planned deadline. Raw REST requests with no explicit
+timeout use the supervisor's configured hard cap (45 minutes by default),
+while MCP callers normally supply the shared 20-minute default.
+See [Antigravity headless timeout controls](https://antigravity.google/docs/cli/headless/).
 
 Common setup commands:
 
@@ -614,15 +673,47 @@ the MCP transport deadline is `mcp_deadline_cancelled`. Neither is retried.
 `modelInvocation` remains truthful, and token usage stays `unknown` unless the
 provider itself reported usage; raw transport bytes are never treated as billed
 tokens. Completion and sticky supervisor verdicts win races idempotently, and
-process-tree cleanup still drives the active one-shot census back to zero.
+physical transport cleanup, rather than socket closure, owns HTTP admission.
+
+Ollama and hosted HTTP attempts appear in `/api/runs/active` before the first
+response byte, with their own `runId`, supervisor progress and
+`transportLifecycle`. HTTP CPU evidence is unavailable; local cancellation
+does not prove remote inference stopped. A fully validated terminal seals
+semantic output after usage and final-text budget checks. Admission remains
+held through bounded EOF/abort drainage and resource cleanup. Later malformed
+bytes are transport diagnostics and cannot replace an accepted answer or its
+usage. A pre-terminal disconnect still cancels this synchronous endpoint.
+
+HTTP `length` results are incomplete (`max_tokens`), refusals are not success,
+and tool requests are `tool_deferred`; these never enter the success cache.
+Unknown and administrative terminal reasons are incomplete. For legacy Ollama
+responses only, an omitted `done_reason` with `done:true` is supported and
+explicitly marked `ollama_done_without_reason_v1`. This is a compatibility
+policy, not evidence of a reported stop reason. See the official
+[Ollama response fields](https://docs.ollama.com/api/generate) and
+[Groq completion schema](https://github.com/groq/groq-typescript/blob/main/src/resources/chat/completions.ts).
+HTTP usage marks `cache_input_included:true`: cached-input counts are a
+breakdown of input tokens, not additional tokens. Claude's exclusive cache
+counts retain their additive accounting.
 
 Timeout receipts distinguish the causal layer. A Relay liveness stop reports
 `providerTimeoutSource: relay_supervisor`; an upstream HTTP timeout reports
 `provider_api_status`; and a provider CLI that exits with an authoritative
-internal-timeout diagnostic reports `provider_cli_diagnostic`. All three are
-normalized to `timed_out` / `failureClass: timeout`, while `stopReason` and
-`supervisorStopReason` preserve whether Relay itself killed the process. Token
-usage remains unknown when the provider did not report it.
+timeout diagnostic reports `provider_cli_diagnostic` and canonical
+`failureClass: provider_timeout_unclassified`. The latter retains the
+provider-reported `timed_out` flag, but does not prove whether a local print
+wait, cancellation, or upstream request failed. Antigravity 1.1.22 uses the
+same error text for more than one of these paths; elapsed time and exact text
+are not sufficient to claim an API status or local timer cause. Confirmed
+Relay/HTTP timeouts remain `failureClass: timeout`; `stopReason` and
+`supervisorStopReason` preserve whether Relay itself stopped the process.
+Token usage remains unknown when the provider did not report it.
+
+A successful Codex text-mode run uses its nonempty final stdout as the answer;
+stderr is a progress transcript, not failure evidence. Such progress text is
+neither returned nor persisted: receipts retain only its character count and
+SHA-256. Failed or empty-answer runs retain diagnostic classification. This
+matches [Codex's stdout/stderr contract](https://learn.chatgpt.com/docs/non-interactive-mode).
 
 Provider success is based on the normalized terminal result, not only the
 process exit code. In particular, a Perplexity exit-zero response whose exact

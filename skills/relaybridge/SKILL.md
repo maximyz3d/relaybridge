@@ -302,7 +302,7 @@ analysis, fan in for the decision.
 ## GitHub tracking (enrolled repos)
 
 If the run's working directory is inside a repo enrolled in
-`config/github-repos.json`, RelayBridge automatically checkpoints the work
+`data/github-repos.json` (or `RELAYBRIDGE_GITHUB_REPOS`), RelayBridge automatically checkpoints the work
 after each successful run: commit → DEVLOG → (opt-in) push → draft PR → bump
 label. Associate work by tagging the prompt:
 

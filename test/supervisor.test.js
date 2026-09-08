@@ -236,6 +236,7 @@ test('provider-reported multi-turn usage stops at a distinct token budget withou
 
 test('provider token reserve requests finalization once without weakening the hard ceiling', () => {
   const s = make({
+    finalizationSupported: true,
     providerBudget: {
       maxOutputTokens: null, maxTotalTokens: 10000, maxCacheReadTokens: null,
       maxCacheCreationTokens: null, maxTurns: null,
@@ -252,7 +253,11 @@ test('provider token reserve requests finalization once without weakening the ha
   assert.equal(reserve.action, 'finalize');
   assert.equal(reserve.reason, 'token_budget_reserve');
   assert.equal(reserve.reserve.reserve, 1000, 'reserve is capped at 10% of a small caller budget');
-  assert.equal(s.evaluate(T0 + 3000).action, 'continue', 'finalization is requested only once');
+  assert.equal(s.evaluate(T0 + 2500).action, 'finalize', 'inspection cannot consume a pending advisory');
+  assert.equal(s.snapshot(T0 + 2500).finalizationRequested, null);
+  assert.equal(s.acknowledgeFinalization(reserve.reserve), true);
+  assert.equal(s.acknowledgeFinalization(reserve.reserve), false);
+  assert.equal(s.evaluate(T0 + 3000).action, 'continue', 'acknowledged finalization is requested only once');
   s.recordProviderUsage({ total_tokens: 10001 }, { phase: 'incremental' });
   const killed = s.evaluate(T0 + 4000);
   assert.equal(killed.action, 'kill');
@@ -262,6 +267,7 @@ test('provider token reserve requests finalization once without weakening the ha
 
 test('hard stop guards take precedence over a finalization reserve on the same tick', async (t) => {
   const reserveOptions = {
+    finalizationSupported: true,
     providerBudget: {
       maxOutputTokens: null, maxTotalTokens: 10000, maxCacheReadTokens: null,
       maxCacheCreationTokens: null, maxTurns: null,
@@ -300,13 +306,22 @@ test('hard stop guards take precedence over a finalization reserve on the same t
 });
 
 test('terminal usage never requests a pointless finalization turn', () => {
-  const s = make({ providerBudget: {
+  const s = make({ finalizationSupported: true, providerBudget: {
     maxOutputTokens: null, maxTotalTokens: 10000, maxCacheReadTokens: null,
     maxCacheCreationTokens: null, maxTurns: null,
   } });
   s.recordProviderUsage({ total_tokens: 9500 }, { phase: 'terminal' });
   assert.equal(s.evaluate(T0 + 1000).action, 'continue');
   assert.equal(s.snapshot(T0 + 1000).finalizationRequested, null);
+});
+
+test('unsupported live input never receives a finalization advisory', () => {
+  const s = make({ providerBudget: { maxTotalTokens: 1000 } });
+  s.recordProviderUsage({ total_tokens: 950 }, { phase: 'incremental' });
+  assert.equal(s.evaluate(T0 + 1000).action, 'continue');
+  assert.equal(s.acknowledgeFinalization({ threshold: 900 }), false);
+  s.recordProviderUsage({ total_tokens: 1001 }, { phase: 'incremental' });
+  assert.equal(s.evaluate(T0 + 2000).reason, 'token_budget');
 });
 
 test('missing or malformed provider usage never falls back to output-size enforcement', () => {

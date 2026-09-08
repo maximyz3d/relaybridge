@@ -42,6 +42,12 @@ test('MCP provider accounting rejects malformed usage and contradictory retry ag
     input_tokens: 10, output_tokens: 5, cache_read_input_tokens: '999',
     cache_creation_input_tokens: 0, total_tokens: 15,
   }, true), null);
+  const inclusive = normalizeProviderUsage({ input_tokens: 12, output_tokens: 6, total_tokens: 18,
+    cache_read_input_tokens: 7, cache_input_included: true }, true);
+  assert.equal(inclusive.total_tokens, 18); assert.equal(inclusive.cache_read_input_tokens, 7);
+  assert.equal(inclusive.cache_input_included, true);
+  assert.equal(normalizeProviderUsage({ input_tokens: 12, output_tokens: 6, total_tokens: 18,
+    cache_read_input_tokens: 7 }, true).total_tokens, 25, 'Claude-style exclusive cache input remains additive');
   for (const malformedCost of [false, '1.25', -1, Infinity]) {
     assert.equal(normalizeProviderUsage({
       input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0,
@@ -118,13 +124,21 @@ async function waitForHealth(baseUrl, proc) {
   throw new Error('timed out waiting for test bridge');
 }
 
-test('MCP stdio exposes resources, safe tools, routing, and provider receipts', { timeout: 30000 }, async (t) => {
+function isLiveProcess(pid) {
+  try { process.kill(Number(pid), 0); return true; }
+  catch { return false; }
+}
+
+test('MCP stdio exposes resources, safe tools, routing, and provider receipts', {
+  timeout: process.platform === 'win32' ? 120000 : 30000,
+}, async (t) => {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ps-bridge-mcp-test-'));
   const tokenPath = path.join(tempRoot, 'capability.token');
   const dataDir = path.join(tempRoot, 'data');
   const staleDataDir = path.join(tempRoot, 'stale-mcp-data');
   const configPath = path.join(tempRoot, 'config.json');
   const invocationMarker = path.join(tempRoot, 'identity-provider-invocations.txt');
+  const lateFinalPidMarker = path.join(tempRoot, 'late-final-provider.pid');
   const allowedRootA = path.join(tempRoot, 'allowed-a');
   const allowedRootB = path.join(tempRoot, 'allowed-b');
   const outsideRoot = path.join(tempRoot, 'outside');
@@ -134,6 +148,7 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   const helper = path.join(ROOT, 'test', 'prompt-file-cli.js');
   const echoProvider = {
       label: 'Echo',
+      oneshot_capabilities: { safe: ['model_invocation', 'workspace_read', 'tool_use'], dangerous: ['model_invocation', 'workspace_read', 'workspace_write', 'tool_use'] },
       safe: [process.execPath, helper, '--version'],
       dangerous: [process.execPath, helper, '--version'],
       oneshot_safe: [
@@ -188,7 +203,8 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
       ...echoProvider,
       label: 'Structured Claude budget-stop fixture',
       oneshot_safe: [
-        process.execPath, helper, '--prompt-file', '{prompt_file}', '--claude-json-multiturn',
+        process.execPath, helper, '--prompt-file', '{prompt_file}',
+        '--claude-json-multiturn-late-final', '--pid-marker', lateFinalPidMarker,
       ],
       oneshot_output_parser: 'claude_json',
     },
@@ -535,7 +551,7 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   assert.ok(listedResources.resources.some((resource) => resource.uri === 'psbridge://context'));
   const healthResource = await client.readResource({ uri: 'psbridge://health' });
   const healthPayload = JSON.parse(healthResource.contents[0].text);
-  assert.equal(healthPayload.version, '2.0.1');
+  assert.equal(healthPayload.version, require('../package.json').version);
   assert.equal(healthPayload.buildId, 'integration-current');
   assert.equal(healthPayload.buildIdentityReady, true);
   assert.equal(healthPayload.buildIdentitySource, 'test_override');
@@ -629,7 +645,7 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   assert.equal(contextBundle.isError, undefined, JSON.stringify(contextBundle.structuredContent));
   assert.match(contextBundle.structuredContent.bundleId, /^ctx_/);
   assert.equal(contextBundle.structuredContent.bundleId, `ctx_${contextBundle.structuredContent.contentSha256.slice(0, 20)}`);
-  assert.equal(contextBundle.structuredContent.bridge.health.version, '2.0.1');
+  assert.equal(contextBundle.structuredContent.bridge.health.version, require('../package.json').version);
   assert.ok(contextBundle.structuredContent.providers.length >= 3);
   assert.equal(contextBundle.structuredContent.transfer.withinBudget, true);
   assert.ok(contextBundle.structuredContent.transferGuide.delegatedWork.includes('get_run'));
@@ -931,8 +947,8 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   assert.equal(providerTimeout.structuredContent.modelInvocation, true);
   assert.equal(providerTimeout.structuredContent.droppedOut, true);
   assert.equal(providerTimeout.structuredContent.timedOut, true);
-  assert.equal(providerTimeout.structuredContent.failureClass, 'timeout');
-  assert.equal(providerTimeout.structuredContent.stopReason, 'provider_internal_timeout');
+  assert.equal(providerTimeout.structuredContent.failureClass, 'provider_timeout_unclassified');
+  assert.equal(providerTimeout.structuredContent.stopReason, 'provider_timeout_unclassified');
   assert.equal(providerTimeout.structuredContent.supervisorStopReason, null);
   assert.equal(providerTimeout.structuredContent.providerTimeoutSource, 'provider_cli_diagnostic');
 
@@ -950,6 +966,8 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   assert.equal(claudeBudgetPartial.structuredContent.droppedOut, true);
   assert.equal(claudeBudgetPartial.structuredContent.partialResult, true);
   assert.equal(claudeBudgetPartial.structuredContent.failureClass, 'token_budget');
+  assert.equal(claudeBudgetPartial.structuredContent.rateLimited, false,
+    'late provider text cannot override the sticky MCP budget verdict');
   assert.equal(claudeBudgetPartial.structuredContent.stopReason, 'token_budget');
   assert.equal(claudeBudgetPartial.structuredContent.supervisorStopReason, 'token_budget');
   assert.equal(claudeBudgetPartial.structuredContent.partialDiagnostic, 'turn 2\n\nturn 3');
@@ -957,6 +975,13 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   assert.equal(claudeBudgetPartial.structuredContent.cleanedOutputUnavailable, true);
   assert.doesNotMatch(claudeBudgetPartial.structuredContent.partialDiagnostic,
     /THINKING_MUST_NOT_ESCAPE|TOOL_INPUT_MUST_NOT_ESCAPE|DUPLICATE_ID_MUST_NOT_ESCAPE/);
+  const lateFinalPid = Number(fs.readFileSync(lateFinalPidMarker, 'utf8').trim());
+  assert.ok(Number.isSafeInteger(lateFinalPid) && lateFinalPid > 0);
+  assert.equal(isLiveProcess(lateFinalPid), false,
+    'MCP must not return until the late-final provider process is gone');
+  assert.equal(Object.prototype.hasOwnProperty.call(
+    JSON.parse(fs.readFileSync(cooldownsPath, 'utf8')), 'usage_json_multiturn',
+  ), false, 'late provider success must not mutate MCP account cooldown state');
 
   const narrationOnly = await client.callTool({
     name: 'ask_provider',
@@ -966,7 +991,9 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   assert.equal(narrationOnly.structuredContent.droppedOut, true);
   assert.equal(narrationOnly.structuredContent.failureClass, 'incomplete_response');
   assert.equal(narrationOnly.structuredContent.stopReason, 'provider_incomplete_response');
-  assert.match(narrationOnly.structuredContent.stdout, /^I will inspect/);
+  assert.equal(narrationOnly.structuredContent.stdout, '');
+  assert.match(narrationOnly.structuredContent.partialDiagnostic, /^I will inspect/);
+  assert.equal(narrationOnly.structuredContent.outputDetector.id, 'future_narration_only');
 
   const perplexityPartial = await client.callTool({
     name: 'ask_provider',
@@ -1158,10 +1185,9 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
       useCache: false,
     },
   });
-  assert.equal(cwdRoute.structuredContent.status, 'failed');
-  assert.ok(cwdRoute.structuredContent.route.candidates.length > 1, 'the route had alternatives but must not replay a deterministic cwd rejection');
-  assert.equal(cwdRoute.structuredContent.attempts.length, 1);
-  assertCwdDiagnostic(cwdRoute.structuredContent.attempts[0]);
+  assert.equal(cwdRoute.structuredContent.blocked, true);
+  assert.equal(cwdRoute.structuredContent.attempts.length, 0, 'cwd is rejected before any routing attempt');
+  assertCwdDiagnostic(cwdRoute.structuredContent);
 
   const cwdCommittee = await client.callTool({
     name: 'run_committee',
@@ -1174,11 +1200,11 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
       useCache: false,
     },
   });
-  assert.equal(cwdCommittee.structuredContent.status, 'failed');
-  assert.equal(cwdCommittee.structuredContent.members.length, 2);
-  cwdCommittee.structuredContent.members.forEach(assertCwdDiagnostic);
+  assert.equal(cwdCommittee.structuredContent.blocked, true);
+  assert.equal(cwdCommittee.structuredContent.members.length, 0);
+  assertCwdDiagnostic(cwdCommittee.structuredContent);
 
-  for (const rejectedMember of [cwdRoute.structuredContent.attempts[0], ...cwdCommittee.structuredContent.members]) {
+  for (const rejectedMember of [cwdRoute.structuredContent, cwdCommittee.structuredContent]) {
     assert.match(rejectedMember.transportReceiptId, /^rcpt_/);
     assert.equal(rejectedMember.transportReceiptPersisted, true);
     const outer = await client.callTool({
@@ -1202,11 +1228,7 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
     assert.equal(containsPath(transportReceipt.structuredContent.receipt, outsideRoot), false);
   }
 
-  const cwdCommitteeRun = await client.callTool({
-    name: 'get_run', arguments: { runId: cwdCommittee.structuredContent.runId },
-  });
-  assert.equal(cwdCommitteeRun.structuredContent.members.length, 2);
-  cwdCommitteeRun.structuredContent.members.forEach(assertCwdDiagnostic);
+  assert.equal(cwdCommittee.structuredContent.runId, undefined, 'all-member rejection precedes creation of a running committee');
 
   const routedProvider = await client.callTool({
     name: 'route_and_ask',
@@ -1226,7 +1248,7 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   const routedEffort = routedTier === 'utility' ? 'low'
     : ['complex', 'critical'].includes(routedTier) ? 'high' : 'medium';
   assert.equal(routedProvider.structuredContent.winner.route.task_tier, routedTier);
-  assert.equal(routedProvider.structuredContent.winner.route.requested_model_tier, routedModelTier);
+  assert.equal(routedProvider.structuredContent.winner.route.requested_model_tier, null, 'routing weight is inferred, not a caller model-tier request');
   assert.equal(routedProvider.structuredContent.winner.route.model_tier, routedModelTier);
   assert.equal(routedProvider.structuredContent.winner.route.requested_effort, null);
   assert.equal(routedProvider.structuredContent.winner.route.applied_effort, routedEffort);
@@ -1272,7 +1294,8 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   assert.deepEqual(strictCommittee.structuredContent.members.map((member) => member.kind), ['codex']);
   assert.equal(strictCommittee.structuredContent.members[0].route.task_tier,
     strictCommittee.structuredContent.route.classification.tier);
-  assert.equal(strictCommittee.structuredContent.members[0].route.requested_model_tier,
+  assert.equal(strictCommittee.structuredContent.members[0].route.requested_model_tier, null);
+  assert.equal(strictCommittee.structuredContent.members[0].route.model_tier,
     strictCommittee.structuredContent.route.classification.tier === 'utility' ? 'light'
       : ['complex', 'critical'].includes(strictCommittee.structuredContent.route.classification.tier)
         ? 'heavy' : 'standard');
@@ -1283,7 +1306,7 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   const localConsensus = await client.callTool({
     name: 'run_committee',
     arguments: {
-      task: 'Review this JavaScript function and propose a test.',
+      task: 'Explain this bounded scenario and outline assumptions and give a short recommendation.',
       providers: ['ollama', 'ollama_coder'],
       maxProviders: 2,
       localOnly: true,
@@ -1301,14 +1324,14 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   const unprovenConsensus = await client.callTool({
     name: 'run_committee',
     arguments: {
-      task: 'Review this JavaScript function and state whether the reviewers actually agree.',
+      task: 'Explain this bounded scenario and outline assumptions and state whether the reviewers actually agree.',
       providers: ['ollama', 'ollama_coder'],
       maxProviders: 2,
       localOnly: true,
       mode: 'consensus',
       synthesisProvider: 'ollama',
       useCache: false,
-      timeoutMs: 5000,
+      timeoutMs: process.platform === 'win32' ? 15000 : 5000,
     },
   });
   assert.equal(unprovenConsensus.structuredContent.synthesisCompleted, true);
@@ -1327,7 +1350,7 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   }, { signal: controller.signal });
   setTimeout(() => controller.abort(new Error('test cancellation')), 150);
   await assert.rejects(slowCall);
-  const cancellationDeadline = Date.now() + 5000;
+  const cancellationDeadline = Date.now() + (process.platform === 'win32' ? 15000 : 5000);
   let activeTaskCount = -1;
   while (Date.now() < cancellationDeadline) {
     const health = await (await fetch(`${baseUrl}/api/health`)).json();
@@ -1346,7 +1369,7 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   const cancelledCommittee = client.callTool({
     name: 'run_committee',
     arguments: {
-      task: 'Review this JavaScript function for cancellation behavior.',
+      task: 'Explain this bounded scenario and outline assumptions and describe cancellation behavior.',
       providers: ['ollama', 'ollama_coder'],
       maxProviders: 2,
       localOnly: true,
@@ -1355,7 +1378,7 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
       timeoutMs: 20000,
     },
   }, { signal: committeeController.signal });
-  const runningRunDeadline = Date.now() + 5000;
+  const runningRunDeadline = Date.now() + (process.platform === 'win32' ? 15000 : 5000);
   let runningRunObserved = false;
   while (Date.now() < runningRunDeadline && !runningRunObserved) {
     for (const name of fs.readdirSync(runsDir)) {
@@ -1437,6 +1460,26 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   });
   assert.equal(usageTransport.structuredContent.receipt.actualTotalTokens, usageOuterReceipt.actualTotalTokens);
   assert.equal(usageTransport.structuredContent.receipt.requestId, usageOuterReceipt.requestId);
+  const budgetOuterReceipt = receipts.structuredContent.receipts.find((receipt) =>
+    receipt.receiptId === claudeBudgetPartial.structuredContent.receiptId);
+  assert.equal(budgetOuterReceipt.status, 'dropped');
+  assert.equal(budgetOuterReceipt.failureClass, 'token_budget');
+  assert.equal(budgetOuterReceipt.stopReason, 'token_budget');
+  assert.equal(budgetOuterReceipt.supervisorStopReason, 'token_budget');
+  assert.equal(budgetOuterReceipt.resultSubtype, null);
+  assert.equal(budgetOuterReceipt.actualTotalTokens, 1695);
+  assert.match(budgetOuterReceipt.transportReceiptId, /^rcpt_/);
+  const budgetTransport = await client.callTool({
+    name: 'get_receipt', arguments: { receiptId: budgetOuterReceipt.transportReceiptId },
+  });
+  assert.equal(budgetTransport.structuredContent.receipt.status, 'dropped');
+  assert.equal(budgetTransport.structuredContent.receipt.failureClass, 'token_budget');
+  assert.equal(budgetTransport.structuredContent.receipt.resultSubtype, null);
+  assert.equal(budgetTransport.structuredContent.receipt.outputChars, 0);
+  assert.equal(budgetTransport.structuredContent.receipt.actualTotalTokens, 1695);
+  assert.equal(budgetTransport.structuredContent.receipt.providerNumTurns, 3);
+  assert.equal(budgetTransport.structuredContent.receipt.providerBudgetEnforcement, 'incremental');
+  assert.ok(budgetTransport.structuredContent.receipt.transportOutputChars > 0);
   const grokQuotaOuterReceipt = receipts.structuredContent.receipts.find((receipt) =>
     receipt.receiptId === grokQuota.structuredContent.receiptId);
   assert.equal(grokQuotaOuterReceipt.vendorQuota.actual, 552305);
@@ -1472,8 +1515,8 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   const providerTimeoutOuter = receipts.structuredContent.receipts.find((receipt) =>
     receipt.receiptId === providerTimeout.structuredContent.receiptId);
   assert.equal(providerTimeoutOuter.status, 'timed_out');
-  assert.equal(providerTimeoutOuter.failureClass, 'timeout');
-  assert.equal(providerTimeoutOuter.stopReason, 'provider_internal_timeout');
+  assert.equal(providerTimeoutOuter.failureClass, 'provider_timeout_unclassified');
+  assert.equal(providerTimeoutOuter.stopReason, 'provider_timeout_unclassified');
   assert.equal(providerTimeoutOuter.supervisorStopReason, null);
   assert.equal(providerTimeoutOuter.providerTimeoutSource, 'provider_cli_diagnostic');
   assert.match(providerTimeoutOuter.transportReceiptId, /^rcpt_/);

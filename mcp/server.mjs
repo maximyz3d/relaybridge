@@ -8,6 +8,20 @@ import { McpServer } from '@modelcontextprotocol/server';
 import { serveStdio } from '@modelcontextprotocol/server/stdio';
 import { z } from 'zod';
 import TIMEOUT_POLICY from '../timeout-policy.cjs';
+import { normalizeGenericValidation } from '../lib/validation-contract.js';
+import { promptTransportLimits, preparePrompt } from '../lib/prompt-transport.js';
+import { normalizeGrounding, prepareGroundedPrompt } from '../lib/workspace-grounding.js';
+import { normalizeTransportLifecycle } from '../lib/attempt-lifecycle.js';
+
+const GROUNDING_FIELDS = {
+  requiresWorkspaceAccess: z.boolean().optional().describe('Require actual workspace access or a complete validated read-only inline evidence bundle.'),
+  inlineEvidence: z.object({ content: z.string().min(1).max(100000), sha256: z.string().regex(/^[0-9a-f]{64}$/),
+    cwdIdentityHash: z.string().regex(/^[0-9a-f]{64}$/) }).strict().optional(),
+};
+import { CONTRACT_FIELDS } from '../lib/execution-contract.js';
+import { SUPPORTED_EFFORTS as EFFORT_LEVELS } from '../lib/effort-controls.js';
+import { validQuotaSeat } from '../lib/quota-seat.js';
+import { validProviderKey } from '../lib/provider-accounts.js';
 import requestContract from '../lib/request-contract.js';
 import {
   BASE_URL,
@@ -49,7 +63,7 @@ function envFirst(...names) {
 const CLI_CONFIG_PATH = path.resolve(envFirst('RELAYBRIDGE_CONFIG_FILE', 'PS_BRIDGE_CONFIG_FILE') || path.join(BRIDGE_ROOT, 'cli-config.json'));
 const TASK_TIERS = ['utility', 'standard', 'complex', 'critical'];
 const MODEL_TIERS = ['light', 'standard', 'heavy'];
-const EFFORT_LEVELS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+const EXECUTION_SCHEMA = z.record(z.string(), z.unknown()).describe('Versioned provider model/effort intent returned by plan_task; all fields are validated by live REST before execution or cache lookup. This grants no permissions.');
 
 export function workflowPermissionDefaults(input = {}, env = process.env) {
   const setting = (current, legacy) => {
@@ -195,9 +209,26 @@ function toolError(error) {
     error: error?.message || String(error),
   };
   if (error instanceof BridgeError) {
+    if (error.detail?.model_invocation === false && error.detail?.validation) {
+      const failure = bridgeFailureResult(error, { kind: null }).sanitized;
+      const receipt = appendReceipt({ event: 'planning_preflight', status: 'blocked',
+        modelInvocation: false, physicalAttemptCount: 0, tokenUsageSource: 'not_invoked',
+        validation: failure.validation, errorCode: failure.errorCode, failureClass: failure.failureClass,
+        transportReceiptId: failure.transportReceiptId, providerRetryCount: 0, transportRetryCount: 0 });
+      Object.assign(payload, failure, { receiptId: receipt.receiptId },
+        { ok: false, blocked: true, attempts: [], members: [], cacheHit: false });
+    }
     payload.route = error.route;
     payload.status = error.status;
     payload.detail = error.detail;
+    const validation = normalizeValidationDiagnostic(error.detail?.validation);
+    if (validation) {
+      payload.validation = validation;
+      payload.errorCode = validation.code;
+      payload.modelInvocation = error.detail?.model_invocation === false ? false : null;
+      payload.physicalAttemptCount = payload.modelInvocation === false ? 0 : null;
+      payload.tokenUsageSource = payload.modelInvocation === false ? 'not_invoked' : 'unknown';
+    }
   }
   return result(payload, { isError: true });
 }
@@ -402,6 +433,7 @@ async function getAccountAwareRoute(args, signal, timeoutMs = ACCOUNT_AWARE_ROUT
       method: 'POST',
       body: {
         task: args.task,
+        cwd: args.cwd, requiresWorkspaceAccess: args.requiresWorkspaceAccess, inlineEvidence: args.inlineEvidence,
         preferKinds: Array.isArray(args.preferredProviders) ? args.preferredProviders : [],
         excludeKinds: Array.isArray(args.excludedProviders) ? args.excludedProviders : [],
         localOnly: args.localOnly === true,
@@ -410,6 +442,8 @@ async function getAccountAwareRoute(args, signal, timeoutMs = ACCOUNT_AWARE_ROUT
         dangerous: args.dangerous === true,
         acknowledgeFilesystemWrites: args.acknowledgeFilesystemWrites === true,
         diagnostics,
+        effort: args.effort, model: args.model, modelTier: args.modelTier,
+        timeoutMs: args.timeoutMs,
         ...(args.providerBudget ? { providerBudget: args.providerBudget } : {}),
       },
       timeoutMs: routeTimeoutMs,
@@ -708,6 +742,8 @@ export function normalizeProviderUsage(value, modelInvocation) {
   const cacheReadTokens = strictOptionalCount('cache_read_input_tokens', 0);
   const cacheCreationTokens = strictOptionalCount('cache_creation_input_tokens', 0);
   const reportedTotal = strictOptionalCount('total_tokens');
+  if (has('cache_input_included') && typeof value.cache_input_included !== 'boolean') return null;
+  const cacheInputIncluded = value.cache_input_included === true;
   if (
     (has('input_tokens') && inputTokens === null)
     || (has('output_tokens') && outputTokens === null)
@@ -716,7 +752,7 @@ export function normalizeProviderUsage(value, modelInvocation) {
     || (has('total_tokens') && reportedTotal === null)
   ) return null;
   const computedTotal = inputTokens !== null && outputTokens !== null
-    ? strictTokenSum([inputTokens, outputTokens, cacheReadTokens || 0, cacheCreationTokens || 0])
+    ? strictTokenSum([inputTokens, outputTokens, cacheInputIncluded ? 0 : cacheReadTokens || 0, cacheInputIncluded ? 0 : cacheCreationTokens || 0])
     : null;
   const totalTokens = computedTotal ?? reportedTotal;
   const thinkingCandidate = strictOptionalCount('thinking_tokens');
@@ -761,6 +797,7 @@ export function normalizeProviderUsage(value, modelInvocation) {
     output_tokens: outputTokens,
     cache_read_input_tokens: cacheReadTokens,
     cache_creation_input_tokens: cacheCreationTokens,
+    cache_input_included: cacheInputIncluded,
     total_tokens: totalTokens,
     thinking_tokens: thinkingTokens,
     cost_usd: cost,
@@ -777,12 +814,12 @@ const PROVIDER_RETRY_ERROR_CATEGORIES = new Set([
 ]);
 
 const PROVIDER_FAILURE_CLASSES = new Set([
-  'cancelled', 'rate_limit', 'budget', 'auth', 'timeout', 'policy',
+  'cancelled', 'rate_limit', 'budget', 'auth', 'timeout', 'provider_timeout_unclassified', 'policy',
   'max_tokens', 'refusal', 'max_turns', 'structured_output_retry_exhausted',
   'tool_deferred', 'aborted_streaming', 'aborted_tools', 'hook_stopped',
   'stop_hook_prevented', 'blocking_limit', 'prompt_too_long',
-  'provider_error', 'admission_limit', 'bridge_identity_mismatch',
-  'incomplete_response', 'token_budget', 'plan_restriction',
+  'provider_error', 'provider_protocol_error', 'output_cap', 'admission_limit', 'bridge_identity_mismatch',
+  'incomplete_response', 'provider_incomplete_response', 'provider_refusal', 'token_budget', 'plan_restriction',
   'client_cancelled', 'mcp_deadline_cancelled',
   'validation', 'configuration', 'safe_filesystem_unverified',
   'safe_isolation_setup', 'isolation_cleanup', 'workspace_grounding',
@@ -839,7 +876,12 @@ function normalizeValidationDiagnostic(value) {
       guidance: 'Repeat admission with the intended working directory. RelayBridge did not execute a provider.',
     };
   }
-  if (value.code !== CWD_OUTSIDE_ALLOWED_ROOTS || value.field !== 'cwd') return null;
+  if (value.code !== CWD_OUTSIDE_ALLOWED_ROOTS) {
+    // Never let malformed authority claims fall through to generic acceptance.
+    if (value.code === CWD_IDENTITY_CHANGED || value.field === 'cwd') return null;
+    return normalizeGenericValidation(value);
+  }
+  if (value.field !== 'cwd') return null;
   const requestedRootHash = strictSha256(value.requestedRootHash);
   const normalizedRootHash = strictSha256(value.normalizedRootHash);
   const canonicalRootHash = value.canonicalRootHash === null
@@ -882,7 +924,14 @@ function normalizeWorkspaceAdmission(value) {
   const bridgeBuildId = strictBoundedString(value.bridgeBuildId, 180);
   const receiptStoreId = strictSha256(value.receiptStoreId);
   if (!cwdIdentityHash || !cwdPolicyId || !bridgeBuildId || !receiptStoreId) return null;
-  return { cwdIdentityHash, cwdPolicyId, bridgeBuildId, receiptStoreId };
+  const execution = value.execution;
+  if (!execution || typeof execution !== 'object' || Array.isArray(execution)
+    || execution.version !== 1 || !strictSha256(execution.configFingerprint)
+    || CONTRACT_FIELDS.some((field) => !Object.prototype.hasOwnProperty.call(execution, field))
+    || Object.keys(execution).some((field) => !CONTRACT_FIELDS.includes(field))) return null;
+  const grounding = normalizeGrounding(value.grounding);
+  if (!grounding || grounding.allowed !== true || grounding.cwdIdentityHash !== cwdIdentityHash) return null;
+  return { cwdIdentityHash, cwdPolicyId, bridgeBuildId, receiptStoreId, execution, grounding };
 }
 
 function strictCountMap(value, allowedKey) {
@@ -1063,6 +1112,14 @@ export function normalizeVendorQuota(value) {
 
 export function normalizeQuotaEvidence(value) {
   if (!value || typeof value !== 'object') return null;
+  if (value.source === 'claude_terminal_api_status') {
+    if (!validProviderKey(value.provider)
+      || value.scope !== 'account' || value.kind !== 'rate_limit' || value.status !== 429
+      || strictTokenCount(value.errorCount) === null
+      || !/^[0-9a-f]{64}$/.test(String(value.errorDiagnosticHash || ''))) return null;
+    return { provider: value.provider, scope: 'account', kind: 'rate_limit', source: value.source,
+      status: 429, errorCount: value.errorCount, errorDiagnosticHash: value.errorDiagnosticHash };
+  }
   const stderrChars = strictTokenCount(value.stderrChars);
   const observedAt = strictBoundedString(value.observedAt, 40);
   if (value.provider !== 'copilot' || value.scope !== 'seat'
@@ -1076,6 +1133,26 @@ export function normalizeQuotaEvidence(value) {
     provider: 'copilot', scope: 'seat', kind: value.kind, source: value.source,
     diagnostic: value.diagnostic, observedAt, stderrChars, stderrHash: value.stderrHash,
   };
+}
+
+export function normalizeProviderCooldown(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || !validQuotaSeat(value.seat)
+    || !['account', 'model'].includes(value.scope)
+    || !['rate_limited', 'quota_exhausted', 'overloaded'].includes(value.reason)
+    || !['retry-after', 'retry-after-capped', 'backoff', 'overload-default'].includes(value.source)
+    || strictTokenCount(value.until) === null || strictTokenCount(value.offences) === null) return null;
+  return { seat: value.seat, scope: value.scope, reason: value.reason, source: value.source,
+    until: value.until, offences: value.offences };
+}
+
+export function normalizeOutputDetector(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || !['gemini_explicit_refusal', 'gemini_progress_only', 'future_narration_only'].includes(value.id)
+    || value.version !== 1 || value.source !== 'provider_terminal_text'
+    || strictTokenCount(value.outputChars) === null
+    || typeof value.outputHash !== 'string' || !/^[0-9a-f]{64}$/.test(value.outputHash)) return null;
+  return { id: value.id, version: 1, source: value.source, outputChars: value.outputChars, outputHash: value.outputHash };
 }
 
 export function normalizeProviderActionRequired(value) {
@@ -1127,6 +1204,10 @@ export function sanitizeProviderResponse(response) {
     invocationId: strictBoundedString(response.invocationId),
     attemptId: strictBoundedString(response.attemptId),
     physicalAttemptCount: strictTokenCount(response.physical_attempt_count),
+    providerRunId: normalizeTransportLifecycle(response.transport_lifecycle)?.runId || null,
+    transportLifecycle: normalizeTransportLifecycle(response.transport_lifecycle),
+    transportDiagnosticCode: strictBoundedString(response.transport_diagnostic_code),
+    providerTerminalCompatibility: response.provider_terminal_compatibility === 'ollama_done_without_reason_v1' ? response.provider_terminal_compatibility : null,
     exitCode: response.exitCode,
     droppedOut: !!response.dropped_out,
     rateLimited: !!response.rate_limited,
@@ -1138,6 +1219,7 @@ export function sanitizeProviderResponse(response) {
     modelInvocation,
     failureClass: PROVIDER_FAILURE_CLASSES.has(rawFailureClass) ? rawFailureClass : null,
     resultSubtype: strictBoundedString(response.result_subtype),
+    outputDetector: normalizeOutputDetector(response.output_detector),
     resultSchemaDisagreement: response.result_schema_disagreement === true,
     providerStopReason: strictBoundedString(response.provider_stop_reason),
     providerTerminalReason: PROVIDER_TERMINAL_REASONS.has(terminalReason) ? terminalReason : null,
@@ -1157,6 +1239,9 @@ export function sanitizeProviderResponse(response) {
     providerErrorObserved: strictTokenCount(response.provider_error_observed),
     providerErrorInvalid: strictTokenCount(response.provider_error_invalid),
     providerErrorDiagnosticTruncated: response.provider_error_diagnostic_truncated === true,
+    providerDiagnosticChars: strictTokenCount(response.provider_diagnostic_chars),
+    providerDiagnosticHash: typeof response.provider_diagnostic_hash === 'string' && /^[a-f0-9]{64}$/.test(response.provider_diagnostic_hash)
+      ? response.provider_diagnostic_hash : null,
     partialResult,
     failureSentinel: strictBoundedString(response.failure_sentinel),
     failureSentinelSource: strictBoundedString(response.failure_sentinel_source),
@@ -1214,22 +1299,28 @@ export function sanitizeProviderResponse(response) {
       ? {
         available: response.writer_diff_summary.available === true,
         reason: strictBoundedString(response.writer_diff_summary.reason),
-        beforeHead: /^[0-9a-f]{40,64}$/.test(String(response.writer_diff_summary.beforeHead || ''))
+        beforeHead: typeof response.writer_diff_summary.beforeHead === 'string'
+          && /^[0-9a-f]{40,64}$/.test(response.writer_diff_summary.beforeHead)
           ? response.writer_diff_summary.beforeHead : null,
-        afterHead: /^[0-9a-f]{40,64}$/.test(String(response.writer_diff_summary.afterHead || ''))
+        afterHead: typeof response.writer_diff_summary.afterHead === 'string'
+          && /^[0-9a-f]{40,64}$/.test(response.writer_diff_summary.afterHead)
           ? response.writer_diff_summary.afterHead : null,
         headChanged: response.writer_diff_summary.headChanged === true,
         changedFileCount: strictTokenCount(response.writer_diff_summary.changedFileCount),
+        changedFileCountLowerBound: strictTokenCount(response.writer_diff_summary.changedFileCountLowerBound),
+        unverifiedFileCount: strictTokenCount(response.writer_diff_summary.unverifiedFileCount),
+        changeCountComplete: response.writer_diff_summary.changeCountComplete === true,
         filesTruncated: response.writer_diff_summary.filesTruncated === true,
         fingerprintsTruncated: response.writer_diff_summary.fingerprintsTruncated === true,
-        statusHash: /^[0-9a-f]{64}$/.test(String(response.writer_diff_summary.statusHash || ''))
+        statusHash: typeof response.writer_diff_summary.statusHash === 'string'
+          && /^[0-9a-f]{64}$/.test(response.writer_diff_summary.statusHash)
           ? response.writer_diff_summary.statusHash : null,
         files: Array.isArray(response.writer_diff_summary.files)
           ? response.writer_diff_summary.files.slice(0, 50).map((file) => ({
             path: file?.sensitivePath === true ? '[redacted-sensitive-path]'
               : clip(String(file?.path || ''), 500).text,
             pathHash: file?.sensitivePath === true ? null
-              : (/^[0-9a-f]{64}$/.test(String(file?.pathHash || '')) ? file.pathHash : null),
+              : (typeof file?.pathHash === 'string' && /^[0-9a-f]{64}$/.test(file.pathHash) ? file.pathHash : null),
             beforeStatus: strictBoundedString(file?.beforeStatus, 32),
             afterStatus: strictBoundedString(file?.afterStatus, 32),
             sensitivePath: file?.sensitivePath === true,
@@ -1241,6 +1332,10 @@ export function sanitizeProviderResponse(response) {
     providerRetries: normalizeProviderRetries(response.provider_retries, modelInvocation),
     vendorQuota: normalizeVendorQuota(response.vendor_quota),
     quotaEvidence: normalizeQuotaEvidence(response.quota_evidence),
+    grounding: normalizeGrounding(response.grounding),
+    cooldown: normalizeProviderCooldown(response.cooldown),
+    retryAt: strictTokenCount(response.retry_at),
+    retryAfterSec: strictTokenCount(response.retry_after),
     providerActionRequired: normalizeProviderActionRequired(response.provider_action_required),
     stdout: stdout.text,
     stderr: stderr.text,
@@ -1309,6 +1404,7 @@ function bridgeFailureResult(error, { kind, signal }) {
       authFailed: authRequired,
       admissionLimited: bridgeStatus === 429,
       modelInvocation: deterministicPreflightRejection ? false : null,
+      physicalAttemptCount: deterministicPreflightRejection ? 0 : null,
       tokenUsageSource: deterministicPreflightRejection ? 'not_invoked' : 'unknown',
       transportRetryCount: 0,
       providerRetries: deterministicPreflightRejection || cancellationClass
@@ -1350,6 +1446,7 @@ function usageFromTransportReceipt(receipt) {
     output_tokens: receipt.actualOutputTokens ?? null,
     cache_read_input_tokens: receipt.actualCacheReadInputTokens ?? null,
     cache_creation_input_tokens: receipt.actualCacheCreationInputTokens ?? null,
+    cache_input_included: receipt.cacheInputIncluded === true,
     total_tokens: receipt.actualTotalTokens ?? null,
     thinking_tokens: receipt.actualThinkingTokens ?? null,
     cost_usd: receipt.provider_reported_cost_usd ?? null,
@@ -1373,6 +1470,10 @@ async function reconcileCancelledTransportAttempt({ requestId, outerReceiptId, k
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   if (!transportReceipt) return sanitized;
+  return reconcileTransportReceipt({ requestId, sanitized, transportReceipt });
+}
+
+export function reconcileTransportReceipt({ requestId, sanitized, transportReceipt }) {
   const supervisorWon = !!transportReceipt.supervisorStopReason;
   const failureClass = supervisorWon
     ? (transportReceipt.failureClass || 'timeout')
@@ -1390,6 +1491,16 @@ async function reconcileCancelledTransportAttempt({ requestId, outerReceiptId, k
     tokenUsageSource: transportReceipt.tokenUsageSource || 'unknown',
     usage: usageFromTransportReceipt(transportReceipt),
     providerRetries: providerRetriesFromReceipt(transportReceipt),
+    quotaEvidence: normalizeQuotaEvidence(transportReceipt.quotaEvidence),
+    cooldown: normalizeProviderCooldown(transportReceipt.cooldown),
+    retryAt: strictTokenCount(transportReceipt.retryAt),
+    retryAfterSec: strictTokenCount(transportReceipt.retryAfterSec),
+    providerApiErrorStatus: Number.isSafeInteger(transportReceipt.providerApiErrorStatus)
+      && transportReceipt.providerApiErrorStatus >= 100 && transportReceipt.providerApiErrorStatus <= 599
+      ? transportReceipt.providerApiErrorStatus : null,
+    rateLimited: normalizeQuotaEvidence(transportReceipt.quotaEvidence)?.kind === 'rate_limit'
+      || transportReceipt.failureClass === 'rate_limit',
+    budgetExceeded: transportReceipt.failureClass === 'token_budget' || transportReceipt.failureClass === 'budget',
     transportReceiptId: transportReceipt.receiptId,
     transportReceiptPersisted: true,
     transportOutputChars: transportReceipt.transportOutputChars ?? null,
@@ -1399,6 +1510,10 @@ async function reconcileCancelledTransportAttempt({ requestId, outerReceiptId, k
     invocationId: transportReceipt.invocationId || requestId,
     attemptId: transportReceipt.attemptId || `${requestId}:attempt:1`,
     physicalAttemptCount: transportReceipt.physicalAttemptCount ?? 1,
+    providerRunId: normalizeTransportLifecycle(transportReceipt.transportLifecycle)?.runId || null,
+    transportLifecycle: normalizeTransportLifecycle(transportReceipt.transportLifecycle),
+    transportDiagnosticCode: strictBoundedString(transportReceipt.transportDiagnosticCode),
+    providerTerminalCompatibility: transportReceipt.providerTerminalCompatibility === 'ollama_done_without_reason_v1' ? transportReceipt.providerTerminalCompatibility : null,
   };
 }
 
@@ -1406,6 +1521,9 @@ async function callProvider({
   kind,
   prompt,
   cwd,
+  requiresWorkspaceAccess,
+  inlineEvidence,
+  semanticMaxChars,
   timeoutMs = TIMEOUT_POLICY.oneShotDefaultMs,
   useCache = true,
   cacheTtlMs,
@@ -1415,6 +1533,8 @@ async function callProvider({
   providerBudget,
   taskTier,
   modelTier,
+  model,
+  execution,
   effort,
   maxEffortOverride = false,
 }) {
@@ -1423,9 +1543,8 @@ async function callProvider({
   const attemptId = `${requestId}:attempt:1`;
   const outerReceiptId = `rcpt_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 8)}`;
   const classification = classifyTask(prompt);
-  const effectiveTaskTier = TASK_TIERS.includes(taskTier) ? taskTier : classification.tier;
-  const effectiveModelTier = MODEL_TIERS.includes(modelTier)
-    ? modelTier : modelTierForTaskTier(effectiveTaskTier);
+  const effectiveTaskTier = taskTier !== undefined ? taskTier : execution ? undefined : classification.tier;
+  const effectiveModelTier = modelTier !== undefined ? modelTier : execution ? undefined : modelTierForTaskTier(effectiveTaskTier);
   const ttl = cacheTtlFor(classification, cacheTtlMs);
   const configFingerprint = stableHash({
     config: fs.readFileSync(CLI_CONFIG_PATH, 'utf8'),
@@ -1437,9 +1556,22 @@ async function callProvider({
   let workspaceAdmission = null;
   if (signal?.aborted) throw signal.reason || new Error('provider call cancelled before admission');
   try {
+    // Validate the complete semantic input before workspace admission or cache
+    // lookup. The server independently repeats this against its current config.
+    const entry = loadCliConfig()[kind] || {};
+    try { preparePrompt(prompt, { ...promptTransportLimits(entry, entry.oneshot_safe || []),
+      policyPrefix: typeof entry.oneshot_safe_prompt_prefix === 'string' ? entry.oneshot_safe_prompt_prefix.trim() : '' }); }
+    catch (error) {
+      throw new BridgeError(error.message, { status: 400, detail: {
+        failureClass: 'validation', validation: error.validation,
+        model_invocation: false, token_usage_source: 'not_invoked', physical_attempt_count: 0,
+      } });
+    }
     const response = await bridgeRequest('/api/workspace/validate', {
       method: 'POST',
-      body: { kind, prompt, cwd, requestId },
+      body: { kind, prompt, cwd, requestId, model, execution, requiresWorkspaceAccess, inlineEvidence,
+        taskTier: effectiveTaskTier, modelTier: effectiveModelTier,
+        effort, maxEffortOverride, providerBudget, dangerous: false },
       timeoutMs: TIMEOUT_POLICY.transportTimeoutMs(timeoutMs),
       signal,
       actionIdentity: true,
@@ -1448,6 +1580,8 @@ async function callProvider({
     if (!workspaceAdmission) {
       throw new Error('RelayBridge returned malformed cwd admission identity; provider execution is blocked.');
     }
+    validateGroundedInput({ kind, entry, prompt, cwd, requiresWorkspaceAccess, inlineEvidence,
+      cwdIdentityHash: workspaceAdmission.cwdIdentityHash, semanticMaxChars });
   } catch (error) {
     ({ sanitized, status } = bridgeFailureResult(error, { kind, signal }));
   }
@@ -1458,9 +1592,9 @@ async function callProvider({
     configFingerprint,
     purpose,
     providerBudget: providerBudget || null,
-    taskTier: effectiveTaskTier,
-    modelTier: effectiveModelTier,
-    effort: effort || null,
+    execution: workspaceAdmission?.execution || execution || null,
+    grounding: workspaceAdmission?.grounding || null,
+    semanticMaxChars: semanticMaxChars ?? null,
     maxEffortOverride: maxEffortOverride === true,
     cwdIdentityHash: workspaceAdmission?.cwdIdentityHash || null,
     cwdPolicyId: workspaceAdmission?.cwdPolicyId || null,
@@ -1548,6 +1682,8 @@ async function callProvider({
         kind,
         prompt,
         cwd,
+        requiresWorkspaceAccess,
+        inlineEvidence,
         requestId,
         outerReceiptId,
         expectedCwdIdentityHash: workspaceAdmission.cwdIdentityHash,
@@ -1557,6 +1693,8 @@ async function callProvider({
         budgetTaskTier: effectiveTaskTier,
         taskTier: effectiveTaskTier,
         modelTier: effectiveModelTier,
+        model,
+        execution: workspaceAdmission.execution,
         effort,
         maxEffortOverride,
         dangerous: false,
@@ -1592,6 +1730,7 @@ async function callProvider({
     actualInputTokens: sanitized.usage?.input_tokens ?? null,
     actualOutputTokens: sanitized.usage?.output_tokens ?? null,
     actualCacheReadInputTokens: sanitized.usage?.cache_read_input_tokens ?? null,
+    cacheInputIncluded: sanitized.usage?.cache_input_included === true,
     actualCacheCreationInputTokens: sanitized.usage?.cache_creation_input_tokens ?? null,
     actualTotalTokens: sanitized.usage?.total_tokens ?? null,
     actualThinkingTokens: sanitized.usage?.thinking_tokens ?? null,
@@ -1599,6 +1738,15 @@ async function callProvider({
     modelUsage: sanitized.usage?.model_usage ?? [],
     vendorQuota: sanitized.vendorQuota ?? null,
     quotaEvidence: sanitized.quotaEvidence ?? null,
+    grounding: sanitized.grounding ?? null,
+    providerRunId: sanitized.providerRunId ?? null,
+    transportLifecycle: sanitized.transportLifecycle ?? null,
+    transportDiagnosticCode: sanitized.transportDiagnosticCode ?? null,
+    providerTerminalCompatibility: sanitized.providerTerminalCompatibility ?? null,
+    outputDetector: sanitized.outputDetector ?? null,
+    cooldown: sanitized.cooldown ?? null,
+    retryAt: sanitized.retryAt ?? null,
+    retryAfterSec: sanitized.retryAfterSec ?? null,
     providerActionRequired: sanitized.providerActionRequired ?? null,
     providerRetryCount: sanitized.providerRetries?.count ?? null,
     providerRetryDelayMs: sanitized.providerRetries?.total_delay_ms ?? null,
@@ -1635,6 +1783,8 @@ async function callProvider({
     providerErrorObserved: sanitized.providerErrorObserved ?? null,
     providerErrorInvalid: sanitized.providerErrorInvalid ?? null,
     providerErrorDiagnosticTruncated: sanitized.providerErrorDiagnosticTruncated ?? false,
+    providerDiagnosticChars: sanitized.providerDiagnosticChars ?? null,
+    providerDiagnosticHash: sanitized.providerDiagnosticHash ?? null,
     partialResult: sanitized.partialResult === true,
     failureSentinel: sanitized.failureSentinel ?? null,
     failureSentinelSource: sanitized.failureSentinelSource ?? null,
@@ -1714,13 +1864,25 @@ function eligibleOneShotKinds(route, config, { selectedOnly = false, allowedKind
     seen.add(candidate.kind);
     if (allowed.size && !allowed.has(candidate.kind)) return false;
     const entry = config[candidate.kind];
-    return candidate.policyScore >= 0 && entry && Array.isArray(entry.oneshot_safe) && entry.oneshot_safe.length;
+    return candidate.eligible === true && candidate.policyScore >= 0 && !candidate.validation && !candidate.blocked
+      && candidate.ready !== false && entry && Array.isArray(entry.oneshot_safe) && entry.oneshot_safe.length;
   });
 }
 
+function validateGroundedInput({ kind, entry, prompt, cwd, requiresWorkspaceAccess, inlineEvidence, cwdIdentityHash, semanticMaxChars }) {
+  try {
+    const composed = prepareGroundedPrompt({ prompt, cwd, requiresWorkspaceAccess, inlineEvidence, cwdIdentityHash, seat: kind, seatConfig: entry });
+    const limits = promptTransportLimits(entry, entry.oneshot_safe || []);
+    return preparePrompt(composed.prompt, { ...limits,
+      maxChars: semanticMaxChars == null ? limits.maxChars : limits.maxChars === null ? semanticMaxChars : Math.min(limits.maxChars, semanticMaxChars),
+      policyPrefix: typeof entry.oneshot_safe_prompt_prefix === 'string' ? entry.oneshot_safe_prompt_prefix.trim() : '' });
+  } catch (error) {
+    throw new BridgeError(error.message, { status: 400, detail: { failureClass: error.code === 'workspace_grounding' ? 'workspace_grounding' : 'validation',
+      validation: error.validation, errorCode: error.code, model_invocation: false, token_usage_source: 'not_invoked', physical_attempt_count: 0 } });
+  }
+}
+
 function rolePrompt(task, role, classification, policy) {
-  const cap = policy.tiers[classification.tier].maxInputChars;
-  const bounded = clip(task, cap);
   const roleInstructions = {
     primary: 'Propose the strongest concrete solution and state assumptions and verification steps.',
     critic: 'Independently find failure modes, unsupported assumptions, security risks, and cheaper alternatives.',
@@ -1730,13 +1892,12 @@ function rolePrompt(task, role, classification, policy) {
   };
   return [
     `You are the ${role} in a read-only RelayBridge advisory committee.`,
-    'Do not edit files, run tools, or claim that a proposal was implemented. Return concise analysis only.',
+    'Do not edit files, launch nested providers, or claim that a proposal was implemented. Use only permitted read-only inspection tools when available; otherwise limit findings to supplied material. Return concise analysis only.',
     roleInstructions[role] || roleInstructions.primary,
     `Task tier: ${classification.tier}. Tags: ${classification.tags.join(', ')}.`,
-    bounded.truncated ? `The task was bounded from ${bounded.originalChars} characters for this seat.` : '',
     '',
     'TASK:',
-    bounded.text,
+    task,
   ].filter(Boolean).join('\n');
 }
 
@@ -1876,12 +2037,15 @@ export function buildServer() {
     title: 'Preview deterministic task routing',
     description: 'Classify a task and preview an auditable local/cheap-first route without calling any model.',
     inputSchema: z.object({
+      ...GROUNDING_FIELDS,
+      cwd: z.string().max(1000).optional(),
       task: z.string().min(1).max(100000),
       preferredProviders: z.array(z.string()).max(8).default([]),
       excludedProviders: z.array(z.string()).max(8).default([]),
       localOnly: z.boolean().default(false),
       maxProviders: z.number().int().min(1).max(4).optional(),
       committeeMode: z.enum(['advisory', 'consensus']).default('advisory'),
+      timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).max(TIMEOUT_POLICY.oneShotMaxMs).default(TIMEOUT_POLICY.oneShotDefaultMs),
       dangerous: z.boolean().default(false).describe('preview the explicit writer route instead of normal safe routing'),
       acknowledgeFilesystemWrites: z.boolean().default(false).describe('required with dangerous=true; confirms persistent writes are authorized'),
     }),
@@ -1908,17 +2072,23 @@ export function buildServer() {
     title: 'Plan a task: company, model, and effort',
     description: 'Given a task description, returns the cheapest capable execution plan: which company/provider, which model inside it, and how much reasoning effort — plus fallbacks and why. Call this BEFORE delegating anything you are unsure about. It exists to stop frontier seats being spent on mechanical edits and max-effort reasoning being spent on arithmetic.',
     inputSchema: z.object({
+      ...GROUNDING_FIELDS,
+      cwd: z.string().max(1000).optional(),
       task: z.string().min(1).describe('what needs doing, in a sentence or two'),
       effort: z.enum(EFFORT_LEVELS).optional().describe('override the effort the tier would pick; xhigh/max require an explicit maxEffortOverride when executed'),
       kind: z.string().optional().describe('force a specific provider and plan around it'),
+      model: z.string().min(1).max(160).optional().describe('exact configured or available model; never silently substituted'),
+      modelTier: z.enum(MODEL_TIERS).optional(),
+      providerBudget: PROVIDER_BUDGET_SCHEMA.nullish(),
+      timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).max(TIMEOUT_POLICY.oneShotMaxMs).default(TIMEOUT_POLICY.oneShotDefaultMs).describe('runtime deadline to use when previewing the provider invocation'),
       dangerous: z.boolean().default(false).describe('plan an explicit writer-capable provider invocation'),
       acknowledgeFilesystemWrites: z.boolean().default(false).describe('required with dangerous=true; confirms persistent writes are authorized'),
     }),
     annotations: READ_ONLY,
-  }, safeHandler(async ({ task, effort, kind, dangerous, acknowledgeFilesystemWrites }, context) => {
+  }, safeHandler(async ({ task, effort, kind, model, modelTier, providerBudget, timeoutMs, dangerous, acknowledgeFilesystemWrites, cwd, requiresWorkspaceAccess, inlineEvidence }, context) => {
     const plan = await bridgeRequest('/api/plan', {
       method: 'POST',
-      body: { task, effort: effort ?? null, kind: kind ?? null, dangerous, acknowledgeFilesystemWrites },
+      body: { task, effort, kind, model, modelTier, providerBudget, timeoutMs, dangerous, acknowledgeFilesystemWrites, cwd, requiresWorkspaceAccess, inlineEvidence },
       timeoutMs: 20000,
       signal: context?.mcpReq?.signal,
     });
@@ -2219,15 +2389,18 @@ export function buildServer() {
     title: 'Ask one provider safely',
     description: 'Run one bounded, non-agentic provider turn with dangerous:false forced, available route metadata, cache controls, quota/failure signals, and an append-only receipt. The provider CLI runs in its own safe/headless mode, which is a vendor-side restriction rather than an OS sandbox. Hosted CLIs may not reveal final model revisions, usage, plan, or provider request IDs.',
     inputSchema: z.object({
+      ...GROUNDING_FIELDS,
       kind: z.string().min(1).max(64),
       prompt: z.string().min(1).max(100000),
       cwd: z.string().max(1000).optional(),
       timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).max(TIMEOUT_POLICY.oneShotMaxMs).default(TIMEOUT_POLICY.oneShotDefaultMs),
       useCache: z.boolean().default(true),
       cacheTtlMs: z.number().int().min(0).max(86400000).optional(),
-      providerBudget: PROVIDER_BUDGET_SCHEMA.optional(),
+      providerBudget: PROVIDER_BUDGET_SCHEMA.nullish(),
       taskTier: z.enum(TASK_TIERS).optional(),
       modelTier: z.enum(MODEL_TIERS).optional(),
+      model: z.string().min(1).max(160).optional(),
+      execution: EXECUTION_SCHEMA.optional(),
       effort: z.enum(EFFORT_LEVELS).optional(),
       maxEffortOverride: z.boolean().default(false),
       acknowledgeHumanGate: z.boolean().default(false),
@@ -2253,6 +2426,7 @@ export function buildServer() {
     title: 'Route and ask with bounded escalation',
     description: 'Apply deterministic routing, call the first eligible safe provider, and escalate only on typed failure. High-stakes routes require explicit acknowledgement.',
     inputSchema: z.object({
+      ...GROUNDING_FIELDS,
       task: z.string().min(1).max(100000),
       cwd: z.string().max(1000).optional(),
       preferredProviders: z.array(z.string()).max(8).default([]),
@@ -2263,8 +2437,8 @@ export function buildServer() {
       useCache: z.boolean().default(true),
       acknowledgeHumanGate: z.boolean().default(false),
       allowModelForDeterministic: z.boolean().default(false),
-      allowInputTruncation: z.boolean().default(false),
-      providerBudget: PROVIDER_BUDGET_SCHEMA.optional(),
+      allowInputTruncation: z.boolean().default(false).describe('Deprecated compatibility field; semantic input is never truncated, even when true.'),
+      providerBudget: PROVIDER_BUDGET_SCHEMA.nullish(),
       effort: z.enum(EFFORT_LEVELS).optional(),
       maxEffortOverride: z.boolean().default(false),
     }),
@@ -2301,8 +2475,7 @@ export function buildServer() {
     }
     const { policy } = loadRoutingData();
     const tierPolicy = policy.tiers[route.classification.tier];
-    const boundedTask = clip(args.task, tierPolicy.maxInputChars);
-    if (boundedTask.truncated && !args.allowInputTruncation) {
+    if (args.task.length > tierPolicy.maxInputChars) {
       const receipt = appendReceipt({
         event: 'route_execute',
         routeId: route.routeId,
@@ -2315,16 +2488,32 @@ export function buildServer() {
         ok: false,
         blocked: true,
         inputBudgetExceeded: true,
+        modelInvocation: false,
+        physicalAttemptCount: 0,
+        tokenUsageSource: 'not_invoked',
+        validation: { code: 'prompt_too_large', field: 'task', retryable: false,
+          reason: 'Complete task exceeds the routing input limit.', inputChars: args.task.length,
+          maxChars: tierPolicy.maxInputChars, inputHash: stableHash(args.task), inputTruncated: false },
         route,
         receiptId: receipt.receiptId,
         inputChars: args.task.length,
         maxInputChars: tierPolicy.maxInputChars,
-        recommendation: 'Reduce the task/context or explicitly set allowInputTruncation=true.',
+        recommendation: 'Shorten the complete task or use a suitable full-input provider; input truncation is disabled.',
       }, { isError: true });
     }
     const config = loadCliConfig();
     const tierEscalations = Number.isInteger(tierPolicy.maxEscalations) ? tierPolicy.maxEscalations : 1;
     const candidates = eligibleOneShotKinds(route, config).slice(0, Math.min(args.maxEscalations, tierEscalations) + 1);
+    if (!candidates.length) {
+      const validation = { code: 'no_eligible_provider', field: 'task', retryable: false,
+        reason: 'No ready provider satisfies the required invocation capabilities, task family, complexity, and admission policy.' };
+      const accounting = { modelInvocation: false, physicalAttemptCount: 0, tokenUsageSource: 'not_invoked' };
+      const receipt = appendReceipt({ event: 'route_execute', routeId: route.routeId,
+        taskHash: route.classification.taskHash, status: 'eligibility_gate', failureClass: 'validation', validation, ...accounting });
+      return result({ ok: false, blocked: true, status: 'eligibility_gate', error: validation.reason,
+        errorCode: validation.code, failureClass: 'validation', validation, route, winner: null, attempts: [],
+        ...accounting, receiptId: receipt.receiptId, receiptPersistenceError: receipt.receiptPersistenceError || null }, { isError: true });
+    }
     const deadlineAt = Math.min(requestedDeadlineAt, Date.now() + tierPolicy.defaultTimeoutMs);
     const rootReceipt = appendReceipt({ event: 'route_execute', routeId: route.routeId, taskHash: route.classification.taskHash, candidates: candidates.map((item) => item.kind), status: 'started' });
     let run = writeRun({
@@ -2341,16 +2530,20 @@ export function buildServer() {
       if (signal?.aborted || Date.now() >= deadlineAt) break;
       const response = await callProvider({
         kind: candidate.kind,
-        prompt: boundedTask.text,
+        prompt: args.task,
         cwd: args.cwd,
+        requiresWorkspaceAccess: args.requiresWorkspaceAccess, inlineEvidence: args.inlineEvidence,
+        semanticMaxChars: tierPolicy.maxInputChars,
         timeoutMs: remainingTime(deadlineAt),
         useCache: args.useCache,
         parentReceiptId: rootReceipt.receiptId,
         purpose: 'route_and_ask',
+        model: candidate.model ?? undefined,
+        execution: candidate.execution ?? undefined,
         signal,
         providerBudget: args.providerBudget,
-        taskTier: route.classification.tier,
-        modelTier: modelTierForTaskTier(route.classification.tier),
+        taskTier: candidate.execution ? undefined : route.classification.tier,
+        modelTier: candidate.execution ? undefined : modelTierForTaskTier(route.classification.tier),
         effort: args.effort,
         maxEffortOverride: args.maxEffortOverride,
       });
@@ -2400,6 +2593,7 @@ export function buildServer() {
     title: 'Run a bounded multi-provider committee',
     description: 'Fan out independent read-only roles to up to four diverse providers, checkpoint partial results, enforce one overall deadline, and optionally ask one safe chair for a structured agreement/mixed/disagreement assessment. Consensus is never inferred from successful text generation alone.',
     inputSchema: z.object({
+      ...GROUNDING_FIELDS,
       task: z.string().min(1).max(100000),
       cwd: z.string().max(1000).optional(),
       providers: z.array(z.string()).max(4).default([]),
@@ -2412,7 +2606,7 @@ export function buildServer() {
       synthesisProvider: z.string().max(64).optional(),
       acknowledgeHumanGate: z.boolean().default(false),
       acknowledgeTruncatedEvidence: z.boolean().default(false),
-      providerBudget: PROVIDER_BUDGET_SCHEMA.optional(),
+      providerBudget: PROVIDER_BUDGET_SCHEMA.nullish(),
       effort: z.enum(EFFORT_LEVELS).optional(),
       maxEffortOverride: z.boolean().default(false),
     }),
@@ -2422,12 +2616,14 @@ export function buildServer() {
     const requestedDeadlineAt = Date.now() + args.timeoutMs;
     const route = await getAccountAwareRoute({
       task: args.task,
+      cwd: args.cwd, requiresWorkspaceAccess: args.requiresWorkspaceAccess, inlineEvidence: args.inlineEvidence,
       preferredProviders: args.providers,
       excludedProviders: [...args.excludedProviders, 'powershell'],
       localOnly: args.localOnly,
       maxProviders: args.maxProviders,
       committeeMode: args.mode,
       providerBudget: args.providerBudget,
+      effort: args.effort,
     }, signal, remainingTime(requestedDeadlineAt, 1));
     if (route.humanGateRequired && !args.acknowledgeHumanGate) {
       return result({ ok: false, blocked: true, route, error: 'High-stakes committee requires acknowledgeHumanGate=true and remains advisory.' }, { isError: true });
@@ -2438,6 +2634,10 @@ export function buildServer() {
     const config = loadCliConfig();
     const { policy } = loadRoutingData();
     const tierPolicy = policy.tiers[route.classification.tier];
+    const explicitInvalidMember = (route.fleetState?.groundingSkipped || []).find((row) => row.validation && args.providers.includes(row.kind));
+    if (explicitInvalidMember) throw new BridgeError(explicitInvalidMember.validation.reason, { status: 400,
+      detail: { failureClass: explicitInvalidMember.validation.code === 'workspace_grounding' ? 'workspace_grounding' : 'validation',
+        validation: explicitInvalidMember.validation, model_invocation: false, token_usage_source: 'not_invoked', physical_attempt_count: 0 } });
     const eligible = eligibleOneShotKinds(route, config, {
       selectedOnly: true,
       allowedKinds: args.providers,
@@ -2454,6 +2654,48 @@ export function buildServer() {
     if (!eligible.length) {
       const receipt = appendReceipt({ event: 'committee', routeId: route.routeId, taskHash: route.classification.taskHash, status: 'no_eligible_provider' });
       return result({ ok: false, blocked: true, route, receiptId: receipt.receiptId, error: 'No eligible safe provider matched this committee policy.' }, { isError: true });
+    }
+    const roles = policy.committee.roles.filter((role) => role !== 'chair');
+    const seatPrompts = eligible.map((candidate, index) =>
+      rolePrompt(args.task, roles[Math.min(index, roles.length - 1)], route.classification, policy));
+    // Validate every complete member packet before starting ANY member.
+    // A later seat's deterministic size failure must not waste earlier seats.
+    try {
+      for (let index = 0; index < eligible.length; index++) {
+        const entry = config[eligible[index].kind];
+        const limits = promptTransportLimits(entry, entry.oneshot_safe || []);
+        preparePrompt(seatPrompts[index], { ...limits,
+          maxChars: limits.maxChars === null ? tierPolicy.maxInputChars : Math.min(limits.maxChars, tierPolicy.maxInputChars),
+          policyPrefix: typeof entry.oneshot_safe_prompt_prefix === 'string' ? entry.oneshot_safe_prompt_prefix.trim() : '' });
+        const candidate = eligible[index];
+        const admission = await bridgeRequest('/api/workspace/validate', { method: 'POST', signal,
+          timeoutMs: remainingTime(requestedDeadlineAt), actionIdentity: true,
+          body: { kind: candidate.kind, prompt: seatPrompts[index], cwd: args.cwd,
+            requiresWorkspaceAccess: args.requiresWorkspaceAccess, inlineEvidence: args.inlineEvidence,
+            requestId: `mcp:${crypto.randomUUID()}`, dangerous: false,
+            execution: candidate.execution ?? undefined, model: candidate.model ?? undefined,
+            taskTier: candidate.execution ? undefined : route.classification.tier,
+            modelTier: candidate.execution ? undefined : modelTierForTaskTier(route.classification.tier),
+            effort: args.effort, maxEffortOverride: args.maxEffortOverride, providerBudget: args.providerBudget } });
+        const normalized = normalizeWorkspaceAdmission(admission);
+        if (!normalized) throw new Error('Malformed live execution admission; committee blocked before dispatch.');
+        validateGroundedInput({ kind: candidate.kind, entry, prompt: seatPrompts[index], cwd: args.cwd,
+          requiresWorkspaceAccess: args.requiresWorkspaceAccess, inlineEvidence: args.inlineEvidence,
+          cwdIdentityHash: normalized.cwdIdentityHash, semanticMaxChars: tierPolicy.maxInputChars });
+        candidate.execution = normalized.execution;
+      }
+    } catch (error) {
+      const validation = normalizeValidationDiagnostic(error.validation || error.detail?.validation);
+      const failure = bridgeFailureResult(error, { kind: null, signal }).sanitized;
+      const receipt = appendReceipt({ event: 'committee', routeId: route.routeId,
+        taskHash: route.classification.taskHash, status: 'preflight_gate',
+        modelInvocation: false, physicalAttemptCount: 0, validation, errorCode: validation?.code || null,
+        transportReceiptId: failure.transportReceiptId, tokenUsageSource: 'not_invoked',
+        providerRetryCount: 0, transportRetryCount: 0 });
+      return result({ ...failure, ok: false, blocked: true, status: 'blocked', members: [], cacheHit: false,
+        route, receiptId: receipt.receiptId, errorCode: validation?.code || null,
+        error: error.message, validation, inputTruncated: false, modelInvocation: false,
+        physicalAttemptCount: 0, tokenUsageSource: 'not_invoked' }, { isError: true });
     }
     const deadlineAt = Math.min(requestedDeadlineAt, Date.now() + tierPolicy.defaultTimeoutMs);
     const rootReceipt = appendReceipt({
@@ -2474,7 +2716,6 @@ export function buildServer() {
       parentReceiptId: rootReceipt.receiptId,
       deadlineAt: new Date(deadlineAt).toISOString(),
     });
-    const roles = policy.committee.roles.filter((role) => role !== 'chair');
     const membersByIndex = new Array(eligible.length);
     const settledMembers = await Promise.allSettled(eligible.map(async (candidate, index) => {
       const role = roles[Math.min(index, roles.length - 1)];
@@ -2482,26 +2723,30 @@ export function buildServer() {
       try {
         if (signal?.aborted) throw signal.reason || new Error('committee cancelled before provider admission');
         if (Date.now() >= deadlineAt) throw new Error('committee deadline exceeded before provider admission');
-        const seatPrompt = rolePrompt(args.task, role, route.classification, policy);
+        const seatPrompt = seatPrompts[index];
         const response = await callProvider({
           kind: candidate.kind,
           prompt: seatPrompt,
           cwd: args.cwd,
+          requiresWorkspaceAccess: args.requiresWorkspaceAccess, inlineEvidence: args.inlineEvidence,
+          semanticMaxChars: tierPolicy.maxInputChars,
           timeoutMs: remainingTime(deadlineAt),
           useCache: args.useCache,
           parentReceiptId: rootReceipt.receiptId,
           purpose: `committee:${role}`,
+          model: candidate.model ?? undefined,
+          execution: candidate.execution ?? undefined,
           signal,
           providerBudget: args.providerBudget,
-          taskTier: route.classification.tier,
-          modelTier: modelTierForTaskTier(route.classification.tier),
+          taskTier: candidate.execution ? undefined : route.classification.tier,
+          modelTier: candidate.execution ? undefined : modelTierForTaskTier(route.classification.tier),
           effort: args.effort,
           maxEffortOverride: args.maxEffortOverride,
         });
         member = {
           ...response,
           role,
-          inputTruncated: args.task.length > tierPolicy.maxInputChars,
+          inputTruncated: false,
           originalTaskChars: args.task.length,
           seatPromptChars: seatPrompt.length,
           taskSha256: route.classification.taskHash,
@@ -2521,37 +2766,51 @@ export function buildServer() {
     let synthesisAssessment = null;
     const memberEvidenceIncomplete = successes.some((member) =>
       member.inputTruncated || member.outputTruncated || member.route?.prompt_truncated);
-    let synthesisInputTruncated = false;
+    let synthesisInputRejected = false;
     if (args.mode === 'consensus' && successes.length >= 2 && !signal?.aborted && Date.now() < deadlineAt) {
       const chairKind = args.synthesisProvider || successes[0].kind;
       if (!successes.some((member) => member.kind === chairKind)) {
         synthesis = { kind: chairKind, exitCode: -1, droppedOut: true, stdout: '', stderr: 'synthesisProvider must be one of the successful, policy-eligible committee members', failureClass: 'policy' };
       } else {
-        const packet = clip(successes.map((member) => `## ${member.kind} (${member.role})\n${member.stdout}`).join('\n\n'), policy.committee.maxSynthesisChars);
-        const originalTask = clip(args.task, 8000);
-        synthesisInputTruncated = packet.truncated || originalTask.truncated;
+        const packet = successes.map((member) => `## ${member.kind} (${member.role})\n${member.stdout}`).join('\n\n');
         const synthesisPrompt = [
           'You are the read-only chair of a multi-provider committee.',
           'Assess actual agreement; successful text generation alone is not consensus. Preserve material disagreements, distinguish evidence from opinion, propose explicit gates, and do not claim implementation.',
           'Return JSON only with this schema:',
           '{"verdict":"agreement|mixed|disagreement","confidence":0.0,"agreements":["..."],"dissent":["..."],"recommendation":"..."}',
           '',
-          `ORIGINAL TASK:\n${originalTask.text}`,
+          `ORIGINAL TASK:\n${args.task}`,
           '',
-          `MEMBER RESPONSES:\n${packet.text}`,
+          `MEMBER RESPONSES:\n${packet}`,
         ].join('\n');
-        synthesis = await callProvider({
+        try {
+          const entry = config[chairKind];
+          const limits = promptTransportLimits(entry, entry.oneshot_safe || []);
+          preparePrompt(synthesisPrompt, { ...limits,
+            maxChars: limits.maxChars === null ? policy.committee.maxSynthesisChars : Math.min(limits.maxChars, policy.committee.maxSynthesisChars),
+            policyPrefix: typeof entry.oneshot_safe_prompt_prefix === 'string' ? entry.oneshot_safe_prompt_prefix.trim() : '' });
+        } catch (error) {
+          synthesisInputRejected = true;
+          synthesis = { kind: chairKind, exitCode: -1, droppedOut: true, stdout: '',
+            stderr: error.message, failureClass: 'validation', validation: normalizeGenericValidation(error.validation),
+            modelInvocation: false, physicalAttemptCount: 0, tokenUsageSource: 'not_invoked', inputTruncated: false };
+        }
+        if (!synthesisInputRejected) synthesis = await callProvider({
           kind: chairKind,
           prompt: synthesisPrompt,
           cwd: args.cwd,
+          requiresWorkspaceAccess: args.requiresWorkspaceAccess, inlineEvidence: args.inlineEvidence,
+          semanticMaxChars: policy.committee.maxSynthesisChars,
           timeoutMs: remainingTime(deadlineAt),
           useCache: args.useCache,
           parentReceiptId: rootReceipt.receiptId,
           purpose: 'committee:chair',
+          model: eligible.find((candidate) => candidate.kind === chairKind)?.model ?? undefined,
+          execution: eligible.find((candidate) => candidate.kind === chairKind)?.execution ?? undefined,
           signal,
           providerBudget: args.providerBudget,
-          taskTier: route.classification.tier,
-          modelTier: modelTierForTaskTier(route.classification.tier),
+          taskTier: eligible.find((candidate) => candidate.kind === chairKind)?.execution ? undefined : route.classification.tier,
+          modelTier: eligible.find((candidate) => candidate.kind === chairKind)?.execution ? undefined : modelTierForTaskTier(route.classification.tier),
           effort: args.effort,
           maxEffortOverride: args.maxEffortOverride,
         });
@@ -2565,7 +2824,7 @@ export function buildServer() {
     // Any truncation on the way in or out — seat prompt clipping, the chair
     // packet, the provider's own prompt cap reported by the bridge, or the
     // sanitized stdout cap — means the committee did not see the whole task.
-    const evidenceIncomplete = memberEvidenceIncomplete || synthesisInputTruncated || !!synthesis?.outputTruncated || !!synthesis?.route?.prompt_truncated;
+    const evidenceIncomplete = memberEvidenceIncomplete || synthesisInputRejected || !!synthesis?.outputTruncated || !!synthesis?.route?.prompt_truncated;
     const evidenceComplete = !evidenceIncomplete || args.acknowledgeTruncatedEvidence;
     const consensusMinConfidence = Number(policy.committee.consensusMinConfidence ?? 0.6);
     const allSeatsSucceeded = successes.length === eligible.length;
@@ -2586,11 +2845,12 @@ export function buildServer() {
     const consensusBlockedReasons = args.mode !== 'consensus' ? [] : [
       successes.length < 2 ? 'fewer than two successful independent members' : null,
       !synthesisCompleted ? 'chair seat did not return a usable response' : null,
+      synthesisInputRejected ? 'complete chair input exceeded its limit; no chair invocation was made' : null,
       synthesisCompleted && !synthesisAssessment ? 'chair response was not a complete structured verdict' : null,
       synthesisAssessment && synthesisAssessment.verdict !== 'agreement' ? `chair verdict was ${synthesisAssessment.verdict}` : null,
       synthesisAssessment?.verdict === 'agreement' && synthesisAssessment.confidence < consensusMinConfidence
         ? `chair confidence ${synthesisAssessment.confidence} is below the policy floor ${consensusMinConfidence}` : null,
-      evidenceIncomplete && !args.acknowledgeTruncatedEvidence ? 'evidence was truncated and acknowledgeTruncatedEvidence was not set' : null,
+      memberEvidenceIncomplete && !args.acknowledgeTruncatedEvidence ? 'member evidence was truncated and acknowledgeTruncatedEvidence was not set' : null,
     ].filter(Boolean);
     run = writeRun({
       ...run,
@@ -2602,6 +2862,7 @@ export function buildServer() {
       synthesis,
       synthesisAssessment,
       synthesisCompleted,
+      synthesisInputRejected,
       consensusAchieved,
       consensusMinConfidence,
       consensusBlockedReasons,
@@ -2618,6 +2879,7 @@ export function buildServer() {
       deadlineExceeded,
       synthesisCompleted,
       consensusAchieved,
+      synthesisInputRejected,
       consensusVerdict: synthesisAssessment?.verdict || (args.mode === 'consensus' ? 'unknown' : 'not_requested'),
       consensusMinConfidence,
       consensusBlockedReasons,
@@ -2664,23 +2926,29 @@ export function buildServer() {
     title: 'Broadcast one prompt to many providers',
     description: 'Send the same prompt to every matching AI provider in one call. WARNING: this spends quota, credits, or local compute on MULTIPLE provider accounts at once — one broadcast can consume a seat of Claude, Codex, Gemini, Grok, and more simultaneously. Target by explicit providers, by a shared tag, or all:true; tag/all selection always skips opt-in autoRoute:false hosted seats unless they are named explicitly in providers. Calls run with dangerous:false through the same bounded one-shot path and receipts as ask_provider.',
     inputSchema: z.object({
+      ...GROUNDING_FIELDS,
       prompt: z.string().min(1).max(100000),
       tag: z.string().regex(/^[a-z][a-z0-9-]{0,23}$/).optional(),
       providers: z.array(z.string()).max(16).default([]),
       all: z.boolean().default(false),
       cwd: z.string().max(1000).optional(),
       timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).max(TIMEOUT_POLICY.oneShotMaxMs).default(TIMEOUT_POLICY.oneShotDefaultMs),
-      providerBudget: PROVIDER_BUDGET_SCHEMA.optional(),
+      providerBudget: PROVIDER_BUDGET_SCHEMA.nullish(),
+      taskTier: z.enum(TASK_TIERS).optional(),
+      modelTier: z.enum(MODEL_TIERS).optional(),
+      model: z.string().min(1).max(160).optional(),
+      execution: EXECUTION_SCHEMA.optional(),
       effort: z.enum(EFFORT_LEVELS).optional(),
       maxEffortOverride: z.boolean().default(false),
     }),
     annotations: { ...ACTION, openWorldHint: true },
-  }, safeHandler(async ({ prompt, tag, providers, all, cwd, timeoutMs, providerBudget, effort, maxEffortOverride }, context) => {
+  }, safeHandler(async ({ prompt, tag, providers, all, cwd, timeoutMs, providerBudget, effort, maxEffortOverride, taskTier, modelTier, model, execution, requiresWorkspaceAccess, inlineEvidence }, context) => {
     const response = await bridgeRequest('/api/broadcast', {
       method: 'POST',
       body: {
         prompt, tag, providers, all, cwd, timeoutMs, providerBudget, effort,
-        maxEffortOverride, dangerous: false,
+        requiresWorkspaceAccess, inlineEvidence,
+        maxEffortOverride, taskTier, modelTier, model, execution, dangerous: false,
       },
       timeoutMs: TIMEOUT_POLICY.transportTimeoutMs(timeoutMs),
       signal: context?.mcpReq?.signal,
@@ -3042,17 +3310,20 @@ export function buildServer() {
     title: 'Submit a background task',
     description: 'Queue a prompt to a provider and return a task id IMMEDIATELY without waiting for the run. Use for work longer than a chat turn, or when the result should be collectable later from a different surface. Link a collab id to append the result to that shared thread.',
     inputSchema: z.object({
+      ...GROUNDING_FIELDS,
       kind: z.string().min(1).max(64), prompt: z.string().min(1).max(100000),
       collab: z.string().max(64).optional(), title: z.string().max(120).optional(),
       cwd: z.string().max(1024).optional(), user: z.string().max(64).optional(),
+      providerBudget: PROVIDER_BUDGET_SCHEMA.nullish(),
       notBefore: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
       dependsOn: z.array(z.string().regex(/^t_[A-Za-z0-9_]+$/)).max(64).optional(),
       requirementIds: z.array(z.string().min(1).max(120)).max(64).optional(),
       correlation: z.object(Object.fromEntries(['requestId', 'runId', 'invocationId', 'attemptId', 'contractId', 'delegationId']
         .map((key) => [key, z.string().min(1).max(200).optional()]))).strict().optional(),
-      providerBudget: PROVIDER_BUDGET_SCHEMA.optional(),
-      taskTier: z.enum(['utility', 'standard', 'complex', 'critical']).optional(),
+        taskTier: z.enum(['utility', 'standard', 'complex', 'critical']).optional(),
       modelTier: z.enum(['light', 'standard', 'heavy']).optional(),
+      model: z.string().min(1).max(160).optional(),
+      execution: EXECUTION_SCHEMA.optional(),
       effort: z.enum(EFFORT_LEVELS).optional(),
       maxEffortOverride: z.boolean().default(false),
       groundingOverride: z.boolean().default(false),
@@ -3153,6 +3424,12 @@ export function buildServer() {
         objective: z.string().max(4000).optional(),
         title: z.string().max(120).optional(),
         cwd: z.string().max(1024).optional(),
+        ...GROUNDING_FIELDS,
+        model: z.string().min(1).max(160).optional(),
+        modelTier: z.enum(MODEL_TIERS).optional(),
+        execution: EXECUTION_SCHEMA.optional(),
+        maxEffortOverride: z.boolean().optional(),
+        timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).max(TIMEOUT_POLICY.oneShotMaxMs).optional(),
         baseSha: z.string().min(1).max(80),
         ownedFiles: z.array(z.string().min(1).max(400)).min(1).max(200),
         doneWhen: z.array(z.string().min(1).max(2000)).min(1).max(40),
@@ -3164,7 +3441,7 @@ export function buildServer() {
         priority: z.number().int().min(0).max(100).optional(),
         dangerous: z.boolean().default(false),
         acknowledgeFilesystemWrites: z.boolean().default(false),
-        providerBudget: PROVIDER_BUDGET_SCHEMA.optional(),
+        providerBudget: PROVIDER_BUDGET_SCHEMA.nullish(),
         toolPolicy: z.object({
           allow: z.array(z.string().max(120)).max(64).optional(),
           deny: z.array(z.string().max(120)).max(64).optional(),
@@ -3176,8 +3453,8 @@ export function buildServer() {
       cwd: z.string().max(1024).optional(),
     }),
     annotations: ACTION,
-  }, safeHandler(async (input) => {
-    const response = await bridgeRequest('/api/delegate', { method: 'POST', body: input });
+  }, safeHandler(async (input, context) => {
+    const response = await bridgeRequest('/api/delegate', { method: 'POST', body: input, signal: context?.mcpReq?.signal });
     const receipt = appendReceipt({ event: 'delegate_tasks', status: response.status, delegationId: response.delegationId });
     return result({ ...response, receiptId: receipt.receiptId });
   }));

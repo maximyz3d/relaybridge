@@ -28,6 +28,19 @@ function write(file, content) {
   fs.writeFileSync(file, content);
 }
 
+function copyStartPreflightFixture(root) {
+  for (const file of [
+    'start.sh',
+    'tools/migrate-github-registry.cjs',
+    'lib/github-tracker.js',
+    'lib/platform.js',
+  ]) {
+    const target = path.join(root, file);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.copyFileSync(path.join(ROOT, file), target);
+  }
+}
+
 function git(root, ...args) {
   const result = spawnSync('git', ['-C', root, ...args], { encoding: 'utf8', windowsHide: true });
   assert.equal(result.status, 0, result.stderr || result.stdout);
@@ -441,32 +454,56 @@ test('atomic manifest failure preserves the prior complete file and removes its 
   assert.doesNotThrow(() => JSON.parse(fs.readFileSync(target, 'utf8')));
 });
 
-test('atomic manifest publication retries transient Windows destination contention', (t) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relaybridge-build-retry-'));
+test('Windows atomic manifest publication retries transient sharing errors without removing the prior file', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relaybridge-build-sharing-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const target = path.join(root, 'build-info.json');
-  const prior = '{"version":"2.0.0","buildId":"prior"}\n';
+  const prior = '{"preserved":true}\n';
   write(target, prior);
   const fsApi = Object.create(fs);
   let attempts = 0;
+  const pauses = [];
   fsApi.renameSync = (from, to) => {
+    assert.equal(fs.readFileSync(target, 'utf8'), prior);
     attempts += 1;
-    if (attempts === 1) {
-      assert.equal(fs.readFileSync(target, 'utf8'), prior,
-        'the prior complete manifest must remain visible while replacement is contended');
-      throw Object.assign(new Error('injected Windows contention'), { code: 'EPERM' });
-    }
-    return fs.renameSync(from, to);
+    if (attempts <= 3) throw Object.assign(new Error('sharing violation'), {
+      code: ['EPERM', 'EACCES', 'EBUSY'][attempts - 1],
+    });
+    fs.renameSync(from, to);
   };
-  writeBuildInfoAtomic(root, { version: '2.0.1', buildId: 'current' }, {
-    fsApi,
-    platform: 'win32',
-    randomUUID: () => 'fixed',
+  writeBuildInfoAtomic(root, { complete: true }, {
+    fsApi, platform: 'win32', renameRetryPause: (ms) => pauses.push(ms),
   });
-  assert.equal(attempts, 2);
-  assert.deepEqual(JSON.parse(fs.readFileSync(target, 'utf8')), {
-    version: '2.0.1', buildId: 'current',
-  });
+  assert.equal(attempts, 4);
+  assert.deepEqual(pauses, [50, 50, 50]);
+  assert.deepEqual(JSON.parse(fs.readFileSync(target, 'utf8')), { complete: true });
+  assert.deepEqual(fs.readdirSync(root), ['build-info.json']);
+});
+
+test('atomic manifest sharing retries are bounded and Windows-only', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relaybridge-build-locked-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const target = path.join(root, 'build-info.json');
+  const prior = '{"preserved":true}\n';
+  write(target, prior);
+  for (const [platform, code, expectedAttempts] of [
+    ['win32', 'EPERM', 21], ['linux', 'EPERM', 1], ['win32', 'EIO', 1],
+  ]) {
+    let attempts = 0;
+    let pauses = 0;
+    const fsApi = Object.create(fs);
+    fsApi.renameSync = () => {
+      attempts += 1;
+      throw Object.assign(new Error('persistent publication failure'), { code });
+    };
+    assert.throws(() => writeBuildInfoAtomic(root, { complete: true }, {
+      fsApi, platform, renameRetryPause: () => { pauses += 1; },
+    }), /persistent publication failure/);
+    assert.equal(attempts, expectedAttempts);
+    assert.equal(pauses, expectedAttempts - 1);
+    assert.equal(fs.readFileSync(target, 'utf8'), prior);
+    assert.deepEqual(fs.readdirSync(root), ['build-info.json']);
+  }
 });
 
 test('concurrent source preparations publish one complete deterministic manifest', async (t) => {
@@ -808,7 +845,7 @@ test('an unready REST build rejects an MCP mutation even when display version an
   let health;
   try { health = await waitForHealth(`http://127.0.0.1:${port}`, proc); }
   catch (error) { throw new Error(`${error.message}\n${output}`); }
-  assert.equal(health.buildId, '2.0.1');
+  assert.equal(health.buildId, require('../package.json').version);
   assert.equal(health.buildIdentityReady, false);
   assert.equal(health.buildIdentitySource, 'package_version_fallback');
   assert.equal(health.buildIdentityReason, 'test_unready');
@@ -863,7 +900,7 @@ test('a launcher-pinned expected identity makes server startup fail before liste
 posixOnly('start.sh owns the exact server across a forced setsid fork', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relaybridge-start-fork-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  fs.copyFileSync(path.join(ROOT, 'start.sh'), path.join(root, 'start.sh'));
+  copyStartPreflightFixture(root);
   write(path.join(root, 'tools', 'prepare-build-info.cjs'),
     "process.stdout.write('2.0.1+aaaaaaaaaaaaaaaa\\n');\n");
   write(path.join(root, 'server.js'), `
@@ -925,7 +962,7 @@ posixOnly('start.sh owns the exact server across a forced setsid fork', async (t
 posixOnly('start.sh aborts a forced-fork child when its inside-session PID handoff cannot be written', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relaybridge-start-handoff-fail-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  fs.copyFileSync(path.join(ROOT, 'start.sh'), path.join(root, 'start.sh'));
+  copyStartPreflightFixture(root);
   write(path.join(root, 'tools', 'prepare-build-info.cjs'),
     "process.stdout.write('2.0.1+aaaaaaaaaaaaaaaa\\n');\n");
   const serverMarker = path.join(root, 'server-started.marker');
@@ -986,7 +1023,7 @@ posixOnly('start.sh never signals an unproven PID injected into its handoff', as
   });
   await waitUntil(() => isLiveProcess(victim.pid));
 
-  fs.copyFileSync(path.join(ROOT, 'start.sh'), path.join(root, 'start.sh'));
+  copyStartPreflightFixture(root);
   write(path.join(root, 'tools', 'prepare-build-info.cjs'),
     "process.stdout.write('2.0.1+aaaaaaaaaaaaaaaa\\n');\n");
   write(path.join(root, 'server.js'), 'throw new Error("must not execute");\n');
@@ -1045,7 +1082,7 @@ posixOnly('start.sh rejects an unrelated valid session leader without signaling 
     return status.status === 0 && pgid === victim.pid && sid === victim.pid;
   });
 
-  fs.copyFileSync(path.join(ROOT, 'start.sh'), path.join(root, 'start.sh'));
+  copyStartPreflightFixture(root);
   write(path.join(root, 'tools', 'prepare-build-info.cjs'),
     "process.stdout.write('2.0.1+aaaaaaaaaaaaaaaa\\n');\n");
   write(path.join(root, 'server.js'), 'throw new Error("must not execute");\n');
@@ -1106,7 +1143,7 @@ posixOnly('start.sh removes wrong or unready exact candidates without leaving a 
         }
         fs.rmSync(root, { recursive: true, force: true });
       });
-      fs.copyFileSync(path.join(ROOT, 'start.sh'), path.join(root, 'start.sh'));
+      copyStartPreflightFixture(root);
       write(path.join(root, 'tools', 'prepare-build-info.cjs'),
         "process.stdout.write('2.0.1+aaaaaaaaaaaaaaaa\\n');\n");
       const serverPidFile = path.join(root, 'server.pid');
@@ -1160,7 +1197,7 @@ posixOnly('start.sh signal cleanup terminates its exact detached session', async
     if (serverPid && isLiveProcess(serverPid)) { try { process.kill(serverPid, 'SIGKILL'); } catch {} }
     fs.rmSync(root, { recursive: true, force: true });
   });
-  fs.copyFileSync(path.join(ROOT, 'start.sh'), path.join(root, 'start.sh'));
+  copyStartPreflightFixture(root);
   write(path.join(root, 'tools', 'prepare-build-info.cjs'),
     "process.stdout.write('2.0.1+aaaaaaaaaaaaaaaa\\n');\n");
   write(path.join(root, 'server.js'), `
@@ -1192,14 +1229,17 @@ posixOnly('start.sh signal cleanup terminates its exact detached session', async
   await assert.rejects(fetch(`http://127.0.0.1:${port}/api/health`));
 });
 
+posixOnly('POSIX lifecycle scripts pass their native shell syntax checks', () => {
+  assert.equal(spawnSync('sh', ['-n', path.join(ROOT, 'install-mcp.sh')]).status, 0);
+  assert.equal(spawnSync('bash', ['-n', path.join(ROOT, 'start.sh')]).status, 0);
+});
+
 test('lifecycle scripts guard credentials, preserve generated identity, and require exact ready health', () => {
   const install = fs.readFileSync(path.join(ROOT, 'install-mcp.sh'), 'utf8').replace(/\r\n/g, '\n');
   const releaseInstall = fs.readFileSync(path.join(ROOT, 'install.ps1'), 'utf8');
   const start = fs.readFileSync(path.join(ROOT, 'start.sh'), 'utf8');
   const windowsStart = fs.readFileSync(path.join(ROOT, 'start.ps1'), 'utf8');
   const windowsMcp = fs.readFileSync(path.join(ROOT, 'install-mcp.ps1'), 'utf8');
-  assert.equal(spawnSync('sh', ['-n', path.join(ROOT, 'install-mcp.sh')]).status, 0);
-  assert.equal(spawnSync('bash', ['-n', path.join(ROOT, 'start.sh')]).status, 0);
   assert.doesNotMatch(install, /snapshot "\$build_info" build-info/);
   assert.doesNotMatch(install, /restore "\$build_info" build-info/);
   assert.match(install, /"\$node_path" "\$build_info_tool" "\$script_dir"/);
@@ -1242,13 +1282,16 @@ test('lifecycle scripts guard credentials, preserve generated identity, and requ
     releaseInstall.indexOf('function Stop-BridgeForCutover'),
     releaseInstall.indexOf('function Start-StagedBridge'),
   );
-  assert.match(cutoverStopBlock, /Get-Process -Id \$reportedPid -ErrorAction Stop/,
+  assert.match(cutoverStopBlock, /\$shutdownProcess = Get-BridgeShutdownProcessHandle \$shutdownPid/,
     'Windows cutover must pin the process identity reported by authenticated health');
-  assert.match(cutoverStopBlock, /\$null = \$oldProcess\.Handle/,
+  const captureBlock = releaseInstall.slice(releaseInstall.indexOf('function Get-BridgeShutdownProcessHandle'), releaseInstall.indexOf('function Stop-BridgeForCutover'));
+  assert.match(captureBlock, /\$null = \$process\.Handle/,
     'Windows cutover must open the exact process handle before requesting shutdown');
   assert.doesNotMatch(cutoverStopBlock, /Stop-Process/,
     'Windows cutover must fail closed instead of signaling a health-reported PID');
-  const cutoverExitBarrier = releaseInstall.indexOf('$oldProcess.HasExited -and -not (Test-LocalPortInUse $BridgePort)');
+  assert.match(cutoverStopBlock, /if \(-not \$shutdownProcess\)/,
+    'failure to capture the exact process must reject cutover');
+  const cutoverExitBarrier = releaseInstall.indexOf('$shutdownProcess.WaitForExit(10000)');
   const cutoverReturn = releaseInstall.indexOf('return $health', cutoverExitBarrier);
   assert.ok(cutoverExitBarrier >= 0 && cutoverReturn > cutoverExitBarrier,
     'Windows cutover must wait for the health-reported process and its listener to terminate');

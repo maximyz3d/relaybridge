@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const crypto = require('crypto');
 const { spawnSync } = require('child_process');
 const {
   captureWriterWorkspaceSnapshot,
@@ -15,6 +16,15 @@ function git(cwd, ...args) {
   const result = spawnSync('git', args, { cwd, encoding: 'utf8', windowsHide: true });
   assert.equal(result.status, 0, result.stderr);
 }
+
+test('an unavailable workspace snapshot reports an unknown change count, not zero', () => {
+  const summary = summarizeWriterWorkspaceDiff({ available: false, reason: 'git_status_failed' }, null);
+  assert.equal(summary.available, false);
+  assert.equal(summary.reason, 'git_status_failed');
+  assert.equal(summary.changedFileCount, null);
+  assert.equal(summary.changedFileCountLowerBound, 0);
+  assert.equal(summary.changeCountComplete, false);
+});
 
 test('writer diff summary reports bounded status without leaking secret paths or contents', (t) => {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-writer-summary-'));
@@ -41,6 +51,11 @@ test('writer diff summary reports bounded status without leaking secret paths or
   assert.equal(secret.path, '[redacted-sensitive-path]');
   assert.equal(secret.pathHash, null);
   assert.doesNotMatch(JSON.stringify(summary), /\.env|hunter2/);
+  const publicCanonical = summary.files.map((file) => [file.path, file.beforeStatus, file.afterStatus])
+    .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
+  assert.equal(summary.statusHash, crypto.createHash('sha256').update(JSON.stringify(publicCanonical)).digest('hex'));
+  const guessedRawCanonical = [['.env', null, '??'], ['tracked.txt', null, ' M']];
+  assert.notEqual(summary.statusHash, crypto.createHash('sha256').update(JSON.stringify(guessedRawCanonical)).digest('hex'));
 
   fs.writeFileSync(path.join(cwd, 'tracked.txt'), 'changed again with identical porcelain status\n');
   const changedAgain = captureWriterWorkspaceSnapshot(cwd);
@@ -72,13 +87,30 @@ test('writer snapshots bound fingerprint work and report truncation', (t) => {
   assert.equal(summary.changedFileCount, 230);
   assert.equal(summary.filesTruncated, true);
   assert.equal(summary.fingerprintsTruncated, true);
+
+  fs.writeFileSync(path.join(cwd, 'new-229.txt'), 'modified beyond fingerprint coverage\n');
+  const later = captureWriterWorkspaceSnapshot(cwd);
+  const uncertain = summarizeWriterWorkspaceDiff(snapshot, later);
+  assert.equal(uncertain.changedFileCount, null, 'unknown content must not be reported as zero changes');
+  assert.equal(uncertain.changedFileCountLowerBound, 0);
+  assert.equal(uncertain.unverifiedFileCount, 30);
+  assert.equal(uncertain.changeCountComplete, false);
 });
 
 test('non-repository writer summary fails closed', () => {
   const before = captureWriterWorkspaceSnapshot(os.tmpdir());
   const summary = summarizeWriterWorkspaceDiff(before, before);
   assert.equal(summary.available, false);
-  assert.equal(summary.changedFileCount, 0);
+  assert.equal(summary.changedFileCount, null);
+});
+
+test('failed fingerprints remain explicitly unknown even without truncation', () => {
+  const snapshot = { available: true, head: 'a'.repeat(40), entries: new Map([['dirty.txt', ' M']]),
+    fingerprints: new Map([['dirty.txt', null]]), fingerprintsTruncated: false };
+  const summary = summarizeWriterWorkspaceDiff(snapshot, snapshot);
+  assert.equal(summary.changedFileCount, null);
+  assert.equal(summary.unverifiedFileCount, 1);
+  assert.equal(summary.changeCountComplete, false);
 });
 
 test('writer snapshot treats control-shaped workspace text as one git path argument', (t) => {

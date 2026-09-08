@@ -217,14 +217,16 @@ model can only refuse or guess, and models lean toward being helpful.
 
 1. **Pre-dispatch gate.** `checkGrounding()` blocks a workspace task on a
    non-grounded seat before any tokens are spent, and says what to do instead.
-   Grounding is inferred from the adapter: `local:*`, `hosted:*`, `api:*` reach
-   the model over HTTP and cannot read files; `subscription:*` CLIs run in the
-   working directory. An unknown adapter is assumed grounded — a false "cannot
-   read" would block legitimate work.
+   Grounding requires the configured invocation mode's explicit
+   `workspace_read` and `tool_use` capabilities. Actual HTTP adapters and
+   Perplexity remain prompt-only. Billing labels, a working directory, or an
+   unknown adapter are not proof of access. These declarations do not bypass
+   the separate safe-filesystem qualification gate.
 2. **Post-hoc verification.** A grounded seat can still hallucinate.
    `verifyReferencedPaths()` extracts file citations from the answer and checks
    them against the workspace, annotating the payload with
-   `grounding_warning` when they are absent.
+   `grounding_warning` when checkable workspace paths are absent. Outside,
+   foreign-platform, and unverifiable paths are not counted as missing files.
 
 | confidence | meaning |
 |---|---|
@@ -233,7 +235,12 @@ model can only refuse or guess, and models lean toward being helpful.
 | `suspect` | most cited paths are absent |
 | `likely-fabricated` | **every** cited path is absent |
 
-Inline work (`review this code: …`) is never blocked — local seats must stay
-useful for what they are best at. A `cwd` alone does not make a task
-workspace-bound. `groundingOverride: true` allows an ungrounded opinion
-deliberately, and flags the answer as unverified.
+Self-contained inline work (`review this code: …`) does not by itself require
+filesystem access; ordinary capability, permission, and input limits still
+apply. A `cwd` alone does not make a task workspace-bound. For file-dependent
+work, a prompt-only seat needs a validated `inlineEvidence` bundle containing
+`content`, its UTF-8 `sha256`, and the current admitted `cwdIdentityHash`.
+The bridge appends the complete content once before checking input limits.
+The digest establishes integrity, not factual completeness. Neither
+`groundingOverride:true` nor `requiresWorkspaceAccess:false` bypasses a detected
+workspace requirement, and inline evidence never authorizes writes.

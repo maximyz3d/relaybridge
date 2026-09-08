@@ -7,6 +7,7 @@ const {
   extractClaudeAssistantCheckpoint,
   redactCheckpointSecrets,
   truncateUtf8Tail,
+  MAX_REDACTION_SOURCE_BYTES,
 } = require('../lib/partial-checkpoint');
 
 test('latest complete Claude assistant text becomes a bounded sanitized checkpoint', () => {
@@ -75,7 +76,7 @@ test('credential-shaped assistant prose is redacted without exposing values', ()
   assert.match(cleaned, /\[REDACTED/);
 });
 
-test('redaction is bounded before credential regexes scan large model text', () => {
+test('complete-source redaction is bounded and precedes checkpoint tail truncation', () => {
   const checkpoint = extractClaudeAssistantCheckpoint([{
     type: 'assistant',
     message: { id: 'large', content: [{ type: 'text', text: `${'x'.repeat(2_000_000)}\napi_key=tail-secret` }] },
@@ -86,7 +87,7 @@ test('redaction is bounded before credential regexes scan large model text', () 
   assert.doesNotMatch(checkpoint.text, /tail-secret/);
 });
 
-test('a bounded tail that starts inside a private-key block fails closed', () => {
+test('private-key redaction preserves safe prose before any tail truncation', () => {
   const syntheticKeyBody = 'SYNTHETICKEYMATERIAL'.repeat(4000);
   const checkpoint = extractClaudeAssistantCheckpoint([{
     type: 'assistant',
@@ -99,8 +100,8 @@ test('a bounded tail that starts inside a private-key block fails closed', () =>
     ].join('\n') }] },
   }], 1024);
 
-  assert.equal(checkpoint.truncated, true);
-  assert.match(checkpoint.text, /^\[REDACTED_PRIVATE_KEY\]\nsafe suffix$/);
+  assert.equal(checkpoint.truncated, false, 'redaction made the complete sanitized text fit; no tail was discarded');
+  assert.equal(checkpoint.text, 'safe prefix\n[REDACTED_PRIVATE_KEY]\nsafe suffix');
   assert.doesNotMatch(checkpoint.text, /SYNTHETICKEYMATERIAL|BEGIN TEST PRIVATE KEY|END TEST PRIVATE KEY/);
 });
 
@@ -113,4 +114,50 @@ test('no assistant text yields explicit unavailable metadata', () => {
     { text: checkpoint.text, eventType: checkpoint.eventType, bytes: checkpoint.bytes, reason: checkpoint.unavailableReason },
     { text: '', eventType: null, bytes: 0, reason: 'no_complete_assistant_text' },
   );
+});
+
+test('credentials crossing the former 48KB redaction boundary never expose a suffix', () => {
+  for (const text of [
+    `password="${'SYNTHETIC_SECRET_'.repeat(5000)}"\nsafe suffix`,
+    `Authorization: Bearer ${'SYNTHETIC_SECRET_'.repeat(5000)}\nsafe suffix`,
+    `{"api_key":"${'SYNTHETIC_SECRET_'.repeat(5000)}"}\nsafe suffix`,
+    `password="${'SYNTHETIC_SECRET_'.repeat(5000)}`,
+  ]) {
+    const checkpoint = extractClaudeAssistantCheckpoint([{ type: 'assistant',
+      message: { id: 'boundary', content: [{ type: 'text', text }] } }], 1024);
+    assert.doesNotMatch(checkpoint.text, /SYNTHETIC_SECRET/);
+    assert.match(checkpoint.text, /REDACTED/);
+    assert.ok(checkpoint.bytes <= 1024);
+  }
+});
+
+test('oversized redaction input fails closed with explicit provenance', () => {
+  const text = 'SYNTHETIC_SECRET_'.repeat(150000);
+  const event = { type: 'assistant', message: { id: 'too-large', content: [{ type: 'text', text }] } };
+  const checkpoint = extractClaudeAssistantCheckpoint([event]);
+  assert.equal(checkpoint.text, '');
+  assert.equal(checkpoint.unavailableReason, 'redaction_input_limit');
+  assert.equal(checkpoint.originalBytes, Buffer.byteLength(text));
+  assert.equal(checkpoint.truncated, true);
+  const fallback = extractClaudeAssistantCheckpoint([{ type: 'assistant', message: {
+    id: 'earlier', content: [{ type: 'text', text: 'safe older checkpoint' }] } }, event]);
+  assert.equal(fallback.text, 'safe older checkpoint');
+  assert.equal(fallback.selectionReason, 'latest_assistant_unavailable_using_previous');
+});
+
+test('a recovered same-ID block clears obsolete redaction-limit provenance', () => {
+  const event = (text) => ({ type: 'assistant', message: {
+    id: 'recovered', content: [{ type: 'text', text }],
+  } });
+  const events = [event('x'.repeat(MAX_REDACTION_SOURCE_BYTES + 1)), event('valid')];
+  const recovered = extractClaudeAssistantCheckpoint(events);
+  assert.equal(recovered.text, 'valid');
+  assert.equal(recovered.originalBytes, 5);
+  assert.equal(recovered.truncated, false);
+  assert.equal(recovered.unavailableReason, null);
+  const conflicted = extractClaudeAssistantCheckpoint([...events, event('different')]);
+  assert.equal(conflicted.text, '');
+  assert.equal(conflicted.unavailableReason, 'no_complete_assistant_text');
+  assert.equal(conflicted.originalBytes, 0);
+  assert.equal(conflicted.truncated, false);
 });

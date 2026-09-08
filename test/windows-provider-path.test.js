@@ -6,7 +6,7 @@ const fs = require('fs');
 const http = require('http');
 const os = require('os');
 const path = require('path');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 
 const ROOT = path.resolve(__dirname, '..');
 const TEST_BUILD_ID = 'relaybridge-windows-path-test';
@@ -48,17 +48,15 @@ test('Windows child PATH discovers the official Cursor install directory and kee
   const tokenPath = path.join(tempRoot, 'capability.token');
   fs.mkdirSync(cursorDir, { recursive: true });
   fs.mkdirSync(allowedRoot, { recursive: true });
-  fs.writeFileSync(cursorShim, [
-    '@echo off',
-    'if /I "%1"=="mixed" (',
-    '  echo Logged in as cached-user',
-    '  echo Not logged in 1>&2',
-    '  exit /b 0',
-    ')',
-    'echo Not logged in',
-    'exit /b 0',
-    '',
-  ].join('\r\n'), 'utf8');
+  fs.copyFileSync(path.join(__dirname, 'fixtures', 'windows-shims', 'cursor-agent.cmd'), cursorShim);
+  fs.copyFileSync(path.join(__dirname, 'fixtures', 'windows-shims', 'cursor-agent.ps1'), path.join(cursorDir, 'cursor-agent.ps1'));
+  fs.copyFileSync(process.execPath, path.join(cursorDir, 'node.exe'));
+  fs.writeFileSync(path.join(cursorDir, 'index.js'), [
+    "if (process.argv[2] === 'mixed') {",
+    "  process.stdout.write('Logged in as cached-user\\n');",
+    "  process.stderr.write('Not logged in\\n');",
+    "} else process.stdout.write('Not logged in\\n');",
+  ].join('\n'), 'utf8');
   const cursorSeat = {
     label: 'Cursor Agent',
     diagnostic_binary: 'agent',
@@ -96,10 +94,12 @@ test('Windows child PATH discovers the official Cursor install directory and kee
   for (const key of Object.keys(serverEnv)) {
     if (key.toUpperCase() === 'PATH') delete serverEnv[key];
   }
-  // Preserve required runner tools (notably Git, used to revalidate the
-  // source identity) while proving RelayBridge itself appends Cursor's
-  // LOCALAPPDATA install directory.
-  serverEnv.Path = inheritedPath;
+  // Source build identity still needs git. Preserve only its exact directory,
+  // not the host provider PATH: Cursor discovery remains the behavior under test.
+  const gitLookup = spawnSync('where.exe', ['git.exe'], { encoding: 'utf8', windowsHide: true });
+  assert.equal(gitLookup.status, 0, gitLookup.stderr || 'git is required by source build verification');
+  const gitDirectory = path.dirname(gitLookup.stdout.trim().split(/\r?\n/)[0]);
+  serverEnv.Path = [path.join(process.env.SystemRoot || 'C:\\Windows', 'System32'), gitDirectory].join(';');
 
   const proc = spawn(process.execPath, [path.join(ROOT, 'server.js')], {
     cwd: ROOT,

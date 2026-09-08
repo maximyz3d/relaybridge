@@ -4,6 +4,7 @@
 const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
+const crypto = require('crypto');
 
 if (process.argv.includes('--version')) {
   process.stdout.write('claude-stream-fixture 1.0.0\n');
@@ -46,7 +47,8 @@ lines.on('line', (line) => {
       cache_creation_input_tokens: 0,
     });
     process.stdout.write(`${JSON.stringify({
-      type: 'result', is_error: false, subtype: 'success', result: 'HEALTHY_STREAM_OK',
+      type: 'result', is_error: false, subtype: 'success',
+      result: 'HEALTHY_STREAM_OK:' + crypto.createHash('sha256').update(event.message.content[0].text).digest('hex'),
       num_turns: 1,
       usage: {
         input_tokens: 10,

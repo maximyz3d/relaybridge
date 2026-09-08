@@ -20,13 +20,32 @@ strictly greater than that baseline.
 
 ## Enrolling a repo
 
-`config/github-repos.json`:
+The live registry is machine-specific runtime state. By default it is stored at
+`data/github-repos.json`, which is ignored by Git and preserved across installs
+and upgrades. `config/github-repos.example.json` is the path-free tracked
+template; RelayBridge never reads it as live enrollment.
+
+Location precedence is:
+
+1. `RELAYBRIDGE_GITHUB_REPOS` (explicit file override)
+2. `RELAYBRIDGE_DATA_DIR/github-repos.json`
+3. `PS_BRIDGE_DATA_DIR/github-repos.json` (legacy data-dir alias)
+4. `<RelayBridge root>/data/github-repos.json`
+
+On first load only, a valid pre-2.1 `config/github-repos.json` is atomically
+migrated to the selected runtime location when that location does not exist.
+An existing runtime registry always wins and is never overwritten by legacy
+state. Invalid legacy JSON or entries fail closed instead of being partially
+migrated. Install and upgrade use this same migration and preserve `data/`.
+
+Example live entry (replace the placeholder with an absolute path native to
+the machine running RelayBridge):
 
 ```jsonc
 {
   "repos": [{
-    "name": "DarthN99/SQ4D_Duet_UI",
-    "path": "D:\\Claude\\SQ4D_Duet_UI",
+    "name": "owner/repository",
+    "path": "/home/user/projects/repository",
     "autoCommit": true,
     "autoPush": false,          // opt-in; default false
     "dryRun": true,             // log intended actions only — start here
@@ -39,6 +58,13 @@ strictly greater than that baseline.
   }]
 }
 ```
+
+Use a Linux-filesystem path such as `/home/...` when RelayBridge runs in WSL.
+Windows drive paths and `/mnt/...` enrollments are rejected there because Git
+and model-CLI workloads on DrvFs are both slower and less reliable. Native
+Windows RelayBridge installations use an absolute Windows path such as
+`C:\\Users\\user\\projects\\repository`. `RELAYBRIDGE_ALLOW_SLOW_WSL_FS=1`
+remains the explicit escape hatch for operators who accept the `/mnt` cost.
 
 Or run **＋ Onboard repo** in the 🐙 GitHub dashboard panel /
 `github_onboard_repo` MCP tool / `POST /api/github/onboard` — one action
@@ -100,5 +126,6 @@ plain git, or through RelayBridge:
   *would* make.
 - Secret skip-list enforced unconditionally.
 - Auth comes from the existing `gh` login — no tokens in config.
+- Enrollment paths live only in ignored runtime state, never in tracked config.
 - Onboarding operates on a branch + draft PR; branch protection, org, and
   billing settings are surfaced as manual steps, never changed.

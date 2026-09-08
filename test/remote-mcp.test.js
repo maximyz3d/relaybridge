@@ -8,9 +8,20 @@ const assert = require('node:assert/strict');
 const express = require('express');
 const {
   mountRemoteMcp, profileFilter, isNeverRemote, isNeverRemoteResource, NEVER_REMOTE,
+  bearerFrom,
 } = require('../lib/remote-mcp');
 
 const TOKEN = 'a'.repeat(64);
+
+test('bearer parsing is bounded and linear without broad whitespace backtracking', () => {
+  for (const authorization of [`Bearer ${TOKEN}`, `bearer\t ${TOKEN} `]) {
+    assert.equal(bearerFrom({ headers: { authorization } }), TOKEN);
+  }
+  for (const authorization of ['Bearer ' + ' '.repeat(100000) + 'x\nX', `Bearer ${TOKEN}\u2028ignored`, [], 'Bearerx ' + TOKEN]) {
+    assert.equal(bearerFrom({ headers: { authorization } }), '');
+  }
+  assert.equal(bearerFrom({ headers: { 'x-relaybridge-token': TOKEN } }), TOKEN);
+});
 
 function withEnv(vars, fn) {
   const prev = {};

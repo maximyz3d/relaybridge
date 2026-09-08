@@ -19,6 +19,17 @@ function readConfig() {
   return JSON.parse(fs.readFileSync(CONFIG, 'utf8'));
 }
 
+// Receipts are append-only JSONL. During cancellation the admission slot may
+// be released before the terminal append finishes. Ignore only an unfinished
+// final line while polling; malformed complete records must still fail tests.
+function readCompleteReceiptRows(tempRoot) {
+  const file = path.join(tempRoot, 'data', 'receipts', new Date().toISOString().slice(0, 10) + '.jsonl');
+  let bytes;
+  try { bytes = fs.readFileSync(file, 'utf8'); }
+  catch (error) { if (error.code === 'ENOENT') return []; throw error; }
+  return bytes.slice(0, bytes.lastIndexOf('\n') + 1).split(/\r?\n/).filter(Boolean).map(JSON.parse);
+}
+
 test('one-shot timeout policy is centralized: 20 min default, ceiling equals the supervisor hard cap', () => {
   assert.equal(TIMEOUT_POLICY.oneShotDefaultMs, 1200000);
   // The explicit-timeout ceiling matches _supervisor.hardCapMs (45 min) so the
@@ -157,8 +168,9 @@ test('provider config uses the installed subscription CLIs and safe headless mod
   assert.deepEqual(config.gemini.login_command, ['agy'], 'Antigravity signs in through its own interactive TUI');
   assert.equal(config.gemini.oneshot_safe[config.gemini.oneshot_safe.indexOf('--add-dir') + 1], '{cwd}');
   assert.equal(config.gemini.oneshot_safe[config.gemini.oneshot_safe.indexOf('--effort') + 1], 'high');
-  assert.equal(config.gemini.oneshot_safe[config.gemini.oneshot_safe.indexOf('--print-timeout') + 1], '15m');
-  assert.equal(config.gemini.oneshot_dangerous[config.gemini.oneshot_dangerous.indexOf('--print-timeout') + 1], '15m');
+  assert.equal(config.gemini.print_timeout_policy, 'supervisor_margin_v1');
+  assert.equal(config.gemini.oneshot_safe[config.gemini.oneshot_safe.indexOf('--print-timeout') + 1], '{supervisor_print_timeout}');
+  assert.equal(config.gemini.oneshot_dangerous[config.gemini.oneshot_dangerous.indexOf('--print-timeout') + 1], '{supervisor_print_timeout}');
   assert.deepEqual(config.gemini.model_tiers.light, {
     args: ['--model', 'gemini-3.5-flash-low'], model: 'gemini-3.5-flash-low',
     suppress_args: [{ flag: '--effort', value_count: 1 }], note: 'current low-effort Flash id reported by agy models',
@@ -395,6 +407,11 @@ async function capabilityHeaders(baseUrl, contentType = false) {
   };
 }
 
+function isLiveProcess(pid) {
+  try { process.kill(Number(pid), 0); return true; }
+  catch { return false; }
+}
+
 test('prompt-file transport preserves long special-character prompts and cleans up', async (t) => {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ps-bridge-test-'));
   const promptTemp = path.join(tempRoot, 'prompt-temp');
@@ -406,6 +423,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   const closedStreamHelper = path.join(ROOT, 'test', 'claude-stdin-closed-cli.js');
   const configPath = path.join(tempRoot, 'config.json');
   const tokenPath = path.join(tempRoot, 'capability.token');
+  const lateFinalPidMarker = path.join(tempRoot, 'late-final-provider.pid');
   const baseSlot = [process.execPath, helper, '--prompt-file', '{prompt_file}'];
   fs.writeFileSync(configPath, JSON.stringify({
     echo: {
@@ -443,6 +461,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
     },
     claude: {
       label: 'Unverified Claude Routing Fixture',
+      oneshot_capabilities: { safe: ['model_invocation'], dangerous: ['model_invocation'] },
       oneshot_safe_filesystem_policy: 'unverified_provider_policy',
       safe: [process.execPath, helper, '--version'],
       dangerous: [process.execPath, helper, '--version'],
@@ -473,6 +492,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
       oneshot_dangerous: [...baseSlot, '--stderr', 'Error: timeout waiting for response', '--exit', '1'],
     },
     headless_permission_denial: {
+      oneshot_capabilities: { safe: ['model_invocation', 'workspace_read', 'tool_use'] },
       label: 'Antigravity Headless Permission Fixture',
       safe: [process.execPath, helper, '--version'],
       dangerous: [process.execPath, helper, '--version'],
@@ -483,6 +503,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
       prompt_max_chars: 80,
     },
     headless_readonly_success: {
+      oneshot_capabilities: { safe: ['model_invocation', 'workspace_read', 'tool_use'] },
       label: 'Antigravity Command-Free Review Fixture',
       safe: [process.execPath, helper, '--version'],
       dangerous: [process.execPath, helper, '--version'],
@@ -493,6 +514,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
     },
     narration_only: {
       label: 'Narration-Only Grok Fixture',
+      oneshot_capabilities: { safe: ['model_invocation', 'workspace_read', 'tool_use'] },
       usage_capability: {
         tokens: 'unavailable', turns: 'unavailable', verified_runtime_version: '1.1.19',
         evidence: 'fixture CLI exposes no authoritative usage',
@@ -512,6 +534,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
     },
     grok: {
       label: 'Grok Quota Fixture',
+      oneshot_capabilities: { safe: ['model_invocation'], dangerous: ['model_invocation'] },
       safe: [process.execPath, helper, '--version'],
       dangerous: [process.execPath, helper, '--version'],
       oneshot_safe: [...baseSlot, '--stderr', "API error (status 429 Too Many Requests): subscription:free-usage-exhausted: You've used all the included free usage for model grok-4.6 for now. Usage resets over a rolling 24-hour window — tokens (actual/limit): 552,305/500,000. Upgrade to a Grok subscription. model_id=grok-4.6", '--exit', '1'],
@@ -521,6 +544,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
     },
     copilot: {
       label: 'Copilot Monthly Quota Fixture',
+      oneshot_capabilities: { safe: ['model_invocation'], dangerous: ['model_invocation'] },
       safe: [process.execPath, helper, '--version'],
       dangerous: [process.execPath, helper, '--version'],
       oneshot_safe: [...baseSlot, '--stderr', "You have exceeded your monthly quota (Request ID: 393F:279076:21CF7B:277870:6A7E5965)\n\nChanges    +0 -0\nAI Credits 0 (3s)\nResume     copilot --resume=fixture", '--exit', '1'],
@@ -542,6 +566,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
     },
     usage_json: {
       label: 'Structured Claude Usage',
+      oneshot_capabilities: { safe: ['model_invocation'] },
       transport: 'subscription:anthropic',
       quota_seat: 'subscription:anthropic:default',
       safe: [process.execPath, helper, '--version'],
@@ -552,6 +577,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
     },
     codex_effort: {
       label: 'Codex Reasoning Effort Fixture',
+      oneshot_capabilities: { safe: ['model_invocation'], dangerous: ['model_invocation'] },
       safe: [process.execPath, helper, '--version'],
       dangerous: [process.execPath, helper, '--version'],
       oneshot_safe: baseSlot,
@@ -582,8 +608,17 @@ test('prompt-file transport preserves long special-character prompts and cleans 
       quota_seat: 'subscription:anthropic:default',
       safe: [process.execPath, helper, '--version'],
       dangerous: [process.execPath, helper, '--version'],
-      oneshot_safe: [...baseSlot, '--claude-json-multiturn'],
-      oneshot_dangerous: [...baseSlot, '--claude-json-multiturn'],
+      oneshot_safe: [...baseSlot, '--claude-json-multiturn-late-final', '--pid-marker', lateFinalPidMarker],
+      oneshot_dangerous: [...baseSlot, '--claude-json-multiturn-late-final', '--pid-marker', lateFinalPidMarker],
+      oneshot_output_parser: 'claude_json',
+    },
+    usage_json_older_terminal_budget: {
+      label: 'Older Terminal Newer Accepted Checkpoint',
+      transport: 'subscription:anthropic',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--claude-json-older-terminal-budget'],
+      oneshot_dangerous: [...baseSlot, '--claude-json-older-terminal-budget'],
       oneshot_output_parser: 'claude_json',
     },
     usage_json_multiturn_bounded: {
@@ -642,6 +677,16 @@ test('prompt-file transport preserves long special-character prompts and cleans 
       dangerous: [process.execPath, helper, '--version'],
       oneshot_safe: [...baseSlot, '--claude-json-longrun'],
       oneshot_dangerous: [...baseSlot, '--claude-json-longrun'],
+      oneshot_output_parser: 'claude_json',
+    },
+    usage_json_terminal_only_budget: {
+      label: 'Terminal-Only Claude Usage Budget Overage',
+      transport: 'subscription:anthropic',
+      quota_seat: 'subscription:anthropic:default',
+      safe: [process.execPath, helper, '--version'],
+      dangerous: [process.execPath, helper, '--version'],
+      oneshot_safe: [...baseSlot, '--claude-json-terminal-only-budget'],
+      oneshot_dangerous: [...baseSlot, '--claude-json-terminal-only-budget'],
       oneshot_output_parser: 'claude_json',
     },
     usage_json_malformed_models: {
@@ -1004,7 +1049,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.ok(datasheetRoute.selected.every((candidate) => candidate.capabilities.includes('research')));
 
   const datasheetCli = spawnSync(process.execPath, [path.join(ROOT, 'bin', 'relaybridge.js'), 'plan', datasheetTask, '--json'], {
-    cwd: ROOT,
+    cwd: tempRoot,
     env: {
       ...process.env,
       RELAYBRIDGE_URL: baseUrl,
@@ -1220,7 +1265,9 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(narrationResult.failureClass, 'incomplete_response');
   assert.equal(narrationResult.stop_reason, 'provider_incomplete_response');
   assert.match(narrationResult.stop_detail, /switch providers/);
-  assert.match(narrationResult.stdout, /^I will inspect/);
+  assert.equal(narrationResult.stdout, '');
+  assert.match(narrationResult.partial_diagnostic, /^I will inspect/);
+  assert.equal(narrationResult.output_detector.id, 'future_narration_only');
   const narrationReceipt = fs.readFileSync(
     path.join(tempRoot, 'data', 'receipts', new Date().toISOString().slice(0, 10) + '.jsonl'), 'utf8',
   ).trim().split(/\r?\n/).map(JSON.parse).find((row) => row.receiptId === narrationResult.receiptId);
@@ -1600,12 +1647,25 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   const multiTurnBudgetResult = await multiTurnBudgetResponse.json();
   assert.equal(multiTurnBudgetResult.stop_reason, 'token_budget');
   assert.equal(multiTurnBudgetResult.failureClass, 'token_budget');
+  assert.equal(multiTurnBudgetResult.rate_limited, false,
+    'a late rate-limit phrase cannot override the sticky local budget verdict');
   assert.equal(multiTurnBudgetResult.rate_limited, false, 'partial tool prose is not vendor quota evidence');
   assert.ok(!multiTurnBudgetResult.cooldown, 'local budget stop must not cool the shared seat');
   assert.equal(multiTurnBudgetResult.timed_out, false);
   assert.equal(multiTurnBudgetResult.dropped_out, true);
   assert.equal(multiTurnBudgetResult.provider_num_turns, 3);
   assert.equal(multiTurnBudgetResult.usage.total_tokens, 1995);
+  assert.deepEqual({
+    input_tokens: multiTurnBudgetResult.usage.input_tokens,
+    output_tokens: multiTurnBudgetResult.usage.output_tokens,
+    cache_read_input_tokens: multiTurnBudgetResult.usage.cache_read_input_tokens,
+    cache_creation_input_tokens: multiTurnBudgetResult.usage.cache_creation_input_tokens,
+  }, {
+    input_tokens: 0,
+    output_tokens: 120,
+    cache_read_input_tokens: 1500,
+    cache_creation_input_tokens: 75,
+  });
   assert.equal(multiTurnBudgetResult.provider_budget_enforcement, 'incremental');
   assert.equal(multiTurnBudgetResult.stdout, '');
   assert.equal(multiTurnBudgetResult.partial_result, true);
@@ -1623,6 +1683,77 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(multiTurnBudgetResult.cleaned_output_unavailable_reason, 'incomplete_or_malformed_terminal_result');
   assert.doesNotMatch(multiTurnBudgetResult.partial_diagnostic,
     /THINKING_MUST_NOT_ESCAPE|TOOL_INPUT_MUST_NOT_ESCAPE|DUPLICATE_ID_MUST_NOT_ESCAPE/);
+  const lateFinalPid = Number(fs.readFileSync(lateFinalPidMarker, 'utf8').trim());
+  assert.ok(Number.isSafeInteger(lateFinalPid) && lateFinalPid > 0);
+  assert.equal(isLiveProcess(lateFinalPid), false,
+    'the late-final provider must be gone before its terminal response is returned');
+  const postBudgetCooldowns = await (await fetch(baseUrl + '/api/cooldowns', { headers: auth })).json();
+  assert.equal(postBudgetCooldowns.cooling.some((item) =>
+    item.seat === 'subscription:anthropic:default'), false,
+  'a late success after a local budget stop must neither clear nor create account cooldown state');
+
+  // Issue #97: the budget overage is only discoverable from the terminal
+  // `result` line itself, written last with no trailing newline, so the kill
+  // is only found when the observer flushes at close — never mid-stream.
+  // That must still suppress the terminal document, and a rate-limit phrase
+  // riding along in it must not recolor the run or touch account cooldowns.
+  const terminalOnlyBudgetResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST',
+    headers: jsonAuth,
+    body: JSON.stringify({
+      kind: 'usage_json_terminal_only_budget', prompt: 'terminal-only budget overage', dangerous: false,
+      providerBudget: {
+        maxOutputTokens: null, maxTotalTokens: 1000, maxCacheReadTokens: null,
+        maxCacheCreationTokens: null, maxTurns: null,
+      },
+    }),
+  });
+  assert.equal(terminalOnlyBudgetResponse.status, 200);
+  const terminalOnlyBudgetResult = await terminalOnlyBudgetResponse.json();
+  assert.equal(terminalOnlyBudgetResult.stop_reason, 'token_budget');
+  assert.equal(terminalOnlyBudgetResult.failureClass, 'token_budget');
+  assert.equal(terminalOnlyBudgetResult.provider_budget_enforcement, 'terminal');
+  assert.equal(terminalOnlyBudgetResult.rate_limited, false,
+    'a rate-limit phrase inside the suppressed terminal result must not override the budget verdict');
+  assert.equal(terminalOnlyBudgetResult.dropped_out, true);
+  assert.equal(terminalOnlyBudgetResult.stdout, '');
+  assert.equal(terminalOnlyBudgetResult.usage.total_tokens, 10000,
+    'suppressing terminal answer content must retain authoritative provider usage');
+  const postTerminalBudgetCooldowns = await (await fetch(baseUrl + '/api/cooldowns', { headers: auth })).json();
+  assert.equal(postTerminalBudgetCooldowns.cooling.some((item) =>
+    item.seat === 'subscription:anthropic:default'), false,
+  'a terminal-only-detected budget stop must never mutate account cooldown state');
+
+  const olderTerminalResponse = await fetch(baseUrl + '/api/oneshot', {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ kind: 'usage_json_older_terminal_budget', prompt: 'newer accepted checkpoint', dangerous: false,
+      providerBudget: { maxOutputTokens: null, maxTotalTokens: 1000, maxCacheReadTokens: null,
+        maxCacheCreationTokens: null, maxTurns: null } }),
+  });
+  assert.equal(olderTerminalResponse.status, 200);
+  const olderTerminal = await olderTerminalResponse.json();
+  assert.equal(olderTerminal.stop_reason, 'token_budget');
+  assert.equal(olderTerminal.failureClass, 'token_budget');
+  assert.equal(olderTerminal.budget_exceeded, true);
+  assert.equal(olderTerminal.dropped_out, true);
+  assert.equal(olderTerminal.provider_budget_enforcement, 'incremental');
+  assert.equal(olderTerminal.stdout, '');
+  assert.equal(olderTerminal.partial_result, true);
+  assert.equal(olderTerminal.partial_checkpoint, 'NEWER_ACCEPTED_CHECKPOINT');
+  assert.equal(olderTerminal.partial_checkpoint_event_type, 'assistant');
+  assert.equal(olderTerminal.partial_checkpoint_unavailable_reason, null);
+  assert.equal(olderTerminal.partial_checkpoint_hash,
+    crypto.createHash('sha256').update('NEWER_ACCEPTED_CHECKPOINT').digest('hex'));
+  assert.equal(olderTerminal.usage.total_tokens, 1202, 'an older terminal must not overwrite the budget-tripping cumulative');
+  assert.equal(olderTerminal.progress.providerUsage.total_tokens, 1202);
+  assert.equal(olderTerminal.progress.providerUsagePhase, 'incremental');
+  assert.equal(olderTerminal.provider_num_turns, 2);
+  assert.equal(olderTerminal.provider_terminal_reason, null);
+  assert.equal(olderTerminal.provider_stop_reason, null);
+  assert.equal(olderTerminal.provider_duration_ms, null);
+  assert.equal(olderTerminal.provider_api_duration_ms, null);
+  assert.equal(olderTerminal.provider_api_error_status, null);
+  assert.match(olderTerminal.stderr, /result precedes newer assistant output/);
 
   const boundedBudgetResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST',
@@ -1652,18 +1783,23 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(boundedBudgetResult.partial_checkpoint, 'final bounded turn');
   assert.equal(boundedBudgetResult.partial_checkpoint_truncated, false);
 
+  const healthyStreamPrompt = 'finish one healthy stream turn\n' + 'unicode 😀 quotes " and backslash \\ newline\n'.repeat(1000);
   const healthyStreamResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST',
     headers: jsonAuth,
     body: JSON.stringify({
-      kind: 'usage_json_stream_healthy', prompt: 'finish one healthy stream turn', dangerous: false,
+      kind: 'usage_json_stream_healthy', prompt: healthyStreamPrompt, dangerous: false,
     }),
   });
   assert.equal(healthyStreamResponse.status, 200);
   const healthyStream = await healthyStreamResponse.json();
-  assert.equal(healthyStream.stdout, 'HEALTHY_STREAM_OK');
+  assert.equal(healthyStream.stdout, 'HEALTHY_STREAM_OK:' + crypto.createHash('sha256').update(healthyStreamPrompt).digest('hex'));
   assert.equal(healthyStream.dropped_out, false);
   assert.equal(healthyStream.route.prompt_transport, 'stdin_stream_json');
+  assert.equal(healthyStream.route.prompt_evidence.effectiveHash, crypto.createHash('sha256').update(healthyStreamPrompt).digest('hex'));
+  const expectedFrame = JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: healthyStreamPrompt }] }, parent_tool_use_id: null }) + '\n';
+  assert.equal(healthyStream.route.prompt_wire_input.bytes, Buffer.byteLength(expectedFrame));
+  assert.equal(healthyStream.route.prompt_wire_input.sha256, crypto.createHash('sha256').update(expectedFrame).digest('hex'));
   assert.equal(healthyStream.graceful_finalization, null);
 
   const gracefulFinalizeResponse = await fetch(baseUrl + '/api/oneshot', {
@@ -1755,6 +1891,17 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(multiTurnReceipt.partialDiagnosticChars, multiTurnBudgetResult.partial_diagnostic.length);
   assert.equal(multiTurnReceipt.partialDiagnosticTruncated, false);
   assert.equal(multiTurnReceipt.cleanedOutputUnavailable, true);
+  assert.equal(multiTurnReceipt.status, 'dropped');
+  assert.equal(multiTurnReceipt.failureClass, 'token_budget');
+  assert.equal(multiTurnReceipt.stopReason, 'token_budget');
+  assert.equal(multiTurnReceipt.supervisorStopReason, 'token_budget');
+  assert.equal(multiTurnReceipt.resultSubtype, null);
+  assert.equal(multiTurnReceipt.outputChars, 0);
+  assert.equal(multiTurnReceipt.actualTotalTokens, 1695);
+  assert.equal(multiTurnReceipt.providerNumTurns, 3);
+  assert.equal(multiTurnReceipt.providerBudgetEnforcement, 'incremental');
+  assert.ok(multiTurnReceipt.transportOutputChars > 0,
+    'late terminal bytes remain represented only by transport diagnostic evidence');
   assert.equal(multiTurnReceipt.partialCheckpointBytes, Buffer.byteLength('turn 3'));
   assert.equal(multiTurnReceipt.partialCheckpointEventType, 'assistant');
   assert.equal(multiTurnReceipt.partialCheckpointTruncated, false);
@@ -1773,18 +1920,19 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(multiTurnGauge.quotaSeat, usageGauge.quotaSeat);
   assert.equal(multiTurnGauge.used.totalTokens, usageGauge.used.totalTokens);
   assert.equal(multiTurnGauge.percentRemaining, usageGauge.percentRemaining);
-  assert.deepEqual(usageGauge.aliases, ['usage_json', 'usage_json_multiturn']);
+  const sharedUsageAliases = ['usage_json', 'usage_json_multiturn', 'usage_json_terminal_only_budget'];
+  assert.deepEqual(usageGauge.aliases, sharedUsageAliases);
   assert.deepEqual(groupedUsage.quotaSeats['subscription:anthropic:default'].providers,
-    ['usage_json', 'usage_json_multiturn']);
+    sharedUsageAliases);
   assert.ok(![groupedUsage.balance.mostDrained, groupedUsage.balance.freshest]
     .includes('usage_json_multiturn'), 'an alias must not be advertised as a separate quota tank');
 
   const groupedPlan = await (await fetch(baseUrl + '/api/plan', {
     method: 'POST', headers: jsonAuth,
-    body: JSON.stringify({ task: 'review this architecture', kind: 'usage_json' }),
+    body: JSON.stringify({ task: 'Explain this bounded scenario.', kind: 'usage_json' }),
   })).json();
   assert.deepEqual(groupedPlan.fleetState.quotaSeats['subscription:anthropic:default'].providers,
-    ['usage_json', 'usage_json_multiturn']);
+    sharedUsageAliases);
   assert.notDeepEqual(
     [groupedPlan.fleetState.balance.mostDrained, groupedPlan.fleetState.balance.freshest],
     ['usage_json', 'usage_json_multiturn'],
@@ -1818,9 +1966,9 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   const operatorQuotaStatus = await (await fetch(baseUrl + '/api/usage/operator-quota', { headers: auth })).json();
   assert.equal(operatorQuotaStatus.observations['subscription:anthropic:default'].provenance, 'human_account_owner');
   assert.deepEqual(operatorQuotaStatus.quotaSeats['subscription:anthropic:default'].providers,
-    ['usage_json', 'usage_json_multiturn']);
+    sharedUsageAliases);
   const observedUsage = await (await fetch(baseUrl + '/api/usage/gauges', { headers: auth })).json();
-  for (const provider of ['usage_json', 'usage_json_multiturn']) {
+  for (const provider of sharedUsageAliases) {
     assert.equal(observedUsage.gauges[provider].basis, 'operator_observed');
     assert.equal(observedUsage.gauges[provider].percentRemaining, 4);
     assert.equal(observedUsage.gauges[provider].configuredEstimate.basis, 'configured');
@@ -1829,7 +1977,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
 
   const observedPlan = await (await fetch(baseUrl + '/api/plan', {
     method: 'POST', headers: jsonAuth,
-    body: JSON.stringify({ task: 'review this architecture', kind: 'usage_json' }),
+    body: JSON.stringify({ task: 'Explain this bounded scenario.', kind: 'usage_json' }),
   })).json();
   assert.equal(observedPlan.fleetState.operatorQuota['subscription:anthropic:default'].percentRemaining, 4);
   assert.equal(observedPlan.fleetState.balance.quotaSeats
@@ -1875,7 +2023,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
 
   const xhighPlanResponse = await fetch(baseUrl + '/api/plan', {
     method: 'POST', headers: jsonAuth,
-    body: JSON.stringify({ task: 'review a difficult architecture', kind: 'codex_effort', effort: 'xhigh' }),
+    body: JSON.stringify({ task: 'Explain a bounded scenario', kind: 'codex_effort', effort: 'xhigh' }),
   });
   assert.equal(xhighPlanResponse.status, 200);
   const xhighPlan = await xhighPlanResponse.json();
@@ -1961,9 +2109,10 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   });
   assert.equal(unsupportedEffortResponse.status, 400);
   const unsupportedEffort = await unsupportedEffortResponse.json();
-  assert.match(unsupportedEffort.error, /cannot express requested effort=minimal/);
+  assert.equal(unsupportedEffort.validation.code, 'unsupported_effort');
+  assert.equal(unsupportedEffort.validation.field, 'effort');
   assert.equal(unsupportedEffort.model_invocation, false);
-  assert.equal(unsupportedEffort.route.effort_method, 'unsupported');
+  assert.equal(unsupportedEffort.physical_attempt_count, 0);
 
   const malformedModelsResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST',
@@ -2284,7 +2433,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(noTimeoutResponse.status, 200);
   const noTimeoutResult = await noTimeoutResponse.json();
   assert.equal(noTimeoutResult.route.requested_timeout_ms, null);
-  assert.equal(noTimeoutResult.route.effective_timeout_ms, null);
+  assert.equal(noTimeoutResult.route.effective_timeout_ms, 2700000);
   assert.equal(noTimeoutResult.route.timeout_clamped, false);
   assert.equal(noTimeoutResult.stop_reason, null);
 
@@ -2297,8 +2446,8 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   const providerTimeoutResult = await providerTimeoutResponse.json();
   assert.equal(providerTimeoutResult.dropped_out, true);
   assert.equal(providerTimeoutResult.timed_out, true);
-  assert.equal(providerTimeoutResult.failureClass, 'timeout');
-  assert.equal(providerTimeoutResult.stop_reason, 'provider_internal_timeout');
+  assert.equal(providerTimeoutResult.failureClass, 'provider_timeout_unclassified');
+  assert.equal(providerTimeoutResult.stop_reason, 'provider_timeout_unclassified');
   assert.equal(providerTimeoutResult.supervisor_stop_reason, null);
   assert.equal(providerTimeoutResult.provider_timeout_source, 'provider_cli_diagnostic');
   assert.equal(providerTimeoutResult.usage, null);
@@ -2307,8 +2456,8 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   ).trim().split(/\r?\n/).map((line) => JSON.parse(line));
   const providerTimeoutReceipt = providerTimeoutLedger.find((row) => row.receiptId === providerTimeoutResult.receiptId);
   assert.equal(providerTimeoutReceipt.status, 'timed_out');
-  assert.equal(providerTimeoutReceipt.failureClass, 'timeout');
-  assert.equal(providerTimeoutReceipt.stopReason, 'provider_internal_timeout');
+  assert.equal(providerTimeoutReceipt.failureClass, 'provider_timeout_unclassified');
+  assert.equal(providerTimeoutReceipt.stopReason, 'provider_timeout_unclassified');
   assert.equal(providerTimeoutReceipt.supervisorStopReason, null);
   assert.equal(providerTimeoutReceipt.providerTimeoutSource, 'provider_cli_diagnostic');
 
@@ -2496,10 +2645,14 @@ test('prompt-file transport preserves long special-character prompts and cleans 
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   assert.equal(activeOneShotCount, 0);
-  const cancellationLedger = fs.readFileSync(path.join(tempRoot, 'data', 'receipts', new Date().toISOString().slice(0, 10) + '.jsonl'), 'utf8')
-    .trim().split(/\r?\n/).map((line) => JSON.parse(line));
-  const cancelledReceipts = cancellationLedger.filter((row) =>
-    row.requestId === 'test:client-cancel:one' && row.status === 'cancelled');
+  const cancellationReceiptDeadline = Date.now() + 5000;
+  let cancelledReceipts = [];
+  do {
+    cancelledReceipts = readCompleteReceiptRows(tempRoot).filter((row) =>
+      row.requestId === 'test:client-cancel:one' && row.status === 'cancelled');
+    if (cancelledReceipts.length) break;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  } while (Date.now() < cancellationReceiptDeadline);
   assert.equal(cancelledReceipts.length, 1, 'client disconnect writes exactly one terminal receipt');
   const cancelledReceipt = cancelledReceipts[0];
   assert.ok(cancelledReceipt, 'client disconnect must persist a terminal provider receipt');
@@ -2543,8 +2696,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   let deadlineReceipt = null;
   const deadlineReceiptWait = Date.now() + 5000;
   while (Date.now() < deadlineReceiptWait && !deadlineReceipt) {
-    const rows = fs.readFileSync(path.join(tempRoot, 'data', 'receipts', new Date().toISOString().slice(0, 10) + '.jsonl'), 'utf8')
-      .trim().split(/\r?\n/).map(JSON.parse);
+    const rows = readCompleteReceiptRows(tempRoot);
     deadlineReceipt = rows.find((row) => row.requestId === 'test:mcp-deadline:one') || null;
     if (!deadlineReceipt) await new Promise((resolve) => setTimeout(resolve, 50));
   }
@@ -2575,8 +2727,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   const raceReceiptWait = Date.now() + 5000;
   let raceReceipts = [];
   while (Date.now() < raceReceiptWait) {
-    raceReceipts = fs.readFileSync(path.join(tempRoot, 'data', 'receipts', new Date().toISOString().slice(0, 10) + '.jsonl'), 'utf8')
-      .trim().split(/\r?\n/).map(JSON.parse)
+    raceReceipts = readCompleteReceiptRows(tempRoot)
       .filter((row) => row.requestId === 'test:completion-race:one');
     if (raceReceipts.length) break;
     await new Promise((resolve) => setTimeout(resolve, 50));
@@ -2610,8 +2761,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   const retryHangDeadline = Date.now() + 5000;
   let retryHangReceipt = null;
   while (Date.now() < retryHangDeadline) {
-    const rows = fs.readFileSync(path.join(tempRoot, 'data', 'receipts', new Date().toISOString().slice(0, 10) + '.jsonl'), 'utf8')
-      .trim().split(/\r?\n/).map((line) => JSON.parse(line));
+    const rows = readCompleteReceiptRows(tempRoot);
     retryHangReceipt = rows.find((row) => row.provider === 'retry_hang' && row.status === 'cancelled') || null;
     if (retryHangReceipt) break;
     await new Promise((resolve) => setTimeout(resolve, 50));
@@ -2666,7 +2816,9 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(proc.exitCode, 0);
 });
 
-test('linked provider accounts fail closed, isolate cooldowns, and refresh mutations', { timeout: 30000 }, async (t) => {
+test('linked provider accounts fail closed, isolate cooldowns, and refresh mutations', {
+  timeout: process.platform === 'win32' ? 90000 : 30000,
+}, async (t) => {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ps-bridge-account-pool-test-'));
   const dataDir = path.join(tempRoot, 'data');
   const configPath = path.join(tempRoot, 'config.json');
@@ -2699,6 +2851,7 @@ test('linked provider accounts fail closed, isolate cooldowns, and refresh mutat
   ];
   const provider = (label, quotaSeat, slotExtra) => ({
     label,
+    oneshot_capabilities: { safe: ['model_invocation'], dangerous: ['model_invocation'] },
     quota_seat: quotaSeat,
     credential_env: 'TEST_ACCOUNT_HOME',
     credential_markers: ['.credentials.json'],
@@ -3639,6 +3792,23 @@ test('readiness and version probes share one diagnostic wall-clock envelope', { 
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ps-bridge-parallel-diag-test-'));
   const configPath = path.join(tempRoot, 'config.json');
   const tokenPath = path.join(tempRoot, 'capability.token');
+  const readinessStarted = path.join(tempRoot, 'readiness-started');
+  const versionStarted = path.join(tempRoot, 'version-started');
+  const synchronizedProbe = (ownMarker, peerMarker, output) => [
+    "const fs = require('node:fs');",
+    `fs.writeFileSync(${JSON.stringify(ownMarker)}, 'started');`,
+    'const deadline = Date.now() + 2000;',
+    'const timer = setInterval(() => {',
+    `if (fs.existsSync(${JSON.stringify(peerMarker)})) {`,
+    'clearInterval(timer);',
+    `process.stdout.write(${JSON.stringify(output)});`,
+    '} else if (Date.now() >= deadline) {',
+    'clearInterval(timer);',
+    "process.stderr.write('peer probe did not start concurrently');",
+    'process.exitCode = 17;',
+    '}',
+    '}, 20);',
+  ].join('');
   fs.writeFileSync(configPath, JSON.stringify({
     staged_probe: {
       label: 'Parallel diagnostic fixture',
@@ -3647,9 +3817,9 @@ test('readiness and version probes share one diagnostic wall-clock envelope', { 
       oneshot_safe: [process.execPath, '-e', ''],
       oneshot_dangerous: [process.execPath, '-e', ''],
       diagnostic_binary: process.execPath,
-      probe: [process.execPath, '-e', "setTimeout(() => process.stdout.write('authenticated'), 1500)"],
+      probe: [process.execPath, '-e', synchronizedProbe(readinessStarted, versionStarted, 'authenticated')],
       probe_timeout_ms: 3000,
-      version_probe: [process.execPath, '-e', "setTimeout(() => process.stdout.write('fixture-v1'), 1000)"],
+      version_probe: [process.execPath, '-e', synchronizedProbe(versionStarted, readinessStarted, 'fixture-v1')],
     },
   }), 'utf8');
 
@@ -3678,15 +3848,13 @@ test('readiness and version probes share one diagnostic wall-clock envelope', { 
 
   await waitForHealth(baseUrl, bridge);
   const headers = await capabilityHeaders(baseUrl);
-  const startedAt = Date.now();
   const response = await fetch(`${baseUrl}/api/diag`, { headers });
-  const elapsedMs = Date.now() - startedAt;
   assert.equal(response.status, 200);
   const diagnostics = await response.json();
   assert.equal(diagnostics.results.staged_probe.ready, true);
   assert.equal(diagnostics.results.staged_probe.runtimeVersion, 'fixture-v1');
-  assert.ok(elapsedMs < 2300,
-    `independent 1.5s and 1s probes ran sequentially (${elapsedMs}ms)`);
+  assert.equal(fs.readFileSync(readinessStarted, 'utf8'), 'started');
+  assert.equal(fs.readFileSync(versionStarted, 'utf8'), 'started');
 });
 
 test('local Ollama adapter uses loopback HTTP, returns final-only text, and records usage', async (t) => {
@@ -3719,7 +3887,7 @@ test('local Ollama adapter uses loopback HTTP, returns final-only text, and reco
     }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
-      model: { malformed: true },
+      model: requestPayload.prompt === 'malformed-model' ? { malformed: true } : 'fake-local:1b',
       response: '<think>private trace</think>\nFINAL_ONLY',
       done: true,
       done_reason: 'stop',
@@ -3737,6 +3905,7 @@ test('local Ollama adapter uses loopback HTTP, returns final-only text, and reco
   fs.writeFileSync(configPath, JSON.stringify({
     ollama_fast: {
       label: 'Fake local model',
+      oneshot_capabilities: { safe: ['model_invocation', 'prompt_only'], dangerous: ['model_invocation', 'prompt_only'] },
       transport: 'local:ollama',
       oneshot_adapter: 'ollama_api',
       model: 'fake-local:1b',
@@ -3810,9 +3979,17 @@ test('local Ollama adapter uses loopback HTTP, returns final-only text, and reco
   assert.equal(result.usage.output_tokens, 3);
   assert.equal(result.usage.total_tokens, 15);
   assert.equal(result.dropped_out, false);
-  assert.equal(requestPayload.stream, false);
+  assert.equal(requestPayload.stream, true);
   assert.equal(requestPayload.think, false);
   assert.equal(requestPayload.options.num_predict, 64);
+
+  const malformedModel = await (await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST', headers, body: JSON.stringify({ kind: 'ollama_fast', prompt: 'malformed-model', dangerous: false }),
+  })).json();
+  assert.equal(malformedModel.failureClass, 'provider_protocol_error');
+  assert.equal(malformedModel.errorCode, 'http_invalid_frame');
+  assert.equal(malformedModel.stdout, '');
+  assert.equal(malformedModel.model_invocation, true);
 
   const terminalBudgetResponse = await fetch(`${baseUrl}/api/oneshot`, {
     method: 'POST', headers,

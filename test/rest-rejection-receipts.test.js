@@ -162,9 +162,24 @@ test('direct REST pre-admission failures persist deduplicated zero-invocation re
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let serverOutput = '';
+  let shutdownToken = '';
   proc.stdout.on('data', (chunk) => { serverOutput += chunk; });
   proc.stderr.on('data', (chunk) => { serverOutput += chunk; });
   t.after(async () => {
+    if (proc.exitCode === null && shutdownToken) {
+      try {
+        await fetch(`${baseUrl}/api/admin/shutdown`, {
+          method: 'POST',
+          headers: { 'X-RelayBridge-Token': shutdownToken },
+        });
+      } catch {}
+    }
+    if (proc.exitCode === null) {
+      await Promise.race([
+        new Promise((resolve) => proc.once('exit', resolve)),
+        new Promise((resolve) => setTimeout(resolve, 6000)),
+      ]);
+    }
     if (proc.exitCode === null) proc.kill('SIGTERM');
     await new Promise((resolve) => proc.exitCode !== null ? resolve() : proc.once('exit', resolve));
     // Remove the deliberately retargeted reparse points before recursively
@@ -184,6 +199,7 @@ test('direct REST pre-admission failures persist deduplicated zero-invocation re
   catch (error) { throw new Error(`${error.message}\n${serverOutput}`); }
   const capability = await (await fetch(`${baseUrl}/api/capability`)).json();
   pathHashKey = capability.token;
+  shutdownToken = capability.token;
   const headers = {
     'Content-Type': 'application/json',
     'X-RelayBridge-Token': capability.token,
@@ -200,6 +216,7 @@ test('direct REST pre-admission failures persist deduplicated zero-invocation re
     assert.equal(payload.failureClass, failureClass);
     assert.equal(payload.model_invocation, false);
     assert.equal(payload.token_usage_source, 'not_invoked');
+    assert.equal(payload.physical_attempt_count, 0);
     assert.equal(payload.transportReceiptId, null);
     assert.equal(payload.transport_retry_count, 0);
     assert.equal(payload.provider_retries.count, 0);
@@ -340,7 +357,7 @@ test('direct REST pre-admission failures persist deduplicated zero-invocation re
   await assertRejected({
     body: { kind: 'mixed_transport', prompt: 'must not start', requestId: 'request:configuration:mixed' },
     status: 400,
-    failureClass: 'configuration',
+    failureClass: 'validation',
   });
   assert.equal(fs.existsSync(invocationMarker), false, 'validation/config rejections must not start a provider process');
 
