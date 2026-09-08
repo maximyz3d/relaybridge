@@ -6,14 +6,14 @@
       "version": 1,
       "title": "Code and debugging",
       "description": "A focused diagnosis or implementation with evidence and verification.",
-      "text": "Explain the likely cause from the available evidence and connect a focused correction to it. Distinguish reasoning from supplied code or logs from an actual reproduction; a logical walkthrough is not an executed test. Attribute supplied execution evidence and distinguish checks performed from checks proposed. Mention unresolved uncertainty only when it could change the answer. Preserve requested scope, format and length; avoid redundant restatement, unnecessary headings and default test checklists."
+      "text": "Explain the likely cause from the available evidence and connect a focused correction to it, including the failure path introduced by that correction. Distinguish reasoning from supplied code or logs from an actual reproduction; a logical walkthrough is not an executed test. Attribute supplied execution evidence and distinguish checks performed from checks proposed. Mention unresolved uncertainty only when it could change the answer. Preserve requested scope, format and length; avoid redundant restatement, unnecessary headings and default test checklists."
     },
     {
       "id": "implementation-plan",
       "version": 1,
       "title": "Implementation planning",
       "description": "Dependencies, ownership, acceptance checks, and realistic next actions.",
-      "text": "Plan concrete steps in dependency order, assigning existing owners or roles where coordination requires them. Preserve every requested behavior and provide observable acceptance checks. Keep proposed work distinct from completed work. Build on existing capabilities rather than inventing replacement architecture. Resolve ordinary reversible choices; mention assumptions only when they change the approach. Respect the requested format and word limit without restating supplied requirements in an introduction. Omit optional risk or rollback commentary before cutting required behavior or acceptance; stopping or rollback is not a substitute for delivering those requirements."
+      "text": "Agree the existing owners' shared interface contract before dependent implementation work. Plan concrete steps in dependency order, assigning existing owners or roles where coordination requires them. Preserve every requested behavior and provide observable acceptance checks. Keep proposed work distinct from completed work. Build on existing capabilities rather than inventing replacement architecture. Resolve ordinary reversible choices; mention assumptions only when they change the approach. Respect the requested format and word limit without restating supplied requirements in an introduction. Omit optional risk or rollback commentary before cutting required behavior or acceptance; stopping or rollback is not a substitute for delivering those requirements."
     },
     {
       "id": "research-synthesis",
