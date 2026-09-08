@@ -8,6 +8,7 @@ const path = require('node:path');
 const { createWorkflowPipeline } = require('../lib/workflow-pipeline');
 const { createWorkflowController, WorkflowControllerError } = require('../lib/workflow-controller');
 const { createIncidentLog } = require('../lib/incident-log');
+const { createRequestLedger } = require('../lib/request-ledger');
 
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rb-controller-'));
@@ -45,6 +46,7 @@ function fixture(t) {
   const controller = createWorkflowController({
     pipeline, taskQueue, incidents, loadConfig: () => config, now: () => clock.value,
   });
+  t.after(() => controller.shutdown());
   return {
     cwd,
     dataDir,
@@ -279,9 +281,12 @@ test('bridge-interrupted tasks require explicit recovery instead of automatic re
   const stopped = f.controller.reconcile(created.runId);
   assert.equal(stopped.workflow.phase, 'failed');
   assert.equal(stopped.workflow.providerTask, null);
-  assert.deepEqual(stopped.nextActions, ['retry_failed_pipeline_provider']);
+  assert.deepEqual(stopped.nextActions, []);
   assert.equal(f.tasks.size, 1, 'status polling must not overlap a potentially surviving process');
 
+  assert.throws(() => f.controller.retryFailedProvider(created.runId, { actor: 'operator' }),
+    (error) => error.code === 'EXECUTION_TERMINATION_REQUIRED');
+  f.tasks.get(planning.task.id).execution = { state: 'fenced', proof: { evidenceId: 'fence_1' } };
   const recovered = f.controller.retryFailedProvider(created.runId, { actor: 'operator' });
   assert.equal(recovered.workflow.phase, 'planning');
   assert.equal(recovered.workflow.providerTask.attempt, 2);
@@ -448,4 +453,79 @@ test('sync resumes crash-interrupted research and implementation handoffs', (t) 
   assert.equal(f.pipeline.get(second.runId).providerTask, null);
   assert.ok(f.controller.reconcile(second.runId).workflow.providerTask,
     'a read-only provider phase without a binding is safe to redispatch');
+});
+
+for (const state of ['interrupted', 'cancelled', 'missing', 'malformed']) {
+  test(`a ${state} bound writer retains its lease until execution is fenced`, (t) => {
+    const f = fixture(t);
+    const created = reachReviewReady(f);
+    const revision = f.controller.startRevision(created.runId);
+    if (state === 'missing') f.tasks.delete(revision.task.id);
+    else Object.assign(f.tasks.get(revision.task.id), { status: state === 'malformed' ? 'failed' : state,
+      execution: state === 'malformed' ? {} : { state: 'uncertain' } });
+    const before = f.pipeline.get(created.runId);
+    assert.throws(() => f.controller.reconcile(created.runId), (e) => e.code === 'WRITER_EXECUTION_UNCERTAIN');
+    assert.throws(() => f.controller.cancel(created.runId), (e) => e.code === 'WRITER_EXECUTION_UNCERTAIN');
+    assert.equal(f.pipeline.get(created.runId).phase, 'revising');
+    assert.equal(f.pipeline.get(created.runId).writerLease.leaseToken, before.writerLease.leaseToken);
+    assert.equal(f.pipeline.get(created.runId).providerTask.taskId, revision.task.id);
+    if (state !== 'missing') {
+      f.tasks.get(revision.task.id).execution = { state: 'fenced', proof: { evidenceId: 'process-fence' } };
+      assert.equal(f.controller.cancel(created.runId).phase, 'cancelled');
+      assert.equal(f.pipeline.get(created.runId).writerLease, null);
+    }
+  });
+}
+
+test('a partial terminal task cannot approve a review even when its text contains APPROVE', (t) => {
+  const f = fixture(t);
+  const created = reachReviewReady(f, createInput(f.cwd), 'APPROVE');
+  const final = f.controller.startFinalReview(created.runId);
+  f.finish(final.task, 'REVIEW_VERDICT: APPROVE', 'done', { flags: { partial_result: true }, receiptId: 'rcpt_partial' });
+  assert.equal(f.controller.reconcile(created.runId).workflow.phase, 'failed');
+  assert.equal(f.incidents.list()[0].classification, 'partial_output');
+});
+
+test('workflow request links persist but planning success and status reads do not assert feature milestones', (t) => {
+  const f = fixture(t);
+  const ledgerDir = path.join(f.dataDir, 'requirements');
+  const ledger = createRequestLedger({ dataDir: ledgerDir });
+  const controller = createWorkflowController({ pipeline: f.pipeline, taskQueue: f.taskQueue,
+    loadConfig: () => f.config, requestLedger: ledger });
+  t.after(() => controller.shutdown());
+  const created = controller.create(createInput(f.cwd));
+  controller.createRequest({ requestId: 'req_queue', actor: 'operator', requirements: [{ requirementId: 'R13', summary: 'Counts' }] });
+  controller.linkRequest(created.runId, { requestId: 'req_queue', actor: 'operator' });
+  const planning = controller.submitResearch(created.runId, { markdown: 'research' });
+  f.finish(planning.task, 'PLAN_STATUS: READY');
+  controller.reconcile(created.runId);
+  const file = path.join(ledgerDir, 'request-ledger.json');
+  const before = fs.readFileSync(file, 'utf8');
+  assert.deepEqual(controller.view(created.runId).requestLinks, [{ requestId: 'req_queue', requirementIds: ['R13'] }]);
+  assert.equal(fs.readFileSync(file, 'utf8'), before);
+  assert.equal(controller.getRequest('req_queue').events.length, 0);
+  const revision = 'a'.repeat(40);
+  controller.recordRequirementEvidence('req_queue', { eventId: 'evt_plan', requirementId: 'R13', actor: 'planner',
+    revision, milestone: 'planned', outcome: 'confirmed', evidence: [{ kind: 'artifact', ref: 'plan-artifact' }],
+    correlation: { runId: created.runId, taskId: planning.task.id } });
+  const coverage = createRequestLedger({ dataDir: ledgerDir }).get('req_queue', { revision }).coverage[0];
+  assert.equal(coverage.milestones.planned.outcome, 'confirmed');
+  for (const key of ['implemented', 'tested', 'approved', 'merged', 'deployed']) assert.equal(coverage.milestones[key].outcome, 'unknown');
+  assert.throws(() => f.controller.createRequest({}), (e) => e.code === 'REQUEST_LEDGER_UNAVAILABLE');
+});
+
+test('frequent uncertain-writer reconciliation cannot postpone its lease heartbeat', (t) => {
+  const f = fixture(t);
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const created = reachReviewReady(f);
+  const revision = f.controller.startRevision(created.runId, { leaseMs: 60000 });
+  Object.assign(f.tasks.get(revision.task.id), { status: 'cancelled', execution: { state: 'uncertain' } });
+  const originalExpiry = f.pipeline.get(created.runId).writerLease.expiresAt;
+  for (let i = 0; i < 25; i++) {
+    f.clock.value += 1000;
+    assert.throws(() => f.controller.reconcile(created.runId), (e) => e.code === 'WRITER_EXECUTION_UNCERTAIN');
+    t.mock.timers.tick(1000);
+  }
+  assert.ok(f.pipeline.get(created.runId).writerLease.expiresAt > originalExpiry,
+    'the existing heartbeat must run despite reconciliation on every second');
 });

@@ -32,6 +32,31 @@ const settled = async (q, id, tries = 60) => {
   throw new Error(`task ${id} never settled (status ${q.get(id)?.status})`);
 };
 
+test('aggregate queued includes admission backoff and removes cancelled waits', async (t) => {
+  const dir = tmpdir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let calls = 0;
+  const q = createTaskQueue({
+    dataDir: dir,
+    executeOneShot: async (_body, res) => {
+      calls++;
+      res.status(429).json({ failureClass: 'admission_limit', model_invocation: false });
+    },
+  });
+  const task = q.submit({ kind: 'claude', prompt: 'wait for a seat' });
+  q._pump();
+  await new Promise(setImmediate);
+  assert.equal(q.get(task.id).status, 'queued');
+  assert.equal(q.stats().active, 0);
+  assert.equal(q.stats().queued, 1, 'deferred admission is still queued work');
+  q.cancel(task.id);
+  assert.equal(q.stats().queued, 0);
+  t.mock.timers.tick(1000);
+  await new Promise(setImmediate);
+  assert.equal(calls, 1, 'a cancelled admission wait never executes again');
+});
+
 test('a caller-reserved task id is persisted exactly once', async () => {
   const dir = tmpdir();
   const q = createTaskQueue({
@@ -221,7 +246,7 @@ for (const asynchronous of [false, true]) {
         throw new Error('PRIVATE_SINK_DETAIL');
       },
       executeOneShot: fakeExecutor(async (body) => body.prompt === 'fail'
-        ? { throw: 'provider failed' } : { payload: { stdout: 'answer', exitCode: 0 } }),
+        ? { payload: { error: 'provider failed', model_invocation: false } } : { payload: { stdout: 'answer', exitCode: 0 } }),
     });
     const failedId = q.submit({ kind: 'claude', prompt: 'fail' }).id;
     const successId = q.submit({ kind: 'claude', prompt: 'success' }).id;
@@ -489,4 +514,273 @@ test('a CLI-style handler may return before its child-process response arrives',
   assert.equal(t.status, 'done');
   assert.equal(t.result, 'late CLI result');
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+const flushQueue = async () => { await new Promise(setImmediate); await new Promise(setImmediate); };
+const recoveryAuthorization = () => ({ authorized: true, ownerFenced: true, actor: 'test-owner', evidenceId: 'fence_1' });
+const resumable = { mode: 'never-started', actor: 'operator', evidenceId: 'request_1' };
+
+function durableFixture(t, overrides = {}) {
+  const dir = tmpdir();
+  const clock = { value: 10000 };
+  const timers = new Map();
+  let sequence = 0;
+  const calls = [];
+  const queues = [];
+  const options = {
+    dataDir: dir, now: () => clock.value,
+    setTimeout(fn, delay) { const id = ++sequence; timers.set(id, { fn, at: clock.value + delay }); return id; },
+    clearTimeout(id) { timers.delete(id); },
+    executeOneShot: async (body, res) => { calls.push(body); res.json({ stdout: 'done', exitCode: 0 }); },
+    ...overrides,
+  };
+  const open = (extra = {}) => { const q = createTaskQueue({ ...options, ...extra }); queues.push(q); return q; };
+  t.after(() => { for (const q of queues) q.shutdown(); fs.rmSync(dir, { recursive: true, force: true }); });
+  return { dir, clock, timers, calls, open,
+    async advance(ms) {
+      clock.value += ms;
+      for (const [id, timer] of [...timers]) if (timer.at <= clock.value) { timers.delete(id); timer.fn(); }
+      await flushQueue();
+    },
+  };
+}
+
+test('deferred recovery preserves the deadline, controls and dependency ordering without duplicate dispatch', async (t) => {
+  const f = durableFixture(t);
+  const first = f.open();
+  const a = first.submit({ kind: 'claude', prompt: 'first', notBefore: 12000, recovery: resumable,
+    requestId: 'request_1', expectedCwdIdentityHash: 'exact-hash', expectedCwdPolicyId: 'exact-policy' });
+  const b = first.submit({ kind: 'claude', prompt: 'second', dependsOn: [a.id], recovery: resumable });
+  assert.deepEqual(first.stats(), { active: 0, queued: 2, maxConcurrent: 3, ready: 0, deferred: 1, blocked: 1, uncertain: 0 });
+  first.shutdown();
+  const restarted = f.open({ authorizeRecovery: recoveryAuthorization });
+  restarted.reconcileOnStartup();
+  restarted._pump();
+  await f.advance(1999);
+  assert.equal(f.calls.length, 0);
+  await f.advance(1);
+  await flushQueue();
+  assert.deepEqual(f.calls.map((body) => body.prompt), ['first', 'second']);
+  assert.equal(f.calls[0].requestId, 'request_1');
+  assert.equal(f.calls[0].expectedCwdIdentityHash, 'exact-hash');
+  assert.equal(f.calls[0].expectedCwdPolicyId, 'exact-policy');
+  assert.equal(restarted.get(b.id).status, 'done');
+  assert.equal(restarted.get(a.id).recovery.lastRecovery.evidenceId, 'fence_1');
+});
+
+test('admission due time survives restart and retries only a proven non-invocation', async (t) => {
+  let attempts = 0;
+  const f = durableFixture(t, { executeOneShot: async (_body, res) => {
+    attempts++;
+    if (attempts === 1) res.status(429).json({ failureClass: 'admission_limit', model_invocation: false, receiptId: 'rejection_1' });
+    else res.json({ stdout: 'done', exitCode: 0 });
+  } });
+  const q = f.open();
+  const task = q.submit({ kind: 'claude', prompt: 'wait', recovery: resumable });
+  await flushQueue();
+  assert.equal(q.get(task.id).nextAttemptAt, 11000);
+  assert.equal(q.get(task.id).execution.state, 'not_invoked');
+  assert.equal(q.stats().deferred, 1);
+  q.shutdown();
+  assert.equal(f.timers.size, 0);
+  const next = f.open({ authorizeRecovery: recoveryAuthorization });
+  await f.advance(999);
+  assert.equal(attempts, 1);
+  await f.advance(1);
+  assert.equal(attempts, 2);
+  assert.equal(next.get(task.id).status, 'done');
+});
+
+for (const proof of [undefined, () => [], () => ({ authorized: true }), () => { throw new Error('probe unavailable'); }]) {
+  test('missing or incomplete recovery authority never resumes queued work', async (t) => {
+    const f = durableFixture(t);
+    const q = f.open();
+    const task = q.submit({ kind: 'claude', prompt: 'never started', notBefore: 11000, recovery: resumable });
+    q.shutdown();
+    const restarted = f.open({ authorizeRecovery: proof });
+    await f.advance(2000);
+    assert.equal(restarted.get(task.id).status, 'interrupted');
+    assert.equal(f.calls.length, 0);
+  });
+}
+
+test('interrupted and legacy writers never replay, even with recovery authorization', async (t) => {
+  const f = durableFixture(t);
+  fs.writeFileSync(path.join(f.dir, 't_writer_1.json'), JSON.stringify({ id: 't_writer_1', status: 'running',
+    body: { dangerous: true }, execution: { state: 'in_flight' } }));
+  fs.writeFileSync(path.join(f.dir, 't_legacy_1.json'), JSON.stringify({ id: 't_legacy_1', status: 'queued', body: {} }));
+  const q = f.open({ authorizeRecovery: recoveryAuthorization });
+  await flushQueue();
+  assert.equal(f.calls.length, 0);
+  assert.equal(q.get('t_writer_1').status, 'interrupted');
+  assert.equal(q.get('t_writer_1').execution.state, 'fenced');
+  assert.equal(q.get('t_legacy_1').status, 'interrupted');
+  assert.throws(() => q.submit({ kind: 'claude', prompt: 'writer', dangerous: true, recovery: resumable }), /read-only/);
+});
+
+for (const payload of [
+  { failureClass: 'admission_limit' },
+  { failureClass: 'admission_limit', model_invocation: true },
+  { failureClass: 'admission_limit', model_invocation: false, physicalAttemptCount: 1 },
+  { failureClass: 'vendor_exhausted', model_invocation: false },
+  { failureClass: 'auth', model_invocation: false },
+]) {
+  test(`real provider gates and uncertain admission are terminal: ${JSON.stringify(payload)}`, async (t) => {
+    let attempts = 0;
+    const f = durableFixture(t, { executeOneShot: async (_body, res) => { attempts++; res.status(429).json(payload); } });
+    const q = f.open();
+    const task = q.submit({ kind: 'claude', prompt: 'bounded work' });
+    await flushQueue();
+    await f.advance(60000);
+    assert.equal(q.get(task.id).status, 'failed');
+    assert.equal(attempts, 1);
+    assert.equal(f.timers.size, 0);
+  });
+}
+
+test('admission backoff is bounded, cancellable, and expires without another dispatch', async (t) => {
+  let attempts = 0;
+  const f = durableFixture(t, { admissionWaitMs: 1500, executeOneShot: async (_body, res) => {
+    attempts++; res.status(429).json({ failureClass: 'admission_limit', model_invocation: false });
+  } });
+  const q = f.open();
+  const task = q.submit({ kind: 'claude', prompt: 'wait' });
+  await flushQueue();
+  await f.advance(1000);
+  assert.equal(q.get(task.id).nextAttemptAt, 11500);
+  await f.advance(500);
+  assert.equal(q.get(task.id).status, 'failed');
+  assert.equal(attempts, 2);
+  assert.equal(f.timers.size, 0);
+  const cancelled = q.submit({ kind: 'claude', prompt: 'cancel wait' });
+  await flushQueue();
+  q.cancel(cancelled.id);
+  assert.equal(f.timers.size, 0);
+  await f.advance(5000);
+  assert.equal(attempts, 3);
+  q.shutdown();
+  q.shutdown();
+  assert.throws(() => q.submit({ kind: 'claude', prompt: 'after shutdown' }), /shut down/);
+});
+
+test('dependencies fail closed and blocked tasks do not starve independent work', async (t) => {
+  const f = durableFixture(t, { maxConcurrent: 1 });
+  const q = f.open();
+  const a = q.submit({ kind: 'claude', prompt: 'parent', notBefore: 12000 });
+  const b = q.submit({ kind: 'claude', prompt: 'dependent', dependsOn: [a.id] });
+  q.submit({ kind: 'claude', prompt: 'independent' });
+  await flushQueue();
+  assert.deepEqual(f.calls.map((body) => body.prompt), ['independent']);
+  q.cancel(a.id);
+  await flushQueue();
+  assert.equal(q.get(b.id).failureClass, 'dependency_failed');
+  assert.throws(() => q.submit({ kind: 'claude', prompt: 'bad edge', dependsOn: ['t_missing_1'] }), /existing tasks/);
+  assert.throws(() => q.submit({ kind: 'claude', prompt: 'bad edge', dependsOn: [a.id, a.id] }), /distinct/);
+});
+
+test('running cancellation and repeated startup reconciliation retain a live execution slot', async (t) => {
+  let response;
+  const f = durableFixture(t, { maxConcurrent: 1, executeOneShot: async (_body, res) => {
+    res._relayDeferredResponse = true; response = res;
+  } });
+  const q = f.open();
+  const task = q.submit({ kind: 'claude', prompt: 'writer', dangerous: true });
+  await flushQueue();
+  q.cancel(task.id);
+  q.reconcileOnStartup();
+  assert.equal(q.stats().active, 1);
+  assert.equal(q.get(task.id).execution.state, 'in_flight');
+  q.shutdown();
+  response.json({ stdout: 'late', exitCode: 0 });
+  await flushQueue();
+  assert.equal(q.get(task.id).status, 'cancelled');
+  assert.equal(q.get(task.id).execution.state, 'settled');
+  assert.equal(q.stats().active, 0);
+});
+
+test('silent or throwing executors reserve uncertain capacity until affirmative fencing', async (t) => {
+  let proof = [];
+  let attempts = 0;
+  const f = durableFixture(t, { maxConcurrent: 1, authorizeRecovery: () => proof,
+    executeOneShot: async (_body, res) => { attempts++; if (attempts === 1) throw new Error('unknown outcome'); res.json({ stdout: 'done' }); },
+  });
+  const q = f.open();
+  const task = q.submit({ kind: 'claude', prompt: 'uncertain writer', dangerous: true });
+  q.submit({ kind: 'claude', prompt: 'next' });
+  await flushQueue();
+  assert.equal(q.stats().uncertain, 1);
+  assert.equal(attempts, 1);
+  assert.throws(() => q.confirmStopped(task.id), /authoritative/);
+  q._pump();
+  assert.equal(attempts, 1);
+  proof = recoveryAuthorization();
+  q.confirmStopped(task.id);
+  await flushQueue();
+  assert.equal(attempts, 2);
+  assert.equal(q.get(task.id).status, 'failed', 'fencing never replays the interrupted operation');
+});
+
+test('submission snapshots prevent caller mutation from changing dispatched authority', async (t) => {
+  const f = durableFixture(t);
+  const q = f.open();
+  const submitted = q.submit({ kind: 'claude', prompt: 'approved', dangerous: false });
+  submitted.body.prompt = 'tampered';
+  submitted.body.dangerous = true;
+  await flushQueue();
+  assert.equal(f.calls[0].prompt, 'approved');
+  assert.equal(f.calls[0].dangerous, false);
+  assert.equal(q.get(submitted.id).body.prompt, 'approved');
+});
+
+test('post-response exceptions do not overwrite a settled outcome or reserve another slot', async (t) => {
+  const f = durableFixture(t, { maxConcurrent: 1, executeOneShot: async (_body, res) => {
+    res.json({ stdout: 'done' });
+    throw new Error('late diagnostic');
+  } });
+  const q = f.open();
+  const ids = [1, 2].map(() => q.submit({ kind: 'claude', prompt: 'work' }).id);
+  await flushQueue();
+  for (const id of ids) assert.equal(q.get(id).status, 'done');
+  assert.equal(q.stats().uncertain, 0);
+});
+
+test('malformed startup records cannot crash status reads or authorize recovery', async (t) => {
+  const f = durableFixture(t);
+  const q = f.open();
+  const task = q.submit({ kind: 'claude', prompt: 'work', notBefore: 12000, recovery: resumable });
+  q.shutdown();
+  const record = JSON.parse(fs.readFileSync(path.join(f.dir, `${task.id}.json`)));
+  record.dependsOn = ['../../outside'];
+  fs.writeFileSync(path.join(f.dir, `${task.id}.json`), JSON.stringify(record));
+  fs.writeFileSync(path.join(f.dir, 't_null_1.json'), 'null');
+  const next = f.open({ authorizeRecovery: recoveryAuthorization });
+  assert.equal(next.get(task.id).status, 'interrupted');
+  assert.equal(next.stats().queued, 0);
+  await f.advance(10000);
+  assert.equal(f.calls.length, 0);
+});
+
+test('admission deadlines expire even while a different execution occupies every slot', async (t) => {
+  let occupyingResponse;
+  let attempts = 0;
+  const f = durableFixture(t, { maxConcurrent: 1, admissionWaitMs: 1500,
+    executeOneShot: async (body, res) => {
+      attempts++;
+      if (body.prompt === 'wait') res.status(429).json({ failureClass: 'admission_limit', model_invocation: false });
+      else { res._relayDeferredResponse = true; occupyingResponse = res; }
+    },
+  });
+  const q = f.open();
+  const waiting = q.submit({ kind: 'claude', prompt: 'wait' });
+  q.submit({ kind: 'claude', prompt: 'occupier' });
+  await flushQueue();
+  await f.advance(1000);
+  assert.equal(q.stats().active, 1);
+  assert.equal(q.get(waiting.id).status, 'queued');
+  await f.advance(500);
+  assert.equal(q.get(waiting.id).status, 'failed');
+  assert.equal(q.get(waiting.id).failureClass, 'admission_limit');
+  assert.equal(attempts, 2);
+  occupyingResponse.json({ stdout: 'finished' });
+  await flushQueue();
 });

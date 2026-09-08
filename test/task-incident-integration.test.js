@@ -38,3 +38,33 @@ test('queue budget failure reaches durable incident inbox without a workflow', a
   assert.match(incident.summary, /local execution budget/);
   assert.equal(JSON.stringify(incident).includes('partial answer'), false);
 });
+
+test('partial output reports a correlated no-verdict explanation to the task, incident and conversation', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rb-partial-incident-'));
+  const incidentDir = path.join(root, 'incidents');
+  const incidents = createIncidentLog({ dataDir: incidentDir });
+  let collab = { transcript: [] };
+  const queue = createTaskQueue({ dataDir: path.join(root, 'tasks'),
+    executeOneShot: async (_body, res) => res.json({ stdout: 'REVIEW_VERDICT: APPROVE token=PRIVATE_RESULT',
+      partial_result: true, error: 'Authorization: Bearer PRIVATE_ERROR', receiptId: 'rcpt_partial',
+      route: { request_id: 'req_exact', invocation_id: 'inv_exact', attempt_id: 'attempt_exact' } }),
+    readCollab: () => collab,
+    writeCollab: (_id, value) => { collab = value; },
+    onFailure: (task) => incidents.report(taskFailureDetails(task)),
+  });
+  t.after(() => { queue.shutdown(); fs.rmSync(root, { recursive: true, force: true }); });
+  const submitted = queue.submit({ kind: 'claude', prompt: 'review', collab: 'c_shared', requirementIds: ['R16'],
+    correlation: { runId: 'wf_exact' } });
+  await new Promise(setImmediate);
+  await new Promise(setImmediate);
+  assert.equal(queue.get(submitted.id).status, 'failed');
+  const [incident] = createIncidentLog({ dataDir: incidentDir }).list();
+  assert.equal(incident.classification, 'partial_output');
+  assert.equal(incident.correlation.requestId, 'req_exact');
+  assert.equal(incident.correlation.invocationId, 'inv_exact');
+  assert.equal(incident.correlation.attemptId, 'attempt_exact');
+  assert.deepEqual(incident.requirementIds, ['R16']);
+  assert.match(collab.transcript[0].text, /No verdict/);
+  assert.match(queue.list()[0].nextAction, /fresh complete review/);
+  assert.doesNotMatch(JSON.stringify({ incident, collab, summary: queue.list() }), /PRIVATE_RESULT|PRIVATE_ERROR|REVIEW_VERDICT: APPROVE/);
+});
