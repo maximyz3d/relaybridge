@@ -1,3 +1,6 @@
+## v2.2.1 - 2026-09-08
+- #123 docs(coordination): preserve owner/storage history and issue122 recovery plan
+
 ## v2.2.0 - 2026-09-08
 - #118 Kickoff integration: provider hardening and Fable-reviewed owner foundation
 
