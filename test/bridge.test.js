@@ -190,7 +190,16 @@ test('provider config uses the installed subscription CLIs and safe headless mod
   assert.ok(config.gemini.dangerous.includes('--dangerously-skip-permissions'));
   assert.equal(config.gemini.npm_package, undefined);
 
-  assert.equal(config.grok.npm_package, '@xai-official/grok');
+  assert.equal(config.gemini_cli.npm_package, '@google/gemini-cli@0.57.0');
+  assert.equal(config.gemini_cli.oneshot_safe_filesystem_policy, 'unverified_provider_policy');
+  assert.equal(config.gemini_cli.probe_auth_authoritative, false);
+  assert.equal(config.gemini_cli.autoRoute, false);
+  assert.deepEqual(config.gemini_cli.oneshot_dangerous, []);
+  assert.equal(config.gemini_cli.oneshot_safe.includes('--effort'), false);
+  assert.equal(config.gemini_cli.oneshot_output_parser, 'gemini_cli_json');
+  assert.equal(config.grok.npm_package, '@xai-official/grok@1.0.13');
+  assert.equal(config.grok.oneshot_output_parser, 'grok_json');
+  assert.deepEqual(config.grok.login_command, ['grok','login']);
   assert.equal(config.grok.model, 'grok-4.6');
   assert.ok(config.grok.dangerous.includes('--always-approve'));
   assert.ok(config.grok.oneshot_safe.includes('{prompt_file}'));
@@ -205,6 +214,7 @@ test('provider config uses the installed subscription CLIs and safe headless mod
   assert.deepEqual(config.grok.oneshot_env, {
     GROK_CLAUDE_MCPS_ENABLED: 'false',
     GROK_CURSOR_MCPS_ENABLED: 'false',
+    GROK_DISABLE_AUTOUPDATER: '1',
   });
 
   assert.equal(config.perplexity.diagnostic_binary, 'pwm');
@@ -3335,6 +3345,9 @@ test('linked provider accounts fail closed, isolate cooldowns, and refresh mutat
 
   const authRefresh = await fetch(`${baseUrl}/api/auth/status?refresh=1`, { headers });
   assert.equal(authRefresh.status, 200);
+  const versionProbeAgents = await (await fetch(`${baseUrl}/api/agents`, { headers })).json();
+  assert.equal(versionProbeAgents.agents.find(agent => agent.id === 'default_stale_pool').readiness.detail,
+    'probe passed; authentication unverified', 'an exit-zero version probe must not display authenticated');
   accountStatus = await (await fetch(`${baseUrl}/api/accounts`, { headers })).json();
   assert.equal(accountStatus.providers.default_stale_pool.accounts
     .find((account) => account.id === 'default').authUnavailable, true,
@@ -3347,9 +3360,13 @@ test('linked provider accounts fail closed, isolate cooldowns, and refresh mutat
 
   const authoritativeProbeConfig = JSON.parse(fs.readFileSync(configPath, 'utf8'));
   authoritativeProbeConfig.default_stale_pool.probe_auth_authoritative = true;
+  authoritativeProbeConfig.default_stale_pool.probe_success_detail = 'fixture authentication verified';
   fs.writeFileSync(configPath, JSON.stringify(authoritativeProbeConfig), 'utf8');
   const authoritativeAuthRefresh = await fetch(`${baseUrl}/api/auth/status?refresh=1`, { headers });
   assert.equal(authoritativeAuthRefresh.status, 200);
+  const authProbeAgents = await (await fetch(`${baseUrl}/api/agents`, { headers })).json();
+  assert.equal(authProbeAgents.agents.find(agent => agent.id === 'default_stale_pool').readiness.detail,
+    'fixture authentication verified');
   accountStatus = await (await fetch(`${baseUrl}/api/accounts`, { headers })).json();
   assert.equal(accountStatus.providers.default_stale_pool.accounts
     .find((account) => account.id === 'default').authUnavailable, false,

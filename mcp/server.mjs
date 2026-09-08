@@ -12,6 +12,11 @@ import { normalizeGenericValidation } from '../lib/validation-contract.js';
 import { promptTransportLimits, preparePrompt } from '../lib/prompt-transport.js';
 import { normalizeGrounding, prepareGroundedPrompt } from '../lib/workspace-grounding.js';
 import { normalizeTransportLifecycle } from '../lib/attempt-lifecycle.js';
+import { compileOutputProfile } from '../lib/output-profiles.js';
+
+const OUTPUT_PROFILE_SCHEMA = z.object({ id:z.string().regex(/^[a-z][a-z0-9-]{0,63}$/),
+  version:z.number().int().positive(), digest:z.string().regex(/^[0-9a-f]{64}$/).optional() }).strict()
+  .describe('Optional output criteria selected from list_output_profiles. Use the returned id/version/digest to pin guidance; it grants no permissions.');
 
 const GROUNDING_FIELDS = {
   requiresWorkspaceAccess: z.boolean().optional().describe('Require actual workspace access or a complete validated read-only inline evidence bundle.'),
@@ -433,6 +438,7 @@ async function getAccountAwareRoute(args, signal, timeoutMs = ACCOUNT_AWARE_ROUT
       method: 'POST',
       body: {
         task: args.task,
+        outputProfile: args.outputProfile,
         cwd: args.cwd, requiresWorkspaceAccess: args.requiresWorkspaceAccess, inlineEvidence: args.inlineEvidence,
         preferKinds: Array.isArray(args.preferredProviders) ? args.preferredProviders : [],
         excludeKinds: Array.isArray(args.excludedProviders) ? args.excludedProviders : [],
@@ -1520,6 +1526,7 @@ export function reconcileTransportReceipt({ requestId, sanitized, transportRecei
 async function callProvider({
   kind,
   prompt,
+  outputProfile,
   cwd,
   requiresWorkspaceAccess,
   inlineEvidence,
@@ -1554,6 +1561,7 @@ async function callProvider({
   let sanitized;
   let status = 'failed';
   let workspaceAdmission = null;
+  let admittedProfile = null, admittedPromptHash = null;
   if (signal?.aborted) throw signal.reason || new Error('provider call cancelled before admission');
   try {
     // Validate the complete semantic input before workspace admission or cache
@@ -1569,7 +1577,7 @@ async function callProvider({
     }
     const response = await bridgeRequest('/api/workspace/validate', {
       method: 'POST',
-      body: { kind, prompt, cwd, requestId, model, execution, requiresWorkspaceAccess, inlineEvidence,
+      body: { kind, prompt, outputProfile, cwd, requestId, model, execution, requiresWorkspaceAccess, inlineEvidence,
         taskTier: effectiveTaskTier, modelTier: effectiveModelTier,
         effort, maxEffortOverride, providerBudget, dangerous: false },
       timeoutMs: TIMEOUT_POLICY.transportTimeoutMs(timeoutMs),
@@ -1580,14 +1588,19 @@ async function callProvider({
     if (!workspaceAdmission) {
       throw new Error('RelayBridge returned malformed cwd admission identity; provider execution is blocked.');
     }
-    validateGroundedInput({ kind, entry, prompt, cwd, requiresWorkspaceAccess, inlineEvidence,
+    const admitted = resolveProfileAdmission(prompt, outputProfile, response);
+    prompt = admitted.prompt; // Ordinary frozen text; do not send outputProfile again.
+    admittedProfile = admitted.profile; admittedPromptHash = admitted.promptHash;
+    const prepared = validateGroundedInput({ kind, entry, prompt, cwd, requiresWorkspaceAccess, inlineEvidence,
       cwdIdentityHash: workspaceAdmission.cwdIdentityHash, semanticMaxChars });
+    if (admittedPromptHash && prepared.evidence.effectiveHash !== admittedPromptHash) throw profileAdmissionError('Local and live prompt policies disagree; provider execution is blocked.');
   } catch (error) {
     ({ sanitized, status } = bridgeFailureResult(error, { kind, signal }));
   }
   const cacheKey = {
     kind,
     prompt,
+    ...(admittedProfile ? { outputProfile:admittedProfile, admittedPromptHash } : {}),
     cwd: cwd || '',
     configFingerprint,
     purpose,
@@ -1688,6 +1701,7 @@ async function callProvider({
         outerReceiptId,
         expectedCwdIdentityHash: workspaceAdmission.cwdIdentityHash,
         expectedCwdPolicyId: workspaceAdmission.cwdPolicyId,
+        ...(admittedPromptHash ? { expectedPromptHash:admittedPromptHash } : {}),
         timeoutMs: TIMEOUT_POLICY.normalizeOneShotTimeoutMs(timeoutMs),
         providerBudget,
         budgetTaskTier: effectiveTaskTier,
@@ -1704,6 +1718,10 @@ async function callProvider({
       actionIdentity: true,
     });
     sanitized = sanitizeProviderResponse(response);
+    if (admittedPromptHash && providerSucceeded(sanitized) && sanitized.route?.prompt_evidence?.effectiveHash !== admittedPromptHash) {
+      sanitized = { ...sanitized, droppedOut:true, failureClass:'prompt_identity_changed',
+        stderr:'Provider response does not match the admitted prompt identity. No verdict or cache entry can be established.' };
+    }
     status = providerSucceeded(sanitized) ? 'completed'
       : sanitized.cancelled ? 'cancelled'
         : sanitized.timedOut ? 'timed_out' : 'dropped';
@@ -1867,6 +1885,30 @@ function eligibleOneShotKinds(route, config, { selectedOnly = false, allowedKind
     return candidate.eligible === true && candidate.policyScore >= 0 && !candidate.validation && !candidate.blocked
       && candidate.ready !== false && entry && Array.isArray(entry.oneshot_safe) && entry.oneshot_safe.length;
   });
+}
+
+function profileAdmissionError(reason) {
+  return new BridgeError(reason, { status:400, detail:{ failureClass:'validation', errorCode:'prompt_identity_changed',
+    validation:{ code:'prompt_identity_changed', field:'outputProfile', reason, retryable:false },
+    model_invocation:false, physical_attempt_count:0, token_usage_source:'not_invoked' } });
+}
+
+function resolveProfileAdmission(prompt, selection, response) {
+  if (selection == null) return { prompt, profile:null, promptHash:null };
+  const descriptor = response.outputProfile;
+  if (!descriptor || descriptor.id !== selection.id || descriptor.version !== selection.version
+    || !strictSha256(descriptor.digest) || selection.digest && selection.digest !== descriptor.digest
+    || !strictSha256(response.promptEvidence?.effectiveHash)) {
+    throw profileAdmissionError('RelayBridge did not return complete output guidance admission evidence.');
+  }
+  let compiled;
+  try { compiled = compileOutputProfile(prompt, { id:descriptor.id, version:descriptor.version, digest:descriptor.digest }, {
+    catalogVersion:descriptor.catalogVersion,
+    profiles:[{ id:descriptor.id, version:descriptor.version, title:descriptor.title, description:descriptor.description, text:descriptor.text }],
+  }); } catch (error) { throw profileAdmissionError(error.message); }
+  if (compiled.prompt !== response.preparedPrompt) throw profileAdmissionError('RelayBridge output guidance snapshot disagrees with its descriptor.');
+  return { prompt:compiled.prompt, promptHash:response.promptEvidence.effectiveHash,
+    profile:{ id:descriptor.id, version:descriptor.version, catalogVersion:descriptor.catalogVersion, digest:descriptor.digest } };
 }
 
 function validateGroundedInput({ kind, entry, prompt, cwd, requiresWorkspaceAccess, inlineEvidence, cwdIdentityHash, semanticMaxChars }) {
@@ -2037,6 +2079,7 @@ export function buildServer() {
     title: 'Preview deterministic task routing',
     description: 'Classify a task and preview an auditable local/cheap-first route without calling any model.',
     inputSchema: z.object({
+      outputProfile: OUTPUT_PROFILE_SCHEMA.optional(),
       ...GROUNDING_FIELDS,
       cwd: z.string().max(1000).optional(),
       task: z.string().min(1).max(100000),
@@ -2068,10 +2111,23 @@ export function buildServer() {
     return result({ ...route, receiptId: receipt.receiptId });
   }));
 
+  server.registerTool('list_output_profiles', {
+    title:'List optional output guidance',
+    description:'Read the bundled versioned output criteria for code, planning, research, decisions, collaboration and design. These shape the response and grant no tools or permissions.',
+    inputSchema:z.object({}), annotations:READ_ONLY,
+  }, safeHandler(async () => result(await bridgeRequest('/api/output-profiles'))));
+
+  server.registerTool('list_workflow_library', {
+    title:'Discover curated workflow references',
+    description:'Read pinned skill, MCP and browser workflow references with source hashes, licenses and locally authored guidance. Discovery does not install, connect or execute upstream tools.',
+    inputSchema:z.object({}), annotations:READ_ONLY,
+  }, safeHandler(async () => result(await bridgeRequest('/api/workflow-library'))));
+
   server.registerTool('plan_task', {
     title: 'Plan a task: company, model, and effort',
     description: 'Given a task description, returns the cheapest capable execution plan: which company/provider, which model inside it, and how much reasoning effort — plus fallbacks and why. Call this BEFORE delegating anything you are unsure about. It exists to stop frontier seats being spent on mechanical edits and max-effort reasoning being spent on arithmetic.',
     inputSchema: z.object({
+      outputProfile: OUTPUT_PROFILE_SCHEMA.optional(),
       ...GROUNDING_FIELDS,
       cwd: z.string().max(1000).optional(),
       task: z.string().min(1).describe('what needs doing, in a sentence or two'),
@@ -2085,10 +2141,10 @@ export function buildServer() {
       acknowledgeFilesystemWrites: z.boolean().default(false).describe('required with dangerous=true; confirms persistent writes are authorized'),
     }),
     annotations: READ_ONLY,
-  }, safeHandler(async ({ task, effort, kind, model, modelTier, providerBudget, timeoutMs, dangerous, acknowledgeFilesystemWrites, cwd, requiresWorkspaceAccess, inlineEvidence }, context) => {
+  }, safeHandler(async ({ task, effort, kind, model, modelTier, providerBudget, timeoutMs, dangerous, acknowledgeFilesystemWrites, cwd, requiresWorkspaceAccess, inlineEvidence, outputProfile }, context) => {
     const plan = await bridgeRequest('/api/plan', {
       method: 'POST',
-      body: { task, effort, kind, model, modelTier, providerBudget, timeoutMs, dangerous, acknowledgeFilesystemWrites, cwd, requiresWorkspaceAccess, inlineEvidence },
+      body: { task, effort, kind, model, modelTier, providerBudget, timeoutMs, dangerous, acknowledgeFilesystemWrites, cwd, requiresWorkspaceAccess, inlineEvidence, outputProfile },
       timeoutMs: 20000,
       signal: context?.mcpReq?.signal,
     });
@@ -2389,6 +2445,7 @@ export function buildServer() {
     title: 'Ask one provider safely',
     description: 'Run one bounded, non-agentic provider turn with dangerous:false forced, available route metadata, cache controls, quota/failure signals, and an append-only receipt. The provider CLI runs in its own safe/headless mode, which is a vendor-side restriction rather than an OS sandbox. Hosted CLIs may not reveal final model revisions, usage, plan, or provider request IDs.',
     inputSchema: z.object({
+      outputProfile: OUTPUT_PROFILE_SCHEMA.optional(),
       ...GROUNDING_FIELDS,
       kind: z.string().min(1).max(64),
       prompt: z.string().min(1).max(100000),
@@ -2426,6 +2483,7 @@ export function buildServer() {
     title: 'Route and ask with bounded escalation',
     description: 'Apply deterministic routing, call the first eligible safe provider, and escalate only on typed failure. High-stakes routes require explicit acknowledgement.',
     inputSchema: z.object({
+      outputProfile: OUTPUT_PROFILE_SCHEMA.optional(),
       ...GROUNDING_FIELDS,
       task: z.string().min(1).max(100000),
       cwd: z.string().max(1000).optional(),
@@ -2531,6 +2589,7 @@ export function buildServer() {
       const response = await callProvider({
         kind: candidate.kind,
         prompt: args.task,
+        outputProfile: args.outputProfile,
         cwd: args.cwd,
         requiresWorkspaceAccess: args.requiresWorkspaceAccess, inlineEvidence: args.inlineEvidence,
         semanticMaxChars: tierPolicy.maxInputChars,
@@ -2555,7 +2614,7 @@ export function buildServer() {
       // receipts; the operator must correct or explicitly enroll the cwd first.
       if (response.modelInvocation === false
         && response.failureClass === 'validation'
-        && [CWD_OUTSIDE_ALLOWED_ROOTS, CWD_IDENTITY_CHANGED]
+        && [CWD_OUTSIDE_ALLOWED_ROOTS, CWD_IDENTITY_CHANGED, 'invalid_output_profile']
           .includes(response.errorCode)) break;
       if (response.failureClass === 'token_budget' || response.stopReason === 'token_budget') break;
       if (signal?.aborted) break;
@@ -2593,6 +2652,7 @@ export function buildServer() {
     title: 'Run a bounded multi-provider committee',
     description: 'Fan out independent read-only roles to up to four diverse providers, checkpoint partial results, enforce one overall deadline, and optionally ask one safe chair for a structured agreement/mixed/disagreement assessment. Consensus is never inferred from successful text generation alone.',
     inputSchema: z.object({
+      outputProfile: OUTPUT_PROFILE_SCHEMA.optional(),
       ...GROUNDING_FIELDS,
       task: z.string().min(1).max(100000),
       cwd: z.string().max(1000).optional(),
@@ -2616,6 +2676,7 @@ export function buildServer() {
     const requestedDeadlineAt = Date.now() + args.timeoutMs;
     const route = await getAccountAwareRoute({
       task: args.task,
+      outputProfile: args.outputProfile,
       cwd: args.cwd, requiresWorkspaceAccess: args.requiresWorkspaceAccess, inlineEvidence: args.inlineEvidence,
       preferredProviders: args.providers,
       excludedProviders: [...args.excludedProviders, 'powershell'],
@@ -2670,7 +2731,7 @@ export function buildServer() {
         const candidate = eligible[index];
         const admission = await bridgeRequest('/api/workspace/validate', { method: 'POST', signal,
           timeoutMs: remainingTime(requestedDeadlineAt), actionIdentity: true,
-          body: { kind: candidate.kind, prompt: seatPrompts[index], cwd: args.cwd,
+          body: { kind: candidate.kind, prompt: seatPrompts[index], outputProfile:args.outputProfile, cwd: args.cwd,
             requiresWorkspaceAccess: args.requiresWorkspaceAccess, inlineEvidence: args.inlineEvidence,
             requestId: `mcp:${crypto.randomUUID()}`, dangerous: false,
             execution: candidate.execution ?? undefined, model: candidate.model ?? undefined,
@@ -2679,10 +2740,13 @@ export function buildServer() {
             effort: args.effort, maxEffortOverride: args.maxEffortOverride, providerBudget: args.providerBudget } });
         const normalized = normalizeWorkspaceAdmission(admission);
         if (!normalized) throw new Error('Malformed live execution admission; committee blocked before dispatch.');
-        validateGroundedInput({ kind: candidate.kind, entry, prompt: seatPrompts[index], cwd: args.cwd,
+        const admitted = resolveProfileAdmission(seatPrompts[index], args.outputProfile, admission);
+        const prepared = validateGroundedInput({ kind: candidate.kind, entry, prompt: admitted.prompt, cwd: args.cwd,
           requiresWorkspaceAccess: args.requiresWorkspaceAccess, inlineEvidence: args.inlineEvidence,
           cwdIdentityHash: normalized.cwdIdentityHash, semanticMaxChars: tierPolicy.maxInputChars });
+        if (admitted.promptHash && prepared.evidence.effectiveHash !== admitted.promptHash) throw profileAdmissionError('Local and live prompt policies disagree; committee blocked before dispatch.');
         candidate.execution = normalized.execution;
+        if (admitted.profile) candidate.outputProfile = { id:admitted.profile.id, version:admitted.profile.version, digest:admitted.profile.digest };
       }
     } catch (error) {
       const validation = normalizeValidationDiagnostic(error.validation || error.detail?.validation);
@@ -2727,6 +2791,7 @@ export function buildServer() {
         const response = await callProvider({
           kind: candidate.kind,
           prompt: seatPrompt,
+          outputProfile: candidate.outputProfile || args.outputProfile,
           cwd: args.cwd,
           requiresWorkspaceAccess: args.requiresWorkspaceAccess, inlineEvidence: args.inlineEvidence,
           semanticMaxChars: tierPolicy.maxInputChars,
@@ -2798,6 +2863,7 @@ export function buildServer() {
         if (!synthesisInputRejected) synthesis = await callProvider({
           kind: chairKind,
           prompt: synthesisPrompt,
+          outputProfile: eligible.find(candidate => candidate.kind === chairKind)?.outputProfile || args.outputProfile,
           cwd: args.cwd,
           requiresWorkspaceAccess: args.requiresWorkspaceAccess, inlineEvidence: args.inlineEvidence,
           semanticMaxChars: policy.committee.maxSynthesisChars,
@@ -2926,6 +2992,7 @@ export function buildServer() {
     title: 'Broadcast one prompt to many providers',
     description: 'Send the same prompt to every matching AI provider in one call. WARNING: this spends quota, credits, or local compute on MULTIPLE provider accounts at once — one broadcast can consume a seat of Claude, Codex, Gemini, Grok, and more simultaneously. Target by explicit providers, by a shared tag, or all:true; tag/all selection always skips opt-in autoRoute:false hosted seats unless they are named explicitly in providers. Calls run with dangerous:false through the same bounded one-shot path and receipts as ask_provider.',
     inputSchema: z.object({
+      outputProfile: OUTPUT_PROFILE_SCHEMA.optional(),
       ...GROUNDING_FIELDS,
       prompt: z.string().min(1).max(100000),
       tag: z.string().regex(/^[a-z][a-z0-9-]{0,23}$/).optional(),
@@ -2942,12 +3009,12 @@ export function buildServer() {
       maxEffortOverride: z.boolean().default(false),
     }),
     annotations: { ...ACTION, openWorldHint: true },
-  }, safeHandler(async ({ prompt, tag, providers, all, cwd, timeoutMs, providerBudget, effort, maxEffortOverride, taskTier, modelTier, model, execution, requiresWorkspaceAccess, inlineEvidence }, context) => {
+  }, safeHandler(async ({ prompt, tag, providers, all, cwd, timeoutMs, providerBudget, effort, maxEffortOverride, taskTier, modelTier, model, execution, requiresWorkspaceAccess, inlineEvidence, outputProfile }, context) => {
     const response = await bridgeRequest('/api/broadcast', {
       method: 'POST',
       body: {
         prompt, tag, providers, all, cwd, timeoutMs, providerBudget, effort,
-        requiresWorkspaceAccess, inlineEvidence,
+        requiresWorkspaceAccess, inlineEvidence, outputProfile,
         maxEffortOverride, taskTier, modelTier, model, execution, dangerous: false,
       },
       timeoutMs: TIMEOUT_POLICY.transportTimeoutMs(timeoutMs),
@@ -3310,6 +3377,7 @@ export function buildServer() {
     title: 'Submit a background task',
     description: 'Queue a prompt to a provider and return a task id IMMEDIATELY without waiting for the run. Use for work longer than a chat turn, or when the result should be collectable later from a different surface. Link a collab id to append the result to that shared thread.',
     inputSchema: z.object({
+      outputProfile: OUTPUT_PROFILE_SCHEMA.optional(),
       ...GROUNDING_FIELDS,
       kind: z.string().min(1).max(64), prompt: z.string().min(1).max(100000),
       collab: z.string().max(64).optional(), title: z.string().max(120).optional(),

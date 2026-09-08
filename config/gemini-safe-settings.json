@@ -1,0 +1,26 @@
+{
+  "hooksConfig": { "enabled": false },
+  "skills": { "enabled": false },
+  "general": {
+    "plan": { "enabled": false },
+    "enableAutoUpdate": false,
+    "enableAutoUpdateNotification": false
+  },
+  "security": {
+    "disableYoloMode": true,
+    "disableAlwaysAllow": true,
+    "auth": { "enforcedType": "oauth-personal" }
+  },
+  "tools": {
+    "core": [],
+    "discoveryCommand": "",
+    "callCommand": "",
+    "useRipgrep": false
+  },
+  "experimental": { "gemmaModelRouter": { "enabled": false } },
+  "advanced": { "ignoreLocalEnv": true },
+  "mcp": {
+    "allowed": ["relaybridge-no-external-servers"],
+    "excluded": ["relaybridge-no-external-servers"]
+  }
+}

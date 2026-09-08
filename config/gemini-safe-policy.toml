@@ -1,0 +1,7 @@
+# Qualification fixture for native Google Gemini CLI 0.57.0.
+# This file is not an enforced RelayBridge launch policy until runtime wiring
+# verifies that the installed CLI actually loaded it. Unknown tools deny too.
+[[rule]]
+toolName = "*"
+decision = "deny"
+priority = 999

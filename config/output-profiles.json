@@ -1,0 +1,47 @@
+{
+  "catalogVersion": 1,
+  "profiles": [
+    {
+      "id": "code-debug",
+      "version": 1,
+      "title": "Code and debugging",
+      "description": "A focused diagnosis or implementation with evidence and verification.",
+      "text": "Explain the likely cause from the available evidence and connect a focused correction to it, including the failure path introduced by that correction. Distinguish reasoning from supplied code or logs from an actual reproduction; a logical walkthrough is not an executed test. Attribute supplied execution evidence and distinguish checks performed from checks proposed. Mention unresolved uncertainty only when it could change the answer. Preserve requested scope, format and length; avoid redundant restatement, unnecessary headings and default test checklists."
+    },
+    {
+      "id": "implementation-plan",
+      "version": 1,
+      "title": "Implementation planning",
+      "description": "Dependencies, ownership, acceptance checks, and realistic next actions.",
+      "text": "Agree the existing owners' shared interface contract before dependent implementation work. Plan concrete steps in dependency order, assigning existing owners or roles where coordination requires them. Preserve every requested behavior and provide observable acceptance checks. Keep proposed work distinct from completed work. Build on existing capabilities rather than inventing replacement architecture. Resolve ordinary reversible choices; mention assumptions only when they change the approach. Respect the requested format and word limit without restating supplied requirements in an introduction. Omit optional risk or rollback commentary before cutting required behavior or acceptance; stopping or rollback is not a substitute for delivering those requirements."
+    },
+    {
+      "id": "research-synthesis",
+      "version": 1,
+      "title": "Research and synthesis",
+      "description": "Source-backed conclusions with dates, uncertainty, and useful gaps.",
+      "text": "Answer the question with the strongest relevant evidence available. Attribute factual claims to sources that actually support them; distinguish retrieved evidence, supplied material and inference. Preserve publication or event dates when freshness matters, and identify missing or conflicting evidence. Do not invent links, quotations or verification. Organize around the decision the reader needs to make, and use the requested depth instead of a fixed report template. Treat these criteria as selection guidance, not mandatory sections. Preserve the user's format, word limit and required behavior. Answer directly; omit redundant restatement and unnecessary headings. Under tight limits, drop optional commentary before required content."
+    },
+    {
+      "id": "decision-analysis",
+      "version": 1,
+      "title": "Decisions and problem solving",
+      "description": "Compare feasible choices and explain what would change the recommendation.",
+      "text": "Apply binding constraints first and rule out infeasible options. Lead with a feasible recommendation and its main reason. Name only the missing evidence that could change it, then give a bounded next check if useful. Do not restate the whole problem, invent precision or expand into an exhaustive option list. Preserve the requested format and required content. A word limit covers the entire answer; aim comfortably below it and omit optional commentary before required reasoning."
+    },
+    {
+      "id": "collaboration-synthesis",
+      "version": 1,
+      "title": "AI collaboration",
+      "description": "Reconcile independent findings without turning consensus into approval.",
+      "text": "Preserve independent findings and their evidence before synthesizing them. Separate agreement, disagreement and missing information. Resolve disagreements with verifiable evidence or a bounded next check; a majority vote is not proof. Attribute material findings and keep task, request or receipt identifiers when supplied. Assign a concrete next owner only within the existing assignment. A planning result or incomplete review does not establish implementation, approval, merge or deployment. Treat these criteria as selection guidance, not mandatory sections. Preserve the user's format, word limit and required behavior. Answer directly; omit redundant restatement and unnecessary headings. Under tight limits, drop optional commentary before required content."
+    },
+    {
+      "id": "design-critique",
+      "version": 1,
+      "title": "UI and design",
+      "description": "User flows, accessible interactions, and specific visual improvements.",
+      "text": "Give the requested number of useful refinements, prioritizing the stated user task and observable friction. Connect each adjustment to its user benefit. Preserve accessible naming, feedback, keyboard operation and context where relevant. Suggest a check only when it adds necessary information and fits the requested length. A supplied description is not a visual inspection or tested interaction; do not invent browser or accessibility evidence. Preserve the requested format and aim comfortably below any word limit, including headings."
+    }
+  ]
+}

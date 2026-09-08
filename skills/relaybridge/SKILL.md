@@ -6,8 +6,9 @@ description: Use RelayBridge to delegate work to other AI CLIs (Claude, Codex, C
 # RelayBridge
 
 A local control plane on `http://127.0.0.1:8787` that routes prompts to AI CLIs
-installed on this machine. Each call runs the vendor's own CLI against the
-user's existing subscription seat, so cost is quota, not metered API billing.
+configured on this machine. Providers may use a subscription, local inference,
+or a metered API. Read the current transport and account evidence; a configured
+token budget is not a provider allowance or a billing guarantee.
 
 The point of delegating through it: **use the cheapest model that can actually
 do the job**, and escalate only on evidence. A definition lookup should not
@@ -16,27 +17,19 @@ to a 1.5B local model.
 
 ## Before anything else
 
-```bash
-# The token is created at first boot and lives in the install directory.
-TOKEN=$(cat "$LOCALAPPDATA/RelayBridge/.bridge-token")
-curl -s -H "X-RelayBridge-Token: $TOKEN" http://127.0.0.1:8787/api/health
-```
+When connected through MCP, call `get_context_bundle` first, then inspect
+`bridge_status`, `list_providers`, and the matching active workflow. Resume its
+recorded next action; do not create a duplicate because a prior chat ended.
+A version probe proves installation, not authentication, safe execution, or
+model availability. Check the separate execution and filesystem-policy gates.
 
-If that fails, the bridge is not running — start it with
-`powershell -ExecutionPolicy Bypass -File "$LOCALAPPDATA\RelayBridge\start.ps1"`.
-Every request needs the `X-RelayBridge-Token` header. Never put the token in a
-URL, a log line, or a prompt body.
-
-Check what is actually usable before routing:
-
-```bash
-curl -s -H "X-RelayBridge-Token: $TOKEN" http://127.0.0.1:8787/api/diag
-```
-
-Each provider reports `found` (CLI on PATH) and `ready` (authenticated). A
-provider that is `found: true, ready: false` needs a one-time `login` in a
-terminal — it will fail every call until then, so route around it rather than
-retrying.
+For REST, use the configured `RELAYBRIDGE_URL` and private capability file
+(`RELAYBRIDGE_TOKEN_FILE`, or the installed `.bridge-token`). Set `TOKEN` in
+the calling process without printing it; never put it in a URL, log, prompt,
+or committed file. The examples below use the default loopback URL. If the
+bridge is unreachable, diagnose its existing process and configuration before
+starting anything. A failed health request is not permission to restart a
+shared runtime or replay its tasks.
 
 ## Delegating a task
 
@@ -56,10 +49,10 @@ callers must generate a unique `requestId` and retain the direct tuple
 atomically. Never attribute a detached response by selecting the newest
 receipt; find the exact request ID or treat provenance as unknown.
 
-**Do not pass `timeoutMs`.** It is an optional hard ceiling, not a kill clock.
-Runs are supervised by progress: a call that keeps producing new content is left
-alone to finish, and one that goes silent or starts repeating is stopped early.
-Setting `timeoutMs` reinstates a fixed guillotine and will cut off long work.
+Use a bounded `timeoutMs` when the assignment has a deadline. The bridge also
+supervises progress, idle stalls, looping and provider budgets; omission uses
+its configured default, not an unlimited run. A timed-out or partial answer
+cannot establish a review verdict.
 
 ## Choosing the model — the whole point
 
@@ -100,58 +93,41 @@ Three rules that matter more than the table:
    `safety_critical` are advisory only: return the recommendation and let the
    human decide.
 
-## Which model *within* the provider
+## Model and effort evidence
 
-Picking the CLI is only half of it. Claude Code can run Haiku or Opus; Codex can
-run Luna or Sol. The routing tier selects the weight class automatically:
+Use `plan_task` or `POST /api/plan` for the exact `primary.execution` tuple,
+and pass that tuple unchanged to the supported execution surface. It binds the
+provider, authority mode, resolved model and requested/applied effort to the
+current configuration. A changed or unavailable model requires a new plan;
+do not drop a rejected model flag and silently accept an account default.
 
-| Task tier | Model tier | Claude | Codex | Gemini |
-|---|---|---|---|---|
-| utility | light | `haiku` | `gpt-5.6-luna` | `gemini-3.5-flash-low` |
-| standard | standard | `sonnet` | `gpt-5.6-terra` | `gemini-3.6-flash-medium` |
-| complex / critical | heavy | `opus` | `gpt-5.6-sol` | `gemini-3.1-pro-high` |
+`list_models` / `GET /api/models` distinguish configured entries from observed
+catalog evidence. Refresh only when current discovery is needed. A static
+model name is not proof the current account can invoke it, and an unavailable
+catalog is not an empty subscription allowance.
 
-`POST /api/route` returns `modelTier` and per-provider `model` + `modelArgs`.
-`POST /api/oneshot` accepts `taskTier` or `modelTier` and applies the flag
-itself — you do not need to build the argument.
+Read `requestedEffort`, `appliedEffort`, `effortMethod` and
+`effortFallbackReason` from the plan. Claude, Codex and Antigravity controls
+may differ by installed version. Native Google Gemini CLI is a different
+provider from Antigravity; never transfer its model, login, or effort claims
+between identities.
 
-```bash
-curl -s -X POST http://127.0.0.1:8787/api/oneshot \
-  -H "X-RelayBridge-Token: $TOKEN" -H "Content-Type: application/json" \
-  -d '{"kind":"claude","taskTier":"utility","prompt":"What does ECONNRESET mean?"}'
-```
+## Optional output guidance and references
 
-Two things that keep this from breaking:
+When a task benefits from a specific output standard, use
+`list_output_profiles`, then supply its exact `{id, version, digest}` as
+`outputProfile` to `plan_task`, `ask_provider`, `route_preview`, `route_and_ask`,
+`run_committee`, `broadcast`, or `submit_task`. Preserve the original request;
+the bridge appends the selected criteria and validates the complete prompt.
+The Tasks panel exposes the same choice. Omit the selector for ordinary calls.
+Do not send both the returned compiled prompt and the selector: that would
+append guidance twice. No dedicated CLI profile flag is provided.
 
-- **Cursor, Copilot, Grok and Perplexity send no model flag at all.** Their
-  lineups depend on the account and org policy, so the account default applies.
-  A missing flag runs; a retired model id fails every call.
-- **Model identifiers rot on a weeks-long cycle.** `gpt-5.4` retires 2026-08-31;
-  Gemini's Flash line has turned over twice this year. Claude pins use stable
-  aliases (`opus`/`sonnet`/`haiku`) for that reason. `/api/route` returns
-  `modelConfig.stale` — when it is true, re-verify with the commands in
-  `_models.verifyCommands` (`agent models`, `codex --help`, Gemini's `/model`)
-  and update `modelsCheckedAt` in `cli-config.json`.
-
-### Finding out what models exist
-
-The bridge probes each CLI at boot and keeps the result, so you can ask what is
-actually callable rather than assuming:
-
-```bash
-curl -s -H "X-RelayBridge-Token: $TOKEN" http://127.0.0.1:8787/api/models
-```
-
-Each provider reports its models with a `tier` and a `bestAt` note. Add
-`?refresh=1` (or `POST /api/models/refresh`) to re-probe after installing or
-upgrading a CLI.
-
-This is what makes the pins above self-correcting. If a configured model is not
-in a provider's own list, it has been retired: the bridge logs a warning, drops
-the flag, and lets the account default answer instead of failing the call.
-`warnings` in the response names any pin in that state. Providers with no list
-command (Copilot, Grok) are left alone rather than second-guessed — only a
-positive probe result can veto a pin.
+`list_workflow_library` lists pinned skill/MCP references and licenses, with
+locally authored guidance. Entries marked `available_not_connected` are
+references only. Inspect current tools and permissions before proposing a
+connection; discovery does not install or execute upstream content.
+See [reference.md](reference.md) for the REST fields.
 
 ### Seeing what other agents and the dashboard are doing
 
@@ -186,17 +162,10 @@ relaybridge plan "refactor the auth middleware and add regression tests"
 or over MCP, `plan_task`. Either returns the tier, the chosen company/model/
 effort, the exact args, the **cheapest capable alternative**, and fallbacks.
 
-Effort by tier: utility → `low`, standard → `medium`, complex/critical → `high`.
-`max` is never automatic; it costs far more for a usually marginal gain.
-
-Providers express effort three different ways, and the plan resolves whichever
-applies — do not hand-build these:
-
-| Provider | How effort works |
-|---|---|
-| Codex | a flag: `--config model_reasoning_effort=high` |
-| Cursor | a model variant: `gpt-5.6-sol-low` … `-high` … `-max` |
-| Claude, Gemini | no knob — the model choice *is* the effort |
+The plan records both the desired effort and what the provider can actually
+apply. Use the returned execution tuple instead of translating an effort label
+into flags yourself. Requested `high` with no supported control remains an
+explicit fallback, not an applied setting.
 
 The cost classes the plan reports: `none` (a shell command, no model), `local`
 (free, on this machine), `subscription` (a seat you already pay for), `metered`
@@ -244,7 +213,8 @@ advisory-only by policy.
 
 Check `stop_reason` before trusting `stdout`:
 
-- `null` — the run completed on its own. Normal.
+- `null` — no supervisor stop was recorded. Also check exit status, provider
+  terminal evidence, failure flags, and whether the requested artifact is complete.
 - `loop_detected` — the CLI repeated itself and was stopped to save tokens.
   **Do not resubmit the same prompt**; it will loop again. Narrow the task,
   supply the missing context, or route to a different provider.

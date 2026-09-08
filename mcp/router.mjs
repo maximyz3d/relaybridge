@@ -100,6 +100,18 @@ export function classifyTask(task) {
     /^\s*(what is|who is|define|spell|translate|convert|list|show|find|where|when|how many)\b/,
     /\b(dictionary|definition|spelling|unit conversion)\b/,
   ]);
+  // Short requests can still require substantive planning or synthesis. Pair
+  // an actual requested action with decision criteria; a bare topic word or
+  // definition should not spend a stronger model by itself.
+  const requestedWork = text.replace(/^(?:(?:please|(?:can|could|would)\s+you|help\s+me)\s+){0,3}/, '');
+  const wordComparison = /^(?:compare|evaluate)\s+(?:the\s+)?(?:words?|meanings?|definitions?|spellings?)\b/.test(requestedWork);
+  const substantivePlanning = /^(?:plan|design|propose|develop|outline)\b/.test(requestedWork)
+    && /\b(?:implementation|dependencies|acceptance criteria|correctness|invariants?|failure handling)\b/.test(text);
+  const substantiveCollaboration = /^(?:coordinate|reconcile|resolve|synthesi[sz]e)\b/.test(requestedWork)
+    && /\b(?:conflicting (?:proposals?|recommendations?|findings)|disagreements?|assigned owners|accountable owners)\b/.test(text);
+  const substantiveDecision = !wordComparison && /^(?:compare|evaluate|diagnose|choose|decide|recommend)\b/.test(requestedWork)
+    && /\b(?:constraints?|tradeoffs?|trade-offs?|competing alternatives|failure modes?|correctness|intermittent\b[^.!?\n]{0,60}\bbug)\b/.test(text);
+  const substantiveReasoning = substantivePlanning || substantiveCollaboration || substantiveDecision;
   const destructive = hasAny(text, [
     /\b(remove recursively|wipe|erase|drop database|force push|reset --hard|overwrite|terminate all|kill all|factory reset)\b/,
     /\b(?:delete|remove)\s+(?:all\s+|the\s+)?(?:files?|directories|folders|databases?|records?|credentials?|keys?|branches)\b/,
@@ -126,13 +138,13 @@ export function classifyTask(task) {
       return !tail || /^(?:(?:of|for|in|under|at)\s+(?:the\s+)?)?(?:"[^"\r\n]{1,1024}"|'[^'\r\n]{1,1024}'|`[^`\r\n]{1,1024}`|[\w./\\:*-]{1,1024})$/.test(tail);
     });
   const whollyDeterministic = looksLikeDeterministic && !looksLikeCode && !looksLikeReview
-    && !looksLikeResearch && !looksLikeReasoning && !looksLikeVision && !looksLikeHardware && !highStakes && !destructive
+    && !looksLikeResearch && !looksLikeReasoning && !substantiveReasoning && !looksLikeVision && !looksLikeHardware && !highStakes && !destructive
     && !semanticClause && completeDeterministicRequest;
 
   if (looksLikeCode) tags.add('coding');
   if (looksLikeReview) tags.add(looksLikeCode ? 'code_review' : 'reasoning');
   if (looksLikeResearch || looksLikeAuthoritativeDocumentResearch) tags.add('research');
-  if (looksLikeReasoning) tags.add('reasoning');
+  if (looksLikeReasoning || substantiveReasoning) tags.add('reasoning');
   if (looksLikeVision) tags.add('vision');
   if (looksLikeHardware) tags.add('hardware');
   if (looksLikeDeterministic) tags.add('deterministic');
@@ -160,7 +172,7 @@ export function classifyTask(task) {
   ) {
     tier = 'complex';
     reasons.push('long, multi-part, or architectural task');
-  } else if (looksLikeCode || looksLikeReview || looksLikeResearch || looksLikeAuthoritativeDocumentResearch || looksLikeReasoning || looksLikeHardware || raw.length > 1000 || conjunctions >= 2) {
+  } else if (looksLikeCode || looksLikeReview || looksLikeResearch || looksLikeAuthoritativeDocumentResearch || looksLikeReasoning || substantiveReasoning || looksLikeHardware || raw.length > 1000 || conjunctions >= 2) {
     tier = 'standard';
     reasons.push('specialized or multi-step task');
   } else {
@@ -169,6 +181,7 @@ export function classifyTask(task) {
 
   if (looksLikeQuickLookup || looksLikeDeterministic) reasons.push('eligible for a cheap or deterministic first route');
   if (looksLikeResearch || looksLikeAuthoritativeDocumentResearch) reasons.push('requires a source-capable route and freshness controls');
+  if (substantiveReasoning) reasons.push('requested planning, reconciliation or decision criteria require substantive reasoning');
 
   const domainTags = [...tags].filter((tag) => !['destructive', 'medical', 'legal', 'financial', 'secrets', 'safety_critical'].includes(tag));
   const confidence = domainTags.includes('general') ? 'low'

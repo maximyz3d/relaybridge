@@ -17,6 +17,9 @@ const { parseHostedTerminal, classifyHttpTerminal } = require('./lib/http-provid
 const { resolveAttemptTiming, renderCliDeadline } = require('./lib/cli-deadline');
 const { validateProviderBudget } = require('./lib/provider-budget');
 const { promptTransportLimits, preparePrompt, renderPromptSlot } = require('./lib/prompt-transport');
+const { compileOutputProfile, listOutputProfiles, profileError } = require('./lib/output-profiles');
+const { listWorkflowLibrary } = require('./lib/workflow-library');
+const { parseNativeProviderOutput } = require('./lib/provider-output');
 const { resolveProviderControls, validateControlRequest, modelControls } = require('./lib/execution-contract');
 const { validationError } = require('./lib/validation-contract');
 const { normalizeEffort } = require('./lib/effort-controls');
@@ -1917,8 +1920,13 @@ function hasProviderInternalTimeoutDiagnostic(value) {
   return PROVIDER_INTERNAL_TIMEOUT_PATTERNS.some((pattern) => pattern.test(diagnostic));
 }
 
-function parseConfiguredOneShotOutput(entry, rawOutput, { ignoreTerminalResult = false } = {}) {
+function parseConfiguredOneShotOutput(entry, rawOutput, { ignoreTerminalResult = false, stderr = '', exitCode = null } = {}) {
   const parser = String(entry?.oneshot_output_parser || 'text');
+  if (parser === 'grok_json' || parser === 'gemini_cli_json') {
+    const parsed = parseNativeProviderOutput(parser, rawOutput, { ignoreTerminalResult, stderr, exitCode });
+    return { ...parsed, output:cleanOutput(parsed.output), retries:normalizeClaudeRetryEvents([]),
+      permissionDenials:normalizeClaudePermissionDenials([]) };
+  }
   if (parser === 'text') {
     return {
       output: cleanOutput(rawOutput), usage: null, isError: false,
@@ -2956,6 +2964,15 @@ app.get('/api/config', (req, res) => {
   res.json(loadConfig());
 });
 
+app.get('/api/output-profiles', (req, res) => {
+  try { res.json(listOutputProfiles()); }
+  catch (error) { res.status(500).json({ error:error.message }); }
+});
+app.get('/api/workflow-library', (req, res) => {
+  try { res.json(listWorkflowLibrary()); }
+  catch (error) { res.status(500).json({ error:error.message }); }
+});
+
 app.use('/api', (req, res, next) => {
   if (shuttingDown && !['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
     return res.status(503).json({ ok: false, code: 'BRIDGE_SHUTTING_DOWN' });
@@ -2974,6 +2991,16 @@ app.get('/api/workspace', (req, res) => {
 // cached provider result.  This endpoint performs the same startup-pinned cwd
 // validation as /api/oneshot without invoking a provider or exposing a host
 // path.  Rejections receive the normal durable zero-invocation receipt.
+function prepareProfiledGrounding(body, snapshot, entry, dangerous) {
+  const compiled = compileOutputProfile(body.prompt, body.outputProfile);
+  const base = { ...body, cwd:snapshot.resolved, cwdIdentityHash:snapshot.cwdIdentityHash,
+    seat:body.kind, seatConfig:entry, dangerous };
+  // Check the original request before guidance can affect lexical grounding.
+  // The final text is checked too; guidance can never weaken the requirement.
+  if (compiled.profile) prepareGroundedPrompt(base);
+  return { compiled, grounded:prepareGroundedPrompt({ ...base, prompt:compiled.prompt }) };
+}
+
 function validateProviderIntent(body, cfg = loadConfig(), snapshot = captureAllowedCwdIdentity(body.cwd), phase = 'execute') {
   if (!providerAccounts.validProviderKey(body.kind) || !Object.prototype.hasOwnProperty.call(cfg, body.kind)) {
     throw validationError('unknown_provider', 'kind', 'Provider is not configured.');
@@ -2991,14 +3018,14 @@ function validateProviderIntent(body, cfg = loadConfig(), snapshot = captureAllo
   const timing = resolveAttemptTiming({ entry, globals: cfg._supervisor || {}, timeoutMs: body.timeoutMs,
     providerBudget: body.providerBudget, taskTier: body.budgetTaskTier || controls.execution.resolvedTaskTier });
   const deadline = renderCliDeadline({ entry, slot: controls.slot, supervisorOptions: timing });
-  const grounded = prepareGroundedPrompt({ ...body, cwd: snapshot.resolved, cwdIdentityHash: snapshot.cwdIdentityHash,
-    seat: body.kind, seatConfig: entry, dangerous: useDanger });
-  if (body.prompt !== undefined) preparePrompt(grounded.prompt, {
+  const { grounded, compiled } = prepareProfiledGrounding(body, snapshot, entry, useDanger);
+  const prepared = body.prompt !== undefined ? preparePrompt(grounded.prompt, {
     ...promptTransportLimits(entry, deadline.slot),
     policyPrefix: !useDanger && typeof entry.oneshot_safe_prompt_prefix === 'string' ? entry.oneshot_safe_prompt_prefix.trim() : '',
-  });
+  }) : null;
   revalidateAllowedCwdIdentity(snapshot);
-  return { ...controls, grounding: grounded.grounding };
+  return { ...controls, grounding: grounded.grounding,
+    ...(compiled.profile ? { outputProfile:compiled.profile, preparedPrompt:compiled.prompt, promptEvidence:prepared.evidence } : {}) };
 }
 function rejectInvalidIntent(res, body, error) {
   return sendOneShotPreAdmissionRejection(res, { statusCode: 400,
@@ -3014,14 +3041,15 @@ app.post('/api/workspace/validate', (req, res) => {
   try {
     const snapshot = captureAllowedCwdIdentity(body.cwd);
     revalidateAllowedCwdIdentity(snapshot);
-    let execution = null, grounding = null;
+    let execution = null, grounding = null, outputProfile = null, preparedPrompt = null, promptEvidence = null;
     if (body.kind !== undefined) {
-      ({ execution, grounding } = validateProviderIntent(body, loadConfig(), snapshot));
+      ({ execution, grounding, outputProfile, preparedPrompt, promptEvidence } = validateProviderIntent(body, loadConfig(), snapshot));
     }
     return res.json({
       ok: true,
       execution,
       grounding,
+      ...(outputProfile ? { outputProfile, preparedPrompt, promptEvidence } : {}),
       cwdIdentityHash: snapshot.cwdIdentityHash,
       cwdPolicyId: CWD_POLICY_IDENTITY,
       model_invocation: false,
@@ -3573,6 +3601,7 @@ app.post('/api/models/refresh', async (req, res) => {
 // and says why, so callers do not have to guess.
 async function planTask({ task, requestedEffort = null, kind = null, requestedProviderBudget,
   filesystemAuthority, intent = {}, signal, taskTierOverride = null }) {
+  const profiled = compileOutputProfile(task, intent.outputProfile);
   kind = kind || intent.kind || intent.execution?.provider || null;
   requestedEffort = intent.effort ?? requestedEffort;
   validateControlRequest({ ...intent, ...(requestedEffort == null ? {} : { effort: requestedEffort }) });
@@ -3637,7 +3666,7 @@ async function planTask({ task, requestedEffort = null, kind = null, requestedPr
     const diagnostic = plan.primary.validation;
     throw validationError(diagnostic.code, diagnostic.field, diagnostic.reason, diagnostic);
   }
-  return { plan, fleetState: route.fleetState };
+  return { plan:{ ...plan, ...(profiled.profile ? { outputProfile:profiled.profile, preparedPrompt:profiled.prompt } : {}) }, fleetState: route.fleetState };
 }
 
 app.post('/api/plan', planningRequestLimit, async (req, res) => {
@@ -3674,7 +3703,7 @@ app.post('/api/route', planningRequestLimit, async (req, res) => {
   if (!['advisory', 'consensus'].includes(committeeMode)) {
     return res.status(400).json({ error: 'committeeMode must be advisory or consensus' });
   }
-  try { validateControlRequest(req.body || {}); }
+  try { validateControlRequest(req.body || {}); compileOutputProfile(task, req.body?.outputProfile); }
   catch (err) { return rejectInvalidIntent(res, { ...req.body, prompt: task }, err); }
   let groundingSnapshot;
   try {
@@ -3834,7 +3863,10 @@ app.get('/api/auth/status', diagnosticRequestLimit, async (req, res) => {
           authAuthoritative: completed && entry.probe_auth_authoritative === true,
           qualificationFailure: result.validation || null,
           transientProbeFailure: result.admissionRejected || result.aborted || result.timedOut || result.model_invocation === false,
-          detail: result.exitCode === 0 ? 'authenticated' : probeText.split('\n')[0].slice(0, 160),
+          detail: completed && result.exitCode === 0
+            ? String(entry.probe_success_detail || (entry.probe_auth_authoritative === true
+              ? 'authenticated' : 'probe passed; authentication unverified')).slice(0, 160)
+            : probeText.split('\n')[0].slice(0, 160),
         }];
       }));
       const refreshedResults = Object.fromEntries(pairs.filter(([, v]) => v));
@@ -4311,7 +4343,7 @@ async function executeOneShot(body, res) {
   let slot = resolveSlot(cliDeadline.slot);
   const safePromptPrefix = !useDanger && typeof entry.oneshot_safe_prompt_prefix === 'string'
     ? entry.oneshot_safe_prompt_prefix.trim() : '';
-  let preparedPrompt, grounding;
+  let preparedPrompt, grounding, outputProfile;
   let resolvedCwd;
   let resolvedCwdIdentity;
   const expectedCwdIdentityHash = body?.expectedCwdIdentityHash;
@@ -4343,10 +4375,15 @@ async function executeOneShot(body, res) {
     });
   }
   try {
-    const grounded = prepareGroundedPrompt({ ...body, cwd: resolvedCwd, cwdIdentityHash: resolvedCwdIdentity.cwdIdentityHash,
-      seat: kind, seatConfig: entry, dangerous: useDanger });
+    const profiled = prepareProfiledGrounding(body, resolvedCwdIdentity, entry, useDanger);
+    const grounded = profiled.grounded;
+    outputProfile = profiled.compiled.profile;
     grounding = grounded.grounding;
     preparedPrompt = preparePrompt(grounded.prompt, { ...promptTransportLimits(entry, slot), policyPrefix: safePromptPrefix });
+    if (body.expectedPromptHash !== undefined && (typeof body.expectedPromptHash !== 'string'
+      || !/^[a-f0-9]{64}$/.test(body.expectedPromptHash) || body.expectedPromptHash !== preparedPrompt.evidence.effectiveHash)) {
+      throw validationError('prompt_identity_changed', 'expectedPromptHash', 'The final prompt changed after admission. Preview and validate the request again.');
+    }
   } catch (err) {
     return rejectBeforeAdmission(400, err.code === 'workspace_grounding' ? 'workspace_grounding' : 'validation', {
       error: err.message, errorCode: err.code, validation: err.validation,
@@ -4547,6 +4584,7 @@ async function executeOneShot(body, res) {
     prompt_transport: promptTransport,
     prompt_truncated: false,
     prompt_evidence: preparedPrompt.evidence,
+    ...(outputProfile ? { output_profile:outputProfile } : {}),
     prompt_wire_input: initialStreamFrame === null ? null : {
       transport: 'stdin_stream_json', bytes: Buffer.byteLength(initialStreamFrame, 'utf8'),
       sha256: crypto.createHash('sha256').update(initialStreamFrame).digest('hex'),
@@ -4798,7 +4836,7 @@ async function executeOneShot(body, res) {
     const semanticStdout = supervisorStdout ?? stdout;
     const transportStdout = stdout + lateStdout;
     const parsedOutput = parseConfiguredOneShotOutput(entry, semanticStdout, {
-      ignoreTerminalResult: stopReason === 'token_budget',
+      ignoreTerminalResult: stopReason === 'token_budget' || ['grok_json','gemini_cli_json'].includes(entry.oneshot_output_parser), stderr,
     });
     const retainedPartial = stopReason === 'token_budget' && !!parsedOutput.partialDiagnostic;
     const checkpoint = stopReason === 'token_budget'
@@ -4999,7 +5037,7 @@ async function executeOneShot(body, res) {
     const semanticStdout = supervisorStdout ?? stdout;
     const transportStdout = stdout + lateStdout;
     let parsedOutput = parseConfiguredOneShotOutput(entry, semanticStdout, {
-      ignoreTerminalResult: stopReason === 'token_budget',
+      ignoreTerminalResult: stopReason === 'token_budget' || !!stopReason && ['grok_json','gemini_cli_json'].includes(entry.oneshot_output_parser), stderr, exitCode:code,
     });
     if (parsedOutput.usage || parsedOutput.numTurns !== null) {
       supervisor.recordProviderUsage({ ...(parsedOutput.usage || {}), turns: parsedOutput.numTurns }, { phase: 'terminal' });
@@ -5018,7 +5056,7 @@ async function executeOneShot(body, res) {
         // suppression the mid-stream same-chunk cutoff applies, so that result
         // can never surface as output, rate-limit prose, or a completed answer.
         if (stopReason === 'token_budget') {
-          parsedOutput = parseConfiguredOneShotOutput(entry, semanticStdout, { ignoreTerminalResult: true });
+          parsedOutput = parseConfiguredOneShotOutput(entry, semanticStdout, { ignoreTerminalResult: true, stderr, exitCode:code });
         }
       }
     }
@@ -5034,7 +5072,11 @@ async function executeOneShot(body, res) {
     const codexProgressTranscript = (kind === 'codex' || entry.npm_package === '@openai/codex')
       && (entry.oneshot_output_parser || 'text') === 'text' && code === 0 && !!cleanedStdout
       && !parsedOutput.isError && !parsedOutput.parseError && !parsedOutput.failureClass && !stopReason;
-    const providerStderr = codexProgressTranscript ? '' : stderr;
+    const nativeStructuredOutput = ['grok_json','gemini_cli_json'].includes(entry.oneshot_output_parser);
+    // Native JSON's diagnostic channel can contain startup/MCP noise. Only
+    // parsed provider error fields establish failure or account authority.
+    const providerStderr = codexProgressTranscript || nativeStructuredOutput ? '' : stderr;
+    const providerFailureDiagnostic = nativeStructuredOutput && !parsedOutput.diagnosticIsProviderError ? '' : parsedOutput.diagnostic;
     if (Array.isArray(parsedOutput.usage?.model_usage) && parsedOutput.usage.model_usage.length) {
       const dominant = [...parsedOutput.usage.model_usage].sort((left, right) =>
         Number(right.cost_usd || 0) - Number(left.cost_usd || 0)
@@ -5055,8 +5097,8 @@ async function executeOneShot(body, res) {
     // This prevents an audit discussing "rate limit" or HTTP 429 handling from
     // being misclassified as a provider failure.
     const failureBlob = vendorEvidenceText({
-      stderr: providerStderr, stdout: semanticStdout, diagnostic: parsedOutput.diagnostic,
-      includeStdout: code !== 0 || !cleanedStdout || parsedOutput.isError || parsedOutput.parseError,
+      stderr: providerStderr, stdout: semanticStdout, diagnostic: providerFailureDiagnostic,
+      includeStdout: !nativeStructuredOutput && (code !== 0 || !cleanedStdout || parsedOutput.isError || parsedOutput.parseError),
       supervisorStopReason: stopReason,
     }).toLowerCase();
     const rate_signals = [
@@ -5068,7 +5110,7 @@ async function executeOneShot(body, res) {
     const budget_signals = ['exceeded usd budget','exceeded the usd budget','max-budget-usd','budget exceeded','budget cap reached'];
     const authoritativeApiFailure = claudeApiStatusFailureClass(
       parsedOutput.apiErrorStatus,
-      cleanOutput([providerStderr, parsedOutput.diagnostic].filter(Boolean).join('\n')),
+      cleanOutput([providerStderr, providerFailureDiagnostic].filter(Boolean).join('\n')),
     );
     const tokenBudgetExceeded = stopReason === 'token_budget';
     const terminalQuotaEvidence = acceptedTerminalQuotaEvidence(parsedOutput, kind);
@@ -5083,7 +5125,7 @@ async function executeOneShot(body, res) {
       prompt,
       stopReason,
       stdout: cleanedStdout,
-      stderr: cleanOutput([providerStderr, parsedOutput.diagnostic].filter(Boolean).join('\n')),
+      stderr: cleanOutput([providerStderr, providerFailureDiagnostic].filter(Boolean).join('\n')),
       exitCode: code,
       modelFlagSent: !!route.model_flag_sent,
     });
@@ -5107,8 +5149,8 @@ async function executeOneShot(body, res) {
     // after the selected provider completed successfully. Only classify the
     // provider route as unauthenticated when the command failed or produced no
     // usable answer.
-    const auth_failed = authoritativeApiFailure === 'auth'
-      || ((code !== 0 || !cleanedStdout || parsedOutput.isError)
+    const auth_failed = authoritativeApiFailure === 'auth' || parsedOutput.failureClass === 'auth'
+      || (!nativeStructuredOutput && (code !== 0 || !cleanedStdout || parsedOutput.isError)
         && runClassification.kind === 'auth_failed');
     const permission_denied = authoritativeApiFailure === 'permission'
       || runClassification.kind === 'headless_command_permission_auto_denied';
@@ -5290,7 +5332,13 @@ app.post('/api/tasks', async (req, res) => {
       : input.execution?.resolvedTaskTier || taskTier || classifiedTaskTier;
     const prepared = { ...input, dangerous: input.dangerous === true, providerBudget, budgetTaskTier, taskTier, modelTier };
     const controls = validateProviderIntent({ ...prepared, dangerous: input.dangerous === true });
-    res.json(taskQueue.submit({ ...prepared, execution: controls.execution }));
+    if (controls.outputProfile && controls.preparedPrompt.length > 100000) {
+      throw profileError('The compiled task exceeds the queue limit of 100000 characters; shorten the original task or guidance.');
+    }
+    const { outputProfile: _selection, ...queueBody } = prepared;
+    res.json(taskQueue.submit({ ...queueBody,
+      ...(controls.outputProfile ? { prompt:controls.preparedPrompt, title:input.title || input.prompt.split('\n')[0] } : {}),
+      execution: controls.execution }));
   }
   catch (err) { return rejectInvalidIntent(res, req.body || {}, err); }
 });
@@ -6693,7 +6741,7 @@ app.post('/api/broadcast', async (req, res) => {
   const {
     prompt, tag, providers, all, dangerous, timeoutMs = TIMEOUT_POLICY.oneShotDefaultMs, cwd,
     providerBudget, effort, maxEffortOverride, model, execution, taskTier, modelTier,
-    requiresWorkspaceAccess, inlineEvidence,
+    requiresWorkspaceAccess, inlineEvidence, outputProfile,
   } = req.body || {};
   const effectiveTimeoutMs = TIMEOUT_POLICY.normalizeOneShotTimeoutMs(timeoutMs);
   if (typeof prompt !== 'string' || !prompt.trim()) {
@@ -6726,7 +6774,7 @@ app.post('/api/broadcast', async (req, res) => {
     // Validate every member before the first provider can consume quota. A
     // planned tuple is provider-bound and cannot be broadcast to other seats.
     for (const kind of targets) intents.set(kind, validateProviderIntent({
-      kind, prompt, cwd, requiresWorkspaceAccess, inlineEvidence, providerBudget: validatedProviderBudget, model, execution,
+      kind, prompt, cwd, requiresWorkspaceAccess, inlineEvidence, outputProfile, providerBudget: validatedProviderBudget, model, execution,
       taskTier: resolvedTaskTier, modelTier: resolvedModelTier, effort, maxEffortOverride,
       dangerous: dangerous === true,
     }, cfg).execution);
@@ -6765,7 +6813,7 @@ app.post('/api/broadcast', async (req, res) => {
     activeCaptured.add(captured);
     executeOneShot({
       kind, prompt, timeoutMs: remainingMs, cwd, dangerous: dangerous === true,
-      requiresWorkspaceAccess, inlineEvidence,
+      requiresWorkspaceAccess, inlineEvidence, outputProfile,
       providerBudget: validatedProviderBudget, budgetTaskTier,
       taskTier: resolvedTaskTier, modelTier: resolvedModelTier, model, execution: intents.get(kind),
       effort, maxEffortOverride,

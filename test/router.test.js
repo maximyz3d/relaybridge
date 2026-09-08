@@ -9,6 +9,33 @@ test.before(async () => {
   router = await import('../mcp/router.mjs');
 });
 
+test('substantive short planning, collaboration and decisions do not fall to the utility tier', () => {
+  for (const task of [
+    'Plan a robust caching implementation with eviction correctness and testable acceptance criteria.',
+    'Coordinate two teams to resolve conflicting recommendations with assigned owners and acceptance criteria.',
+    'Reconcile conflicting proposals, identify assumptions, and assign accountable owners.',
+    'Compare feasible options against constraints and explain the tradeoffs before recommending a decision.',
+    'Diagnose an intermittent cache eviction bug and propose a correction with acceptance checks.',
+    'Design a cache algorithm with eviction invariants and testable acceptance criteria.',
+    'Plan a caching implementation meeting acceptance criteria.',
+    'Plan a calendar implementation with conflict resolution and acceptance criteria.',
+    'Compare the terms of these proposals against budget constraints.',
+    'Can you please plan an implementation with acceptance criteria?',
+    'Could you help me plan an implementation with dependencies?',
+    'Coordinate a meeting to resolve conflicting proposals with assigned owners.',
+  ]) {
+    const c = router.classifyTask(task); assert.equal(c.tier,'standard',task);
+    assert.ok(c.tags.includes('reasoning'),task); assert.notEqual(c.routingConfidence.level,'low',task);
+  }
+  for (const task of ['Plan a meeting for Tuesday','Plan my morning schedule',
+    'Coordinate a 15-minute meeting tomorrow','Define implementation plan in one sentence',
+    'What is a tradeoff?','List the acceptance criteria from this paragraph','Compare 2 and 3',
+    'Compare the definitions of tradeoffs and constraints.',
+    'Compare the meanings of the terms tradeoffs and constraints.']) assert.equal(router.classifyTask(task).tier,'utility',task);
+  for (const task of ['Plan to rotate production signing keys','Plan to delete all records',
+    'Plan a patient prescription dosage change']) assert.equal(router.classifyTask(task).tier,'critical',task);
+});
+
 test('deterministic preference cannot replace architecture or mixed semantic work', () => {
   for (const task of ['Design the architecture and migration for this repository.',
     'Compute SHA256 then review architecture safety.', 'Compute SHA256 then explain how collision resistance works.',
