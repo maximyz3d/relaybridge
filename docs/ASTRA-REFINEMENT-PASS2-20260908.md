@@ -66,8 +66,30 @@ Implementation checkpoints:
   It uses the SDK's registered callback update API because assigning only the
   exposed handler would leave the cached executor unchanged.
 
-Full-suite and fresh combined closing review remain pending. Private fixture
-outputs are local; no raw machine logs or runtime transcripts are published.
+Full suite on code head `aa494c318e11e63c3e8d56f2b3d358f7c3140cb4`:
+1,060 tests, 1,056 passed, zero failed, four skipped (101 seconds).
+Chromium tests ran using disposable tooling outside the repository. Skips were
+the environment-dependent skill installer and three native Windows cases;
+Windows qualification depends on CI. Production `npm audit --omit=dev` reports
+zero vulnerabilities. Build preparation reports `2.3.0+7a059becfcbac0c5`.
+Private fixture outputs are local; no raw machine logs or runtime transcripts
+are published.
+
+Fresh independent native Astra/ultra closing review `/root/astra_closing2`:
+`REVIEW_VERDICT: APPROVE`, bound to the complete base-to-code-head diff above.
+It inspected shutdown admission/lifetimes and the installed MCP SDK callback
+update contract; no material code findings remained. Its nonblocking README
+restart correction is included after the reviewed code commit. The release
+auditor `/root/astra_ui_audit2` separately approved corrective `9f196d7`,
+confirming both mirrors advertise v6 and the fleet upgrade regression passes.
+The lifecycle and provider auditors also returned bounded APPROVE verdicts.
+These native review identifiers are not RelayBridge provider receipt IDs or
+Claude verdicts. No Claude was invoked. Provider authentication, legacy fencing,
+Windows replacement and shared deployment are not qualified by these reviews.
+
+Root staged only the named implementation/tests and this sanitized handoff;
+the code commit was clean before review and was pushed without rewriting its
+ancestry. The closing documentation commit also owns `README.md`.
 
 ## Accepted audit findings
 
