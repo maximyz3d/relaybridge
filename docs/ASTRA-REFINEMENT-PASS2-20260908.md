@@ -136,3 +136,40 @@ force-stops its target. The automatic `/api/admin/restart` endpoint now returns
 path exists. The MCP stop/start workflow remains separate. This deliberately
 removes the unsafe automatic helper from the REST execution path; it does not
 claim Windows restart qualification or change the standalone helper file.
+
+## Live review transport finding and correction
+
+PR: <https://github.com/maximyz3d/relaybridge/pull/128>.
+Published checkpoint: `6bebfdba7468e8f0eccbfc89a1e06e74cdd1714d`.
+Linux, Windows (including MCP registration and installer lifecycle) and CodeQL
+passed on that checkpoint. Astra `/root/astra_closing2` also approved its
+documentation-only delta from the prior reviewed code head.
+
+Two bounded read-only live review attempts ran through a disposable bridge;
+neither returned a complete verdict and neither is approval:
+
+- First attempt: temporary MCP client harness used the wrong SDK timeout-option
+  position and expired before a result. NO VERDICT. Context receipt
+  `rcpt_mttib4ta_d4bd90dd`; preview receipt `rcpt_mttib4wa_045be07e`.
+  No complete provider result/receipt was retained from this harness attempt.
+- Second attempt: NO VERDICT. MCP receipt `rcpt_mttie1h7_2e2164df`, bridge receipt
+  `rcpt_mttikhgh_a350336d`, run `run_mttie1ho_e7ebb182`, request/invocation
+  `mcp:87b11cc0-b901-4599-abc7-85e0bdf4d07d`, attempt
+  `mcp:87b11cc0-b901-4599-abc7-85e0bdf4d07d:attempt:1`.
+  The HTTP fetch failed after 300,632 ms while the provider was producing
+  output, despite its 900,000 ms configured budget. The bridge subsequently
+  recorded client cancellation. Requested/outgoing model was `gpt-6-astra`,
+  applied effort `ultra`; vendor-observed model remained unknown.
+
+The timing is consistent with the installed Node v22.23.2 / Undici 6.28.0
+[independent 300-second header/body defaults](https://raw.githubusercontent.com/nodejs/undici/v6.28.0/docs/docs/api/Client.md).
+The generic fetch error alone cannot prove which internal timer fired.
+Root accepts additional ownership of `mcp/bridge-client.mjs` and
+`test/mcp-bridge-transport.test.js` to remove that hidden transport ceiling.
+The existing loopback transport uses built-in Node HTTP with a dedicated socket,
+the caller's bounded abort signal through body completion, unchanged identity
+and token checks, no redirects or retries, and byte/chunk response bounds.
+The two-second capability bootstrap remains separate. Accelerated regressions
+cover buffered headers, request deadline and caller cancellation before/after
+headers, malformed truncation, redirect refusal, and no repeated failed POST.
+Fresh correction checks and closing evidence follow before merge.

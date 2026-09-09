@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -28,6 +29,61 @@ const START_LOCK = path.join(BRIDGE_ROOT, '.mcp-start.lock');
 const OUT_LOG = path.join(BRIDGE_ROOT, 'bridge.mcp.out.log');
 const ERR_LOG = path.join(BRIDGE_ROOT, 'bridge.mcp.err.log');
 const MAX_BRIDGE_REQUEST_TIMEOUT_MS = TIMEOUT_POLICY.oneShotMaxMs + TIMEOUT_POLICY.transportGraceMs;
+// Accommodates the provider output ceiling even after JSON escaping, while
+// refusing an unbounded response from a broken local server.
+const MAX_BRIDGE_RESPONSE_BYTES = 128 * 1024 * 1024;
+const MAX_BRIDGE_RESPONSE_CHUNKS = 65536;
+
+function requestBridgeText(url, { method, headers, body, signal }) {
+  return new Promise((resolve, reject) => {
+    const fail = (error) => reject(signal.aborted && signal.reason instanceof Error ? signal.reason : error);
+    // fetch has an independent 300s header timeout in supported Node releases.
+    // A buffered provider may legitimately need longer. This dedicated socket
+    // obeys the caller's bounded AbortSignal through headers AND response body,
+    // without inheriting a global agent's shorter idle timeout or redirecting
+    // an authenticated request to another origin.
+    const request = http.request(url, { method, headers, signal, agent: false }, (response) => {
+      const chunks = [];
+      let bytes = 0, ended = false;
+      response.on('error', fail);
+      response.on('aborted', () => fail(new Error('RelayBridge response was incomplete')));
+      response.on('close', () => { if (!ended) fail(new Error('RelayBridge response was incomplete')); });
+      if (response.statusCode >= 300 && response.statusCode < 400) {
+        const error = new Error('RelayBridge redirect refused');
+        fail(error);
+        response.destroy(error);
+        request.destroy(error);
+        return;
+      }
+      if (Number(response.headers['content-length']) > MAX_BRIDGE_RESPONSE_BYTES) {
+        const error = new Error('RelayBridge response exceeds the transport size limit');
+        fail(error);
+        response.destroy(error);
+        request.destroy(error);
+        return;
+      }
+      response.on('data', (chunk) => {
+        bytes += chunk.length;
+        if (bytes > MAX_BRIDGE_RESPONSE_BYTES || chunks.length >= MAX_BRIDGE_RESPONSE_CHUNKS) {
+          const error = new Error('RelayBridge response exceeds the transport size limit');
+          fail(error);
+          response.destroy(error);
+          request.destroy(error);
+          return;
+        }
+        chunks.push(chunk);
+      });
+      response.on('end', () => {
+        ended = true;
+        if (!response.complete) return fail(new Error('RelayBridge response was incomplete'));
+        resolve({ ok: response.statusCode >= 200 && response.statusCode < 300,
+          status: response.statusCode, text: Buffer.concat(chunks, bytes).toString('utf8') });
+      });
+    });
+    request.on('error', fail);
+    request.end(body);
+  });
+}
 
 function boundedBridgeRequestTimeoutMs(value) {
   const parsed = Number(value);
@@ -142,11 +198,10 @@ export async function bridgeRequest(route, {
   }
   let response;
   try {
-    response = await fetch(new URL(route, BASE_URL), {
+    response = await requestBridgeText(new URL(route, BASE_URL), {
       method,
       headers,
       body: body === undefined ? undefined : JSON.stringify(body),
-      redirect: 'error',
       signal: signal
         ? AbortSignal.any([signal, AbortSignal.timeout(requestTimeoutMs)])
         : AbortSignal.timeout(requestTimeoutMs),
@@ -154,7 +209,7 @@ export async function bridgeRequest(route, {
   } catch (error) {
     throw new BridgeError(`RelayBridge request failed: ${error.message}`, { route, cause: error });
   }
-  const text = await response.text();
+  const text = response.text;
   let payload;
   try { payload = text ? JSON.parse(text) : {}; }
   catch { payload = { text: text.slice(0, 10000) }; }
