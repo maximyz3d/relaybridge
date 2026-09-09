@@ -173,3 +173,30 @@ The two-second capability bootstrap remains separate. Accelerated regressions
 cover buffered headers, request deadline and caller cancellation before/after
 headers, malformed truncation, redirect refusal, and no repeated failed POST.
 Fresh correction checks and closing evidence follow before merge.
+
+At `32715872c6ed93053e226c95bef39e36a04ed3b9`, the full Chromium-enabled suite
+passed 1,068 tests (1,064 passed, zero failed, four skipped; 104 seconds).
+Native `/root/astra_transport_closing` returned a bounded APPROVE, but the
+independent live Astra correction review found an additional protocol-switch
+edge case and returned **REVIEW_VERDICT: REVISE**. That later finding was accepted.
+
+Live REVISE: MCP receipt `rcpt_mttiv041_6fca9b87`; bridge receipt
+`rcpt_mttiyb4y_857e8685`; run `run_mttiv04c_938f6d0a`; request/invocation
+`mcp:decf6de5-99f8-4203-a2b9-ad1545a6eead`; attempt
+`mcp:decf6de5-99f8-4203-a2b9-ad1545a6eead:attempt:1`.
+Exit 0, one physical model invocation, no timeout/cancellation/dropout/partial
+output, and receipts persisted. Verdict text SHA-256:
+`8efedb7cea596623135a62a86b6d95813c8715afb58a03d2e6e716caf8c26c9c`.
+Requested/outgoing Astra and applied ultra are recorded; vendor-observed model
+remains unknown. This is a complete review verdict, not provider authentication
+or deployment qualification.
+
+The accepted P2 finding: HTTP 101 bypasses Node's ordinary response callback,
+then closes its request and removes its abort listener. Without handling that
+path, the promise could outlive its deadline. Root adds explicit rejection and
+detached-socket cleanup for upgrade/CONNECT, plus a guarded request-close
+fallback before an ordinary response arrives. The native reviewer independently
+confirmed the finding and required `socket.destroy()` without an error argument,
+because Node removes its socket-error listener before emitting those events.
+The actual HTTP 101 regression verifies rejection and socket closure. The
+updated focused transport/lifecycle/identity/routing suite passes 53/53.

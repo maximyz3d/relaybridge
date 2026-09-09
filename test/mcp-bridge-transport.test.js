@@ -117,3 +117,14 @@ test('truncated and oversized responses fail without a partial success', async (
   handler = (_req, res) => { res.writeHead(200, { 'Content-Length': 128 * 1024 * 1024 + 1 }); res.flushHeaders(); };
   await assert.rejects(bridgeRequest('/api/test'), /transport size limit/);
 });
+
+test('HTTP protocol switches reject promptly and close the upgraded socket', { timeout: 5000 }, async () => {
+  let resolveClosed; const closed = new Promise(resolve => { resolveClosed = resolve; });
+  handler = (_req, res) => {
+    res.socket.once('close', resolveClosed);
+    res.writeHead(101, { Connection: 'Upgrade', Upgrade: 'websocket' });
+    res.end();
+  };
+  await assert.rejects(bridgeRequest('/api/test', { timeoutMs: 1000 }), /protocol switch refused/);
+  await closed;
+});

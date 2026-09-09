@@ -37,12 +37,14 @@ const MAX_BRIDGE_RESPONSE_CHUNKS = 65536;
 function requestBridgeText(url, { method, headers, body, signal }) {
   return new Promise((resolve, reject) => {
     const fail = (error) => reject(signal.aborted && signal.reason instanceof Error ? signal.reason : error);
+    let responseReceived = false;
     // fetch has an independent 300s header timeout in supported Node releases.
     // A buffered provider may legitimately need longer. This dedicated socket
     // obeys the caller's bounded AbortSignal through headers AND response body,
     // without inheriting a global agent's shorter idle timeout or redirecting
     // an authenticated request to another origin.
     const request = http.request(url, { method, headers, signal, agent: false }, (response) => {
+      responseReceived = true;
       const chunks = [];
       let bytes = 0, ended = false;
       response.on('error', fail);
@@ -79,6 +81,16 @@ function requestBridgeText(url, { method, headers, body, signal }) {
         resolve({ ok: response.statusCode >= 200 && response.statusCode < 300,
           status: response.statusCode, text: Buffer.concat(chunks, bytes).toString('utf8') });
       });
+    });
+    const rejectProtocolSwitch = (_response, socket) => {
+      fail(new Error('RelayBridge protocol switch refused'));
+      socket.destroy();
+      request.destroy();
+    };
+    request.on('upgrade', rejectProtocolSwitch);
+    request.on('connect', rejectProtocolSwitch);
+    request.on('close', () => {
+      if (!responseReceived) fail(new Error('RelayBridge request closed before a response'));
     });
     request.on('error', fail);
     request.end(body);
