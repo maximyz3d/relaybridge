@@ -2700,6 +2700,42 @@ const hostExecSlots = createOperationSlots({ limit: 4 });
 const installSlots = createOperationSlots({ limit: 1 });
 const probePool = createReadOperationPool({ maxActive: 4, maxQueued: 64, maxSubscribers: 64 });
 let authGeneration = 0;
+let admissionClosed = false;
+let activeRequestBodies = 0, activeRequestHandlers = 0, activeBackgroundTasks = 0;
+
+function rejectShutdownAdmission(res) {
+  return res.status(503).json({ ok:false, code:'BRIDGE_SHUTTING_DOWN', failureClass:'bridge_shutting_down',
+    retryable:false, model_invocation:false, physical_attempt_count:0, token_usage_source:'not_invoked' });
+}
+
+// A disconnected HTTP caller does not end asynchronous work. Keep the
+// handler reservation until its own promise settles, separately from sockets.
+function trackedHandler(handler) {
+  return async function (req, res, next) {
+    if (admissionClosed) return rejectShutdownAdmission(res);
+    activeRequestHandlers++;
+    try { return await handler(req, res, next); }
+    finally { activeRequestHandlers--; }
+  };
+}
+
+function trackedMcpCallback(callback) {
+  return async function (...args) {
+    if (admissionClosed) throw new Error('BRIDGE_SHUTTING_DOWN: no new MCP work accepted');
+    activeRequestHandlers++;
+    try { return await callback.apply(this,args); }
+    finally { activeRequestHandlers--; }
+  };
+}
+
+function lifecycleExempt(req) {
+  const route = req.path.toLowerCase().replace(/\/+$/, '');
+  return (['GET','HEAD'].includes(req.method) && route === '/api/health')
+    || (req.method === 'POST' && ['/api/admin/shutdown','/api/admin/restart'].includes(route));
+}
+function isWorkRequest(req) {
+  return /^\/(?:api|mcp)(?:\/|$)/i.test(req.path);
+}
 
 function rejectOperationAdmission(res, error) {
   res.set('Retry-After', '1');
@@ -2713,7 +2749,23 @@ function diagnosticGeneration(cfg) {
   return `${authGeneration}:${crypto.createHash('sha256').update(JSON.stringify(cfg)).digest('hex')}`;
 }
 app.disable('x-powered-by');
+app.use((req, res, next) => {
+  if (!isWorkRequest(req) || lifecycleExempt(req)) return next();
+  if (admissionClosed) return rejectShutdownAdmission(res);
+  activeRequestBodies++;
+  let released = false;
+  const release = () => { if (!released) { released = true; activeRequestBodies--; } };
+  res.once('finish', release); res.once('close', release);
+  next();
+});
 app.use(express.json({ limit: '1mb' }));
+// A slow body upload may have passed the first gate before stop acceptance.
+app.use((req, res, next) => {
+  if (admissionClosed && !lifecycleExempt(req) && isWorkRequest(req)) {
+    return rejectShutdownAdmission(res);
+  }
+  next();
+});
 
 const ALLOWED_ORIGINS = new Set([
   `http://${HOST}:${PORT}`,
@@ -2977,13 +3029,6 @@ app.get('/api/workflow-library', (req, res) => {
   catch (error) { res.status(500).json({ error:error.message }); }
 });
 
-app.use('/api', (req, res, next) => {
-  if (shuttingDown && !['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
-    return res.status(503).json({ ok: false, code: 'BRIDGE_SHUTTING_DOWN' });
-  }
-  next();
-});
-
 // Authenticated workspace-policy discovery keeps browser defaults aligned with
 // an operator-supplied allowlist. The public health endpoint intentionally does
 // not expose local filesystem paths.
@@ -3087,6 +3132,7 @@ async function runProbe(slotRaw, timeoutMs = 15000, stripEnv = [], signal) {
     code: error.code || null, validation: error.validation || null, timedOut: false,
     model_invocation: false, ...extra });
   if (signal?.aborted) return notRun(new Error('diagnostic cancelled'), { aborted: true });
+  if (admissionClosed) return notRun(new Error('bridge shutting down'));
   const env = buildEnv({}, stripEnv);
   const [configuredBinary, ...args] = resolveSlot(slotRaw);
   let launch;
@@ -3110,6 +3156,7 @@ async function runProbe(slotRaw, timeoutMs = 15000, stripEnv = [], signal) {
 // Only actual close or a confirmed no-child startup failure frees admission.
 function runPhysicalProbe(launch, timeoutMs, signal) {
   return new Promise((resolve) => {
+    if (admissionClosed) return resolve({ exitCode:-1, stdout:'', stderr:'bridge shutting down', model_invocation:false });
     if (signal.aborted) return resolve({ exitCode: -1, stdout: '', stderr: 'diagnostic cancelled', timedOut: false, aborted: true, model_invocation: false });
     let proc;
     try {
@@ -3349,6 +3396,7 @@ function agentSummary(kind, entry) {
 }
 
 async function readOllamaTags(tagsUrl, signal) {
+  if (admissionClosed) return { completed:false, error:'bridge shutting down', admissionRejected:true };
   const key = crypto.createHash('sha256').update(JSON.stringify({
     type: 'ollama_tags', url: tagsUrl.href, timeoutMs: 4000, maxBytes: 1048576, redirect: 'manual',
   })).digest('hex');
@@ -3356,7 +3404,9 @@ async function readOllamaTags(tagsUrl, signal) {
   const timer = setTimeout(() => deadline.abort(), 6000);
   timer.unref?.();
   try {
-    return await probePool.run(key, (workerSignal) => readBoundedJson(tagsUrl, { signal: workerSignal }),
+    return await probePool.run(key, (workerSignal) => admissionClosed
+      ? { completed:false, error:'bridge shutting down', admissionRejected:true }
+      : readBoundedJson(tagsUrl, { signal: workerSignal }),
       { signal: signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal });
   } catch (error) {
     return { completed: false, error: error.message, aborted: !!signal?.aborted,
@@ -3585,18 +3635,18 @@ app.get('/api/runs/active', (req, res) => {
 });
 
 // What models each provider can actually run, plus what each is best at.
-app.get('/api/models', async (req, res) => {
+app.get('/api/models', trackedHandler(async (req, res) => {
   if (req.query.refresh === '1' || !modelRegistry) {
     try { await discoverModels(); } catch (err) { return res.status(500).json({ ok: false, error: err.message }); }
   }
   const cfg = loadConfig();
   res.json({ ok: true, ...(modelRegistry || { providers: {}, warnings: [] }), staleness: modelConfigStaleness(cfg._models || {}) });
-});
+}));
 
-app.post('/api/models/refresh', async (req, res) => {
+app.post('/api/models/refresh', trackedHandler(async (req, res) => {
   try { res.json({ ok: true, ...(await discoverModels()) }); }
   catch (err) { res.status(500).json({ ok: false, error: err.message }); }
-});
+}));
 
 // Full execution plan for a task: company, model, AND effort together.
 // Routing alone answers "which CLI"; that is not enough to avoid waste. Sending
@@ -3673,7 +3723,7 @@ async function planTask({ task, requestedEffort = null, kind = null, requestedPr
   return { plan:{ ...plan, ...(profiled.profile ? { outputProfile:profiled.profile, preparedPrompt:profiled.prompt } : {}) }, fleetState: route.fleetState };
 }
 
-app.post('/api/plan', planningRequestLimit, async (req, res) => {
+app.post('/api/plan', planningRequestLimit, trackedHandler(async (req, res) => {
   const controller = new AbortController();
   res.once('close', () => { if (!res.writableEnded) controller.abort(); });
   const { task } = req.body || {};
@@ -3686,11 +3736,11 @@ app.post('/api/plan', planningRequestLimit, async (req, res) => {
     if (error.validation) return rejectInvalidIntent(res, { ...req.body, prompt: task }, error);
     res.status(error.statusCode || 500).json({ ok: false, error: error.message, ...(error.code ? { errorCode: error.code } : {}) });
   }
-});
+}));
 
 // Delegation: classify a task, rank providers by tier, and pick the model
 // weight class inside each. Advisory — it returns a plan, it does not dispatch.
-app.post('/api/route', planningRequestLimit, async (req, res) => {
+app.post('/api/route', planningRequestLimit, trackedHandler(async (req, res) => {
   const controller = new AbortController();
   res.once('close', () => { if (!res.writableEnded) controller.abort(); });
   const {
@@ -3798,7 +3848,7 @@ app.post('/api/route', planningRequestLimit, async (req, res) => {
   } catch (err) {
     if (!res.destroyed && !res.writableEnded) res.status(500).json({ ok: false, error: err.message });
   }
-});
+}));
 
 // Which providers are installed but not signed in. "found && !ready" is exactly
 // that state: the CLI resolves on PATH but its own probe reports no session.
@@ -3836,7 +3886,7 @@ function probeReadiness(entry, probe, text) {
   return { completed, ready:completed && probe.exitCode === 0 && expected && !rejected };
 }
 
-app.get('/api/auth/status', diagnosticRequestLimit, async (req, res) => {
+app.get('/api/auth/status', diagnosticRequestLimit, trackedHandler(async (req, res) => {
   const cfg = loadConfig();
   const generation = diagnosticGeneration(cfg);
   const controller = new AbortController();
@@ -3932,9 +3982,9 @@ app.get('/api/auth/status', diagnosticRequestLimit, async (req, res) => {
     homeMismatch: (process.env.USERPROFILE || process.env.HOME || '') !== homeDir,
     credentials,
   });
-});
+}));
 
-app.get('/api/diag', diagnosticRequestLimit, async (req, res) => {
+app.get('/api/diag', diagnosticRequestLimit, trackedHandler(async (req, res) => {
   const controller = new AbortController();
   let clientGone = false;
   res.on('close', () => {
@@ -4084,7 +4134,7 @@ app.get('/api/diag', diagnosticRequestLimit, async (req, res) => {
     }
     res.json({ results, routing });
   }
-});
+}));
 
 app.get('/api/permissions', (req, res) => {
   res.json({ fullPermissions: state.fullPermissions });
@@ -4251,6 +4301,9 @@ async function executeOneShot(body, res) {
       route,
     });
   };
+  if (admissionClosed) return rejectBeforeAdmission(503, 'bridge_shutting_down', {
+    error:'bridge shutting down', retryable:false, model_invocation:false, physical_attempt_count:0,
+  });
   // Two timeout regimes compose here. The timeout policy bounds any EXPLICIT
   // caller timeout, so a caller can neither starve a run nor exceed the
   // transport ceiling the MCP client allows. When the caller sends nothing, no
@@ -4472,6 +4525,9 @@ async function executeOneShot(body, res) {
       });
     }
   }
+  if (admissionClosed) return rejectBeforeAdmission(503, 'bridge_shutting_down', {
+    error:'bridge shutting down', retryable:false, model_invocation:false, physical_attempt_count:0,
+  });
   releaseAdmission = acquireOneShot(kind);
   if (!releaseAdmission) {
     return rejectBeforeAdmission(429, 'admission_limit', {
@@ -5307,11 +5363,11 @@ async function executeOneShot(body, res) {
   }
 }
 
-app.post('/api/oneshot', (req, res) => executeOneShot({
+app.post('/api/oneshot', trackedHandler((req, res) => executeOneShot({
   ...req.body,
   _relayClient: req.get('X-RelayBridge-Client') || null,
   _relayClientDeadlineAt: req.get('X-RelayBridge-Client-Deadline-At') || null,
-}, res));
+}, res)));
 
 // ---- Async task queue (lib/task-queue.js) --------------------------------
 // Submission is decoupled from collection so work outlives the surface that
@@ -5331,7 +5387,7 @@ const taskQueue = createTaskQueue({
   log: (m) => console.log(m),
 });
 
-app.post('/api/tasks', async (req, res) => {
+app.post('/api/tasks', trackedHandler(async (req, res) => {
   try {
     const input = req.body || {};
     if (input.deliveryMode !== undefined && input.deliveryMode !== 'queued') {
@@ -5373,7 +5429,7 @@ app.post('/api/tasks', async (req, res) => {
     if (['TASK_INTENT_CONFLICT', 'QUEUE_EXECUTION_UNCERTAIN', 'DELIVERY_UNAVAILABLE', 'INVALID_DELIVERY'].includes(err.code)) return sendDeliveryError(res, err);
     return rejectInvalidIntent(res, req.body || {}, err);
   }
-});
+}));
 function sendDeliveryError(res, error) {
   const code = error.code || 'INVALID_DELIVERY';
   const status = code === 'TASK_NOT_FOUND' ? 404 : ['TASK_INTENT_CONFLICT', 'RESULT_IDENTITY_MISMATCH'].includes(code) ? 409
@@ -5462,7 +5518,7 @@ const delegation = createDelegationCoordinator({
   log: (m) => console.log(m),
 });
 
-app.post('/api/delegate', rateLimit(delegationRateLimitOptions), async (req, res) => {
+app.post('/api/delegate', rateLimit(delegationRateLimitOptions), trackedHandler(async (req, res) => {
   const controller = new AbortController();
   res.once('close', () => { if (!res.writableEnded) controller.abort(); });
   const input = req.body || {};
@@ -5533,7 +5589,7 @@ app.post('/api/delegate', rateLimit(delegationRateLimitOptions), async (req, res
   } finally {
     delegationSelection = new Map();
   }
-});
+}));
 app.get('/api/delegations', (req, res) => {
   try { res.json({ delegations: delegation.list({ status: req.query.status, limit: req.query.limit }), stats: delegation.stats() }); }
   catch (err) { res.status(400).json({ error: err.message }); }
@@ -6705,10 +6761,13 @@ githubTracker.setActivityFile(path.join(DATA_DIR, 'github-activity.jsonl'));
 
 function trackRunAfterResponse(meta) {
   // setImmediate so the one-shot response is already on the wire.
+  // Reserve before scheduling: accepted checkpoint work can outlive its HTTP
+  // response and must settle before a normal shutdown is accepted.
+  activeBackgroundTasks++;
   setImmediate(() => {
-    githubTracker.trackRun(meta).catch((err) => {
+    Promise.resolve().then(() => githubTracker.trackRun(meta)).catch((err) => {
       githubTracker.logActivity({ action: 'track_run', runId: meta.runId, tracked: false, reason: 'unhandled tracker error', detail: err.message });
-    });
+    }).finally(() => { activeBackgroundTasks--; });
   });
 }
 
@@ -6721,24 +6780,24 @@ app.get('/api/github/repos', (req, res) => {
   catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.get('/api/github/versions', async (req, res) => {
+app.get('/api/github/versions', trackedHandler(async (req, res) => {
   try { res.json({ repo: String(req.query.repo || ''), versions: await githubTracker.listVersions(String(req.query.repo || '')) }); }
   catch (err) { res.status(400).json({ error: err.message }); }
-});
+}));
 
-app.get('/api/github/versions/show', async (req, res) => {
+app.get('/api/github/versions/show', trackedHandler(async (req, res) => {
   try { res.json(await githubTracker.showVersion(String(req.query.repo || ''), String(req.query.tag || ''))); }
   catch (err) { res.status(400).json({ error: err.message }); }
-});
+}));
 
 // Rollback convenience: NEW branch from a tag — never a force-reset.
-app.post('/api/github/checkout-version', async (req, res) => {
+app.post('/api/github/checkout-version', trackedHandler(async (req, res) => {
   try { res.json(await githubTracker.checkoutVersion(String(req.body?.repo || ''), String(req.body?.tag || ''))); }
   catch (err) { res.status(400).json({ error: err.message }); }
-});
+}));
 
 // Manual tracking trigger for a working directory (dashboard button / MCP).
-app.post('/api/github/track', async (req, res) => {
+app.post('/api/github/track', trackedHandler(async (req, res) => {
   const { runId, kind, user, prompt, cwd, intent } = req.body || {};
   try {
     res.json(await githubTracker.trackRun({
@@ -6747,18 +6806,18 @@ app.post('/api/github/track', async (req, res) => {
       prompt: prompt || intent || '', cwd, intent,
     }));
   } catch (err) { res.status(400).json({ error: err.message }); }
-});
+}));
 
 // Provision the full automation stack into a repo in one action (draft PR).
-app.post('/api/github/onboard', async (req, res) => {
+app.post('/api/github/onboard', trackedHandler(async (req, res) => {
   try { res.json(await githubOnboard.onboardRepo({ name: req.body?.name, path: req.body?.path })); }
   catch (err) { res.status(400).json({ error: err.message, errorCode: err.code || null, cleanupFailure: err.cleanupFailure || null }); }
-});
+}));
 
-app.post('/api/github/upgrade-repos', async (req, res) => {
+app.post('/api/github/upgrade-repos', trackedHandler(async (req, res) => {
   try { res.json(await githubOnboard.upgradeRepos()); }
   catch (err) { res.status(500).json({ error: err.message }); }
-});
+}));
 
 
 // ---- Agent registry (AI providers with routing tags) -------------------
@@ -6797,7 +6856,7 @@ app.post('/api/agents/:id/tags', (req, res) => {
 // admission caps, per-provider limits, receipts, and output cleaning behave
 // exactly like /api/oneshot. Members that hit the global concurrency cap are
 // queued (bounded retry on admission_limit) instead of failing.
-app.post('/api/broadcast', async (req, res) => {
+app.post('/api/broadcast', trackedHandler(async (req, res) => {
   const {
     prompt, tag, providers, all, dangerous, timeoutMs = TIMEOUT_POLICY.oneShotDefaultMs, cwd,
     providerBudget, effort, maxEffortOverride, model, execution, taskTier, modelTier,
@@ -6928,7 +6987,7 @@ app.post('/api/broadcast', async (req, res) => {
     timeoutMs: effectiveTimeoutMs,
     deadlineAt: new Date(deadlineAt).toISOString(),
   });
-});
+}));
 
 
 // Install one CLI by its kind. Providers may use npm, Python/pip, or an exact
@@ -7038,6 +7097,7 @@ app.post('/api/open-url', (req, res) => {
   const reply = (fn) => { if (replied) return; replied = true; fn(); };
 
   const tryOpener = (i) => {
+    if (admissionClosed) return reply(() => rejectShutdownAdmission(res));
     if (i >= openers.length) {
       return reply(() => res.status(501).json({
         error: `no ${browser} browser opener available on ${plat.label} (tried: ${openers.map((entry) => entry.bin).join(', ')})`,
@@ -7126,43 +7186,37 @@ app.post('/api/projects', (req, res) => {
 // wait for the singleton bridge to release its port, and start the new build.
 // The capability-token middleware protects this destructive endpoint.
 app.post('/api/admin/shutdown', (req, res) => {
-  const active = taskQueue.stats().active + activeChildren.size + sessions.size;
-  if (active > 0 && req.body?.force !== true) {
-    return res.status(409).json({ ok: false, code: 'BRIDGE_BUSY', active });
+  const queue = taskQueue.stats(), probes = probePool.snapshot();
+  // These are overlapping busy reasons, never a unique task/execution count.
+  const busy = { requests:activeRequestBodies, handlers:activeRequestHandlers,
+    background:activeBackgroundTasks,
+    oneShots:activeOneShotCount, runs:activeRuns.size, children:activeChildren.size, sessions:sessions.size,
+    hostExec:hostExecSlots.snapshot().active, installs:installSlots.snapshot().active,
+    probes:probes.active + probes.queued, discovery:discoveryInFlight ? 1 : 0,
+    queueActive:queue.active, queueQueued:queue.queued };
+  if (Object.values(busy).some(value => value > 0) && req.body?.force !== true) {
+    return res.status(409).json({ ok:false, code:'BRIDGE_BUSY', busy });
   }
+  admissionClosed = true;
+  taskQueue.shutdown();
   res.json({ ok: true, stopping: true, pid: process.pid, instanceId: INSTANCE_ID });
   setTimeout(shutdown, 100);
 });
 
-// Full restart: reply first, then hand off to the detached restart.ps1 helper,
-// which waits for this PID to release the port and relaunches server.js. The
-// helper only exists for Windows; other platforms report 501 instead of
-// killing the process without a relauncher.
+// The legacy Windows helper force-stops a PID and lacks a retained-process
+// handshake. Keep this automatic endpoint unavailable until that cutover is
+// qualified; an acknowledgement must not imply a safe replacement was started.
 app.post('/api/admin/restart', (req, res) => {
-  if (process.platform !== 'win32') {
-    return res.status(501).json({ ok: false, restarting: false, error: 'restart helper is Windows-only; stop and start the bridge manually', platform: process.platform });
-  }
-  res.json({ ok: true, restarting: true, pid: process.pid, instanceId: INSTANCE_ID });
-  setTimeout(() => {
-    try {
-      const helper = spawn('powershell.exe', [
-        '-NoProfile',
-        '-ExecutionPolicy', 'Bypass',
-        '-File', path.join(ROOT, 'restart.ps1'),
-        '-TargetPid', String(process.pid),
-        '-Port', String(PORT),
-      ], { cwd: ROOT, detached: true, stdio: 'ignore', windowsHide: true });
-      helper.unref();
-    } catch (err) {
-      console.warn('[RelayBridge] restart helper failed to launch: ' + err.message);
-    }
-  }, 100);
+  return res.status(501).json({ ok:false, restarting:false, code:'RESTART_REQUIRES_COORDINATED_CUTOVER',
+    error:'Automatic restart is unavailable. Let active work finish, then use a coordinated stop/start.',
+    platform:process.platform });
 });
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
 
 wss.on('connection', (ws, req) => {
+  if (admissionClosed) { ws.close(1001, 'bridge shutting down'); return; }
   // Same DNS-rebinding guard as the HTTP middleware, applied before the URL
   // parse: a rebound page's socket really is loopback and only its Host names
   // the attacker. Parsing an arbitrary Host into the base URL also throws for a
@@ -7189,6 +7243,7 @@ wss.on('connection', (ws, req) => {
   }
   session.attach(ws);
   ws.on('message', (raw) => {
+    if (admissionClosed) { ws.close(1001, 'bridge shutting down'); return; }
     try {
       const msg = JSON.parse(raw.toString('utf8'));
       if (msg.type === 'input') session.write(msg.data || '');
@@ -7212,6 +7267,8 @@ function configureRemoteMcp(mcpModule) {
   try {
     remoteMcpStatus = mountRemoteMcp(app, {
       token: CAPABILITY_TOKEN,
+      wrapHandler: trackedHandler,
+      wrapCallback: trackedMcpCallback,
       buildServer: () => mcpModule.buildServer(),
       log: (m) => console.log(m),
     });
@@ -7329,6 +7386,7 @@ startBridgeListener().catch((err) => {
 let shuttingDown = false;
 function shutdown() {
   if (shuttingDown) return;
+  admissionClosed = true;
   shuttingDown = true;
   // Stop dispatch and heartbeats before terminating any worker process.
   try { taskQueue.shutdown(); } catch (error) { console.error('[RelayBridge] queue shutdown failed:', error.message); }

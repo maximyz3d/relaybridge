@@ -49,7 +49,25 @@ and completed outstanding calls. No shared cutover is performed by this pass.
 
 ## Evidence
 
-Implementation, full-suite and closing review results are pending.
+Implementation checkpoints:
+
+- `88076d9`: Hono 4.13.7; production audit clean, MCP compatibility 10/10 PASS.
+- `ab715c9`: workflow draft/focus fixes; Chromium 2/2 PASS. Native Astra UI
+  review APPROVE, plus independent synthetic detail-failure/recovery,
+  creation-race and accessible-description checks.
+- `bf8ce7c`: native Gemini/readiness fixes; focused 44/44 PASS. Native Astra
+  review APPROVE, including 24 independent pure-function checks.
+- `8d57637`: npm release metadata; version/build/template checks 96/96 PASS.
+  Native review requested a fleet marker correction: the old maximum was
+  already v5. `9f196d7` raises the shipped release workflow to v6; 65 focused
+  version/GitHub checks PASS. Reviewed commits were not amended.
+- Lifecycle fixtures: 36/36 passed before the added remote callback case;
+  the new actual-server remote disconnect/barrier case passes independently.
+  It uses the SDK's registered callback update API because assigning only the
+  exposed handler would leave the cached executor unchanged.
+
+Full-suite and fresh combined closing review remain pending. Private fixture
+outputs are local; no raw machine logs or runtime transcripts are published.
 
 ## Accepted audit findings
 
@@ -78,3 +96,21 @@ and the existing REST admission tests. Closing admissions must be synchronous
 with accepting shutdown, separate from cleanup idempotency, and must not
 release uncertainty or replay tasks. Release-version consistency is still
 under audit before selecting its exact scope.
+
+The completed release audit confirms VERSION is 2.3.0 while root npm metadata
+still says 2.0.1. Root accepts changes to the canonical and installed
+`compute-version.cjs` and `version-on-merge.yml`, current `package.json` and
+`package-lock.json`, plus `test/versioning.test.js`. The release commit will
+update existing root npm version fields alongside VERSION without executing
+npm lifecycle scripts, changing dependency entries, or requiring npm manifests
+in non-npm repositories. Malformed/symlinked inputs must fail before writes.
+
+Lifecycle integration additionally owns `lib/remote-mcp.js` and the existing
+`test/bridge.test.js` compatibility assertion. Busy details identify overlapping
+reservations rather than mislabeling their sum as a unique execution count.
+The adjacent Windows REST restart helper has no retained-process handshake and
+force-stops its target. The automatic `/api/admin/restart` endpoint now returns
+501 on every platform, leaving the bridge running, until a qualified replacement
+path exists. The MCP stop/start workflow remains separate. This deliberately
+removes the unsafe automatic helper from the REST execution path; it does not
+claim Windows restart qualification or change the standalone helper file.

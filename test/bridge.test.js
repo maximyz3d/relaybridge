@@ -2643,7 +2643,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(busyShutdown.status, 409);
   const busyShutdownResult = await busyShutdown.json();
   assert.equal(busyShutdownResult.code, 'BRIDGE_BUSY');
-  assert.ok(busyShutdownResult.active > 0);
+  assert.ok(busyShutdownResult.busy.oneShots > 0);
   assert.equal((await fetch(baseUrl + '/api/health')).status, 200, 'busy shutdown refusal must leave the bridge running');
   firstController.abort();
   await firstSlow.catch(() => {});
@@ -4289,10 +4289,13 @@ test('agents listing, tag updates, and broadcast fan-out respect auth, autoRoute
   assert.ok(activity.runs.some((run) => run.runId === everyone.runId && run.mode === 'broadcast'));
   assert.ok(activity.receipts.some((receipt) => receipt.provider === 'alpha_one'));
 
-  // Restart is Windows-only; elsewhere it must refuse instead of dying.
-  if (process.platform !== 'win32') {
+  // The unqualified automatic helper must refuse on every platform.
+  {
     const restart = await fetch(baseUrl + '/api/admin/restart', { method: 'POST', headers: jsonAuth });
     assert.equal(restart.status, 501);
-    assert.equal((await restart.json()).restarting, false);
+    const refused = await restart.json();
+    assert.equal(refused.restarting, false);
+    assert.equal(refused.code, 'RESTART_REQUIRES_COORDINATED_CUTOVER');
+    assert.equal((await fetch(baseUrl + '/api/health')).status, 200);
   }
 });
