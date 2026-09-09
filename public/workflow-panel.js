@@ -29,15 +29,23 @@
       const actions = $('#workflow-actions');
       const focused = document.activeElement?.dataset?.workflowAction;
       actions.replaceChildren();
+      const reasons = $('#workflow-action-reasons'); reasons.replaceChildren();
       for (const action of model.actions) {
         const button = document.createElement('button'); button.className = 'btn';
         button.textContent = action.label; button.dataset.workflowAction = action.name;
         const reason = action.blocked || (action.token && !leases.get(selected)?.leaseToken ? 'Enter the matching writer lease token.' : '')
           || (uncertainActions.has(selected + ':' + action.name) ? 'The last response was uncertain; inspect the saved workflow before any replacement.' : '');
         button.disabled = busy || creating || !!reason; button.title = reason;
+        if (reason) {
+          const item = document.createElement('li'); item.id = 'workflow-reason-' + action.name;
+          item.textContent = action.label + ': ' + reason;
+          button.setAttribute('aria-describedby', item.id); reasons.append(item);
+        }
         button.addEventListener('click', () => void act(action)); actions.append(button);
       }
-      if (focused) [...actions.children].find(button => button.dataset.workflowAction === focused && !button.disabled)?.focus({ preventScroll:true });
+      reasons.hidden = !reasons.children.length;
+      if (focused) ([...actions.children].find(button => button.dataset.workflowAction === focused && !button.disabled)
+        || $('#workflow-status')).focus({ preventScroll:true });
       $('#workflow-token').placeholder = leases.has(selected) ? 'Writer token retained in this page' : 'Paste the token returned by your lease claim';
       $('#workflow-copy-token').disabled = !leases.has(selected);
     }
@@ -73,8 +81,12 @@
           if (typeof item.runId !== 'string') continue;
           list.append(new Option(`${item.phase} · ${item.runId}`, item.runId));
         }
-        if ([...list.options].some(option => option.value === preferred)) list.value = preferred;
-        else list.value = '';
+        // The list is a recent window, not proof that an explicitly selected
+        // workflow was deleted. Refresh its authoritative detail by ID.
+        if (preferred && ![...list.options].some(option => option.value === preferred)) {
+          list.append(new Option('Selected workflow · ' + preferred, preferred));
+        }
+        list.value = preferred;
         if (selected !== list.value) await select(list.value);
         else await refreshDetail();
         if (!list.value) status('Select a workflow or create one. Loading does not dispatch work.');
@@ -123,7 +135,7 @@
       const full = $('#workflow-write-consent').checked;
       const body = { cwd, objective, acceptance, profile:$('#workflow-profile').value,
         permissionMode:full ? 'full' : 'safe', acknowledgeFilesystemWrites:full };
-      creating = true; render(); status('Creating the workflow record…');
+      creating = true; listGate.begin(); detailGate.begin(); render(); status('Creating the workflow record…');
       try {
         const data = await api('/api/workflows', { method:'POST', body:JSON.stringify(body) });
         const runId = data.workflow?.runId;
