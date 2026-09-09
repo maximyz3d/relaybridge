@@ -1,3 +1,6 @@
+## v2.3.1 - 2026-09-09
+- #128 fix: refine workflow context, provider readiness, and shutdown reliability
+
 ## v2.3.0 - 2026-09-08
 - #127 feat: add Astra workflows, queued result recovery, and Gemini quota gates
 
