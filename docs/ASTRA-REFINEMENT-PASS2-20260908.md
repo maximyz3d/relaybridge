@@ -4,6 +4,14 @@ Canonical external run: `RB-ASTRA-REFINEMENT-2-20260908`.
 Base: `03cfb00eae34ad8197e7a5d0d83e6927214dbb39` (main, v2.3.0).
 Branch: `codex/astra-refinement-2-20260908`.
 
+Final reviewed code: `0f7ba37a459bc9a565a577e5b516da1cd2b62d65`.
+Final local suite: **1,069 tests, 1,065 passed, zero failures, four skips**
+(Chromium enabled, 103.5 seconds); focused transport checks: **53/53 PASS**;
+production audit: **zero vulnerabilities**. Independent native and live
+Astra/ultra closing reviews: **APPROVE**. Exact receipts and review limits are
+recorded at the end. This handoff's enclosing commit changes documentation only.
+GitHub PR #128 carries final CI and merge status; no shared deployment occurred.
+
 The owner requested another set of refinement passes and publication. Root is
 the only writer and GitHub publisher; native delegates use Astra/ultra and are
 read-only. This isolated worktree has no matching active managed workflow.
@@ -200,3 +208,74 @@ confirmed the finding and required `socket.destroy()` without an error argument,
 because Node removes its socket-error listener before emitting those events.
 The actual HTTP 101 regression verifies rejection and socket closure. The
 updated focused transport/lifecycle/identity/routing suite passes 53/53.
+
+## Final closing evidence and exact ownership
+
+The complete implementation remains based on
+`03cfb00eae34ad8197e7a5d0d83e6927214dbb39`; the clean final code head is
+`0f7ba37a459bc9a565a577e5b516da1cd2b62d65`. Native
+`/root/astra_closing2` approved the original complete source range through
+`6bebfdba7468e8f0eccbfc89a1e06e74cdd1714d`; native
+`/root/astra_transport_closing` bound its final correction APPROVE to the final
+code head. No reviewed commit was reset, amended, dropped or force-pushed.
+
+Fresh live correction review of `6bebfdb..0f7ba37`:
+**REVIEW_VERDICT: APPROVE**, no must-fix findings.
+
+- MCP receipt: `rcpt_mttj1vv6_bb2329c4`.
+- Bridge receipt: `rcpt_mttj53a4_464b90fe`.
+- Run: `run_mttj1vvh_129add72`.
+- Request/invocation: `mcp:2b96d3ee-e2b8-411b-bac1-c1db7d8fb7ff`.
+- Attempt: `mcp:2b96d3ee-e2b8-411b-bac1-c1db7d8fb7ff:attempt:1`.
+- Context: `rcpt_mttj1vsm_07c21a2e`; route preview:
+  `rcpt_mttj1vv1_b1a23669`.
+- Verdict text SHA-256:
+  `6d4e8103ef5a4394aa39e85c3b4f5bf7a189103df7d0ff005d1e4211d0b449c7`.
+- Build: `2.3.0+8e0d530ad2ba45ec`; requested/outgoing `gpt-6-astra`,
+  requested/applied `ultra`, safe read-only mode, vendor-observed model unknown.
+- Exit 0, one physical invocation, no partial output/dropout/timeout/cancellation,
+  both receipts persisted. No raw transcript or runtime store is published.
+
+The real no-provider loopback smoke withheld response headers for 310,000 ms
+and returned successfully after **310,068 ms** with a 360,000 ms request budget.
+It tested `32715872c6ed93053e226c95bef39e36a04ed3b9`; the later correction adds
+protocol-switch rejection without changing the successful response path.
+This is elapsed-time evidence beyond the old five-minute failure. The automated
+fetch-poisoning regression separately establishes transport independence.
+
+Nonblocking coverage limits retained from review: CONNECT, the request-close
+fallback, streamed byte overflow and chunk-count overflow were inspected but
+not individually exercised. The body-cancellation fixture synchronizes with
+the server write, so that specific case can race header arrival; the separate
+body deadline regression covers a stalled response. Windows qualification
+comes from CI; no local native Windows tests were claimed. No review qualifies
+Grok/Gemini account authentication, shared cutover, legacy fencing, unattended
+operation or completion of controller/goal acceptance.
+
+Root's exact 23 changed files (including this documentation-only handoff):
+
+```text
+.github/scripts/compute-version.cjs
+.github/workflows/version-on-merge.yml
+README.md
+docs/ASTRA-REFINEMENT-PASS2-20260908.md
+lib/provider-failure.js
+lib/remote-mcp.js
+mcp/bridge-client.mjs
+package-lock.json
+package.json
+public/index.html
+public/workflow-panel.js
+server.js
+templates/github-automations/compute-version.cjs
+templates/github-automations/version-on-merge.yml
+test/bridge.test.js
+test/github-tracker.test.js
+test/http-lifecycle.integration.test.js
+test/mcp-bridge-transport.test.js
+test/operation-admission-rest.test.js
+test/provider-failure.test.js
+test/provider-output.test.js
+test/versioning.test.js
+test/workflow-ui.test.js
+```
