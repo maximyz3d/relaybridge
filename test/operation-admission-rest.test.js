@@ -144,6 +144,37 @@ test('incomplete auth output cannot quarantine a cold default or erase prior aut
   assert.deepEqual(fs.readFileSync(registryPath), bytes, 'timeout cannot renew or clear auth authority');
 });
 
+test('auth refresh and diagnostics agree on expected and rejected exit-zero probe output', {timeout:30000}, async t => {
+  let mode;
+  const bridge = await startTestBridge(t, root => {
+    mode = path.join(root, 'probe-output'); fs.writeFileSync(mode, 'Not logged in');
+    const script = path.join(root, 'probe.js');
+    fs.writeFileSync(script, "process.stdout.write(require('fs').readFileSync(process.argv[2],'utf8'))");
+    return {fixture:{label:'fixture', credential_env:'FIXTURE_AUTH_CONFIG', safe:[process.execPath],
+      probe:[process.execPath,script,mode], probe_expect:'Logged in as', probe_reject:['not logged in'],
+      probe_auth_authoritative:true, probe_success_detail:'authenticated fixture'}};
+  });
+  const account = () => JSON.parse(fs.readFileSync(path.join(bridge.root,'data/accounts.json')))
+    .providers.fixture.accounts.find(item => item.id === 'default');
+  for (const output of ['Not logged in', 'Logged in as fixture\nNot logged in']) {
+    fs.writeFileSync(mode, output);
+    const auth = (await bridge.request('/api/auth/status?refresh=1')).body;
+    assert.equal(auth.signedOutCount, 1);
+    assert.ok(account().authFailureMarker, 'exit-zero rejection must preserve authentication quarantine');
+    const diag = (await bridge.request('/api/diag')).body.results.fixture;
+    assert.equal(diag.ready, false); assert.equal(diag.authFailed, true); assert.equal(diag.authAuthoritative, true);
+  }
+  fs.writeFileSync(mode, 'Fixture version only');
+  await bridge.request('/api/auth/status?refresh=1');
+  assert.ok(account().authFailureMarker, 'a missing expected string cannot clear authentication quarantine');
+  assert.equal((await bridge.request('/api/diag')).body.results.fixture.ready, false);
+  fs.writeFileSync(mode, 'Logged in as fixture');
+  assert.equal((await bridge.request('/api/auth/status?refresh=1')).body.signedOutCount, 0);
+  assert.equal(account().authFailureMarker, undefined);
+  const ready = (await bridge.request('/api/diag')).body.results.fixture;
+  assert.equal(ready.ready, true); assert.equal(ready.authFailed, false);
+});
+
 test('old in-flight diagnostics cannot publish readiness after an operator auth-retry mutation', { timeout: 30000 }, async (t) => {
   let marker, release;
   const bridge = await startTestBridge(t, (root) => {

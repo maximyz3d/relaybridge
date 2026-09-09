@@ -3827,6 +3827,15 @@ function probeIndicatesAuthFailure(text) {
   return AUTH_FAILURE_RE.test(String(text || ''));
 }
 
+function probeReadiness(entry, probe, text) {
+  const completed = probe.model_invocation !== false && !probe.timedOut && !probe.aborted && !probe.admissionRejected;
+  const normalized = text.toLowerCase();
+  const expected = !entry.probe_expect || normalized.includes(String(entry.probe_expect).toLowerCase());
+  const rejected = (Array.isArray(entry.probe_reject) ? entry.probe_reject : [])
+    .some(value => normalized.includes(String(value).toLowerCase()));
+  return { completed, ready:completed && probe.exitCode === 0 && expected && !rejected };
+}
+
 app.get('/api/auth/status', diagnosticRequestLimit, async (req, res) => {
   const cfg = loadConfig();
   const generation = diagnosticGeneration(cfg);
@@ -3859,18 +3868,18 @@ app.get('/api/auth/status', diagnosticRequestLimit, async (req, res) => {
         if (!found) return [kind, { found: false, ready: false, detail: 'not installed' }];
         const result = await runProbe(entry.probe, Number(entry.probe_timeout_ms || 30000), entry.strip_env || [], controller.signal);
         const probeText = cleanOutput([result.stdout, result.stderr].filter(Boolean).join('\n'));
-        const completed = result.model_invocation !== false && !result.timedOut && !result.aborted && !result.admissionRejected;
+        const { completed, ready } = probeReadiness(entry, result, probeText);
         return [kind, {
           found: true,
-          ready: completed && result.exitCode === 0,
-          authFailed: completed && result.exitCode !== 0 && probeIndicatesAuthFailure(probeText),
+          ready,
+          authFailed: completed && !ready && probeIndicatesAuthFailure(probeText),
           authAuthoritative: completed && entry.probe_auth_authoritative === true,
           qualificationFailure: result.validation || null,
           transientProbeFailure: result.admissionRejected || result.aborted || result.timedOut || result.model_invocation === false,
-          detail: completed && result.exitCode === 0
+          detail: ready
             ? String(entry.probe_success_detail || (entry.probe_auth_authoritative === true
               ? 'authenticated' : 'probe passed; authentication unverified')).slice(0, 160)
-            : probeText.split('\n')[0].slice(0, 160),
+            : (entry.probe_redact ? 'readiness check failed' : probeText.split('\n')[0].slice(0, 160)),
         }];
       }));
       const refreshedResults = Object.fromEntries(pairs.filter(([, v]) => v));
@@ -4004,13 +4013,10 @@ app.get('/api/diag', diagnosticRequestLimit, async (req, res) => {
     ]);
     if (probe) {
       probeExitCode = probe.exitCode;
-      ready = !probe.timedOut && !probe.aborted && probe.exitCode === 0;
       const probeText = cleanOutput([probe.stdout, probe.stderr].filter(Boolean).join('\n'));
-      if (entry.probe_expect && !probeText.toLowerCase().includes(String(entry.probe_expect).toLowerCase())) ready = false;
-      const probeReject = Array.isArray(entry.probe_reject) ? entry.probe_reject : [];
-      if (probeReject.some((value) => probeText.toLowerCase().includes(String(value).toLowerCase()))) ready = false;
-      authFailed = probe.model_invocation !== false && !probe.timedOut && !probe.aborted && !probe.admissionRejected
-        && !ready && probeIndicatesAuthFailure(probeText);
+      const readiness = probeReadiness(entry, probe, probeText);
+      ready = readiness.ready;
+      authFailed = readiness.completed && !ready && probeIndicatesAuthFailure(probeText);
       detail = ready && entry.probe_success_detail
         ? String(entry.probe_success_detail).slice(0, 300)
         : (entry.probe_redact ? (ready ? 'readiness check passed' : 'readiness check failed') : probeText.split('\n')[0].slice(0, 300));
