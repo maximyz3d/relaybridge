@@ -483,7 +483,7 @@
           <button class="btn primary" id="workflow-create">Create workflow record</button>
         </details>
         <div class="task-fields"><label for="workflow-select">Saved workflow<select id="workflow-select"><option value="">Select a saved workflow</option></select></label><div class="task-actions"><button class="btn" id="workflow-refresh">Refresh saved state</button></div></div>
-        <p id="workflow-status" role="status" class="muted"></p>
+        <p id="workflow-status" role="status" tabindex="-1" class="muted"></p>
         <div id="workflow-detail" hidden>
           <p id="workflow-phase"></p><p id="workflow-workspace" class="muted"></p><p id="workflow-objective-view"></p>
           <p id="workflow-writer" class="muted"></p><p id="workflow-notice" class="task-notice"></p>
@@ -494,6 +494,7 @@
           <button class="btn" id="workflow-copy-token" disabled>Copy writer token</button>
           <p class="muted">Lease tokens stay in this page's memory. Copy yours before closing the page if you will continue from another client. A refresh is read-only; reconciliation can advance an advisor task.</p>
           <div id="workflow-actions" class="task-actions"></div>
+          <ul id="workflow-action-reasons" class="muted" hidden></ul>
         </div>
       </div>
     </details>

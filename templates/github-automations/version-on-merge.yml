@@ -1,4 +1,4 @@
-# rb-template v4
+# rb-template v6
 # .github/workflows/version-on-merge.yml
 #
 # GitHub-native version tracking. This is the SOURCE OF TRUTH for versions —
@@ -97,7 +97,7 @@ jobs:
             exit 1
           fi
 
-          echo "$NEW_VERSION" > VERSION
+          node .github/scripts/compute-version.cjs --write-release "$NEW_VERSION"
           DATE=$(date +%Y-%m-%d)
           TMP=$(mktemp)
           { echo "## v$NEW_VERSION - $DATE"; echo "- #$PR_NUMBER $PR_TITLE"; echo ""; \
@@ -107,6 +107,9 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add VERSION CHANGELOG.md
+          for manifest in package.json package-lock.json; do
+            if [ -f "$manifest" ]; then git add -- "$manifest"; fi
+          done
           git commit -m "chore(release): v$NEW_VERSION [skip ci]"
           git tag -a "v$NEW_VERSION" -m "v$NEW_VERSION"
           git push --atomic origin \

@@ -1,4 +1,4 @@
-// # rb-template v3
+// # rb-template v4
 'use strict';
 
 // Keep version selection outside the workflow shell so the exact behavior can
@@ -6,6 +6,7 @@
 // .github/scripts/compute-version.cjs and intentionally has no dependencies.
 
 const fs = require('node:fs');
+const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 
 const STRICT_VERSION = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/;
@@ -121,7 +122,76 @@ function repositoryTags() {
   return output.split(/\r?\n/).filter(Boolean);
 }
 
+function writeReleaseVersion(version, root = process.cwd()) {
+  requireVersion(version, 'release version');
+  const pending = [];
+  const read = name => {
+    const file = path.join(root, name);
+    let stat;
+    try { stat = fs.lstatSync(file); } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`${name} must be a regular file`);
+    return { file, stat, bytes:fs.readFileSync(file) };
+  };
+  const versionFile = read('VERSION');
+  pending.push({ name:'VERSION', existing:versionFile, text:version + '\n' });
+  // Validate every present manifest before modifying any release file.
+  for (const name of ['package.json', 'package-lock.json']) {
+    const existing = read(name);
+    if (!existing) continue;
+    let manifest;
+    try {
+      const text = existing.bytes.toString('utf8');
+      if (!Buffer.from(text,'utf8').equals(existing.bytes)) throw new Error('invalid UTF-8');
+      manifest = JSON.parse(text);
+    } catch { throw new Error(`${name} must contain valid JSON`); }
+    if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) throw new Error(`${name} must contain a JSON object`);
+    if (name === 'package-lock.json' && Object.hasOwn(manifest,'packages')
+        && (!manifest.packages || typeof manifest.packages !== 'object' || Array.isArray(manifest.packages))) {
+      throw new Error('package-lock.json packages must contain a JSON object');
+    }
+    const rootPackage = manifest.packages?.[''];
+    if (name === 'package-lock.json' && rootPackage !== undefined
+        && (!rootPackage || typeof rootPackage !== 'object' || Array.isArray(rootPackage))) {
+      throw new Error('package-lock.json root package must contain a JSON object');
+    }
+    let changed = false;
+    if (Object.hasOwn(manifest,'version')) { manifest.version = version; changed = true; }
+    if (name === 'package-lock.json' && rootPackage && Object.hasOwn(rootPackage,'version')) {
+      rootPackage.version = version; changed = true;
+    }
+    if (changed) pending.push({name,existing,text:JSON.stringify(manifest,null,2) + '\n'});
+  }
+  // Guard concurrent edits and symlink replacement before opening any writer.
+  for (const item of pending) {
+    const current = read(item.name);
+    if (item.existing ? !current || current.stat.dev !== item.existing.stat.dev
+        || current.stat.ino !== item.existing.stat.ino || !current.bytes.equals(item.existing.bytes) : current !== null) {
+      throw new Error(`${item.name} changed during release preparation`);
+    }
+  }
+  for (const item of pending) {
+    const file = path.join(root,item.name);
+    const flags = fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW || 0)
+      | (item.existing ? 0 : fs.constants.O_CREAT | fs.constants.O_EXCL);
+    const fd = fs.openSync(file,flags,item.existing?.stat.mode || 0o644);
+    try {
+      const opened = fs.fstatSync(fd);
+      if (!opened.isFile() || (item.existing && (opened.dev !== item.existing.stat.dev || opened.ino !== item.existing.stat.ino))) {
+        throw new Error(`${item.name} changed before release write`);
+      }
+      fs.writeFileSync(fd,item.text); fs.ftruncateSync(fd,Buffer.byteLength(item.text)); fs.fsyncSync(fd);
+    } finally { fs.closeSync(fd); }
+  }
+  return pending.map(item => item.name);
+}
+
 function main() {
+  if (process.argv[2] === '--write-release') {
+    if (process.argv.length !== 4) throw new Error('--write-release requires exactly one version');
+    writeReleaseVersion(process.argv[3]);
+    return;
+  }
+  if (process.argv.length > 2) throw new Error('unknown version command');
   const setVersionPresent = process.env.SET_VERSION_PRESENT === 'true';
   const result = computeVersion({
     tags: repositoryTags(),
@@ -148,4 +218,5 @@ module.exports = {
   findBaseline,
   nextVersion,
   computeVersion,
+  writeReleaseVersion,
 };

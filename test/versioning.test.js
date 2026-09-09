@@ -9,6 +9,56 @@ const { execFileSync, spawnSync } = require('node:child_process');
 
 const versioning = require('../templates/github-automations/compute-version.cjs');
 
+test('release write mode synchronizes existing npm roots and preserves dependencies without lifecycle execution', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(),'rb-release-write-'));
+  t.after(() => fs.rmSync(dir,{recursive:true,force:true}));
+  const pkg = {name:'fixture',version:'1.0.0',scripts:{version:'must never execute'},dependencies:{fixture:'^3.0.0'}};
+  const lock = {name:'fixture',version:'1.0.0',lockfileVersion:3,packages:{'':{name:'fixture',version:'1.0.0',dependencies:pkg.dependencies},'node_modules/fixture':{version:'3.1.0',integrity:'fixture'}}};
+  fs.writeFileSync(path.join(dir,'package.json'),JSON.stringify(pkg));
+  fs.writeFileSync(path.join(dir,'package-lock.json'),JSON.stringify(lock));
+  const script = path.resolve(__dirname,'../.github/scripts/compute-version.cjs');
+  const result = spawnSync(process.execPath,[script,'--write-release','2.3.1'],{cwd:dir,encoding:'utf8'});
+  assert.equal(result.status,0,result.stderr); assert.equal(result.stdout,'');
+  assert.equal(fs.readFileSync(path.join(dir,'VERSION'),'utf8'),'2.3.1\n');
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir,'package.json'))),{...pkg,version:'2.3.1'});
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir,'package-lock.json'))),{...lock,version:'2.3.1',packages:{...lock.packages,'':{...lock.packages[''],version:'2.3.1'}}});
+});
+
+test('release writes support non-npm and unversioned private repositories', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(),'rb-release-no-npm-'));
+  t.after(() => fs.rmSync(dir,{recursive:true,force:true}));
+  assert.deepEqual(versioning.writeReleaseVersion('1.2.3',dir),['VERSION']);
+  const original = '{"private":true,"dependencies":{"fixture":"1.0.0"}}';
+  fs.writeFileSync(path.join(dir,'package.json'),original);
+  assert.deepEqual(versioning.writeReleaseVersion('1.2.4',dir),['VERSION']);
+  assert.equal(fs.readFileSync(path.join(dir,'package.json'),'utf8'),original);
+});
+
+test('invalid release versions and malformed later manifests fail before changing any file', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(),'rb-release-invalid-'));
+  t.after(() => fs.rmSync(dir,{recursive:true,force:true}));
+  fs.writeFileSync(path.join(dir,'VERSION'),'1.0.0\n');
+  fs.writeFileSync(path.join(dir,'package.json'),'{"version":"1.0.0"}');
+  for (const malformed of ['{invalid','null','[]','{"packages":null}','{"packages":{"":false}}']) {
+    fs.writeFileSync(path.join(dir,'package-lock.json'),malformed);
+    assert.throws(() => versioning.writeReleaseVersion('2.0.0',dir),/JSON/);
+    assert.equal(fs.readFileSync(path.join(dir,'VERSION'),'utf8'),'1.0.0\n');
+    assert.equal(fs.readFileSync(path.join(dir,'package.json'),'utf8'),'{"version":"1.0.0"}');
+  }
+  for (const invalid of ['v2.0.0','2.0.0\n','2.0','02.0.0']) assert.throws(() => versioning.writeReleaseVersion(invalid,dir),/strict/);
+});
+
+test('release write refuses symlinked metadata before modifying VERSION', {skip:process.platform === 'win32'}, t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(),'rb-release-link-'));
+  t.after(() => fs.rmSync(dir,{recursive:true,force:true}));
+  fs.writeFileSync(path.join(dir,'VERSION'),'1.0.0\n');
+  fs.writeFileSync(path.join(dir,'target.json'),'{"version":"1.0.0"}');
+  fs.symlinkSync('target.json',path.join(dir,'package.json'));
+  assert.throws(() => versioning.writeReleaseVersion('2.0.0',dir),/regular file/);
+  assert.equal(fs.readFileSync(path.join(dir,'VERSION'),'utf8'),'1.0.0\n');
+  assert.equal(fs.readFileSync(path.join(dir,'target.json'),'utf8'),'{"version":"1.0.0"}');
+});
+
 test('strict versions contain exactly three canonical numeric components', () => {
   assert.equal(versioning.parseVersion('0.0.0').text, '0.0.0');
   assert.equal(versioning.parseVersion('12.345.678').text, '12.345.678');

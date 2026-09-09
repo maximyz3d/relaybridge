@@ -122,8 +122,8 @@ test('Gemini exact refusal and present-progress-only terminals are unusable with
     ["I'll inspect the repository now.", 'incomplete_response', 'gemini_progress_only'],
     ['I am reviewing the results.', 'incomplete_response', 'gemini_progress_only'],
   ];
-  for (const [stdout, kind, detector] of outputs) {
-    const result = classifyRunFailure({ provider: 'gemini', prompt: 'Return concrete findings.', stdout, exitCode: 0 });
+  for (const provider of ['gemini', 'gemini_cli']) for (const [stdout, kind, detector] of outputs) {
+    const result = classifyRunFailure({ provider, prompt: 'Return concrete findings.', stdout, exitCode: 0 });
     assert.equal(result.kind, kind, stdout);
     assert.equal(result.partialResult, true); assert.equal(result.partialDiagnostic, stdout);
     assert.equal(result.retryable, false); assert.equal(result.failUp, true);
@@ -134,6 +134,7 @@ test('Gemini exact refusal and present-progress-only terminals are unusable with
 });
 
 test('literal transformations and requested plans retain their content across both narration detectors', () => {
+  for (const provider of ['gemini', 'gemini_cli']) {
   for (const [prompt, stdout] of [
     ['Please provide a detailed implementation plan.', "I'll inspect the repository now."],
     ['Translate into English: Estoy descargando las hojas de datos.', 'I am downloading the datasheets.'],
@@ -141,12 +142,14 @@ test('literal transformations and requested plans retain their content across bo
     ['Repeat verbatim: I will inspect the repository.\nNext I will review the tests.', 'I will inspect the repository.\nNext I will review the tests.'],
     ['Return findings.', 'I am reviewing the results: the cache has two unbounded maps.'],
     ['Return findings.', 'I am reviewing the tests and found a cache race.'],
-  ]) assert.equal(classifyRunFailure({ provider: 'gemini', prompt, stdout, exitCode: 0 }).kind, 'ok', prompt);
-  assert.equal(classifyRunFailure({ provider: 'gemini', prompt: 'Plan then implement the fix.',
+  ]) assert.equal(classifyRunFailure({ provider, prompt, stdout, exitCode: 0 }).kind, 'ok', prompt);
+  assert.equal(classifyRunFailure({ provider, prompt: 'Plan then implement the fix.',
     stdout: "I'll inspect the repository now.", exitCode: 0 }).kind, 'incomplete_response');
+  }
 });
 
 test('Gemini terminal detectors reject quoted examples, mixed results and unsupported provider identities', () => {
+  for (const provider of ['gemini', 'gemini_cli']) {
   const progress = 'I am downloading the datasheets. This should just take a moment.';
   const refusal = 'Sorry, I cannot fulfill your request.';
   for (const stdout of [
@@ -155,10 +158,11 @@ test('Gemini terminal detectors reject quoted examples, mixed results and unsupp
     'I cannot verify fabrication readiness, but the schema validation has a race at line 12.',
     '"' + progress + '"', '> ' + refusal, '```text\n' + refusal + '\n```',
     '| Example |\n| ' + progress + ' |', JSON.stringify({ example: refusal }),
-  ]) assert.equal(classifyRunFailure({ provider: 'gemini', stdout, exitCode: 0 }).kind, 'ok', stdout);
-  assert.equal(classifyRunFailure({ provider: 'gemini', prompt: 'Repeat verbatim: ' + progress, stdout: progress, exitCode: 0 }).kind, 'ok');
+  ]) assert.equal(classifyRunFailure({ provider, stdout, exitCode: 0 }).kind, 'ok', stdout);
+  assert.equal(classifyRunFailure({ provider, prompt: 'Repeat verbatim: ' + progress, stdout: progress, exitCode: 0 }).kind, 'ok');
   assert.equal(classifyRunFailure({ provider: 'unrelated', stdout: progress, exitCode: 0 }).kind, 'ok');
-  assert.equal(classifyRunFailure({ provider: 'gemini', stdout: refusal, exitCode: 0, stopReason: 'token_budget' }).kind, 'supervisor_token_budget');
+  assert.equal(classifyRunFailure({ provider, stdout: refusal, exitCode: 0, stopReason: 'token_budget' }).kind, 'supervisor_token_budget');
+  }
 });
 
 test('Grok future-tense process narration is incomplete, preserved, and never retried on the same seat', () => {

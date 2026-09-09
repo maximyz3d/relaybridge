@@ -998,6 +998,13 @@ test('canonical templates exist and carry rb-template versions', () => {
   assert.equal(onboard.templateVersion('no header'), 0);
 });
 
+test('npm release synchronization is offered to fleets already on template version five', () => {
+  assert.ok(onboard.canonicalVersion() > 5, 'a v5 fleet must not be classified as current');
+  const releaseTemplate = fs.readFileSync(path.join(onboard.TEMPLATE_DIR,'version-on-merge.yml'),'utf8');
+  assert.ok(onboard.templateVersion(releaseTemplate) > 5);
+  assert.match(releaseTemplate, /compute-version\.cjs --write-release/);
+});
+
 test('managed CONTRIBUTING upgrades preserve user bytes and refuse edited or malformed blocks', () => {
   const current = fs.readFileSync(path.join(onboard.TEMPLATE_DIR, 'CONTRIBUTING-snippet.md'), 'utf8');
   const prior = fs.readFileSync(path.join(onboard.TEMPLATE_DIR, 'history', 'CONTRIBUTING-snippet.v1.md'), 'utf8');

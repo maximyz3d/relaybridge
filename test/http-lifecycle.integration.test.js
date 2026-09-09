@@ -23,6 +23,21 @@ async function fixture(t, { supervisor = { idleMs: 1000, hardCapMs: 3000 } } = {
   return { bridge, requests, receipts };
 }
 
+test('normal shutdown refuses an admitted HTTP model call until its transport settles', {timeout:15000}, async t => {
+  const {bridge,requests} = await fixture(t);
+  const pending = bridge.request('/api/oneshot', {kind:'ollama_fast',prompt:'bounded shutdown fixture',dangerous:false});
+  await waitFor(() => requests.length === 1);
+  const busy = await bridge.request('/api/admin/shutdown', {});
+  assert.equal(busy.status, 409); assert.equal(busy.body.code, 'BRIDGE_BUSY');
+  assert.equal(busy.body.busy.oneShots, 1);
+  requests[0].res.end('{"response":"Completed normally.","done":true}');
+  const result = (await pending).body;
+  assert.equal(result.stdout, 'Completed normally.'); assert.equal(result.dropped_out, false);
+  await waitFor(async () => (await bridge.request('/api/runs/active')).body.count === 0);
+  assert.equal((await bridge.request('/api/admin/shutdown', {})).status, 200);
+  await waitFor(() => bridge.proc.exitCode !== null);
+});
+
 test('HTTP >10KB prompt is active before first byte and streams under the same durable run identity', { timeout: 15000 }, async (t) => {
   const { bridge, requests, receipts } = await fixture(t);
   const pending = bridge.request('/api/oneshot', { kind: 'ollama_fast', prompt: 'x'.repeat(12001), requestId: 'http-lifecycle-stream', dangerous: false });

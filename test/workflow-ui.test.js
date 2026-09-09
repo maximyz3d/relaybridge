@@ -35,6 +35,7 @@ test('browser workflow panel is lazy, pins Astra, retains late claims and requir
     '/vendor/xterm/lib/xterm.js':'node_modules/@xterm/xterm/lib/xterm.js', '/vendor/xterm/css/xterm.css':'node_modules/@xterm/xterm/css/xterm.css',
     '/vendor/xterm-addon-fit/lib/addon-fit.js':'node_modules/@xterm/addon-fit/lib/addon-fit.js' };
   let exists = false, releaseClaim, delayClaim = false, releaseRead, delayRead = false, delayList = false, releaseList;
+  let omitSelected = false, delayRenew = false, releaseRenew;
   const workflow = { runId:'wf_fixture', phase:'scoping', profile:'codex-astra-ultra', phasePolicy, cwd:'/fixture', permissionMode:'full', writerLease:null };
   let actions = ['submit_pipeline_research'], blockedActions = [];
   const projection = () => ({ workflow:structuredClone(workflow), nextActions:[...actions], blockedActions,
@@ -56,7 +57,10 @@ test('browser workflow panel is lazy, pins Astra, retains late claims and requir
         actions = ['complete_pipeline_revision', 'renew_pipeline_writer_lease'];
         return json({ workflow, lease:{ actor:'codex', leaseToken:'fixture-private-lease-token' } });
       }
-      if (url.pathname.endsWith('/lease/renew')) return json({ workflow, lease:{ actor:'codex', leaseToken:'fixture-private-lease-token' } });
+      if (url.pathname.endsWith('/lease/renew')) {
+        if (delayRenew) await new Promise(resolve => { releaseRenew = resolve; });
+        return json({ workflow, lease:{ actor:'codex', leaseToken:'fixture-private-lease-token' } });
+      }
       if (url.pathname.endsWith('/revision/complete') && body.leaseToken !== 'fixture-private-lease-token') return route.fulfill({status:409,contentType:'application/json',body:JSON.stringify({error:'Lease token rejected'})});
       if (url.pathname.endsWith('/revision/complete')) { workflow.phase = 'revision_ready'; workflow.writerLease = null; actions = ['start_pipeline_final_review']; return json(projection()); }
       if (url.pathname.endsWith('/final-review/start')) { workflow.phase = 'final_reviewing'; actions = ['reconcile_pipeline']; return json(projection()); }
@@ -65,6 +69,8 @@ test('browser workflow panel is lazy, pins Astra, retains late claims and requir
     reads.push(url.pathname);
     if (url.pathname === '/api/workflows') {
       const response = { workflows:exists ? [structuredClone(workflow), {...workflow,runId:'wf_other',phase:'complete'}] : [] };
+      if (omitSelected) response.workflows = Array.from({length:40}, (_,index) =>
+        ({...workflow, runId:index ? 'wf_newer_' + index : 'wf_other', phase:'complete'}));
       if (delayList) { delayList=false; await new Promise(resolve => { releaseList=resolve; }); }
       return json(response);
     }
@@ -103,12 +109,23 @@ test('browser workflow panel is lazy, pins Astra, retains late claims and requir
   assert.equal(await page.locator('#workflow-plan').textContent(),'Fixture saved plan');
   assert.equal(await page.locator('#workflow-criteria').textContent(),'Fixture criteria');
   const writesBeforeRefresh = writes.length;
+  await page.locator('#workflow-evidence').fill('Keep this selected workflow draft.');
+  omitSelected = true;
+  const recentReads = reads.length;
   await page.locator('#workflow-refresh').click();
+  await page.waitForFunction(() => document.querySelector('#workflow-select').options.length === 42);
+  assert.equal(await page.locator('#workflow-select').inputValue(), 'wf_fixture');
+  assert.equal(await page.locator('#workflow-evidence').inputValue(), 'Keep this selected workflow draft.');
+  assert.ok(reads.slice(recentReads).includes('/api/workflows/wf_fixture'));
   assert.equal(writes.length, writesBeforeRefresh);
+  omitSelected = false;
+  await page.locator('#workflow-refresh').click();
+  await page.waitForFunction(() => document.querySelector('#workflow-select').options.length === 3);
   delayList=true; await page.locator('#workflow-refresh').click();
   for(let i=0;i<100&&!releaseList;i++) await new Promise(r=>setTimeout(r,10));
   assert.ok(releaseList); await page.locator('#workflow-select').selectOption('wf_other');
   await page.locator('#workflow-phase').filter({hasText:'complete'}).waitFor(); releaseList();
+  assert.equal(await page.locator('#workflow-evidence').inputValue(), '', 'explicit selection clears the prior draft');
   await page.evaluate(()=>Promise.resolve());
   assert.equal(await page.locator('#workflow-select').inputValue(),'wf_other');
   await page.locator('#workflow-select').selectOption('wf_fixture');
@@ -116,9 +133,12 @@ test('browser workflow panel is lazy, pins Astra, retains late claims and requir
   delayRead = true; await page.locator('#workflow-refresh').click();
   for (let i=0;i<100&&!releaseRead;i++) await new Promise(r => setTimeout(r, 10));
   assert.ok(releaseRead);
-  delayClaim = true; await page.locator('[data-workflow-action="claim_pipeline_revision"]').click();
+  delayClaim = true;
+  await page.locator('[data-workflow-action="claim_pipeline_revision"]').focus();
+  await page.keyboard.press('Enter');
   for (let i=0;i<100&&!releaseClaim;i++) await new Promise(r => setTimeout(r, 10));
   assert.ok(releaseClaim);
+  assert.equal(await page.evaluate(() => document.activeElement.id), 'workflow-status', 'pending action keeps keyboard focus in context');
   await page.locator('#tasks-close-btn').click(); releaseClaim();
   for (let i=0;i<100&&workflow.phase!=='revising';i++) await new Promise(r => setTimeout(r, 10));
   await page.locator('#tasks-btn').click();
@@ -130,16 +150,26 @@ test('browser workflow panel is lazy, pins Astra, retains late claims and requir
   assert.equal(await page.locator('#workflow-token').inputValue(), '');
   assert.doesNotMatch(await page.locator('#staged-workflows').innerText(), /fixture-private-lease-token/);
   assert.equal(await page.evaluate(() => Object.values(localStorage).some(v => v.includes('fixture-private-lease-token'))), false);
-  await page.locator('[data-workflow-action="renew_pipeline_writer_lease"]').click();
+  delayRenew = true;
+  await page.locator('[data-workflow-action="renew_pipeline_writer_lease"]').focus();
+  await page.keyboard.press('Enter');
+  for (let i=0;i<100&&!releaseRenew;i++) await new Promise(r => setTimeout(r, 10));
+  assert.ok(releaseRenew);
+  await page.locator('#workflow-evidence').fill('Keep editing while the renewal completes.');
+  releaseRenew();
   await page.locator('#workflow-status').filter({ hasText:'refreshed' }).waitFor();
+  assert.equal(await page.evaluate(() => document.activeElement.id), 'workflow-evidence', 'response does not steal editor focus');
+  assert.equal(await page.locator('#workflow-evidence').inputValue(), 'Keep editing while the renewal completes.');
   assert.equal(writes.at(-1).body.leaseMs, 14400000);
   await page.locator('#workflow-evidence').fill('Fixture corrective evidence.');
-  await page.locator('#workflow-token').fill('wrong-token'); await complete.click();
+  await page.locator('#workflow-token').fill('wrong-token'); await complete.focus(); await page.keyboard.press('Enter');
   await page.locator('#workflow-status').filter({hasText:'Lease token rejected'}).waitFor();
+  assert.equal(await page.evaluate(() => document.activeElement.id), 'workflow-status', 'rejected action retains keyboard context');
   await page.locator('#workflow-token').fill('fixture-private-lease-token');
   assert.equal(await complete.isEnabled(),true,'confirmed rejection permits correcting the token');
-  await complete.click();
+  await complete.focus(); await page.keyboard.press('Enter');
   await page.locator('#workflow-phase').filter({ hasText:'revision_ready' }).waitFor();
+  assert.equal(await page.evaluate(() => document.activeElement.id), 'workflow-status', 'removed completed action leaves a stable focus target');
   assert.equal(writes.at(-1).body.leaseToken, 'fixture-private-lease-token');
   assert.match(await page.locator('#workflow-notice').innerText(), /fresh final review/);
   assert.equal(await page.locator('#workflow-copy-token').isEnabled(), false);

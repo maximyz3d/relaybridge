@@ -4,6 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const http = require('node:http');
 const { startTestBridge, waitFor, completeJsonLines } = require('./helpers/temporary-bridge');
 
 function controlledFixture(root) {
@@ -16,6 +17,125 @@ function controlledFixture(root) {
   ].join('\n'));
   return script;
 }
+
+test('shutdown reserves incomplete request bodies and rejects late probes and submissions', {timeout:15000}, async t => {
+  let marker;
+  const bridge = await startTestBridge(t, root => {
+    marker = path.join(root,'invocations');
+    const script = path.join(root,'probe.js');
+    fs.writeFileSync(script, "require('fs').appendFileSync(process.argv[2],'invoked\\n');process.stdout.write('fixture')");
+    return {fixture:{safe:[process.execPath],probe:[process.execPath,script,marker]}};
+  });
+  const request = http.request(bridge.base+'/api/tasks', {method:'POST',headers:{...bridge.headers,'Content-Length':'1000'}});
+  request.on('error', () => {}); request.write('{');
+  t.after(() => request.destroy());
+  await new Promise(resolve => request.once('socket', socket => socket.connecting ? socket.once('connect',resolve) : resolve()));
+  // The body parser must have received the partial upload before the census.
+  await new Promise(resolve => setTimeout(resolve, 50));
+  const busy = await bridge.request('/api/admin/shutdown', {});
+  assert.equal(busy.status, 409); assert.ok(busy.body.busy.requests >= 1);
+  request.destroy();
+  let accepted;
+  await waitFor(async () => { accepted = await bridge.request('/api/admin/shutdown', {}); return accepted.status === 200; });
+  const results = await Promise.all([
+    bridge.request('/api/diag'),
+    bridge.request('/api/auth/status?refresh=1'),
+    bridge.request('/api/tasks', {kind:'fixture',prompt:'never admitted'}),
+    bridge.request('/api/oneshot', {kind:'fixture',prompt:'never admitted'}),
+    bridge.request('/API/diag'),
+    bridge.request('/API/sessions', {kind:'fixture'}),
+    bridge.request('/Api/permissions', {fullPermissions:true}),
+  ]);
+  for (const result of results) {
+    assert.equal(result.status,503); assert.equal(result.body.failureClass,'bridge_shutting_down');
+    assert.equal(result.body.model_invocation,false); assert.equal(result.body.physical_attempt_count,0);
+  }
+  assert.equal(fs.existsSync(marker),false);
+  assert.equal(fs.readdirSync(path.join(bridge.root,'data/tasks')).filter(name=>name.endsWith('.json')).length,0);
+  await waitFor(() => bridge.proc.exitCode !== null);
+});
+
+test('a disconnected asynchronous handler remains busy until its work settles', {timeout:15000}, async t => {
+  const os = require('node:os');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(),'rb-handler-lifetime-'));
+  t.after(() => fs.rmSync(root,{recursive:true,force:true}));
+  const marker = path.join(root,'started'), release = path.join(root,'release'), preload = path.join(root,'preload.cjs');
+  fs.writeFileSync(preload, [
+    "const fs=require('fs');",
+    `require(${JSON.stringify(path.resolve(__dirname,'../lib/github-tracker.js'))}).listVersions = async () => {`,
+    `fs.writeFileSync(${JSON.stringify(marker)},'started');`,
+    `await new Promise(resolve=>{const timer=setInterval(()=>{if(fs.existsSync(${JSON.stringify(release)})){clearInterval(timer);resolve();}},10);});`,
+    'return [];};',
+  ].join('\n'));
+  const bridge = await startTestBridge(t, () => ({}), {nodeArgs:['--require',preload]});
+  const caller = new AbortController();
+  const pending = bridge.request('/api/github/versions?repo=fixture', undefined, {signal:caller.signal});
+  const rejected = assert.rejects(pending,{name:'AbortError'});
+  await waitFor(() => fs.existsSync(marker)); caller.abort(); await rejected;
+  const busy = await bridge.request('/api/admin/shutdown', {});
+  assert.equal(busy.status,409); assert.equal(busy.body.busy.handlers,1);
+  fs.writeFileSync(release,'finish');
+  await waitFor(async () => (await bridge.request('/api/admin/shutdown',{})).status === 200);
+  await waitFor(() => bridge.proc.exitCode !== null);
+});
+
+test('accepted post-response checkpoint work blocks normal shutdown until it settles', {timeout:15000}, async t => {
+  const os = require('node:os');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(),'rb-background-lifetime-'));
+  t.after(() => fs.rmSync(root,{recursive:true,force:true}));
+  const marker = path.join(root,'started'), release = path.join(root,'release'), preload = path.join(root,'preload.cjs');
+  fs.writeFileSync(preload, [
+    "const fs=require('fs');",
+    `require(${JSON.stringify(path.resolve(__dirname,'../lib/github-tracker.js'))}).trackRun = async () => {`,
+    `fs.writeFileSync(${JSON.stringify(marker)},'started');`,
+    `await new Promise(resolve=>{const timer=setInterval(()=>{if(fs.existsSync(${JSON.stringify(release)})){clearInterval(timer);resolve();}},10);});`,
+    'return {tracked:false};};',
+  ].join('\n'));
+  const bridge = await startTestBridge(t, () => ({fixture:{safe:[process.execPath],
+    oneshot_safe:[process.execPath,'-e',"process.stdout.write('Completed fixture answer.')"]}}), {nodeArgs:['--require',preload]});
+  const result = await bridge.request('/api/oneshot',{kind:'fixture',prompt:'Answer the fixture.',dangerous:false});
+  assert.equal(result.body.stdout,'Completed fixture answer.');
+  await waitFor(() => fs.existsSync(marker));
+  const busy = await bridge.request('/api/admin/shutdown',{});
+  assert.equal(busy.status,409); assert.equal(busy.body.busy.background,1);
+  fs.writeFileSync(release,'finish');
+  await waitFor(async () => (await bridge.request('/api/admin/shutdown',{})).status === 200);
+  await waitFor(() => bridge.proc.exitCode !== null);
+});
+
+test('disconnected remote MCP tool retains its callback reservation after HTTP closes', {timeout:15000}, async t => {
+  const os = require('node:os');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(),'rb-mcp-lifetime-'));
+  t.after(() => fs.rmSync(root,{recursive:true,force:true}));
+  const marker = path.join(root,'started'), release = path.join(root,'release'), preload = path.join(root,'preload.cjs');
+  fs.writeFileSync(preload, [
+    "const fs=require('fs');",
+    `const req=require('module').createRequire(${JSON.stringify(path.resolve(__dirname,'../package.json'))});`,
+    "const remote=req('./lib/remote-mcp'), original=remote.mountRemoteMcp;",
+    "remote.mountRemoteMcp=(app,opts)=>original(app,{...opts,buildServer:()=>{",
+    "const server=new (req('@modelcontextprotocol/server').McpServer)({name:'fixture',version:'1'});",
+    "server.registerTool('fixture_wait',{inputSchema:req('zod').z.object({})},async()=>{",
+    `fs.writeFileSync(${JSON.stringify(marker)},'started');`,
+    `await new Promise(resolve=>{const timer=setInterval(()=>{if(fs.existsSync(${JSON.stringify(release)})){clearInterval(timer);resolve();}},10);});`,
+    "return {content:[{type:'text',text:'completed'}]};});return server;}});",
+  ].join('\n'));
+  const bridge = await startTestBridge(t, () => ({}), {nodeArgs:['--require',preload],env:{RELAYBRIDGE_REMOTE_MCP:'1'}});
+  assert.equal((await bridge.request('/api/remote-mcp/status')).body.enabled,true);
+  const headers = {...bridge.headers,Accept:'application/json, text/event-stream'};
+  const init = await fetch(bridge.base+'/mcp',{method:'POST',headers,body:JSON.stringify({jsonrpc:'2.0',id:1,method:'initialize',params:{protocolVersion:'2025-06-18',capabilities:{},clientInfo:{name:'fixture',version:'1'}}})});
+  assert.equal(init.status,200); await init.text();
+  if(init.headers.get('mcp-session-id')) headers['mcp-session-id']=init.headers.get('mcp-session-id');
+  const caller = new AbortController();
+  const pending = fetch(bridge.base+'/mcp',{method:'POST',headers,signal:caller.signal,
+    body:JSON.stringify({jsonrpc:'2.0',id:2,method:'tools/call',params:{name:'fixture_wait',arguments:{}}})}).then(response=>response.text());
+  const rejected = assert.rejects(pending,{name:'AbortError'});
+  await waitFor(()=>fs.existsSync(marker)); caller.abort(); await rejected;
+  const busy = await bridge.request('/api/admin/shutdown',{});
+  assert.equal(busy.status,409); assert.ok(busy.body.busy.handlers >= 1);
+  fs.writeFileSync(release,'finish');
+  await waitFor(async () => (await bridge.request('/api/admin/shutdown',{})).status === 200);
+  await waitFor(() => bridge.proc.exitCode !== null);
+});
 
 test('concurrent diagnostic callers share one physical probe; one subscriber cancellation does not kill it', { timeout: 30000 }, async (t) => {
   let marker, release;
@@ -142,6 +262,37 @@ test('incomplete auth output cannot quarantine a cold default or erase prior aut
   const transient = await bridge.request('/api/auth/status?refresh=1');
   assert.equal(transient.body.signedOutCount, 1);
   assert.deepEqual(fs.readFileSync(registryPath), bytes, 'timeout cannot renew or clear auth authority');
+});
+
+test('auth refresh and diagnostics agree on expected and rejected exit-zero probe output', {timeout:30000}, async t => {
+  let mode;
+  const bridge = await startTestBridge(t, root => {
+    mode = path.join(root, 'probe-output'); fs.writeFileSync(mode, 'Not logged in');
+    const script = path.join(root, 'probe.js');
+    fs.writeFileSync(script, "process.stdout.write(require('fs').readFileSync(process.argv[2],'utf8'))");
+    return {fixture:{label:'fixture', credential_env:'FIXTURE_AUTH_CONFIG', safe:[process.execPath],
+      probe:[process.execPath,script,mode], probe_expect:'Logged in as', probe_reject:['not logged in'],
+      probe_auth_authoritative:true, probe_success_detail:'authenticated fixture'}};
+  });
+  const account = () => JSON.parse(fs.readFileSync(path.join(bridge.root,'data/accounts.json')))
+    .providers.fixture.accounts.find(item => item.id === 'default');
+  for (const output of ['Not logged in', 'Logged in as fixture\nNot logged in']) {
+    fs.writeFileSync(mode, output);
+    const auth = (await bridge.request('/api/auth/status?refresh=1')).body;
+    assert.equal(auth.signedOutCount, 1);
+    assert.ok(account().authFailureMarker, 'exit-zero rejection must preserve authentication quarantine');
+    const diag = (await bridge.request('/api/diag')).body.results.fixture;
+    assert.equal(diag.ready, false); assert.equal(diag.authFailed, true); assert.equal(diag.authAuthoritative, true);
+  }
+  fs.writeFileSync(mode, 'Fixture version only');
+  await bridge.request('/api/auth/status?refresh=1');
+  assert.ok(account().authFailureMarker, 'a missing expected string cannot clear authentication quarantine');
+  assert.equal((await bridge.request('/api/diag')).body.results.fixture.ready, false);
+  fs.writeFileSync(mode, 'Logged in as fixture');
+  assert.equal((await bridge.request('/api/auth/status?refresh=1')).body.signedOutCount, 0);
+  assert.equal(account().authFailureMarker, undefined);
+  const ready = (await bridge.request('/api/diag')).body.results.fixture;
+  assert.equal(ready.ready, true); assert.equal(ready.authFailed, false);
 });
 
 test('old in-flight diagnostics cannot publish readiness after an operator auth-retry mutation', { timeout: 30000 }, async (t) => {

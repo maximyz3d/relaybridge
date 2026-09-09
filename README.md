@@ -496,7 +496,7 @@ The dashboard includes:
 - a Full Permissions toggle for browser-created sessions
 - 📡 Broadcast: send one prompt to several providers at once (pick a tag or check providers; opt-in hosted quota seats start unchecked) and read per-provider result cards
 - 🧩 Agents: a provider table with model, readiness, the autoRoute flag, and editable routing tags saved back to `cli-config.json`
-- ⟳ Restart and ⏻ Stop buttons: restart relaunches the bridge through `restart.ps1` and reloads the page when the new instance is healthy; stop shuts the bridge down and shows an offline screen
+- ⟳ Restart and ⏻ Stop buttons: automatic restart is unavailable until a coordinated replacement path is qualified (HTTP 501); stop refuses while work is reserved, then closes admissions and shuts down when idle
 
 New collaboration rooms preselect local seats when available. Hosted seats are opt-in so a fresh room does not accidentally spend subscription quota.
 
@@ -595,7 +595,7 @@ Core routes:
 | GET | `/api/activity` | Recent run and receipt summaries |
 | POST | `/api/open-url` | Open an allowed HTTP(S) URL locally |
 | POST | `/api/admin/shutdown` | Graceful bridge shutdown |
-| POST | `/api/admin/restart` | Full restart via the detached `restart.ps1` helper (Windows; 501 elsewhere) |
+| POST | `/api/admin/restart` | Returns 501 with `RESTART_REQUIRES_COORDINATED_CUTOVER` on every platform; the bridge stays running |
 
 Direct REST callers holding the token are trusted operators.
 

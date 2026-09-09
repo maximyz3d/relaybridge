@@ -65,6 +65,7 @@ test('native parser wiring preserves failure provenance and never bypasses unver
     gemini_warning:{parser:'gemini_cli_json',code:0,stdout:JSON.stringify({response:'An incomplete answer.',warnings:['Agent execution blocked: policy example discusses rate limit 429 and budget exceeded.']})},
     gemini_auth_mismatch:{parser:'gemini_cli_json',code:1,stdout:JSON.stringify({error:{type:'Error',message:'Authentication required.',code:41}})},
     gemini_blocked:{parser:'gemini_cli_json',code:0,stdout:JSON.stringify({response:'This must never execute.'}),blocked:true},
+    gemini_cli:{parser:'gemini_cli_json',code:0,stdout:JSON.stringify({response:'Sorry, I cannot fulfill your request.'})},
   };
   const bridge = await startTestBridge(t,root => {
     marker = path.join(root,'native-invocations.jsonl');
@@ -103,4 +104,15 @@ test('native parser wiring preserves failure provenance and never bypasses unver
   const blocked = (await bridge.request('/api/oneshot',{kind:'gemini_blocked',prompt:'Explain the supplied conceptual fixture.',dangerous:false,cwd:bridge.root})).body;
   assert.equal(blocked.model_invocation,false,JSON.stringify(blocked));
   assert.equal(completeJsonLines(marker).length,before);
+  for (const [response, failure, detector] of [
+    ['Sorry, I cannot fulfill your request.', 'provider_refusal', 'gemini_explicit_refusal'],
+    ['I am downloading the datasheets. This should just take a moment.', 'incomplete_response', 'gemini_progress_only'],
+  ]) {
+    fs.writeFileSync(path.join(bridge.root, 'gemini_cli.json'), JSON.stringify({kind:'gemini_cli',code:0,stdout:JSON.stringify({response})}));
+    const {body} = await bridge.request('/api/oneshot',{kind:'gemini_cli',prompt:'Return concrete findings.',dangerous:false,cwd:bridge.root});
+    assert.equal(body.failureClass, failure, JSON.stringify(body));
+    assert.equal(body.stdout, ''); assert.equal(body.dropped_out, true);
+    assert.equal(body.partial_result, true); assert.equal(body.partial_diagnostic, response);
+    assert.equal(body.output_detector.id, detector);
+  }
 });
