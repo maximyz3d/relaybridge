@@ -926,6 +926,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
       HOME: realProviderHome,
       USERPROFILE: realProviderHome,
       RELAYBRIDGE_ALLOWED_ROOTS: tempRoot,
+      RELAYBRIDGE_MAX_ACTIVE_PER_PROVIDER: '1',
     },
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'],

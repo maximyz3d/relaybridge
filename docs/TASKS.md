@@ -96,7 +96,9 @@ piece that makes "continue the conversation from anywhere" work.
 
 ## Limits and guarantees
 
-- Concurrency capped (`RELAYBRIDGE_MAX_TASKS`, default 3); the rest queue.
+- Concurrency capped (`RELAYBRIDGE_MAX_TASKS`, default 8 and bounded by the
+  global one-shot limit); the rest queue. Tasks share the same provider slots
+  as direct calls (default 4 per provider, 8 total).
 - Results capped at ~200KB, prompts at 100KB — a runaway CLI cannot fill the disk.
 - Every state change is written before it is announced, via write-then-rename,
   so a crash mid-write cannot leave a half-parsed task.
