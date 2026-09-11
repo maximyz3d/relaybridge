@@ -137,7 +137,7 @@ export function classifyTask(task) {
     /\b(remove recursively|wipe|erase|drop database|force push|reset --hard|overwrite|terminate all|kill all|factory reset)\b/,
     /\b(?:delete|remove)\s+(?:all\s+|the\s+)?(?:files?|directories|folders|databases?|records?|credentials?|keys?|branches)\b/,
     /\brotate\s+(?:the\s+)?(?:production\s+)?(?:signing|encryption|api|access)?\s*keys?\b/,
-    /\b(?:deploy\b.*\bproduction|production\b.*\bdeploy)\b/,
+    /\b(?:deploy\b[^.!?;\n]{0,40}\bproduction|production\b[^.!?;\n]{0,40}\bdeploy)\b/,
   ]);
   const medical = /\b(medical|diagnosis|patient|prescription|dosage)\b/.test(riskText);
   const legal = /\b(legal|lawsuit|attorney|criminal charge|court filing)\b/.test(text);

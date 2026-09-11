@@ -278,6 +278,14 @@ test('reasoning and mutation signals avoid the known under- and over-routing cas
   assert.ok(!cssCleanup.tags.includes('destructive'));
 });
 
+test('deploy/production destructive gate is clause-scoped, not prompt-wide', () => {
+  const unrelated = router.classifyTask('We should deploy the new docs site this week. Separately, review how the production database schema evolved over the last year and summarize the history.');
+  assert.ok(!unrelated.tags.includes('destructive'));
+
+  const stillCaught = router.classifyTask('Please deploy this build straight to production right now.');
+  assert.ok(stillCaught.tags.includes('destructive'));
+});
+
 test('specialized capability routes fail closed when no capable provider is ready', () => {
   const diagnostics = readyDiagnostics();
   diagnostics.gemini = { found: true, ready: false, detail: 'unavailable' };
