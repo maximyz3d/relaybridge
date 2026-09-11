@@ -4,7 +4,9 @@ Usage protection, automatic handoff, dynamic supervision and bounded progress
 assessment are on by default. Open **Fuel → Usage protection** to change them.
 The default subscription reserve is **5%**, configurable from **2% to 5%**.
 Settings persist in the bridge data directory. Usage protection takes effect
-on active work; the dynamic supervision setting applies to newly started runs.
+on active work. Dynamic timer mode applies to newly started runs; disabling
+dynamic supervision or progress assessment immediately revokes assessments on
+active runs, without changing their existing timer mode.
 
 ## Native allowance
 
@@ -77,6 +79,14 @@ coordinator for the canonical workspace, or call `register_coordinator` once:
 }
 ```
 
+For retryable external registration, generate a cryptographically random
+32-byte token locally (64 lowercase hexadecimal characters) **before** the call,
+retain it privately, and supply it as `ownerToken`. Retry the identical inputs
+with the same token after a lost response. This returns the current checkpoint
+and original ownership generation without starting duplicate work. Changed
+inputs or a released/replaced owner are rejected. Tokens are not included in
+status, handoff documents or stored JSON; only private hashes are persisted.
+
 Preserve the returned `id`, `ownerToken`, and `epoch`. Supply validated `model`
 and `accountId` when the host uses a specific configured route. Record decisions,
 completed/pending work, files, tests, next actions and base revision with
@@ -104,7 +114,22 @@ It can inspect the checkpoint, propose bounded read-only assignments, collect
 their results and update the handoff. It has a twelve-round limit and never
 automatically acquires an implementation writer lease. If implementation needs
 to continue in a host chat, `resume_from_checkpoint` returns the handoff and a
-new owner token after physical settlement. RelayBridge cannot change the model
+new owner token after physical settlement. It first collects any already-settled
+coordinator/worker result and receipt, without launching another task. A completed
+objective stays complete. Omitted `model`/`accountId` retain the current route
+when the provider is unchanged; explicit routes must retain a comparable tier
+and the original provider restrictions.
+
+For retryable `resume_from_checkpoint`, supply a **new**, privately retained
+`ownerToken` and `expectedEpoch` equal to the observed ownership generation,
+along with `id`, `kind` and any explicit model/account selection. Exact retries
+return the same acquisition only while that owner remains current and unreleased;
+they preserve newer checkpoints and do not increment the epoch again. A changed
+request, stale generation or different owner cannot reuse the acquisition.
+Legacy calls omitting these optional token fields still receive a random token,
+but cannot recover that token if the acquisition response is lost.
+
+RelayBridge cannot change the model
 of an arbitrary open Codex/Claude chat or force that host to write a checkpoint;
 external coordination requires this cooperative protocol.
 
@@ -133,9 +158,11 @@ retry information, and assessment state. Shipped Codex uses versioned JSONL
 output; only accepted terminal records produce a completed answer. Unsupported
 structured parsers provide partial observability, not invented progress.
 
-After a twenty-minute assessment interval, a permitted light/low model may
-inspect a bounded public snapshot. It uses ordinary capacity, needs fresh quota
-again at dispatch, and gets at most three assessments per run, with five-minute
+After twenty minutes without useful progress (the default idle interval), a
+permitted light/low model may inspect a bounded public snapshot. Useful progress
+defers this check and renews its allowance of at most three attempts. Tool starts,
+failures and the assessor's own opinion do not renew the allowance. Each check
+uses ordinary capacity and fresh quota again at dispatch, with five-minute
 spacing, one global assessor, a two-minute deadline and explicit token budgets.
 No assessor recursively assesses another assessor. Missing capacity or ambiguous
 evidence leaves work running and marks the assessment unavailable/unknown.
@@ -146,14 +173,15 @@ that cites the exact supplied evidence. New useful progress or a distinct tool
 operation invalidates an older assessment. An assessment alone cannot approve
 an implementation or replace the pipeline's fresh review gates.
 
-Turning off `dynamicSupervision` or `assessorEnabled` while adaptive supervision
-stays on (no explicit `timeoutMs`) does not restore a fixed elapsed-time kill or
-add an idle-only stop: the assessor simply never runs, so an automatic stuck
-stop can never be corroborated. The run's assessor state reports
-`assessor_disabled` so this is visible on the dashboard and in `/api/runs/active`
-instead of silently doing nothing; token/output budgets, quota reserve admission
-and any deadline actually supplied (queued `timeoutMs`, a per-provider
-`hardCapMs`, or `_supervisor.hardDeadline:true`) remain fully enforced.
+Turning off `dynamicSupervision` or `assessorEnabled` immediately invalidates
+accepted/in-flight judgments and requests cancellation of obsolete assessors.
+Re-enabling cannot revive those judgments. Cancelled assessors keep their slot
+until their execution is durably settled; a missing parent cannot leave an
+unaccounted background assessment. Existing adaptive runs keep their timer mode:
+no elapsed-time or idle-only stop is added by toggling assessment off. Token/output
+budgets, quota reserve protection and explicitly supplied deadlines remain active.
+The dashboard reports disabled, deferred, unavailable and exhausted assessment
+states, and identifies older judgments invalidated by new work.
 
 ## REST and MCP collection
 

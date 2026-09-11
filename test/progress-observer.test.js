@@ -85,3 +85,27 @@ test('Codex refuses contradictory messages and work after a terminal, while pres
   const failed = parse([{ type: 'turn.failed', error: { message: 'You have hit your usage limit' } }]);
   assert.equal(failed.diagnosticIsProviderError, true); assert.match(failed.diagnostic, /usage limit/);
 });
+test('Claude completion is matched, deduplicated and private, and invalidates a prior stuck verdict', () => {
+  const p = new ProgressObserver({ parser: 'claude_json', startedAt: 0, runId: 'run_one', attemptId: 'a1' });
+  for (let i = 0; i < 13; i++) p.event({ type: 'assistant', message: { id: 'msg'+i, content: [{ type: 'text', text: 'Repeated checkpoint' }] } }, i * 1000);
+  p.event({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'secret-tool-id', name: 'private-name', input: 'private-input' }] } }, 20000);
+  const snap = p.snapshot(300000);
+  p.acceptAssessment({ runId: 'run_one', attemptId: 'a1', evidenceHash: snap.hash, verdict: 'stuck', evidenceIds: [snap.evidence[0].id] }, snap, 300000);
+  assert.equal(p.corroboratedStall(300000, 240000), true);
+  const result = { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'secret-tool-id', content: 'private-output' }] } };
+  p.event(result, 301000); p.event(result, 302000);
+  p.event({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'unmatched' }] } }, 303000);
+  const current = p.snapshot(304000);
+  assert.equal(current.counts.toolsCompleted, 1); assert.equal(current.lastProgressAt, 301000);
+  assert.equal(current.lastToolActivityAt, 301000); assert.equal(p.corroboratedStall(304000, 240000), false);
+  for (const secret of ['secret-tool-id', 'private-name', 'private-input', 'private-output', 'unmatched']) assert.equal(JSON.stringify(current).includes(secret), false);
+  assert.equal(p.acceptAssessment({ runId: 'run_one', attemptId: 'a1', evidenceHash: snap.hash, verdict: 'stuck', evidenceIds: [snap.evidence[0].id] }, snap, 305000), false);
+});
+test('Claude failed completions do not invent useful progress and tool identity storage stays bounded', () => {
+  const p = new ProgressObserver({ parser: 'claude_json', startedAt: 0 });
+  for (let i = 0; i < 4200; i++) {
+    p.event({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'tool'+i }] } }, i + 1);
+    p.event({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'tool'+i, is_error: true }] } }, i + 2);
+  }
+  assert.equal(p.claudeTools.size, 4096); assert.equal(p.counts.toolsFailed, 4200); assert.equal(p.lastProgressAt, 0);
+});

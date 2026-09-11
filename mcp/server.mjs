@@ -3547,13 +3547,14 @@ export function buildServer() {
     inputSchema: z.object({}).strict(), annotations: ACTION,
   }, safeHandler(async () => result(await bridgeRequest('/api/usage/native/refresh', { method: 'POST', body: {}, actionIdentity: true, timeoutMs: 90000 }))));
   server.registerTool('register_coordinator', { title: 'Register a project coordinator and durable handoff',
-    description: 'Register once per canonical workspace. External mode continuously checkpoints a cooperating host agent; managed mode launches a bounded read-only delegator through the task queue. Preserve specific project provider/model restrictions. Managed delegation does not grant write permission.',
+    description: 'Register once per canonical workspace. External mode continuously checkpoints a cooperating host agent; managed mode launches a bounded read-only delegator through the task queue. For retryable external registration, generate and retain ownerToken before the call and retry with identical inputs. Preserve specific project provider/model restrictions. Managed delegation does not grant write permission.',
     inputSchema: z.object({ cwd: z.string().min(1).max(1024), objective: z.string().min(1).max(12000),
       constraints: z.string().max(12000).optional(), fileScope: z.array(z.string().max(500)).max(128).optional(),
       kind: z.string().min(1).max(64), allowedProviders: z.array(z.string().min(1).max(64)).min(1).max(8),
       model: z.string().min(1).max(160).optional(), accountId: z.string().min(1).max(100).optional(),
       mode: z.enum(['external', 'managed']).default('external'), modelTier: z.enum(['light', 'standard', 'heavy']).default('standard'),
-      effort: z.enum(EFFORT_LEVELS).default('medium'), workflowId: workflowIdSchema.optional(), checkpoint: continuityCheckpointSchema.optional() }).strict(), annotations: EXTERNAL_ACTION,
+      effort: z.enum(EFFORT_LEVELS).default('medium'), workflowId: workflowIdSchema.optional(), checkpoint: continuityCheckpointSchema.optional(),
+      ownerToken: z.string().regex(/^[a-f0-9]{64}$/).optional() }).strict(), annotations: EXTERNAL_ACTION,
   }, safeHandler(async (input) => result(await bridgeRequest('/api/continuity', { method: 'POST', body: input, actionIdentity: true }))));
   server.registerTool('list_coordinators', { title: 'List durable project coordinators',
     description: 'Read current coordinator, handoff state and ownership generation; status reads never dispatch successors or assessors.',
@@ -3573,8 +3574,10 @@ export function buildServer() {
       releaseEvidence: z.string().min(1).max(2000), writerLeaseToken: z.string().regex(/^[a-f0-9]{64}$/).optional() }).strict(), annotations: EXTERNAL_ACTION,
   }, safeHandler(async ({ id, ...input }) => result(await bridgeRequest(`/api/continuity/${id}/yield`, { method: 'POST', body: input, actionIdentity: true }))));
   server.registerTool('resume_from_checkpoint', { title: 'Take over a released project as an external coordinator',
-    description: 'Acquire a new ownership generation after the previous coordinator has physically settled or explicitly released. Requires an originally permitted comparable provider with verified fresh headroom. Returns the durable document and new owner token; does not change this host chat model or grant a writer lease.',
-    inputSchema: z.object({ id: continuityIdSchema, kind: z.string().min(1).max(64) }).strict(), annotations: ACTION,
+    description: 'Acquire a new ownership generation after the previous coordinator has physically settled or explicitly released. Requires an originally permitted comparable provider with verified fresh headroom. Supply a new caller-held ownerToken plus expectedEpoch for safe identical retries after a lost response. Omitted model/account retain the current route when kind is unchanged. Returns the durable document and new owner token; does not change this host chat model or grant a writer lease.',
+    inputSchema: z.object({ id: continuityIdSchema, kind: z.string().min(1).max(64),
+      model: z.string().min(1).max(160).optional(), accountId: z.string().min(1).max(100).optional(),
+      ownerToken: z.string().regex(/^[a-f0-9]{64}$/).optional(), expectedEpoch: z.number().int().min(1).optional() }).strict(), annotations: ACTION,
   }, safeHandler(async ({ id, ...input }) => result(await bridgeRequest(`/api/continuity/${id}/resume`, { method: 'POST', body: input, actionIdentity: true }))));
 
   server.registerTool('submit_task', {

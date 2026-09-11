@@ -442,8 +442,8 @@
       <label><input id="continuity-protect" type="checkbox" checked> Protect remaining allowance</label>
       <label style="margin-left:12px;">Reserve <input id="continuity-reserve" type="number" min="2" max="5" step="0.1" value="5" style="width:60px;">%</label><br>
       <label><input id="continuity-handoff" type="checkbox" checked> Automatically hand off managed coordination</label><br>
-      <label><input id="continuity-dynamic" type="checkbox" checked> Let productive jobs continue beyond default timers</label><br>
-      <label><input id="continuity-assessor" type="checkbox" checked> Use bounded low-tier progress assessments</label>
+      <label><input id="continuity-dynamic" type="checkbox" checked> Let productive jobs continue beyond default timers (new runs)</label><br>
+      <label><input id="continuity-assessor" type="checkbox" checked> Use bounded low-tier progress assessments (active runs)</label>
       <div><button class="btn" id="continuity-save">Save settings</button> <button class="btn" id="native-usage-refresh">Refresh native usage</button> <span id="continuity-save-status" class="muted"></span></div>
       <p class="muted">Checkpoints are saved while work runs. External chat agents must register and explicitly yield; native usage can be unavailable or delayed.</p>
       <div id="continuity-usage"></div>
@@ -629,6 +629,7 @@
 <script src="/vendor/xterm/lib/xterm.js"></script>
 <script src="/vendor/xterm-addon-fit/lib/addon-fit.js"></script>
 <script src="/dashboard-state.js"></script>
+<script src="/continuity-view.js"></script>
 <script src="/workflow-panel.js"></script>
 <script>
 const API = location.origin;
@@ -2851,9 +2852,11 @@ function fuelBar(pct, basis){
   const c = basis === 'unmetered' ? '#64748b' : p > 50 ? '#4ade80' : p > 20 ? '#facc15' : '#f87171';
   return `<div style="background:#1e293b;border-radius:3px;height:14px;width:130px;display:inline-block;vertical-align:middle;overflow:hidden;"><div style="width:${p}%;height:100%;background:${c};"></div></div> <span style="font-size:11px;">${basis==='unmetered'?'∞':p+'%'}</span>`;
 }
-let continuitySettingsDirty = false, continuityRefreshGeneration = 0;
+const continuityView = window.RelayBridgeContinuityView;
+const continuitySettings = continuityView.createSettingsState();
+let continuityRefreshGeneration = 0;
 for (const id of ['continuity-protect','continuity-reserve','continuity-handoff','continuity-dynamic','continuity-assessor']) {
-  document.getElementById(id)?.addEventListener('input', () => { continuitySettingsDirty = true; });
+  document.getElementById(id)?.addEventListener('input', () => { continuitySettings.edit(); $('#continuity-save-status').textContent = 'Unsaved changes'; });
 }
 async function refreshContinuityPanel() {
   const generation = ++continuityRefreshGeneration;
@@ -2861,7 +2864,7 @@ async function refreshContinuityPanel() {
     const [config, usage, projects, active] = await Promise.all([
       api('/api/settings/continuity'), api('/api/usage/native'), api('/api/continuity'), api('/api/runs/active')]);
     if (!fuelDialog.open || generation !== continuityRefreshGeneration) return;
-    if (!continuitySettingsDirty) {
+    if (continuitySettings.canHydrate) {
       const values = config.settings;
       $('#continuity-protect').checked = values.usageProtection;
       $('#continuity-reserve').value = values.reservePercent;
@@ -2880,22 +2883,32 @@ async function refreshContinuityPanel() {
       const link = document.createElement('a'); link.href = url; link.download = `${button.dataset.handoff}-handoff.md`; link.click(); URL.revokeObjectURL(url);
     });
     $('#continuity-progress').innerHTML = '<h4>Live progress</h4>' + (!(active.runs || []).length ? '<div class="muted">No active work.</div>' : '') + (active.runs || []).map(run =>
-      `<details><summary>${esc(run.kind)} · ${esc(run.assessor?.state || 'observing')} · ${run.hardCapRemainingMs == null ? 'adaptive' : 'explicit deadline'}</summary><div>${esc(run.progress?.summary || 'No public checkpoint yet; useful progress is unverified.')}</div><small>${esc(JSON.stringify(run.progress?.counts || {}))}</small><div>${esc(run.assessor?.verdict?.reason || '')}</div></details>`).join('');
-  } catch (error) { $('#continuity-save-status').textContent = error.message; }
+      `<details><summary>${esc(run.kind)} · ${esc(continuityView.assessmentLabel(run.assessor))} · ${run.hardCapRemainingMs == null ? 'adaptive' : 'explicit deadline'}</summary><div>${esc(run.progress?.summary || 'No public checkpoint yet; useful progress is unverified.')}</div><small>${esc(continuityView.progressCounts(run.progress?.counts))}</small><div>${esc(run.assessor?.stale ? '' : run.assessor?.verdict?.reason || '')}</div></details>`).join('');
+  } catch (error) {
+    if (fuelDialog.open && generation === continuityRefreshGeneration && !continuitySettings.saving) $('#continuity-save-status').textContent = error.message;
+  }
 }
 $('#continuity-save')?.addEventListener('click', async () => {
+  const ticket = continuitySettings.beginSave();
+  if (!ticket) return;
   continuityRefreshGeneration++;
+  $('#continuity-save').disabled = true;
+  $('#continuity-save-status').textContent = 'Saving…';
   try {
     await api('/api/settings/continuity', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
       usageProtection: $('#continuity-protect').checked, reservePercent: Number($('#continuity-reserve').value),
       autoHandoff: $('#continuity-handoff').checked, dynamicSupervision: $('#continuity-dynamic').checked,
       assessorEnabled: $('#continuity-assessor').checked }) });
-    continuitySettingsDirty = false; $('#continuity-save-status').textContent = 'Saved'; refreshContinuityPanel();
-  } catch (error) { $('#continuity-save-status').textContent = error.message; }
+    continuitySettings.finishSave(ticket, true);
+    $('#continuity-save-status').textContent = continuitySettings.dirty ? 'Saved; newer changes are still unsaved' : 'Saved';
+    refreshContinuityPanel();
+  } catch (error) { continuitySettings.finishSave(ticket, false); $('#continuity-save-status').textContent = error.message; }
+  finally { $('#continuity-save').disabled = false; }
 });
 $('#native-usage-refresh')?.addEventListener('click', async () => {
+  const generation = continuityRefreshGeneration;
   try { await api('/api/usage/native/refresh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); refreshContinuityPanel(); }
-  catch (error) { $('#continuity-save-status').textContent = error.message; }
+  catch (error) { if (fuelDialog.open && generation === continuityRefreshGeneration && !continuitySettings.saving) $('#continuity-save-status').textContent = error.message; }
 });
 async function refreshFuel(){
   refreshContinuityPanel();

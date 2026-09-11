@@ -3,6 +3,9 @@ const test = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs'), path = require('node:path');
 const { startTestBridge, waitFor, completeJsonLines } = require('./helpers/temporary-bridge');
 const ROOT = path.resolve(__dirname, '..');
+const inheritedBridgeKeys = Object.keys(process.env).filter((key) => /^(RELAYBRIDGE_|PS_BRIDGE_)/.test(key));
+const cleanEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !inheritedBridgeKeys.includes(key)));
+const unsetBridgeEnv = Object.fromEntries(inheritedBridgeKeys.map((key) => [key, undefined]));
 async function fixture(t) {
   let events;
   const bridge = await startTestBridge(t, (root) => {
@@ -31,7 +34,7 @@ async function fixture(t) {
       oneshot_capabilities: { safe: ['model_invocation', 'workspace_read', 'tool_use'] },
       ...(kind === 'codex' ? { npm_package: '@openai/codex', native_usage_command: [process.execPath, script, kind, root] } : {}),
     }])) };
-  }, { env: { RELAYBRIDGE_WARM_DIAG: '0', RELAYBRIDGE_REMOTE_MCP: '0' } });
+  }, { env: { ...unsetBridgeEnv, RELAYBRIDGE_WARM_DIAG: '0', RELAYBRIDGE_REMOTE_MCP: '0' } });
   return { ...bridge, events };
 }
 test('native quota stops only after a durable checkpoint and launches one physically fenced successor', { timeout: 30000 }, async (t) => {
@@ -94,7 +97,7 @@ test('default MCP collection returns a recoverable pending handle and leaves the
   const bridge = await fixture(t);
   const [{ Client }, { StdioClientTransport }] = await Promise.all([import('@modelcontextprotocol/client'), import('@modelcontextprotocol/client/stdio')]);
   const transport = new StdioClientTransport({ command: process.execPath, args: [path.join(ROOT, 'mcp/server.mjs')], cwd: ROOT,
-    env: { ...process.env, NODE_ENV: 'test', RELAYBRIDGE_TEST_BUILD_ID: 'security-integration-fixture', RELAYBRIDGE_COLLECTION_MS: '150',
+    env: { ...cleanEnv, NODE_ENV: 'test', RELAYBRIDGE_TEST_BUILD_ID: 'security-integration-fixture', RELAYBRIDGE_COLLECTION_MS: '150',
       RELAYBRIDGE_URL: bridge.base, RELAYBRIDGE_TOKEN_FILE: path.join(bridge.root,'token'), RELAYBRIDGE_DATA_DIR: path.join(bridge.root,'data'), RELAYBRIDGE_CONFIG_FILE: bridge.configPath }, stderr: 'pipe' });
   const client = new Client({ name: 'continuity-collection-test', version: '1' });
   t.after(async () => { await client.close(); await transport.close(); }); await client.connect(transport);
@@ -105,5 +108,42 @@ test('default MCP collection returns a recoverable pending handle and leaves the
   assert.equal(task.body.timeoutMs, undefined);
   const result = await call('get_task_result', { id: value.taskId });
   assert.equal(result.resultState, 'persisted'); assert.equal(result.metadata.complete, true); assert.equal(result.result, 'Completed delayed answer.');
+  assert.equal(completeJsonLines(bridge.events).filter((e) => e.kind === 'claude' && e.type === 'started').length, 1);
+  // Exercise the actual MCP acquisition schemas and REST persistence without
+  // starting another model: caller-known capabilities survive a lost response.
+  await call('set_continuity_settings', { autoHandoff: false });
+  await bridge.request('/api/usage/native', { kind: 'claude', rate_limits: { five_hour: {
+    used_percentage: 20, resets_at: Math.floor(Date.now()/1000) + 3600 } } });
+  const registration = { mode: 'external', kind: 'claude', cwd: bridge.root, objective: 'Continue from the verified result',
+    allowedProviders: ['claude'], ownerToken: 'a'.repeat(64), model: 'fixture-model' };
+  const source = await call('register_coordinator', registration);
+  assert.ok(source.id, JSON.stringify(source));
+  const repeated = await call('register_coordinator', registration); assert.equal(repeated.id, source.id); assert.equal(repeated.epoch, 1);
+  await call('checkpoint_and_yield', { id: source.id, ownerToken: registration.ownerToken, epoch: 1,
+    checkpoint: { completed: 'Exact worker result collected' }, releaseEvidence: 'All owned work physically settled' });
+  const acquisition = { id: source.id, kind: 'claude', model: 'fixture-model', accountId: 'default', ownerToken: 'b'.repeat(64), expectedEpoch: 1 };
+  const next = await call('resume_from_checkpoint', acquisition), retry = await call('resume_from_checkpoint', acquisition);
+  assert.equal(next.epoch, 2, JSON.stringify(next)); assert.equal(retry.epoch, 2); assert.equal(retry.ownerToken, acquisition.ownerToken);
+  assert.equal(retry.checkpoint.completed, 'Exact worker result collected');
+  const projection = await call('get_coordinator', { id: source.id });
+  assert.equal(projection.ownerToken, undefined); assert.equal(projection.lastAcquisition, undefined);
+  assert.equal(completeJsonLines(bridge.events).filter((e) => e.kind === 'claude' && e.type === 'started').length, 1);
+});
+
+test('live settings revoke assessment immediately and revoked admission never launches a provider', { timeout: 20000 }, async (t) => {
+  const bridge = await fixture(t);
+  const pending = bridge.request('/api/oneshot', { kind: 'claude', cwd: bridge.root, prompt: 'RB_SLOW inspect this project', dangerous: false });
+  const run = await waitFor(async () => (await bridge.request('/api/runs/active')).body.runs[0]);
+  assert.equal(run.adaptive, true);
+  const settings = await bridge.request('/api/settings/continuity', { assessorEnabled: false }, { method: 'PUT' });
+  assert.equal(settings.status, 200);
+  const active = (await bridge.request('/api/runs/active')).body.runs.find((r) => r.runId === run.runId);
+  assert.equal(active.assessor.enabled, false); assert.equal(active.assessor.state, 'assessor_disabled');
+  assert.equal(active.hardCapRemainingMs, null); assert.equal(active.adaptive, true);
+  assert.equal((await pending).body.exitCode, 0);
+  const refused = await bridge.request('/api/oneshot', { kind: 'claude', cwd: bridge.root, prompt: 'Do not launch',
+    source: 'progress-assessor', requestId: 'queued:t_assess_revoked', dangerous: false });
+  assert.equal(refused.body.failureClass, 'assessment_revoked', JSON.stringify(refused.body));
+  assert.equal(refused.body.model_invocation, false);
   assert.equal(completeJsonLines(bridge.events).filter((e) => e.kind === 'claude' && e.type === 'started').length, 1);
 });
