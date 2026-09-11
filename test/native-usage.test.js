@@ -73,6 +73,18 @@ test('a malformed Codex individualLimit is marked invalid, not silently dropped'
   assert.equal(nullReset.buckets[0].windows.find((w) => w.id === 'individual').invalid, undefined);
   // A valid sibling window must still be present alongside the invalid individual marker.
   assert.equal(overRange.buckets[0].windows.find((w) => w.id === 'primary').percentRemaining, 90);
+  // A malformed non-object individualLimit is invalid evidence, not absence: it must not be
+  // silently skipped just because it fails the "is an object" shape check.
+  for (const malformed of ['bad', 0, false, ['nope']]) {
+    const parsed = base(malformed);
+    const window = parsed.buckets[0].windows.find((w) => w.id === 'individual');
+    assert.ok(window, `expected an individual window marker for ${JSON.stringify(malformed)}`);
+    assert.equal(window.invalid, true);
+    assert.equal(window.percentRemaining, undefined);
+  }
+  // A legitimate missing/null individualLimit must remain absent, not fabricated as invalid.
+  assert.equal(base(undefined).buckets[0].windows.find((w) => w.id === 'individual'), undefined);
+  assert.equal(base(null).buckets[0].windows.find((w) => w.id === 'individual'), undefined);
 });
 test('native quota RPC performs initialization and account read only, then closes its process', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rb-quota-rpc-'));

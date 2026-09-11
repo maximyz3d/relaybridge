@@ -61,6 +61,24 @@ test('explicit denial protects the seat even when every window is malformed', (t
   assert.equal(headroom.protected, true);
   assert.equal(f.store.verdict('codex').admit, false);
 });
+test('a malformed individualLimit scalar poisons the bucket and retains the prior individual reading through a fullSnapshot replacement', (t) => {
+  const f = fixture(t), reset = T / 1000 + 86400;
+  const withIndividual = (individualLimit) => parseCodexRateLimits({ ordinaryUsageAllowed: true, rateLimits: { limitId: 'codex' },
+    rateLimitsByLimitId: { codex: { primary: { usedPercent: 20, windowDurationMins: 10080, resetsAt: reset }, individualLimit } } },
+    { quotaSeat: 'codex', observedAt: f.at() });
+  f.store.observe(withIndividual({ remainingPercent: 3, resetsAt: reset }));
+  assert.equal(f.store.headroom('codex').percentRemaining, 3);
+  for (const malformed of ['bad', 0, false, ['nope']]) {
+    f.advance(1000);
+    f.store.observe(withIndividual(malformed));
+    const headroom = f.store.headroom('codex');
+    // The good sibling primary window (80% remaining) must not make this bucket look
+    // fresh: the malformed individual window poisons it, and the prior 3% is retained.
+    assert.equal(headroom.reason, 'native_evidence_invalid');
+    assert.equal(headroom.windows.find((w) => w.id === 'individual').percentRemaining, 3);
+    assert.equal(f.store.verdict('codex').admit, false);
+  }
+});
 test('a low window stays protected after the same window turns invalid, across all native parsers', (t) => {
   const f = fixture(t), reset = T / 1000 + 86400;
   // Codex RPC: valid 3%-remaining primary window blocks admission, then a malformed
