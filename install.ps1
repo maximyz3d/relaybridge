@@ -751,6 +751,29 @@ function Restore-ShippedManagedSupervisorBudget($Merged, $Defaults, $Existing) {
   return $Merged
 }
 
+# An output protocol is indivisible: adding a parser without its argv corrupts results.
+function Restore-ShippedCodexProtocol($Merged, $Defaults, $Existing) {
+  $old = $Existing.PSObject.Properties['codex']
+  if ($null -eq $old) { return $Merged }
+  $target = $Merged.PSObject.Properties['codex']
+  $shipped = $Defaults.PSObject.Properties['codex']
+  if ($null -eq $target -or $null -eq $shipped -or $null -eq $old.Value) { return $Merged }
+  $schema = $Defaults.PSObject.Properties['_config_merge']
+  $retired = if ($schema) { $schema.Value.PSObject.Properties['codex_json_protocol_v1'] } else { $null }
+  $knownLegacy = $null -ne $retired -and $null -eq $old.Value.PSObject.Properties['oneshot_output_parser'] -and $null -eq $old.Value.PSObject.Properties['usage_capability']
+  if ($knownLegacy) {
+    foreach ($key in @('oneshot_safe', 'oneshot_dangerous')) {
+      if (-not (Test-ExactJsonStringArray $old.Value.$key $retired.Value.$key)) { $knownLegacy = $false }
+    }
+  }
+  foreach ($key in @('oneshot_safe', 'oneshot_dangerous', 'oneshot_output_parser', 'usage_capability')) {
+    $source = if ($knownLegacy) { $shipped.Value.PSObject.Properties[$key] } else { $old.Value.PSObject.Properties[$key] }
+    $target.Value.PSObject.Properties.Remove($key)
+    if ($null -ne $source) { $target.Value | Add-Member -NotePropertyName $key -NotePropertyValue $source.Value }
+  }
+  return $Merged
+}
+
 function Merge-JsonFile([string]$DefaultPath, [string]$ExistingPath) {
   if (-not (Test-Path -LiteralPath $ExistingPath -PathType Leaf)) { return }
   if (-not (Test-Path -LiteralPath $DefaultPath -PathType Leaf)) {
@@ -773,6 +796,7 @@ function Merge-JsonFile([string]$DefaultPath, [string]$ExistingPath) {
     $merged = Restore-ShippedManagedLoginCommands $merged $defaults $existing
     $merged = Restore-ShippedRequiredStripEnv $merged $defaults
     $merged = Restore-ShippedManagedSupervisorBudget $merged $defaults $existing
+    $merged = Restore-ShippedCodexProtocol $merged $defaults $existing
   }
   $tempPath = "$DefaultPath.merge.$([Guid]::NewGuid().ToString('N')).tmp"
   try {

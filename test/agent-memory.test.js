@@ -21,8 +21,8 @@ test('the primer stays short enough to load every session', () => {
 test('the primer carries the rules that must never be forgotten', () => {
   assert.match(primer, /127\.0\.0\.1:8787/, 'agents need the endpoint');
   assert.match(primer, /X-RelayBridge-Token/, 'agents need the auth header');
-  assert.match(primer, /Never send `timeoutMs`/, 'sending timeoutMs reinstates the guillotine');
-  assert.match(primer, /loop_detected/, 'resubmitting a looping prompt wastes tokens');
+  assert.match(primer, /Omit `timeoutMs` unless an explicit deadline/, 'explicit deadlines remain deliberate');
+  assert.match(primer, /exact ID/, 'pending work is collected without duplication');
   assert.match(primer, /409 auth_required/, 'agents must know what a signed-out provider looks like');
   assert.match(primer, /human gate/, 'high-stakes work must not be auto-executed');
 });

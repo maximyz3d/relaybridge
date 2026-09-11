@@ -2444,7 +2444,8 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(noTimeoutResponse.status, 200);
   const noTimeoutResult = await noTimeoutResponse.json();
   assert.equal(noTimeoutResult.route.requested_timeout_ms, null);
-  assert.equal(noTimeoutResult.route.effective_timeout_ms, 2700000);
+  assert.equal(noTimeoutResult.route.effective_timeout_ms, null);
+  assert.equal(noTimeoutResult.route.dynamic_supervision, true);
   assert.equal(noTimeoutResult.route.timeout_clamped, false);
   assert.equal(noTimeoutResult.stop_reason, null);
 

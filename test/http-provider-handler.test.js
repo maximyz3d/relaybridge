@@ -18,7 +18,7 @@ async function run(response, providerBudget = {}) {
   let result, released = 0, cleaned = 0;
   const activeRuns = new Map();
   const context = vm.createContext({ crypto, AbortController, RunSupervisor, createAttemptLifecycle, readProviderBody,
-    readOllamaStream, HTTP_PROVIDER_LIMITS, parseHostedTerminal, classifyHttpTerminal, activeRuns,
+    readOllamaStream, HTTP_PROVIDER_LIMITS, parseHostedTerminal, classifyHttpTerminal, activeRuns, continuityControls: new Map(), subscriptionUsage: { fingerprint: () => null }, continuity: { saveRun: () => null },
     nonnegativeUsageNumber: (value) => Number.isSafeInteger(value) && value >= 0 ? value : null,
     safeTokenSum: (values) => values.reduce((sum, value) => sum + value, 0),
     cleanOutput: (value) => String(value || '').trim(), hostedChatUrl: () => new URL('https://fixture.invalid'),

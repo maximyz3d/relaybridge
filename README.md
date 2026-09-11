@@ -403,31 +403,23 @@ explanation. HTTP adapters currently expose no reasoning-effort control.
 `observed_model` is populated only when the provider reports one. Unknown final
 model revisions remain unknown.
 
-Provider prompts default to a 20-minute deadline and accept an explicit
-`timeoutMs` up to 45 minutes. The liveness supervisor also grants buffered
-print-mode CLIs the full 20-minute default silence window, so a healthy Claude
-response is not killed by the earlier six-minute idle heuristic.
-`ask_provider`, routed calls, committees,
-broadcasts, the REST one-shot path, and the MCP transport all use
-`config/timeout-policy.json`; direct REST values above the cap are clamped and
-reported as `route.effective_timeout_ms`. Routed work still shares one overall
-tier deadline, and caller cancellation still terminates the provider process
-tree. Rerun `install-mcp.ps1` or `install-mcp.sh` after changing this policy so
-Codex receives a host-side tool timeout long enough to cover the provider cap and transport
-grace. These longer deadlines do not change `dangerous:false`, advisory-only
-committee behavior, or any human gate.
+Provider work uses adaptive supervision by default. Productive tasks can run
+past 30 minutes; silence or elapsed time alone does not stop them. Explicit
+`timeoutMs` values (up to 45 minutes), custom operator deadlines and token/output
+budgets remain enforced. Gemini's immutable native print wait has a separate
+24-hour ceiling plus a bounded drain margin. Preview and execution report the
+same policy without changing the requested model or effort.
 
-Gemini/Antigravity print slots use `print_timeout_policy: supervisor_margin_v1`
-and the server-owned `{supervisor_print_timeout}` placeholder. Preview and
-dispatch derive its finite wait from the effective supervisor hard cap plus
-30–31 seconds; no fixed 15-minute or unlimited override is used. Both safe and
-writer slots follow this rule, and linked-account flags cannot override it.
-`primary.cliDeadline` and `route.cli_deadline` report the rendered value;
-changing the runtime timeout does not change the bound model/effort tuple.
-The CLI forwards the planned deadline. Raw REST requests with no explicit
-timeout use the supervisor's configured hard cap (45 minutes by default),
-while MCP callers normally supply the shared 20-minute default.
-See [Antigravity headless timeout controls](https://antigravity.google/docs/cli/headless/).
+Default MCP calls use durable queued tasks. A `pending` result includes a
+`taskId` to collect with `get_task_result`; ending collection leaves the worker
+running. Use `cancel_task` to request actual cancellation.
+
+**Usage protection is on by default**, with a 5% reserve adjustable to 2–5% in
+Fuel. Native allowance observations, continuous handoffs, comparable-provider
+coordinator takeover, and bounded progress assessments are described in
+[Usage-aware continuity](docs/CONTINUITY.md). External host chats cooperate by
+checkpointing and explicitly yielding; managed successors coordinate read-only
+work while existing writer leases and review gates remain authoritative.
 
 Common setup commands:
 

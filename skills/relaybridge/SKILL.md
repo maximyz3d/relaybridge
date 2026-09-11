@@ -49,10 +49,17 @@ callers must generate a unique `requestId` and retain the direct tuple
 atomically. Never attribute a detached response by selecting the newest
 receipt; find the exact request ID or treat provenance as unknown.
 
-Use a bounded `timeoutMs` when the assignment has a deadline. The bridge also
-supervises progress, idle stalls, looping and provider budgets; omission uses
-its configured default, not an unlimited run. A timed-out or partial answer
-cannot establish a review verdict.
+Omit `timeoutMs` for adaptive work; supply it only when an explicit deadline is
+intended. Silence and elapsed time do not establish a stall. Honor token/output
+budgets and current cited progress assessments. A partial answer cannot establish
+a review verdict. A default MCP `pending` result contains a durable `taskId`:
+collect `get_task_result` with `id=taskId`, without resubmitting.
+
+For ongoing projects, reuse or register an external coordinator, preserve its
+owner token/epoch, and checkpoint after decisions and completed work. Inspect
+native quota in `get_context_bundle`; when instructed to yield, stop new work,
+settle owned writers, and use `checkpoint_and_yield`. Preserve original provider,
+model and writer restrictions. See [continuity](../../docs/CONTINUITY.md).
 
 ## Choosing the model — the whole point
 
@@ -256,7 +263,7 @@ CPU advancing means it is thinking), `suspect_loop` (repeating; watch it).
 ## Parallel work
 
 Independent read-only subtasks can run concurrently — the bridge caps
-concurrency at 4. Two constraints: never create multiple writers to the same
+concurrency at eight globally and four per provider by default. Two constraints: never create multiple writers to the same
 files, and give each provider a genuinely independent slice. Fan out for
 analysis, fan in for the decision.
 

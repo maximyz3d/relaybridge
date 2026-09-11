@@ -15,7 +15,7 @@ test('all provider launch paths use one shell-free qualifier; no command-line re
     assert.ok(source.indexOf('qualifiedProviderLaunch(', start) > start);
   }
   assert.match(source, /pty\.spawn\(launch\.file, launch\.args/);
-  assert.equal((source.match(/spawn\(launch\.file, launch\.args/g) || []).length, 5);
+  assert.equal((source.match(/spawn\(launch\.file, launch\.args/g) || []).length, 6);
 });
 
 test('native Windows REST keeps hostile argv/env exact across argument/file/stdin/session/probe/install and rejects unknown shims', {

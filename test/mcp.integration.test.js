@@ -413,7 +413,7 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   }
   for (const toolName of ['ask_provider', 'route_and_ask', 'run_committee', 'broadcast']) {
     const timeoutSchema = listedTools.tools.find((tool) => tool.name === toolName).inputSchema.properties.timeoutMs;
-    assert.equal(timeoutSchema.default, 1200000, `${toolName} uses the centralized 20-minute default`);
+    assert.equal(timeoutSchema.default, undefined, `${toolName} leaves execution adaptive unless explicitly bounded`);
     assert.equal(timeoutSchema.maximum, 2700000, `${toolName} accepts up to the transport ceiling (supervisor hard cap)`);
   }
   assert.ok(!toolNames.has('exec'), 'raw command execution must not be exposed over MCP');

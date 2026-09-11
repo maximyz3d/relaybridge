@@ -52,7 +52,7 @@ The main delegation call.
 | `requestId` | string | Caller-generated unique identity (`[A-Za-z0-9._:-]`, 8-160 characters). Mandatory for concurrent raw callers; retain it with the direct response tuple. |
 | `dangerous` | boolean | Optional. `false` (default) runs the read-only/plan slot. `true` allows the CLI to act agentically — only with explicit human intent. |
 | `cwd` | string | Optional working directory, validated against the allow list. |
-| `timeoutMs` | number | Optional bounded deadline; omission uses the configured default. Progress supervision and provider budgets also apply. |
+| `timeoutMs` | number | Optional bounded deadline; omission uses adaptive supervision. Progress supervision and provider budgets also apply. |
 | `taskTier` | string | Optional. `utility` / `standard` / `complex` / `critical` — selects the model weight class. |
 | `modelTier` | string | Optional. `light` / `standard` / `heavy`. Overrides `taskTier`. |
 | `outputProfile` | object | Optional exact `{id, version, digest?}` from `/api/output-profiles`; appended as ordinary output criteria after the original request. |
@@ -174,19 +174,15 @@ in the receipt, and does not retry the identical request or switch to
 Configured under `_supervisor` in `cli-config.json`; any provider may override
 with its own `supervisor` block.
 
-| Key | Default | Meaning |
-|---|---|---|
-| `idleMs` | 360000 | Silence before a run is suspect. Generous because print-mode CLIs emit nothing until done. |
-| `hardCapMs` | 2700000 | Absolute ceiling (45 min). |
-| `graceExtensions` | 3 | Idle windows granted when CPU proves work is happening. |
-| `loopRepeatThreshold` | 12 | Identical lines before calling it a loop. |
-| `noNewContentMs` | 240000 | Output growing with nothing new in it — churn. |
-| `maxOutputBytes` | 12582912 | Runaway-output guard. |
-| `onUnverifiableIdle` | `kill` | What to do when idle and CPU cannot be sampled. |
+Default supervision is adaptive. The twenty-minute idle interval requests
+assessment; silence, CPU activity and elapsed time do not justify termination.
+Current cited assessment plus corroborated repetition/failure evidence can stop
+stuck work. Explicit deadlines and token/output budgets remain hard limits.
+The output memory guard is 12 MiB. Disabling dynamic supervision restores legacy
+idle/hard-cap behavior for newly started runs.
 
-Progress is judged on new content, not elapsed time: a run producing new output
-is never interrupted, and one repeating itself is stopped well before the
-ceiling.
+See [continuity](../../docs/CONTINUITY.md) for settings, native allowance,
+coordinator tools, physical ownership fences and durable result collection.
 
 ## Receipts
 

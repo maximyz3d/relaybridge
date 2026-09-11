@@ -15,8 +15,8 @@ For subscription gauges without a current quota observation:
   including legacy numeric `configured` inputs. Dashboard fuel is neutral
   `unknown`, never an inferred red zero.
 
-Current `vendor_observed` evidence retains priority over expiring
-`operator_observed` percentages. Operator reports remain advisory, not verified
+Current `vendor_observed` evidence retains priority over `native_observed`
+allowance windows and expiring `operator_observed` percentages. Operator reports remain advisory, not verified
 vendor limits. Recognized, scoped, unexpired vendor exhaustion can still gate
 admission. Authentication, actual concurrency and cooldown guards are unchanged.
 Unknown capacity does not guarantee that an invocation will succeed.
@@ -31,3 +31,7 @@ Operations: do not erase quota history, invent a fresh operator percentage, or
 reset genuine rate-limit observations to repair a display error. Install this
 change only after the shared runtime is idle or its owner has handed it off;
 source/test completion is not proof that a running process has been updated.
+
+Native allowance, reserve settings, freshness and handoff behavior are described
+in [Usage-aware continuity](CONTINUITY.md). Protection defaults to 5%; local
+token estimates never supply missing native percentages.

@@ -218,6 +218,40 @@ test('defaults leave real headroom for long agentic tasks', () => {
   assert.ok(DEFAULTS.idleMs >= 180000, 'buffered print-mode CLIs need a wide idle window');
 });
 
+test('adaptive supervision with the assessor disabled never silently restores a hard timeout or idle-only kill, and keeps budgets/explicit deadlines enforced', () => {
+  // The server-side assessor loop gates on settings.dynamicSupervision/assessorEnabled and simply
+  // never calls acceptAssessment() when either is off. corroboratedStall() can then never fire,
+  // so evaluate()'s adaptive branch must keep returning 'continue' through repeated and quiet
+  // output for a full 120-minute virtual clock rather than falling back to an idle/loop kill or
+  // a fabricated hard cap โ€” exactly the accepted design, not a defect to patch around.
+  const s = new RunSupervisor(resolveSupervisorOptions({ startedAt: T0 }));
+  assert.equal(s.opts.adaptive, true);
+  assert.equal(s.opts.hardDeadline, false, 'no explicit deadline means no hard cap fabricated for a disabled assessor');
+  let now = T0;
+  for (let minute = 1; minute <= 120; minute++) {
+    now = T0 + minute * 60000;
+    // Alternate between an exact repeat (would trip loop_detected in the legacy branch)
+    // and total silence (would trip idle_stall in the legacy branch) every other minute.
+    if (minute % 2 === 0) s.recordOutput('same status line again\n', now);
+    const verdict = s.evaluate(now);
+    assert.equal(verdict.action, 'continue', `unexpectedly stopped at minute ${minute}: ${verdict.reason}`);
+  }
+  assert.equal(s.stopped, null);
+  assert.equal(s.progress.assessment, null, 'no assessment was ever accepted, matching a disabled assessor');
+
+  // Token/output budgets remain authoritative with the assessor disabled.
+  const budgeted = new RunSupervisor(resolveSupervisorOptions({ startedAt: T0,
+    providerBudget: { maxOutputTokens: null, maxTotalTokens: 1000, maxCacheReadTokens: null, maxCacheCreationTokens: null, maxTurns: null } }));
+  budgeted.recordProviderUsage({ total_tokens: 1500 }, { phase: 'incremental' });
+  assert.equal(budgeted.evaluate(T0 + 60000).reason, 'token_budget');
+
+  // An explicit deadline (queued timeoutMs / per-provider hardCapMs) remains an absolute ceiling.
+  const deadlined = new RunSupervisor(resolveSupervisorOptions({ startedAt: T0, hardCapMs: 1800000 }));
+  assert.equal(deadlined.opts.hardDeadline, true);
+  deadlined.recordOutput('still going\n', T0 + 1800000);
+  assert.equal(deadlined.evaluate(T0 + 1800000).reason, 'hard_cap');
+});
+
 test('provider-reported multi-turn usage stops at a distinct token budget without estimates', () => {
   const s = make({ providerBudget: {
     maxOutputTokens: 1000, maxTotalTokens: 5000, maxCacheReadTokens: null,

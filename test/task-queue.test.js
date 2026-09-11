@@ -784,3 +784,22 @@ test('admission deadlines expire even while a different execution occupies every
   occupyingResponse.json({ stdout: 'finished' });
   await flushQueue();
 });
+
+test('unsettledInWorkspace keeps claiming a workspace for still-queued work and releases it once cancelled', async (t) => {
+  const f = durableFixture(t, { maxConcurrent: 1 });
+  const q = f.open();
+  const cwd = fs.realpathSync(f.dir);
+  // Not yet dispatched (deferred past `now`), so execution.state stays 'never_started'.
+  // A workspace census that only looked at in_flight/uncertain execution would miss this
+  // and let an external yield race ahead of work that was already accepted.
+  const deferred = q.submit({ kind: 'claude', prompt: 'later', cwd, notBefore: f.clock.value + 60000 });
+  await flushQueue();
+  assert.equal(q.get(deferred.id).status, 'queued');
+  assert.equal(q.unsettledInWorkspace(cwd), true,
+    'a still-queued prior task must keep claiming its workspace so a yield cannot race ahead of it');
+  assert.equal(q.unsettledInWorkspace(f.dir + '-unrelated'), false);
+  q.cancel(deferred.id);
+  assert.equal(q.get(deferred.id).status, 'cancelled');
+  assert.equal(q.unsettledInWorkspace(cwd), false,
+    'a cancelled never-started task must not block the workspace forever');
+});

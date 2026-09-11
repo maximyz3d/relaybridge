@@ -23,10 +23,14 @@ For concurrent raw calls, generate a different request ID per call and retain
 the direct response's `requestId`/`invocationId`/`receiptId` tuple. Never infer
 ownership from the newest receipt after a shell detaches.
 
-**Do not send `timeoutMs`.** It is an optional hard ceiling, not a kill clock.
-Runs are supervised by progress — a call producing new content is left alone to
-finish; one that goes silent or repeats itself is stopped early. Sending
-`timeoutMs` reinstates a fixed guillotine that cuts off long work mid-task.
+Omit `timeoutMs` unless an explicit deadline is intended. Productive work may
+continue beyond 30 minutes. Silence alone does not prove a stall. Honor current
+cited progress assessments, quota reserve and token/output budgets. Collect
+pending tasks by their exact task ID; never duplicate them.
+
+Register/reuse project continuity and checkpoint meaningful milestones. Before
+quota is exhausted, explicitly yield only after owned writers settle; preserve
+original provider restrictions and pipeline leases. See [continuity](../../docs/CONTINUITY.md).
 
 ## Which model for which task
 
@@ -132,7 +136,7 @@ Check `stop_reason` before trusting `stdout`:
   context, or switch providers.
 - `idle_stall` — went silent with no CPU activity; usually a wedged CLI or a
   hidden interactive prompt. Check `/api/diag` for that provider's auth state.
-- `hard_cap` — hit the 45 minute ceiling. Split the task.
+- `hard_cap` — reached an explicit deadline or legacy/custom operator ceiling.
 - `output_cap` — runaway output, almost always a malformed prompt.
 
 Also honor `rate_limited` (skip that provider for the session, do not retry),

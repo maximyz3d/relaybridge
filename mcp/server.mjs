@@ -13,6 +13,7 @@ import { promptTransportLimits, preparePrompt } from '../lib/prompt-transport.js
 import { normalizeGrounding, prepareGroundedPrompt } from '../lib/workspace-grounding.js';
 import { normalizeTransportLifecycle } from '../lib/attempt-lifecycle.js';
 import { compileOutputProfile } from '../lib/output-profiles.js';
+import { redactCheckpointSecrets } from '../lib/partial-checkpoint.js';
 import { normalizeQualitativeQuotaExhaustion } from '../lib/vendor-quota.js';
 
 const OUTPUT_PROFILE_SCHEMA = z.object({ id:z.string().regex(/^[a-z][a-z0-9-]{0,63}$/),
@@ -481,12 +482,15 @@ async function buildContextBundle({
     }
   };
   const routing = loadRoutingData();
-  const [diagnostics, sessionsRaw, collabsRaw, projectsRaw, workflowsRaw] = await Promise.all([
+  const [diagnostics, sessionsRaw, collabsRaw, projectsRaw, workflowsRaw, coordinatorsRaw, nativeRaw, continuitySettingsRaw] = await Promise.all([
     includeDiagnostics ? capture('diagnostics', () => getDiagnostics(signal), {}) : {},
     capture('sessions', () => bridgeRequest('/api/sessions', { signal }), []),
     capture('collaborations', () => bridgeRequest('/api/collabs', { signal }), { collabs: [] }),
     capture('projects', () => bridgeRequest('/api/projects', { signal }), { projects: [] }),
     capture('pipelines', () => bridgeRequest('/api/workflows?limit=20', { signal }), { workflows: [] }),
+    capture('coordinators', () => bridgeRequest('/api/continuity', { signal }), { coordinators: [] }),
+    capture('nativeUsage', () => bridgeRequest('/api/usage/native', { signal }), { observations: [] }),
+    capture('continuitySettings', () => bridgeRequest('/api/settings/continuity', { signal }), {}),
   ]);
   // Read health after diagnostics so the bundle does not count its own short-
   // lived readiness probes as active delegated work.
@@ -538,7 +542,7 @@ async function buildContextBundle({
     };
   }));
 
-  const runningRuns = listRuns(200).filter((run) => run.status === 'running');
+  const runningRuns = listRuns(200).filter((run) => ['running', 'pending'].includes(run.status));
   const bundle = {
     schemaVersion: 1,
     generatedAt: new Date().toISOString(),
@@ -562,6 +566,15 @@ async function buildContextBundle({
       runningRunsTotal: runningRuns.length,
       runningRunsTruncated: runningRuns.length > MAX_RUNNING_RUNS,
       pipelines: Array.isArray(workflowsRaw?.workflows) ? workflowsRaw.workflows : [],
+    },
+    continuity: {
+      settings: continuitySettingsRaw.settings || null,
+      coordinators: (coordinatorsRaw.coordinators || []).slice(0, 16).map((c) => ({ id: c.id, cwd: c.cwd,
+        objective: clip(c.objective || '', 500).text, owner: c.owner, state: c.state, epoch: c.epoch,
+        nextAction: c.nextAction, handoffEndpoint: c.handoffEndpoint })),
+      quota: (nativeRaw.observations || []).slice(0, 16).map((q) => ({ quotaSeat: q.quotaSeat,
+        percentRemaining: q.percentRemaining, freshness: q.freshness, source: q.source, protected: q.protected })),
+      detailTools: ['list_coordinators', 'get_coordinator', 'native_usage'],
     },
     sessions: {
       total: Array.isArray(sessionsRaw) ? sessionsRaw.length : 0,
@@ -591,7 +604,7 @@ async function buildContextBundle({
         'psbridge://evidence', 'psbridge://sessions', 'psbridge://collabs', 'psbridge://runs',
       ],
       note: 'This bundle is a bounded handoff. Use the named detail tools for omitted history or longer output; no secret token is included.',
-      cancellation: 'Cancellation is request-scoped only. Aborting an MCP call aborts its HTTP requests, and the bridge kills that provider process tree, but there is no job registry: a cancelled run is checkpointed as cancelled and cannot be resumed, and no tool can cancel a run started by a different MCP request.',
+      cancellation: 'Default provider calls return durable pending task handles when collection ends. Collect get_task_result with id=taskId; do not resubmit. cancel_task explicitly stops queued work and requests process termination. Direct explicitly timed calls retain request-scoped cancellation. External coordinators must checkpoint and explicitly yield; automatic successors do not acquire a writer lease.',
     },
     transfer: {
       requestedMaxChars: maxChars,
@@ -625,6 +638,11 @@ async function buildContextBundle({
   // Keep a reserve for the bundle ID, receipt ID, and size metadata added after
   // trimming so the final MCP payload stays inside the caller's character cap.
   const targetMaxChars = Math.max(1000, maxChars - 2048);
+  noteInitialOmission((coordinatorsRaw.coordinators || []).length > 16 || (nativeRaw.observations || []).length > 16, 'continuity detail beyond 16 entries; use named detail tools');
+  while (size() > targetMaxChars && (bundle.continuity.coordinators.length || bundle.continuity.quota.length)) {
+    if (bundle.continuity.coordinators.length) bundle.continuity.coordinators.pop(); else bundle.continuity.quota.pop();
+    noteInitialOmission(true, 'continuity summaries trimmed; use named detail tools');
+  }
   while (size() > targetMaxChars && bundle.recentReceipts.length) {
     bundle.recentReceipts.pop();
     bundle.transfer.truncated = true;
@@ -695,6 +713,9 @@ async function buildContextBundle({
     bundle.sessions.truncated = true;
     bundle.transfer.truncated = true;
     if (!bundle.transfer.omissions.includes('older session summaries')) bundle.transfer.omissions.push('older session summaries');
+  }
+  for (const [items, label] of [[bundle.activeWork.pipelines, 'pipeline summaries'], [bundle.providers, 'provider summaries'], [bundle.sectionErrors, 'section error detail']]) {
+    while (size() > targetMaxChars && items.length) { items.pop(); noteInitialOmission(true, `${label} trimmed; use named detail tools`); }
   }
   const contentHashMaterial = {
     ...bundle,
@@ -827,7 +848,8 @@ const PROVIDER_FAILURE_CLASSES = new Set([
   'stop_hook_prevented', 'blocking_limit', 'prompt_too_long',
   'provider_error', 'provider_protocol_error', 'output_cap', 'admission_limit', 'bridge_identity_mismatch',
   'incomplete_response', 'provider_incomplete_response', 'provider_refusal', 'token_budget', 'plan_restriction',
-  'client_cancelled', 'mcp_deadline_cancelled',
+  'client_cancelled', 'mcp_deadline_cancelled', 'quota_reserve', 'quota_unknown', 'assessor_stuck',
+  'account_identity_changed', 'coordinator_yielded', 'no_verdict',
   'validation', 'configuration', 'safe_filesystem_unverified',
   'safe_isolation_setup', 'isolation_cleanup', 'workspace_grounding',
   'account_registry_invalid', 'account_configuration_invalid',
@@ -1226,6 +1248,7 @@ export function sanitizeProviderResponse(response) {
     timedOut: !!response.timed_out,
     cancelled: !!response.cancelled,
     modelInvocation,
+    tokenUsageSource: modelInvocation === false ? 'not_invoked' : strictBoundedString(response.token_usage_source) || (modelInvocation === null ? 'unknown' : response.usage?.token_source || 'chars_div_4'),
     failureClass: PROVIDER_FAILURE_CLASSES.has(rawFailureClass) ? rawFailureClass : null,
     resultSubtype: strictBoundedString(response.result_subtype),
     outputDetector: normalizeOutputDetector(response.output_detector),
@@ -1359,7 +1382,7 @@ export function sanitizeProviderResponse(response) {
 }
 
 function providerSucceeded(response) {
-  return !!response &&
+  return !!response && response.pending !== true && response.terminal !== false && !response.partialResult &&
     response.exitCode === 0 &&
     !response.droppedOut &&
     !response.rateLimited &&
@@ -1534,8 +1557,11 @@ async function callProvider({
   cwd,
   requiresWorkspaceAccess,
   inlineEvidence,
+  continuityId,
+  continuityEpoch,
   semanticMaxChars,
-  timeoutMs = TIMEOUT_POLICY.oneShotDefaultMs,
+  timeoutMs,
+  collectionMs = 10000,
   useCache = true,
   cacheTtlMs,
   parentReceiptId,
@@ -1549,7 +1575,13 @@ async function callProvider({
   effort,
   maxEffortOverride = false,
 }) {
-  const requestId = `mcp:${crypto.randomUUID()}`;
+  const durableTaskId = timeoutMs === undefined ? `t_mcp_${crypto.randomBytes(12).toString('hex')}` : null;
+  const collectionOverride = Number(process.env.RELAYBRIDGE_COLLECTION_MS);
+  const collectionBudget = Number.isSafeInteger(collectionOverride) && collectionOverride >= 100 && collectionOverride <= 30000
+    ? Math.min(collectionOverride, collectionMs) : Math.min(30000, Math.max(100, collectionMs));
+  const collectionDeadlineAt = durableTaskId ? Date.now() + collectionBudget : null;
+  const collectionRemaining = () => Math.max(1, collectionDeadlineAt - Date.now());
+  const requestId = durableTaskId ? `queued:${durableTaskId}` : `mcp:${crypto.randomUUID()}`;
   const invocationId = requestId;
   const attemptId = `${requestId}:attempt:1`;
   const outerReceiptId = `rcpt_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 8)}`;
@@ -1584,7 +1616,7 @@ async function callProvider({
       body: { kind, prompt, outputProfile, cwd, requestId, model, execution, requiresWorkspaceAccess, inlineEvidence,
         taskTier: effectiveTaskTier, modelTier: effectiveModelTier,
         effort, maxEffortOverride, providerBudget, dangerous: false },
-      timeoutMs: TIMEOUT_POLICY.transportTimeoutMs(timeoutMs),
+      timeoutMs: durableTaskId ? collectionRemaining() : TIMEOUT_POLICY.transportTimeoutMs(timeoutMs),
       signal,
       actionIdentity: true,
     });
@@ -1692,6 +1724,63 @@ async function callProvider({
     }
   }
 
+  if (!sanitized && durableTaskId) {
+    let submission = null;
+    appendReceipt({ event: 'provider_submission_intent', status: 'prepared', taskId: durableTaskId,
+      provider: kind, requestId, invocationId, attemptId, parentReceiptId, purpose });
+    let handle = { taskId: durableTaskId, status: 'submission_unconfirmed', resultState: 'pending',
+      resultEndpoint: `/api/tasks/${durableTaskId}/result` };
+    const pending = () => {
+      const receipt = appendReceipt({ receiptId: outerReceiptId, event: 'provider_call', purpose,
+        parentReceiptId, provider: kind, status: 'pending', taskId: durableTaskId,
+        requestId, invocationId, attemptId });
+      return { ...handle, kind, pending: true, terminal: false, collectionExpired: Date.now() >= collectionDeadlineAt,
+        collectionStopReason: signal?.aborted ? 'collection_cancelled' : Date.now() >= collectionDeadlineAt ? 'collection_deadline' : 'collection_unavailable',
+        submissionConfirmed: !!submission,
+        cancelled: false, deadlineExceeded: false, requestId, invocationId, attemptId,
+        receiptId: receipt.receiptId, nextAction: 'Collect get_task_result with this taskId. Collection ending does not stop or resubmit the worker.' };
+    };
+    try {
+      handle = await bridgeRequest('/api/tasks', { method: 'POST', actionIdentity: true, signal, timeoutMs: collectionRemaining(),
+        body: { deliveryMode: 'queued', taskId: durableTaskId, kind, prompt, cwd, requiresWorkspaceAccess, inlineEvidence,
+          requestId, outerReceiptId, continuityId, continuityEpoch, expectedCwdIdentityHash: workspaceAdmission.cwdIdentityHash,
+          expectedCwdPolicyId: workspaceAdmission.cwdPolicyId,
+          ...(admittedPromptHash ? { expectedPromptHash: admittedPromptHash } : {}),
+          providerBudget, budgetTaskTier: effectiveTaskTier, taskTier: effectiveTaskTier,
+          modelTier: effectiveModelTier, model, execution: workspaceAdmission.execution,
+          effort, maxEffortOverride, dangerous: false } });
+      submission = handle;
+    } catch (error) {
+      // An uncertain POST is reconciled by its original durable ID, never replayed
+      // under a new identity. A definite pre-admission rejection remains an error.
+      if (error.status >= 400 && error.status < 500 && error.status !== 408) {
+        ({ sanitized, status } = bridgeFailureResult(error, { kind, signal }));
+      } else { try { handle = await bridgeRequest(handle.resultEndpoint, { timeoutMs: Math.min(3000, collectionRemaining()) }); } catch { return pending(); } }
+    }
+    if (!sanitized) {
+      const until = collectionDeadlineAt;
+      while (handle.resultState === 'pending' && Date.now() < until && !signal?.aborted) {
+        await new Promise((resolve) => setTimeout(resolve, Math.min(250, Math.max(1, until - Date.now()))));
+        try { handle = await bridgeRequest(handle.resultEndpoint, { timeoutMs: Math.min(3000, collectionRemaining()), signal }); } catch { return pending(); }
+      }
+      if (handle.resultState === 'pending' || signal?.aborted) return pending();
+      // Only the verified, redacted delivery projection supplies result text.
+      let task;
+      try { task = await bridgeRequest(`/api/tasks/${durableTaskId}`, { timeoutMs: Math.min(3000, collectionRemaining()) }); } catch { return pending(); }
+      const stored = task.task || task;
+      const complete = handle.resultState === 'persisted' && handle.status === 'done' && handle.metadata?.complete === true && handle.metadata?.partial !== true;
+      sanitized = sanitizeProviderResponse({ ...stored.providerMetadata, kind, stdout: handle.result || '', stderr: redactCheckpointSecrets(stored.stderr || '', 4000),
+        actionPreflight: submission?.actionPreflight,
+        dropped_out: !complete, exitCode: stored.exitCode, route: stored.route, usage: stored.usage,
+        receiptId: handle.metadata?.providerReceiptId || stored.receiptId,
+        ...stored.flags, failureClass: stored.failureClass, stop_reason: stored.stopReason,
+        partial_result: !complete, model_invocation: stored.execution?.state === 'not_invoked' ? false : stored.providerMetadata?.model_invocation ?? handle.metadata?.modelInvocation ?? null,
+        requestId, invocationId, attemptId });
+      sanitized.taskId = durableTaskId;
+      status = providerSucceeded(sanitized) ? 'completed' : sanitized.cancelled ? 'cancelled' : sanitized.timedOut ? 'timed_out' : 'dropped';
+    }
+  }
+
   if (!sanitized) try {
     const response = await bridgeRequest('/api/oneshot', {
       method: 'POST',
@@ -1703,6 +1792,8 @@ async function callProvider({
         inlineEvidence,
         requestId,
         outerReceiptId,
+        continuityId,
+        continuityEpoch,
         expectedCwdIdentityHash: workspaceAdmission.cwdIdentityHash,
         expectedCwdPolicyId: workspaceAdmission.cwdPolicyId,
         ...(admittedPromptHash ? { expectedPromptHash:admittedPromptHash } : {}),
@@ -1717,7 +1808,7 @@ async function callProvider({
         maxEffortOverride,
         dangerous: false,
       },
-      timeoutMs: TIMEOUT_POLICY.transportTimeoutMs(timeoutMs),
+      timeoutMs: durableTaskId ? collectionRemaining() : TIMEOUT_POLICY.transportTimeoutMs(timeoutMs),
       signal,
       actionIdentity: true,
     });
@@ -1738,6 +1829,10 @@ async function callProvider({
       : sanitized.timedOut ? 'timed_out' : status;
   }
 
+  if (admittedPromptHash && providerSucceeded(sanitized) && sanitized.route?.prompt_evidence?.effectiveHash !== admittedPromptHash) {
+    sanitized = { ...sanitized, droppedOut: true, failureClass: 'prompt_identity_changed', stdout: '',
+      stderr: 'Provider response does not match the admitted prompt identity.' }; status = 'dropped';
+  }
   const receipt = appendReceipt({
     receiptId: outerReceiptId,
     event: 'provider_call',
@@ -2022,7 +2117,7 @@ function numericBoundsOf(field, depth = 0) {
 
 export function buildServer() {
   const server = new McpServer({ name: 'relaybridge', version: PACKAGE.version }, {
-    instructions: 'Read before acting: call get_context_bundle when taking over existing work, then use bridge_status, list_providers, list_pipelines, and route_preview as needed. For staged code work, Codex owns orchestration and primary implementation: create one workflow, submit a bounded research brief, follow nextActions, use reconcile_pipeline while provider phases are active, and never overlap writer leases. get_pipeline is status-only and never spends provider quota. AI provider one-shots (ask_provider, route_and_ask, run_committee) always force dangerous:false, so they consume subscription quotas or local compute in the provider CLI\'s own safe/headless mode. Terminals are different: start_safe_session only forces the vendor bypass flags off, and start_safe_session(kind="powershell") opens a real host PowerShell shell running with your account\'s full privileges. Anything sent through send_session_input executes on the host with no sandbox and no filesystem confinement, so it needs host approval and human review. The /api/exec route, provider installs, and the global full-permissions toggle are not exposed as tools. Routing scores are operator preferences, not universal model-quality claims; use receipts and preserve the human gate for high-stakes work.',
+    instructions: 'Read before acting: call get_context_bundle when taking over existing work, then use bridge_status, list_providers, list_pipelines, and route_preview as needed. For long projects, use list_coordinators/register_coordinator and checkpoint_coordinator after decisions or completed work. Honor early yield instructions before quota exhaustion. A registered permitted successor may take over coordination. For staged code work, Codex normally owns orchestration and primary implementation: create one workflow, submit a bounded research brief, follow nextActions, use reconcile_pipeline while provider phases are active, and never overlap writer leases. get_pipeline is status-only and never spends provider quota. AI provider one-shots (ask_provider, route_and_ask, run_committee) always force dangerous:false, so they consume subscription quotas or local compute in the provider CLI\'s own safe/headless mode. Terminals are different: start_safe_session only forces the vendor bypass flags off, and start_safe_session(kind="powershell") opens a real host PowerShell shell running with your account\'s full privileges. Anything sent through send_session_input executes on the host with no sandbox and no filesystem confinement, so it needs host approval and human review. The /api/exec route, provider installs, and the global full-permissions toggle are not exposed as tools. Routing scores are operator preferences, not universal model-quality claims; use receipts and preserve the human gate for high-stakes work.',
     capabilities: { tools: {}, resources: {} },
     cacheHints: {
       'tools/list': { ttlMs: 60000, cacheScope: 'private' },
@@ -2092,7 +2187,7 @@ export function buildServer() {
       localOnly: z.boolean().default(false),
       maxProviders: z.number().int().min(1).max(4).optional(),
       committeeMode: z.enum(['advisory', 'consensus']).default('advisory'),
-      timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).max(TIMEOUT_POLICY.oneShotMaxMs).default(TIMEOUT_POLICY.oneShotDefaultMs),
+      timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).max(TIMEOUT_POLICY.oneShotMaxMs).optional(),
       dangerous: z.boolean().default(false).describe('preview the explicit writer route instead of normal safe routing'),
       acknowledgeFilesystemWrites: z.boolean().default(false).describe('required with dangerous=true; confirms persistent writes are authorized'),
     }),
@@ -2140,7 +2235,7 @@ export function buildServer() {
       model: z.string().min(1).max(160).optional().describe('exact configured or available model; never silently substituted'),
       modelTier: z.enum(MODEL_TIERS).optional(),
       providerBudget: PROVIDER_BUDGET_SCHEMA.nullish(),
-      timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).max(TIMEOUT_POLICY.oneShotMaxMs).default(TIMEOUT_POLICY.oneShotDefaultMs).describe('runtime deadline to use when previewing the provider invocation'),
+      timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).max(TIMEOUT_POLICY.oneShotMaxMs).optional().describe('runtime deadline to use when previewing the provider invocation'),
       dangerous: z.boolean().default(false).describe('plan an explicit writer-capable provider invocation'),
       acknowledgeFilesystemWrites: z.boolean().default(false).describe('required with dangerous=true; confirms persistent writes are authorized'),
     }),
@@ -2447,14 +2542,16 @@ export function buildServer() {
 
   server.registerTool('ask_provider', {
     title: 'Ask one provider safely',
-    description: 'Run one bounded, non-agentic provider turn with dangerous:false forced, available route metadata, cache controls, quota/failure signals, and an append-only receipt. The provider CLI runs in its own safe/headless mode, which is a vendor-side restriction rather than an OS sandbox. Hosted CLIs may not reveal final model revisions, usage, plan, or provider request IDs.',
+    description: 'Run one safe provider turn; omitted timeout uses a durable task and may return a pending taskId after bounded collection. An explicit timeout is a hard deadline. Run one bounded, non-agentic provider turn with dangerous:false forced, available route metadata, cache controls, quota/failure signals, and an append-only receipt. The provider CLI runs in its own safe/headless mode, which is a vendor-side restriction rather than an OS sandbox. Hosted CLIs may not reveal final model revisions, usage, plan, or provider request IDs.',
     inputSchema: z.object({
       outputProfile: OUTPUT_PROFILE_SCHEMA.optional(),
       ...GROUNDING_FIELDS,
+      continuityId: z.string().regex(/^ct_[a-f0-9]{24}$/).optional(),
+      continuityEpoch: z.number().int().min(1).optional(),
       kind: z.string().min(1).max(64),
       prompt: z.string().min(1).max(100000),
       cwd: z.string().max(1000).optional(),
-      timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).max(TIMEOUT_POLICY.oneShotMaxMs).default(TIMEOUT_POLICY.oneShotDefaultMs),
+      timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).max(TIMEOUT_POLICY.oneShotMaxMs).optional(),
       useCache: z.boolean().default(true),
       cacheTtlMs: z.number().int().min(0).max(86400000).optional(),
       providerBudget: PROVIDER_BUDGET_SCHEMA.nullish(),
@@ -2495,7 +2592,7 @@ export function buildServer() {
       excludedProviders: z.array(z.string()).max(8).default([]),
       localOnly: z.boolean().default(false),
       maxEscalations: z.number().int().min(0).max(3).default(2),
-      timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).max(TIMEOUT_POLICY.oneShotMaxMs).default(TIMEOUT_POLICY.oneShotDefaultMs),
+      timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).max(TIMEOUT_POLICY.oneShotMaxMs).optional(),
       useCache: z.boolean().default(true),
       acknowledgeHumanGate: z.boolean().default(false),
       allowModelForDeterministic: z.boolean().default(false),
@@ -2507,7 +2604,7 @@ export function buildServer() {
     annotations: EXTERNAL_ACTION,
   }, safeHandler(async (args, context) => {
     const signal = context?.mcpReq?.signal;
-    const requestedDeadlineAt = Date.now() + args.timeoutMs;
+    const requestedDeadlineAt = Date.now() + (args.timeoutMs ?? 30000);
     const route = await getAccountAwareRoute({
       ...args,
       excludedProviders: [...args.excludedProviders, 'powershell'],
@@ -2597,7 +2694,8 @@ export function buildServer() {
         cwd: args.cwd,
         requiresWorkspaceAccess: args.requiresWorkspaceAccess, inlineEvidence: args.inlineEvidence,
         semanticMaxChars: tierPolicy.maxInputChars,
-        timeoutMs: remainingTime(deadlineAt),
+        timeoutMs: args.timeoutMs === undefined ? undefined : remainingTime(deadlineAt),
+        collectionMs: remainingTime(deadlineAt),
         useCache: args.useCache,
         parentReceiptId: rootReceipt.receiptId,
         purpose: 'route_and_ask',
@@ -2611,6 +2709,12 @@ export function buildServer() {
         maxEffortOverride: args.maxEffortOverride,
       });
       attempts.push(response);
+      if (response.pending) {
+        run = writeRun({ ...run, status: 'pending', members: attempts, deadlineAt: null });
+        return result({ ok: false, pending: true, terminal: false, status: 'pending', runId: run.runId,
+          attempts, winner: null, pendingTasks: attempts.filter((r) => r.pending), receiptId: rootReceipt.receiptId,
+          nextAction: 'Collect the exact task result. No fallback was dispatched.' });
+      }
       run = writeRun({ ...run, status: 'running', members: attempts });
       if (providerSucceeded(response)) break;
       // A cwd policy rejection is deterministic and provider-independent.
@@ -2665,7 +2769,7 @@ export function buildServer() {
       mode: z.enum(['advisory', 'consensus']).default(loadRoutingData().policy.committee.defaultMode),
       maxProviders: z.number().int().min(1).max(4).default(3),
       localOnly: z.boolean().default(false),
-      timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).max(TIMEOUT_POLICY.oneShotMaxMs).default(TIMEOUT_POLICY.oneShotDefaultMs),
+      timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).max(TIMEOUT_POLICY.oneShotMaxMs).optional(),
       useCache: z.boolean().default(true),
       synthesisProvider: z.string().max(64).optional(),
       acknowledgeHumanGate: z.boolean().default(false),
@@ -2677,7 +2781,7 @@ export function buildServer() {
     annotations: EXTERNAL_ACTION,
   }, safeHandler(async (args, context) => {
     const signal = context?.mcpReq?.signal;
-    const requestedDeadlineAt = Date.now() + args.timeoutMs;
+    const requestedDeadlineAt = Date.now() + (args.timeoutMs ?? 30000);
     const route = await getAccountAwareRoute({
       task: args.task,
       outputProfile: args.outputProfile,
@@ -2799,7 +2903,8 @@ export function buildServer() {
           cwd: args.cwd,
           requiresWorkspaceAccess: args.requiresWorkspaceAccess, inlineEvidence: args.inlineEvidence,
           semanticMaxChars: tierPolicy.maxInputChars,
-          timeoutMs: remainingTime(deadlineAt),
+          timeoutMs: args.timeoutMs === undefined ? undefined : remainingTime(deadlineAt),
+        collectionMs: remainingTime(deadlineAt),
           useCache: args.useCache,
           parentReceiptId: rootReceipt.receiptId,
           purpose: `committee:${role}`,
@@ -2830,6 +2935,13 @@ export function buildServer() {
     const members = settledMembers.map((settled, index) => settled.status === 'fulfilled'
       ? settled.value
       : (membersByIndex[index] || { kind: eligible[index].kind, role: roles[Math.min(index, roles.length - 1)], exitCode: -1, droppedOut: true, stdout: '', stderr: settled.reason?.message || String(settled.reason), failureClass: signal?.aborted ? 'cancelled' : 'adapter_error', cancelled: !!signal?.aborted }));
+    if (members.some((member) => member.pending)) {
+      run = writeRun({ ...run, status: 'pending', members, deadlineAt: null });
+      return result({ ok: false, pending: true, terminal: false, status: 'pending', runId: run.runId,
+        members, pendingTasks: members.filter((member) => member.pending), synthesis: null,
+        synthesisCompleted: false, consensusAchieved: false, consensusVerdict: 'unknown',
+        receiptId: rootReceipt.receiptId, nextAction: 'Collect the exact member tasks before requesting synthesis; no chair was dispatched.' });
+    }
     const successes = members.filter(providerSucceeded);
     let synthesis = null;
     let synthesisAssessment = null;
@@ -2871,7 +2983,8 @@ export function buildServer() {
           cwd: args.cwd,
           requiresWorkspaceAccess: args.requiresWorkspaceAccess, inlineEvidence: args.inlineEvidence,
           semanticMaxChars: policy.committee.maxSynthesisChars,
-          timeoutMs: remainingTime(deadlineAt),
+          timeoutMs: args.timeoutMs === undefined ? undefined : remainingTime(deadlineAt),
+        collectionMs: remainingTime(deadlineAt),
           useCache: args.useCache,
           parentReceiptId: rootReceipt.receiptId,
           purpose: 'committee:chair',
@@ -2884,6 +2997,12 @@ export function buildServer() {
           effort: args.effort,
           maxEffortOverride: args.maxEffortOverride,
         });
+        if (synthesis?.pending) {
+          run = writeRun({ ...run, status: 'pending', members, synthesis, deadlineAt: null });
+          return result({ ok: false, pending: true, terminal: false, status: 'pending', runId: run.runId,
+            members, synthesis, pendingTasks: [synthesis], synthesisCompleted: false, consensusAchieved: false,
+            consensusVerdict: 'unknown', receiptId: rootReceipt.receiptId });
+        }
         if (providerSucceeded(synthesis)) synthesisAssessment = parseChairAssessment(synthesis.stdout);
       }
     }
@@ -3003,7 +3122,7 @@ export function buildServer() {
       providers: z.array(z.string()).max(16).default([]),
       all: z.boolean().default(false),
       cwd: z.string().max(1000).optional(),
-      timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).max(TIMEOUT_POLICY.oneShotMaxMs).default(TIMEOUT_POLICY.oneShotDefaultMs),
+      timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).max(TIMEOUT_POLICY.oneShotMaxMs).optional(),
       providerBudget: PROVIDER_BUDGET_SCHEMA.nullish(),
       taskTier: z.enum(TASK_TIERS).optional(),
       modelTier: z.enum(MODEL_TIERS).optional(),
@@ -3254,12 +3373,13 @@ export function buildServer() {
     description: 'After planning is ready, give Codex the one writer lease for this canonical workspace. Preserve the returned lease token until completion or renewal.',
     inputSchema: z.object({
       runId: workflowIdSchema,
+      actor: z.enum(['codex', 'claude']).default('codex'),
       leaseMs: z.number().int().min(60000).max(86400000).optional(),
     }),
     annotations: ACTION,
-  }, safeHandler(async ({ runId, leaseMs }, context) => result(await bridgeRequest(
+  }, safeHandler(async ({ runId, leaseMs, actor }, context) => result(await bridgeRequest(
     `/api/workflows/${encodeURIComponent(runId)}/implementation/claim`, {
-      method: 'POST', body: { actor: 'codex', ...(leaseMs == null ? {} : { leaseMs }) },
+      method: 'POST', body: { actor, ...(leaseMs == null ? {} : { leaseMs }) },
       signal: context?.mcpReq?.signal, actionIdentity: true,
     },
   ))));
@@ -3269,13 +3389,14 @@ export function buildServer() {
     description: 'Release Codex\'s writer lease, store exact changed-file and verification evidence, and queue one fresh read-only review using the persisted profile.',
     inputSchema: z.object({
       runId: workflowIdSchema,
+      actor: z.enum(['codex', 'claude']).default('codex'),
       leaseToken: z.string().regex(/^[a-f0-9]{64}$/),
       markdown: z.string().min(1).max(100000),
     }),
     annotations: EXTERNAL_ACTION,
-  }, safeHandler(async ({ runId, leaseToken, markdown }, context) => result(await bridgeRequest(
+  }, safeHandler(async ({ runId, leaseToken, markdown, actor }, context) => result(await bridgeRequest(
     `/api/workflows/${encodeURIComponent(runId)}/implementation/complete`, {
-      method: 'POST', body: { actor: 'codex', leaseToken, markdown },
+      method: 'POST', body: { actor, leaseToken, markdown },
       signal: context?.mcpReq?.signal, actionIdentity: true,
     },
   ))));
@@ -3402,6 +3523,63 @@ export function buildServer() {
     inputSchema: z.object({}).strict(), annotations: READ_ONLY,
   }, safeHandler(async (_input, context) => result(await bridgeRequest('/api/requests', { signal: context?.mcpReq?.signal }))));
 
+  const continuityIdSchema = z.string().regex(/^ct_[a-f0-9]{24}$/);
+  const continuityCheckpointSchema = z.object(Object.fromEntries(
+    ['decisions', 'completed', 'pending', 'files', 'tests', 'nextActions', 'baseRevision']
+      .map((key) => [key, z.string().max(12000).optional()]))).strict();
+  const continuityOwnerFields = { ownerToken: z.string().regex(/^[a-f0-9]{64}$/), epoch: z.number().int().min(1),
+    checkpoint: continuityCheckpointSchema };
+  server.registerTool('get_continuity_settings', { title: 'Read usage protection settings',
+    description: 'Read default-on quota reserve, automatic handoff and dynamic supervision settings without invoking a model.',
+    inputSchema: z.object({}).strict(), annotations: READ_ONLY,
+  }, safeHandler(async () => result(await bridgeRequest('/api/settings/continuity'))));
+  server.registerTool('set_continuity_settings', { title: 'Set usage protection and supervision',
+    description: 'Persist usage protection, reserve (2–5 percent), automatic handoff, dynamic supervision and bounded low-tier assessments. Disabled protection does not erase checkpoints or quota evidence.',
+    inputSchema: z.object({ usageProtection: z.boolean().optional(), reservePercent: z.number().min(2).max(5).optional(),
+      autoHandoff: z.boolean().optional(), dynamicSupervision: z.boolean().optional(), assessorEnabled: z.boolean().optional() }).strict(), annotations: ACTION,
+  }, safeHandler(async (input) => result(await bridgeRequest('/api/settings/continuity', { method: 'PUT', body: input, actionIdentity: true }))));
+  server.registerTool('native_usage', { title: 'Read native subscription allowance',
+    description: 'Read applicable native quota windows, reset, source, freshness and measured percentage depletion. Unknown is not a remaining allowance estimate.',
+    inputSchema: z.object({}).strict(), annotations: READ_ONLY,
+  }, safeHandler(async () => result(await bridgeRequest('/api/usage/native'))));
+  server.registerTool('refresh_native_usage', { title: 'Refresh native allowance without generation',
+    description: 'Request a bounded native Codex account RPC, rate-limited to once per minute. No thread, turn, model call or credential read. Claude data is supplied by its passive stream/statusline.',
+    inputSchema: z.object({}).strict(), annotations: ACTION,
+  }, safeHandler(async () => result(await bridgeRequest('/api/usage/native/refresh', { method: 'POST', body: {}, actionIdentity: true, timeoutMs: 90000 }))));
+  server.registerTool('register_coordinator', { title: 'Register a project coordinator and durable handoff',
+    description: 'Register once per canonical workspace. External mode continuously checkpoints a cooperating host agent; managed mode launches a bounded read-only delegator through the task queue. For retryable external registration, generate and retain ownerToken before the call and retry with identical inputs. Preserve specific project provider/model restrictions. Managed delegation does not grant write permission.',
+    inputSchema: z.object({ cwd: z.string().min(1).max(1024), objective: z.string().min(1).max(12000),
+      constraints: z.string().max(12000).optional(), fileScope: z.array(z.string().max(500)).max(128).optional(),
+      kind: z.string().min(1).max(64), allowedProviders: z.array(z.string().min(1).max(64)).min(1).max(8),
+      model: z.string().min(1).max(160).optional(), accountId: z.string().min(1).max(100).optional(),
+      mode: z.enum(['external', 'managed']).default('external'), modelTier: z.enum(['light', 'standard', 'heavy']).default('standard'),
+      effort: z.enum(EFFORT_LEVELS).default('medium'), workflowId: workflowIdSchema.optional(), checkpoint: continuityCheckpointSchema.optional(),
+      ownerToken: z.string().regex(/^[a-f0-9]{64}$/).optional() }).strict(), annotations: EXTERNAL_ACTION,
+  }, safeHandler(async (input) => result(await bridgeRequest('/api/continuity', { method: 'POST', body: input, actionIdentity: true }))));
+  server.registerTool('list_coordinators', { title: 'List durable project coordinators',
+    description: 'Read current coordinator, handoff state and ownership generation; status reads never dispatch successors or assessors.',
+    inputSchema: z.object({}).strict(), annotations: READ_ONLY,
+  }, safeHandler(async () => result(await bridgeRequest('/api/continuity'))));
+  server.registerTool('get_coordinator', { title: 'Read one project handoff',
+    description: 'Read the complete durable checkpoint and task references by continuity id, without resuming work.',
+    inputSchema: z.object({ id: continuityIdSchema }).strict(), annotations: READ_ONLY,
+  }, safeHandler(async ({ id }) => result(await bridgeRequest(`/api/continuity/${id}`))));
+  server.registerTool('checkpoint_coordinator', { title: 'Save current coordinator decisions and progress',
+    description: 'Persist completed/pending work, decisions, files, tests and next actions throughout the project. Retain ownerToken and epoch. If state is awaiting_owner_release, stop new work and prepare to yield before allowance runs out.',
+    inputSchema: z.object({ id: continuityIdSchema, ...continuityOwnerFields }).strict(), annotations: ACTION,
+  }, safeHandler(async ({ id, ...input }) => result(await bridgeRequest(`/api/continuity/${id}/checkpoint`, { method: 'POST', body: input, actionIdentity: true }))));
+  server.registerTool('checkpoint_and_yield', { title: 'Checkpoint and explicitly release the current coordinator',
+    description: 'Use only after this host agent and every owned writer have stopped new work. Persist the handoff and explicit release evidence; optionally release an unfinished external pipeline writer using its exact lease token. The bridge cannot stop or change the model of your host chat. A permitted managed successor may be dispatched after release.',
+    inputSchema: z.object({ id: continuityIdSchema, ...continuityOwnerFields,
+      releaseEvidence: z.string().min(1).max(2000), writerLeaseToken: z.string().regex(/^[a-f0-9]{64}$/).optional() }).strict(), annotations: EXTERNAL_ACTION,
+  }, safeHandler(async ({ id, ...input }) => result(await bridgeRequest(`/api/continuity/${id}/yield`, { method: 'POST', body: input, actionIdentity: true }))));
+  server.registerTool('resume_from_checkpoint', { title: 'Take over a released project as an external coordinator',
+    description: 'Acquire a new ownership generation after the previous coordinator has physically settled or explicitly released. Requires an originally permitted comparable provider with verified fresh headroom. Supply a new caller-held ownerToken plus expectedEpoch for safe identical retries after a lost response. Omitted model/account retain the current route when kind is unchanged. Returns the durable document and new owner token; does not change this host chat model or grant a writer lease.',
+    inputSchema: z.object({ id: continuityIdSchema, kind: z.string().min(1).max(64),
+      model: z.string().min(1).max(160).optional(), accountId: z.string().min(1).max(100).optional(),
+      ownerToken: z.string().regex(/^[a-f0-9]{64}$/).optional(), expectedEpoch: z.number().int().min(1).optional() }).strict(), annotations: ACTION,
+  }, safeHandler(async ({ id, ...input }) => result(await bridgeRequest(`/api/continuity/${id}/resume`, { method: 'POST', body: input, actionIdentity: true }))));
+
   server.registerTool('submit_task', {
     title: 'Submit a background task',
     description: 'Queue a prompt to a provider and return a task id IMMEDIATELY without waiting for the run. Use for work longer than a chat turn, or when the result should be collectable later from a different surface. Link a collab id to append the result to that shared thread.',
@@ -3410,9 +3588,12 @@ export function buildServer() {
       taskId: z.string().regex(/^t_[A-Za-z0-9_]{1,120}$/).optional(),
       outputProfile: OUTPUT_PROFILE_SCHEMA.optional(),
       ...GROUNDING_FIELDS,
+      continuityId: z.string().regex(/^ct_[a-f0-9]{24}$/).optional(),
+      continuityEpoch: z.number().int().min(1).optional(),
       kind: z.string().min(1).max(64), prompt: z.string().min(1).max(100000),
       collab: z.string().max(64).optional(), title: z.string().max(120).optional(),
       cwd: z.string().max(1024).optional(), user: z.string().max(64).optional(),
+      timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).max(TIMEOUT_POLICY.oneShotMaxMs).optional(),
       providerBudget: PROVIDER_BUDGET_SCHEMA.nullish(),
       notBefore: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
       dependsOn: z.array(z.string().regex(/^t_[A-Za-z0-9_]+$/)).max(64).optional(),

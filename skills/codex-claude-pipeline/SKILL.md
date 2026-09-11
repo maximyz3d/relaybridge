@@ -108,3 +108,10 @@ Use `get_pipeline` as the sole side-effect-free status read for an active
 pipeline. Use identity-gated `reconcile_pipeline` only when `nextActions` names
 it; that operation may settle or dispatch provider work. A slow phase is not
 permission to start another copy.
+
+## Usage-aware coordination
+
+Use the [continuity protocol](../../docs/CONTINUITY.md) to checkpoint meaningful milestones and explicitly yield
+an unfinished project before native allowance runs out. A coordinator transfer
+preserves provider restrictions, writer exclusivity and fresh review gates.
+Managed successors do not acquire implementation authority automatically.

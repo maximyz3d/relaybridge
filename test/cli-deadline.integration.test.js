@@ -39,7 +39,7 @@ test('Gemini deadline is identical in REST/CLI/MCP plans, dispatched argv, and r
       assert.equal(planned.status, 200, JSON.stringify(planned.body));
       const primary = planned.body.primary;
       assert.equal(primary.validation, null, JSON.stringify(primary));
-      assert.equal(primary.effectiveTimeoutMs, timeoutMs === 4000 ? 4000 : 2700000);
+      assert.equal(primary.effectiveTimeoutMs, timeoutMs === undefined ? null : timeoutMs === 4000 ? 4000 : 2700000);
       const body = buildAskBody(planned.body, task, bridge.root);
       assert.equal(body.timeoutMs, timeoutMs);
       const result = await bridge.request('/api/oneshot', { ...body, dangerous });
@@ -64,7 +64,7 @@ test('Gemini deadline is identical in REST/CLI/MCP plans, dispatched argv, and r
   const call = async (name, args) => (await client.callTool({ name, arguments: args })).structuredContent;
   for (const timeoutMs of [undefined, 4000]) {
     const plan = await call('plan_task', { task, kind: 'gemini', cwd: bridge.root, timeoutMs });
-    assert.equal(plan.primary.effectiveTimeoutMs, timeoutMs || 1200000);
+    assert.equal(plan.primary.effectiveTimeoutMs, timeoutMs ?? null);
     const result = await call('ask_provider', { kind: 'gemini', prompt: task, cwd: bridge.root,
       timeoutMs, execution: plan.primary.execution, useCache: false });
     assert.equal(result.exitCode, 0, JSON.stringify(result));

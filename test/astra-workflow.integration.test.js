@@ -20,6 +20,7 @@ test('REST workflow carries Astra/ultra through the real queue and argv without 
     const codex = structuredClone(require('../cli-config.json').codex);
     codex.oneshot_safe = [process.execPath, script, '-'];
     codex.oneshot_dangerous = [];
+    codex.oneshot_output_parser = 'text';
     delete codex.probe; delete codex.version_probe;
     return { _models: { discoverOnBoot: false }, codex };
   }, { env: { RELAYBRIDGE_WARM_DIAG: '0', RELAYBRIDGE_REMOTE_MCP: '0' } });
