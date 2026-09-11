@@ -243,6 +243,83 @@ function Test-SamePath([string]$Left, [string]$Right) {
   return [string]::Equals((Get-NormalizedPath $Left), (Get-NormalizedPath $Right), [StringComparison]::OrdinalIgnoreCase)
 }
 
+function Split-WindowsCommandLine([string]$CommandLine) {
+  if (-not $CommandLine -or $CommandLine.Length -gt 32768) { return @() }
+  if (-not ('RelayBridgeInstallArgv' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class RelayBridgeInstallArgv {
+  [DllImport("shell32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+  public static extern IntPtr CommandLineToArgvW(string commandLine, out int count);
+  [DllImport("kernel32.dll")]
+  public static extern IntPtr LocalFree(IntPtr memory);
+}
+'@
+  }
+  $count = 0
+  $memory = [RelayBridgeInstallArgv]::CommandLineToArgvW($CommandLine, [ref]$count)
+  if ($memory -eq [IntPtr]::Zero) { throw 'install_preflight_unavailable: command-line parser failed' }
+  try {
+    $values = @()
+    # Ownership needs only executable and script. Long trailing argument lists
+    # must not hide an otherwise exact MCP registration.
+    for ($index = 0; $index -lt [Math]::Min($count, 2); $index++) {
+      $values += [Runtime.InteropServices.Marshal]::PtrToStringUni([Runtime.InteropServices.Marshal]::ReadIntPtr($memory, $index * [IntPtr]::Size))
+    }
+    return $values
+  } finally { $null = [RelayBridgeInstallArgv]::LocalFree($memory) }
+}
+
+function ConvertTo-InstallMcpHolder([string]$InstallRoot, $ProcessRow) {
+  if ([string]$ProcessRow.Name -ine 'node.exe') { return $null }
+  $arguments = @(Split-WindowsCommandLine ([string]$ProcessRow.CommandLine))
+  # Installer registrations use node plus one absolute script. A path inside
+  # an unrelated program's later arguments is not ownership evidence.
+  if ($arguments.Count -lt 2 -or $arguments[1] -notmatch '^(?:[A-Za-z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+[\\/])') { return $null }
+  foreach ($entry in @('server.mjs', 'launcher.mjs')) {
+    $expected = Join-Path $InstallRoot ('mcp\' + $entry)
+    if (Test-SamePath $arguments[1] $expected) {
+      return [pscustomobject]@{ pid = [int]$ProcessRow.ProcessId; parentPid = [int]$ProcessRow.ParentProcessId;
+        createdAt = [string]$ProcessRow.CreationDate; image = 'node.exe';
+        role = $(if ($entry -eq 'launcher.mjs') { 'mcp_launcher' } else { 'mcp_adapter' });
+        script = Get-NormalizedPath $expected; evidence = 'active_registered_mcp_process' }
+    }
+  }
+  return $null
+}
+
+function Get-InstallMcpProcessRows {
+  Get-CimInstance -ClassName Win32_Process -Filter "Name='node.exe'" -Property ProcessId,ParentProcessId,Name,CommandLine,CreationDate -OperationTimeoutSec 10 -ErrorAction Stop
+}
+
+function Get-InstallMcpHolders([string]$InstallRoot) {
+  $holders = @(); $seen = @{}; $rows = 0; $count = 0
+  try {
+    foreach ($row in (Get-InstallMcpProcessRows)) {
+      $rows++
+      if ($rows -gt 4096) { throw 'process census limit' }
+      $holder = ConvertTo-InstallMcpHolder $InstallRoot $row
+      if ($null -eq $holder -or $seen.ContainsKey($holder.pid)) { continue }
+      $seen[$holder.pid] = $true; $count++
+      if ($holders.Count -lt 32) { $holders += $holder }
+    }
+  } catch { throw 'install_preflight_unavailable: native MCP process census could not be completed; retry before updating.' }
+  return [pscustomobject]@{ holderCount = $count; holders = $holders; truncated = $count -gt $holders.Count;
+    coverage = 'supported_absolute_mcp_registrations'; kernelLockVerified = $false }
+}
+
+function Assert-InstallRootMcpAvailable([string]$InstallRoot, [string]$Phase) {
+  $evidence = Get-InstallMcpHolders $InstallRoot
+  if ($evidence.holderCount -eq 0) { return }
+  $detail = [ordered]@{ failureClass = 'install_root_locked'; phase = $Phase;
+    holderCount = $evidence.holderCount; holders = $evidence.holders; truncated = $evidence.truncated;
+    evidence = 'active_registered_mcp_process'; kernelLockVerified = $false; recovery = 'disconnect_mcp_then_retry' }
+  $exception = [InvalidOperationException]::new('install_root_locked: active RelayBridge MCP clients can retain the install directory. Disconnect these hosts, rerun the update, then reconnect. ' + ($detail | ConvertTo-Json -Depth 5 -Compress))
+  $exception.Data['failureClass'] = 'install_root_locked'
+  throw $exception
+}
+
 function Get-Sha256([string]$Path) {
   $stream = [IO.File]::OpenRead($Path)
   $sha = [Security.Cryptography.SHA256]::Create()
@@ -1058,7 +1135,18 @@ function Move-InstallRootForCutover([string]$FromRoot, [string]$ToRoot) {
       return
     } catch {
       $nativeCode = $_.Exception.GetBaseException().HResult -band 0xffff
-      if ($nativeCode -notin @(32, 33) -or $attempt -eq 49) { throw }
+      if ($nativeCode -notin @(32, 33)) { throw }
+      if ($attempt -eq 49) {
+        $original = $_.Exception
+        $evidence = [pscustomobject]@{ holderCount = $null; holders = @(); truncated = $false; coverage = 'unavailable' }
+        try { $evidence = Get-InstallMcpHolders $FromRoot } catch { }
+        $detail = [ordered]@{ failureClass = 'install_root_locked'; phase = 'rename'; nativeCode = $nativeCode;
+          holderCount = $evidence.holderCount; holders = $evidence.holders; truncated = $evidence.truncated;
+          coverage = $evidence.coverage; kernelLockVerified = $false; recovery = 'disconnect_mcp_then_retry' }
+        $exception = [IO.IOException]::new('install_root_locked: Windows still holds the exact cutover directory. ' + ($detail | ConvertTo-Json -Depth 5 -Compress), $original)
+        $exception.Data['failureClass'] = 'install_root_locked'
+        throw $exception
+      }
       Start-Sleep -Milliseconds 100
     }
   }
@@ -1191,6 +1279,7 @@ $legacyRegistrySource = if ($hadExistingInstall) {
 
 New-Item -ItemType Directory -Path $tempRoot, $extractRoot -Force | Out-Null
 try {
+  if ($hadExistingInstall) { Assert-InstallRootMcpAvailable $InstallDir 'preflight' }
   if ($SourceDir) {
     $sourceRootPath = Get-NormalizedPath $SourceDir
     if (-not (Test-Path -LiteralPath $sourceRootPath -PathType Container)) { throw "SourceDir is not a directory: $sourceRootPath" }
@@ -1235,7 +1324,9 @@ try {
   Assert-NoInjectedInstallFailure 'after-stage'
 
   if ($runtimeSource) {
+    if ($hadExistingInstall) { Assert-InstallRootMcpAvailable $InstallDir 'before_shutdown' }
     $oldHealth = Stop-BridgeForCutover $runtimeSource $Port ([ref]$oldHealth)
+    if ($hadExistingInstall) { Assert-InstallRootMcpAvailable $InstallDir 'before_runtime_move' }
     # Capture any operator edits made while staging, after the old process has
     # drained and immediately before the atomic promotion.
     Merge-OperatorConfiguration $stageRoot $runtimeSource

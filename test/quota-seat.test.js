@@ -209,7 +209,7 @@ test('one operator observation is shared by every alias while model vendor evide
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test('a shared cooldown blocks every alias except the explicitly requested provider', () => {
+test('a shared cooldown blocks every alias including an explicitly requested provider', () => {
   const diagnostics = {
     claude: { found: true, ready: true },
     claude_fable: { found: true, ready: true },
@@ -226,6 +226,6 @@ test('a shared cooldown blocks every alias except the explicitly requested provi
 
   const explicit = applyCooldownsToDiagnostics(diagnostics, cooling, ['claude_fable']);
   assert.equal(explicit.diagnostics.claude.ready, false);
-  assert.equal(explicit.diagnostics.claude_fable.ready, true);
-  assert.deepEqual(explicit.skipped, ['claude']);
+  assert.equal(explicit.diagnostics.claude_fable.ready, false);
+  assert.deepEqual(explicit.skipped, ['claude', 'claude_fable']);
 });

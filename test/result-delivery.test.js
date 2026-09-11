@@ -61,7 +61,9 @@ test('recognized environment credentials are redacted without erasing evidence h
 
 test('failure, partial, missing and contradictory output never becomes a complete answer', () => {
   for (const fields of [{ ok: false }, { partial_result: true }, { dropped_out: true }, { failureClass: 'timeout' },
-    { error: 'provider failed' }, { exitCode: 2 }, { auth_failed: true }, { budget_exceeded: true }, { timed_out: true }]) {
+    { error: 'provider failed' }, { exitCode: 2 }, { auth_failed: true }, { budget_exceeded: true }, { timed_out: true },
+    { stdout_truncated: true }, { stdoutTruncated: true }, { prompt_truncated: true },
+    { route: { prompt_truncated: true } }, { route: { prompt_evidence: { truncated: true } } }]) {
     const value = sanitizeResult(payload({ ...fields, provider_terminal_reason: 'end_turn' }), false, taskRecord());
     assert.equal(value.metadata.complete, false); assert.equal(value.metadata.partial, true);
     assert.equal(value.metadata.providerCompleted, null);
@@ -192,4 +194,63 @@ test('acknowledging a corrupt file cannot overwrite a different task', t => {
   const before = [fs.readFileSync(source), fs.readFileSync(victim)];
   assert.throws(() => q.acknowledgeResult('t_source', { receiptStoreId: STORE, sha256: record.resultEnvelope.sha256 }), { code: 'DELIVERY_UNAVAILABLE' });
   assert.deepEqual([fs.readFileSync(source), fs.readFileSync(victim)], before);
+});
+
+test('delivery receipts repair after restart without provider replay or duplicate acknowledgement', async t => {
+  const { deliveryReceipts, createDeliveryReceiptSink } = require('../lib/delivery-receipts');
+  const receipts = fs.mkdtempSync(path.join(os.tmpdir(), 'rb-delivery-receipts-'));
+  t.after(() => fs.rmSync(receipts, { recursive: true, force: true }));
+  let unavailable = true;
+  const sink = createDeliveryReceiptSink({ directory: receipts, append: receipt => {
+    if (unavailable) throw new Error('fixture disk unavailable');
+    fs.appendFileSync(path.join(receipts, receipt.timestamp.slice(0, 10) + '.jsonl'), JSON.stringify(receipt) + '\n');
+  } });
+  const { q, opts, calls } = queue(t, { appendDeliveryReceipt: sink });
+  q.submitDurable('t_delivery_receipts', { kind: input.kind, prompt: input.prompt });
+  const done = await finished(q, 't_delivery_receipts');
+  assert.equal(done.status, 'done'); assert.equal(calls(), 1);
+  assert.deepEqual(fs.readdirSync(receipts), []);
+  unavailable = false;
+  q.shutdown();
+  const restored = createTaskQueue(opts); t.after(() => restored.shutdown());
+  const result = restored.getResult(done.id);
+  const acknowledgement = { receiptStoreId: STORE, sha256: result.metadata.sha256 };
+  restored.acknowledgeResult(done.id, acknowledgement);
+  restored.acknowledgeResult(done.id, acknowledgement);
+  const rows = fs.readdirSync(receipts).flatMap(file => fs.readFileSync(path.join(receipts, file), 'utf8').trim().split('\n').map(JSON.parse));
+  assert.deepEqual(rows.map(row => row.event), ['delivery_persisted', 'delivery_acknowledged']);
+  assert.equal(rows[0].resultDelivered, false); assert.equal(rows[1].resultDelivered, true);
+  assert.equal(rows[0].resultHash, result.metadata.sha256); assert.equal(calls(), 1);
+  const conflicting = { ...deliveryReceipts(restored.get(done.id), STORE)[0], resultBytes: 1 };
+  assert.throws(() => sink(conflicting), /identity conflict/);
+  const before = JSON.stringify(rows);
+  restored.getResult(done.id);
+  assert.equal(JSON.stringify(rows), before);
+});
+
+test('cache/turn amplification is bounded provider-usage advice, never a stop', () => {
+  const { usageAmplification } = require('../lib/usage-amplification');
+  const advice = usageAmplification({ cacheReadTokens: 4651565, inputTokens: 0, outputTokens: 36998, turns: 51 });
+  assert.equal(advice.action, 'review_efficiency'); assert.equal(advice.automaticStop, false);
+  assert.equal(advice.repeatedTurnAmplification, true);
+  assert.equal(usageAmplification({ turns: 100 }).action, 'none');
+  assert.deepEqual(usageAmplification({ cacheReadTokens: 2000000, cacheCreationTokens: 100,
+    inputTokens: 2000600, cacheInputIncluded: true, outputTokens: 100, turns: 50 }),
+  usageAmplification({ cacheReadTokens: 2000000, cacheCreationTokens: 100,
+    inputTokens: 500, cacheInputIncluded: false, outputTokens: 100, turns: 50 }));
+});
+
+test('legacy truncation metadata cannot publish complete delivery evidence', () => {
+  const { deliveryReceipts } = require('../lib/delivery-receipts');
+  for (const resultIntegrity of [{ truncated: true }, { inputTruncated: true }]) {
+    const task = taskRecord({ resultIntegrity, finishedAt: 1000 });
+    const projected = resultProjection(task, STORE);
+    assert.equal(projected.metadata.complete, false);
+    assert.equal(projected.metadata.partial, true);
+    assert.equal(projected.metadata.providerCompleted, null);
+    const receipt = deliveryReceipts(task, STORE)[0];
+    assert.equal(receipt.complete, false);
+    assert.equal(receipt.partial, true);
+    assert.equal(receipt.providerCompleted, null);
+  }
 });

@@ -138,8 +138,8 @@ test('pure budget stop does not clear or extend an existing shared Claude/Fable 
   const file = path.join(bridge.root, 'data', 'cooldowns.json');
   const before = fs.readFileSync(file, 'utf8');
   const second = await invoke('claude_fable', 'pure-budget');
-  assert.equal(second.body.failureClass, 'token_budget');
-  assert.equal(second.body.rate_limited, false);
+  assert.equal(second.body.failureClass, 'provider_cooldown');
+  assert.equal(second.body.model_invocation, false);
   assert.equal(fs.readFileSync(file, 'utf8'), before);
 });
 

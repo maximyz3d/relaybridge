@@ -47,7 +47,7 @@ if (client === 'codex') {
     const section = codexSection(text, name);
     if (!section) process.exit(1);
     const targetMatch = section.match(/args\s*=\s*\[\s*"([^"]+)"\s*\]/);
-    const target = targetMatch ? decodeQuoted(targetMatch[1]) : (/mcp[\\/]+server\.mjs/i.test(section) ? 'C:\\legacy\\RelayBridge\\mcp\\server.mjs' : 'C:\\other\\server.js');
+    const target = targetMatch ? decodeQuoted(targetMatch[1]) : (/mcp[\\/]+(?:server|launcher)\.mjs/i.test(section) ? 'C:\\legacy\\RelayBridge\\mcp\\server.mjs' : 'C:\\other\\server.js');
     const env = Object.fromEntries([...section.matchAll(/^([A-Z0-9_]+)\s*=\s*"([^"]*)"\s*$/gm)].map((match) => [match[1], decodeQuoted(match[2])]));
     process.stdout.write(JSON.stringify({
       name,

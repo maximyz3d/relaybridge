@@ -64,7 +64,7 @@ installation is:
 ./install-chrome-mcp.sh --full-permissions
 ```
 
-`install-mcp.sh` resolves `mcp/server.mjs` from the checkout containing the
+`install-mcp.sh` resolves `mcp/launcher.mjs` from the checkout containing the
 script, creates or validates a mode-0600 capability-token file without printing
 the token, snapshots both client configurations, registers the exact server
 path with both CLIs, derives Codex `tool_timeout_sec` from the repository timeout
@@ -314,7 +314,7 @@ and use this effective boundary:
 --strict-mcp-config
 --mcp-config {"mcpServers":{}}
 --tools Read,Glob,Grep
---permission-mode plan
+--permission-mode dontAsk
 --no-session-persistence
 --autocompact 150k
 ```

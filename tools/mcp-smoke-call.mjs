@@ -9,7 +9,7 @@ import { spawn } from 'node:child_process';
 // that — setting RELAYBRIDGE_PORT alone silently targets the default port.
 const PORT = process.env.RELAYBRIDGE_PORT || '8787';
 const BRIDGE_URL = process.env.RELAYBRIDGE_URL || `http://127.0.0.1:${PORT}`;
-const child = spawn(process.execPath, ['mcp/server.mjs'], {
+const child = spawn(process.execPath, ['mcp/launcher.mjs'], {
   stdio: ['pipe', 'pipe', 'pipe'],
   env: { ...process.env, RELAYBRIDGE_URL: BRIDGE_URL, RELAYBRIDGE_PORT: PORT },
 });

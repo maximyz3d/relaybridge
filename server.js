@@ -10,11 +10,16 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
+const { queueTerminalInput } = require('./lib/terminal-input');
+const { createTerminalQuotaObserver } = require('./lib/terminal-quota');
+const { ANSWER_PROMPT, answerHealth } = require('./lib/answer-health');
+const { readPerplexityState } = require('./lib/perplexity-diagnostics');
+const { validateWorkspaceWriteContract } = require('./lib/workspace-write-contract');
 const { RunSupervisor, normalizeProviderBudget } = require('./lib/run-supervisor');
 const { createAttemptLifecycle } = require('./lib/attempt-lifecycle');
 const { readOllamaStream, readProviderBody, LIMITS: HTTP_PROVIDER_LIMITS } = require('./lib/http-provider-stream');
 const { parseHostedTerminal, classifyHttpTerminal } = require('./lib/http-provider-terminal');
-const { resolveAttemptTiming, renderCliDeadline } = require('./lib/cli-deadline');
+const { resolveAttemptTiming, renderCliDeadline, nativeTransportState } = require('./lib/cli-deadline');
 const { resolveConcurrencyPolicy } = require('./lib/concurrency-policy');
 const { createSubscriptionUsage } = require('./lib/subscription-usage');
 const { createContinuity } = require('./lib/continuity');
@@ -40,7 +45,16 @@ const {
 const { buildTaskPlan, costClassFor } = require('./lib/task-plan');
 const { createWorkflowPipeline } = require('./lib/workflow-pipeline');
 const { createWorkflowController } = require('./lib/workflow-controller');
+const { createOwnedExecutionBackend } = require('./lib/owned-execution-backend');
+const { qualifyOwnedHost } = require('./lib/owned-host-qualification');
+const { registerOwnedWorkflowRoutes } = require('./lib/owned-workflow-routes');
+const { hash: ownerIdentityHash } = require('./lib/execution-owner');
 const { createIncidentLog, taskFailureDetails } = require('./lib/incident-log');
+const { createDeliveryReceiptSink } = require('./lib/delivery-receipts');
+const { usageAmplification } = require('./lib/usage-amplification');
+const { writerPermissionArgs, createCopilotDenialObserver, FLAGS: COPILOT_WRITER_FLAGS } = require('./lib/copilot-permission-policy');
+const { sampleProcessCensus, validateChildProcessPolicy, fanoutWarnings, createCensusCpuTracker } = require('./lib/process-census');
+const { cancelActiveRun } = require('./lib/active-run-cancel');
 const { createDelegationCoordinator, delegationTaskTier } = require('./lib/delegation');
 const { buildFuelGauge } = require('./lib/fuel-gauge');
 const { buildQuotaSeatGroups } = require('./lib/quota-seat');
@@ -679,7 +693,7 @@ function listAgentActivity(limit = 12) {
   return { runs, receipts };
 }
 
-function appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt }) {
+function appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt, cooldownAuthorityChanged = false }) {
   const usage = payload.usage && typeof payload.usage === 'object' ? payload.usage : null;
   const modelInvocation = payload.model_invocation === false ? false
     : payload.model_invocation === null ? null : true;
@@ -729,6 +743,9 @@ function appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt }
     actualCacheCreationInputTokens: actualCacheCreationTokens,
     cacheInputIncluded: usage?.cache_input_included === true,
     actualTotalTokens,
+    usageAmplification: usageAmplification({ cacheReadTokens: actualCacheReadTokens,
+      cacheCreationTokens: actualCacheCreationTokens ?? 0, cacheInputIncluded: usage?.cache_input_included === true,
+      inputTokens: actualInputTokens, outputTokens: actualOutputTokens, turns: payload.provider_num_turns }),
     actualThinkingTokens: nonnegativeUsageNumber(usage?.thinking_tokens),
     provider_reported_cost_usd: nonnegativeCostNumber(usage?.cost_usd),
     tokenUsageSource,
@@ -741,6 +758,10 @@ function appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt }
     physicalAttemptCount: Number.isSafeInteger(payload.physical_attempt_count) ? payload.physical_attempt_count : modelInvocation === false ? 0 : 1,
     runId: payload.runId || route?.run_id || null,
     transportLifecycle: payload.transport_lifecycle || null,
+    processCensus: payload.process_census || null,
+    processWarnings: payload.process_warnings || [],
+    nativeTransport: payload.native_transport || null,
+    providerState: payload.provider_state || null,
     outerReceiptId: route?.outer_receipt_id || null,
     modelUsage: Array.isArray(usage?.model_usage) ? usage.model_usage : [],
     vendorQuota: payload.vendor_quota || null,
@@ -782,6 +803,8 @@ function appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt }
     providerErrorHash: payload.provider_error_diagnostic
       ? crypto.createHash('sha256').update(String(payload.provider_error_diagnostic)).digest('hex') : null,
     partialResult: payload.partial_result === true,
+    auditUsability: payload.audit_usability || null,
+    groundingCitations: payload.grounding_citations || null,
     failureSentinel: normalizeClaudeResultString(payload.failure_sentinel),
     failureSentinelSource: normalizeClaudeResultString(payload.failure_sentinel_source),
     partialDiagnosticChars: payload.partial_result === true
@@ -845,6 +868,7 @@ function appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt }
                 : payload.exitCode === 0 && !payload.dropped_out ? null : 'provider_error'),
     route,
   };
+  if (receipt.cooldown && modelInvocation === true && cooldownAuthorityChanged) receipt.cooldown = { ...receipt.cooldown, sourceReceiptId: receipt.receiptId };
   appendBridgeReceiptRecord(receipt);
   return receipt;
 }
@@ -1077,6 +1101,7 @@ function sendOneShotPreAdmissionRejection(res, {
 }
 
 function sendOneShotResult(res, payload, meta) {
+  let cooldownObservation = null;
   const canDeliver = !res.writableEnded && !res.destroyed;
   if ((!canDeliver && meta?.persistAfterDisconnect !== true) || res._relayReceiptPersisted) return;
   const requestId = meta?.route?.request_id || null;
@@ -1135,6 +1160,18 @@ function sendOneShotResult(res, payload, meta) {
       stop_detail: classified.detail,
     };
   }
+  if (payload.grounding?.required && !payload.grounding.evidence && payload.stdout && payload.model_invocation !== false) {
+    try {
+      const audit = verifyReferencedPaths(payload.stdout, meta.cwd);
+      payload.grounding_citations = audit;
+      payload.audit_usability = { required: true, usable: audit.confidence === 'likely-fabricated' ? false
+        : audit.confidence === 'ok' ? true : null, confidence: audit.confidence || 'unverifiable',
+        reason: audit.note || null };
+      if (audit.note) payload.grounding_warning = audit.note;
+    } catch {
+      payload.audit_usability = { required: true, usable: null, confidence: 'unverifiable', reason: 'citation verification unavailable' };
+    }
+  }
   // Usage ledger: every run — CLI, local Ollama, hosted adapter — exits
   // through here, so this single hook catches them all. Wrapped because
   // accounting must never be able to break a response.
@@ -1181,27 +1218,16 @@ function sendOneShotResult(res, payload, meta) {
         model: payload.route?.resolved_model_identity || payload.model || null,
         startedAt: meta.startedAt, ok, failureKind,
       });
-      // Post-hoc grounding check: a seat WITH access can still hallucinate, and
-      // an answer citing only nonexistent files is not about this repository.
-      try {
-        if (ok && meta.cwd && payload.stdout) {
-          const v = verifyReferencedPaths(payload.stdout, meta.cwd);
-          if (v.checked && (v.confidence === 'likely-fabricated' || v.confidence === 'suspect')) {
-            payload.grounding_warning = v.note;
-            payload.grounding_citations = { confidence: v.confidence, missing: v.missing.slice(0, 10), present: v.present.slice(0, 10), citations: v.citations.slice(0, 20) };
-          }
-        }
-      } catch { /* verification is advisory; never fail a run over it */ }
       try {
         if (ok) {
-          cooldowns.noteSuccess(effectiveQuotaSeat);
+          cooldowns.noteSuccess(effectiveQuotaSeat, { startedAt: meta.startedAt });
           // A model-scoped cooldown is keyed by provider rather than account.
           // A successful call through any linked account proves that model is
           // available again, while the account-specific clear above remains
           // isolated to the subscription that paid for this run.
           const providerCooldown = cooldowns.status(meta.kind);
           if (effectiveQuotaSeat !== meta.kind && providerCooldown.cooling
-            && providerCooldown.scope === 'model') cooldowns.noteSuccess(meta.kind);
+            && providerCooldown.scope === 'model') cooldowns.noteSuccess(meta.kind, { startedAt: meta.startedAt });
         }
         else if (cooldownKind) {
           // An explicitly model-scoped vendor observation must not cool every
@@ -1216,6 +1242,7 @@ function sendOneShotResult(res, payload, meta) {
                 supervisorStopReason: payload.supervisor_stop_reason }), payload.retry_after),
             scope: payload.vendor_quota?.scope === 'model' ? 'model' : 'account',
           });
+          cooldownObservation = cooldown;
           if (cooldown?.until) {
             // Return the deadline actually committed by the shared cooldown
             // store. Workflow/task retry logic must not guess a shorter delay
@@ -1232,6 +1259,7 @@ function sendOneShotResult(res, payload, meta) {
               source: cooldown.source,
               offences: cooldown.offences,
               scope: cooldown.scope,
+              ...(cooldown.sourceReceiptId ? { sourceReceiptId: cooldown.sourceReceiptId } : {}),
             };
           }
         }
@@ -1246,7 +1274,7 @@ function sendOneShotResult(res, payload, meta) {
                   DATA_DIR, meta.kind, selectedAccountId, loadConfig()[meta.kind] || {},
                 )
               : null;
-          if (changed) invalidateAccountRegistry();
+          if (changed) invalidateAccountRegistry({ healthOnly: true });
           if (selectedAccountId === providerAccounts.DEFAULT_ACCOUNT_ID) {
             if (ok) updateDefaultAccountRuntimeAuth(meta.kind, true);
             else if (payload.auth_failed === true) updateDefaultAccountRuntimeAuth(meta.kind, false);
@@ -1256,8 +1284,12 @@ function sendOneShotResult(res, payload, meta) {
     }
   } catch { /* ignored on purpose */ }
   try {
-    const receipt = appendBridgeProviderReceipt({ ...meta, payload });
+    const receipt = appendBridgeProviderReceipt({ ...meta, payload, cooldownAuthorityChanged: cooldownObservation?.authorityChanged === true });
     res._relayReceiptPersisted = receipt.receiptId;
+    if (cooldownObservation) {
+      cooldowns.attachReceipt(cooldownObservation, receipt.receiptId);
+      if (payload.cooldown) payload.cooldown = receipt.cooldown;
+    }
     if (canDeliver) res.json({ ...payload, receiptId: receipt.receiptId, receiptPersisted: true });
     return payload;
   } catch (error) {
@@ -2157,7 +2189,7 @@ function hostedChatUrl(entry) {
   const url = new URL(raw);
   if (url.protocol !== 'https:') throw new Error('hosted provider api_base_url must use HTTPS');
   if (isBlockedHostedAiHost(url.hostname)) {
-    throw new Error(`hosted provider is blocked by geo/supply-chain policy: ${url.hostname}`);
+    throw Object.assign(new Error('Hosted provider is blocked by geo/supply-chain policy.'), { code: 'hosted_endpoint_blocked' });
   }
   return url;
 }
@@ -2332,12 +2364,13 @@ async function runHttpProviderOneShot({ entry, prompt, effectivePrompt, res, rou
     const progress = supervisor.snapshot();
     const stop = state.stop;
     if (stop) {
-      const clientStop = stop.source === 'client';
+      const clientStop = stop.source === 'client' || ['operator_cancelled', 'client_cancelled'].includes(stop.reason);
+      const timeStop = ['hard_cap', 'idle_stall', 'provider_internal_timeout'].includes(stop.reason);
       payload = { ...payload, stdout: '', failureClass: stop.reason === 'token_budget' ? 'token_budget'
-        : clientStop ? stop.reason : stop.reason === 'output_cap' ? 'output_cap' : 'timeout',
+        : clientStop ? stop.reason : timeStop ? 'timeout' : stop.reason,
         stop_reason: stop.reason, supervisor_stop_reason: stop.source === 'supervisor' ? stop.reason : null,
-        stop_detail: stop.detail, cancelled: clientStop, timed_out: !clientStop && stop.reason !== 'token_budget' && stop.reason !== 'output_cap',
-        provider_timeout_source: stop.source === 'supervisor' && !['token_budget', 'output_cap'].includes(stop.reason) ? 'relay_supervisor' : null,
+        stop_detail: stop.detail, cancelled: clientStop, timed_out: !clientStop && timeStop,
+        provider_timeout_source: stop.source === 'supervisor' && timeStop ? 'relay_supervisor' : null,
         budget_exceeded: stop.reason === 'token_budget', dropped_out: true,
         usage: acceptedUsage || payload?.usage || null };
     }
@@ -2359,6 +2392,10 @@ async function runHttpProviderOneShot({ entry, prompt, effectivePrompt, res, rou
 }
 
 const activeChildren = new Set();
+const ownedChildStops = new WeakMap();
+const liveOwnedAdmissions = new Set();
+const ownedDispatchIdentities = new Map();
+let ownedExecutionBackend = null;
 const activeOneShots = new Map();
 const CONCURRENCY_POLICY = resolveConcurrencyPolicy();
 const MAX_ACTIVE_ONESHOTS = CONCURRENCY_POLICY.maxActiveOneShots;
@@ -2367,7 +2404,9 @@ let activeOneShotCount = 0;
 
 function acquireOneShot(kind) {
   const providerCount = activeOneShots.get(kind) || 0;
-  if (activeOneShotCount >= MAX_ACTIVE_ONESHOTS || providerCount >= MAX_ACTIVE_PER_PROVIDER) return null;
+  const restored = (ownedExecutionBackend?.reservationSnapshot() || []).filter(row => row.held && !liveOwnedAdmissions.has(row.ownerId));
+  if (activeOneShotCount + restored.length >= MAX_ACTIVE_ONESHOTS
+    || providerCount + restored.filter(row => row.provider === kind).length >= MAX_ACTIVE_PER_PROVIDER) return null;
   activeOneShotCount++;
   activeOneShots.set(kind, providerCount + 1);
   let released = false;
@@ -2393,6 +2432,8 @@ function trackChild(proc) {
 // shims can leave the actual AI CLI running and consuming quota.  Kill the
 // verified wrapper tree on timeout or client disconnect.
 function killProcessTree(proc) {
+  const ownedStop = proc && ownedChildStops.get(proc);
+  if (ownedStop) { ownedStop(); return; }
   // Delegated to lib/platform.js. The old POSIX branch was proc.kill('SIGTERM')
   // — the CLI died but the subprocesses it spawned (node shims, MCP servers)
   // survived, holding ports and file locks. killTree signals the whole tree,
@@ -2430,6 +2471,7 @@ const sampleTreeCpuMs = platform.sampleTreeCpuMs;
 async function discoverModels() {
   if (discoveryInFlight) return discoveryInFlight;
   const cfg = loadConfig();
+  const generation = diagnosticGeneration(cfg);
   const globals = cfg._models || {};
   const timeoutMs = Number(globals.discoveryTimeoutMs) > 0 ? Number(globals.discoveryTimeoutMs) : 20000;
   discoveryInFlight = (async () => {
@@ -2437,6 +2479,13 @@ async function discoverModels() {
     for (const kind of Object.keys(cfg).filter((k) => !k.startsWith('_') && k !== 'powershell')) {
       const entry = cfg[kind];
       if (!entry || typeof entry !== "object") continue;
+      if (entry.oneshot_adapter === 'openai_chat_api') {
+        const readiness = await probeHostedReadiness(kind, entry);
+        probeResults[kind] = readiness.modelCatalog?.models
+          ? { models: readiness.modelCatalog.models }
+          : { error: readiness.modelCatalog?.diagnosticCode || 'model catalog unavailable' };
+        continue;
+      }
       if (Array.isArray(entry.models_static) && entry.models_static.length) {
         probeResults[kind] = { models: entry.models_static.slice() };
         continue;
@@ -2454,6 +2503,7 @@ async function discoverModels() {
         probeResults[kind] = { error: err.message };
       }
     }
+    if (generation !== diagnosticGeneration(loadConfig())) throw Object.assign(new Error('model discovery authority changed; refresh again'), { code: 'diagnostic_stale' });
     const registry = buildRegistry({ probeResults, config: cfg });
     modelRegistry = registry;
     try {
@@ -2485,6 +2535,7 @@ class Session {
     this.command = command;
     this.args = args;
     this.cwd = cwd || USER_HOME || ROOT;
+    ownedExecutionBackend?.assertWorkspaceLaunchAllowed({ cwd: this.cwd });
     this.buffer = []; // ring buffer of recent output
     this.bufferMax = 2000; // lines
     this.clients = new Set(); // WebSocket clients
@@ -2493,6 +2544,7 @@ class Session {
     this.exited = false;
     this.exitCode = null;
     this.startedAt = Date.now();
+    this.quotaObserver = createTerminalQuotaObserver(kind);
     this._spawn();
   }
 
@@ -2566,6 +2618,7 @@ class Session {
   }
 
   _onData(text) {
+    this.quotaObserver.output(text);
     this.buffer.push(text);
     if (this.buffer.length > this.bufferMax) {
       this.buffer.splice(0, this.buffer.length - this.bufferMax);
@@ -2578,6 +2631,23 @@ class Session {
     if (this.exited) return;   // pipe mode can deliver both 'error' and 'close'
     this.exited = true;
     this.exitCode = code;
+    const observation = this.quotaObserver.finish(code, this.stopReason);
+    if (observation) {
+      try {
+        const seat = observation.scope === 'model' ? this.kind : quotaSeatForProvider(this.kind);
+        usageLedger.observeVendorQuota({ ...observation, quotaSeat: seat });
+        const cooldown = cooldowns.noteFailure(seat, 'quota_exhausted', {
+          scope: observation.scope,
+          retryAfterSec: observation.reset.kind === 'provider_reset' ? observation.reset.durationMs / 1000 : null });
+        const receiptId = `rcpt_${Date.now().toString(36)}_${crypto.randomBytes(4).toString('hex')}`;
+        appendBridgeReceiptRecord({ receiptId, timestamp: new Date().toISOString(), event: 'terminal_quota_observed',
+          bridgeBuildId: BRIDGE_BUILD_ID, receiptStoreId: RECEIPT_STORE_IDENTITY.id,
+          sessionId: this.id, provider: this.kind, quotaSeat: seat, modelInvocation: null,
+          evidenceHash: observation.evidenceHash, reset: observation.reset, source: observation.source,
+          vendorQuota: observation });
+        cooldowns.attachReceipt(cooldown, receiptId);
+      } catch { /* retained in-memory authority remains available; never invent a receipt */ }
+    }
     const msg = `\r\n[RelayBridge] process exited with code ${code}\r\n`;
     this.buffer.push(msg);
     // The banner pushed past bufferMax without the trim _onData does.
@@ -2606,19 +2676,16 @@ class Session {
     if (typeof reaper.unref === 'function') reaper.unref();
   }
 
-  write(input) {
-    if (this.exited) return false;
-    try {
-      if (this._mode === 'pty') {
-        this.proc.write(input);
-      } else {
-        if (!this.proc.stdin || this.proc.stdin.destroyed) return false;
-        this.proc.stdin.write(input);
-      }
-    } catch {
-      return false; // stream torn down between the exited check and the write
-    }
-    return true;
+  write(input, mode = 'keystrokes') {
+    this.quotaObserver.input(input);
+    const result = queueTerminalInput(this.proc, this._mode, input, {
+      mode, exited: this.exited, onUpdate: (update) => {
+        if (this.lastInput?.inputId === update.inputId) this.lastInput = update;
+        for (const ws of this.clients) this._sendTo(ws, JSON.stringify({ type: 'input_status', ...update }));
+      },
+    });
+    this.lastInput = result;
+    return result;
   }
 
   resize(cols, rows) {
@@ -2629,6 +2696,7 @@ class Session {
 
   kill() {
     if (this.exited) return;
+    this.stopReason = 'operator_cancelled';
     killProcessTree(this.proc);
   }
 
@@ -2655,6 +2723,7 @@ class Session {
       exited: this.exited,
       exitCode: this.exitCode,
       mode: this._mode,
+      lastInput: this.lastInput || null,
       startedAt: this.startedAt,
     };
   }
@@ -2708,6 +2777,7 @@ function createSessionFromKind(kind, opts = {}) {
 
 // ---- HTTP / WS server ----
 const app = express();
+const answerProbeRequestLimit = createRequestLimiter({ family: 'answer_probe', limit: 12 });
 const diagnosticRequestLimit = createRequestLimiter({ family: 'diagnostics', limit: 120 });
 const planningRequestLimit = createRequestLimiter({ family: 'planning', limit: 120 });
 const execRequestLimit = createRequestLimiter({ family: 'host_exec', limit: 60 });
@@ -2717,7 +2787,9 @@ const installRequestLimit = createRequestLimiter({ family: 'provider_install', l
 const hostExecSlots = createOperationSlots({ limit: 4 });
 const installSlots = createOperationSlots({ limit: 1 });
 const probePool = createReadOperationPool({ maxActive: 4, maxQueued: 64, maxSubscribers: 64 });
+const hostedCatalog = require('./lib/hosted-model-catalog').createHostedModelCatalog({ pool: probePool });
 let authGeneration = 0;
+let answerHealthEpoch = 0;
 let admissionClosed = false;
 let activeRequestBodies = 0, activeRequestHandlers = 0, activeBackgroundTasks = 0;
 
@@ -3065,7 +3137,7 @@ app.get('/api/workspace', (req, res) => {
 // path.  Rejections receive the normal durable zero-invocation receipt.
 function prepareProfiledGrounding(body, snapshot, entry, dangerous) {
   const compiled = compileOutputProfile(body.prompt, body.outputProfile);
-  const base = { ...body, cwd:snapshot.resolved, cwdIdentityHash:snapshot.cwdIdentityHash,
+  const base = { ...body, cwdExplicit: typeof body.cwd === 'string' && !!body.cwd.trim(), cwd:snapshot.resolved, cwdIdentityHash:snapshot.cwdIdentityHash,
     seat:body.kind, seatConfig:entry, dangerous };
   // Check the original request before guidance can affect lexical grounding.
   // The final text is checked too; guidance can never weaken the requirement.
@@ -3074,6 +3146,7 @@ function prepareProfiledGrounding(body, snapshot, entry, dangerous) {
 }
 
 function validateProviderIntent(body, cfg = loadConfig(), snapshot = captureAllowedCwdIdentity(body.cwd), phase = 'execute') {
+  validateWorkspaceWriteContract(body);
   if (!providerAccounts.validProviderKey(body.kind) || !Object.prototype.hasOwnProperty.call(cfg, body.kind)) {
     throw validationError('unknown_provider', 'kind', 'Provider is not configured.');
   }
@@ -3262,6 +3335,7 @@ function updateDefaultAccountRuntimeAuth(kind, authenticated) {
 
 function armDefaultAccountRuntimeAuthRetry(kind) {
   authGeneration += 1;
+  answerHealthEpoch += 1;
   const priorResults = lastDiagnostics?.results && typeof lastDiagnostics.results === 'object'
     ? lastDiagnostics.results : {};
   const prior = priorResults[kind] && typeof priorResults[kind] === 'object'
@@ -3371,7 +3445,7 @@ function applyFilesystemEligibilityToDiagnostics(diagnostics = {}, cfg = {}, { d
 function applyGroundingEligibilityToDiagnostics(diagnostics, cfg, body, snapshot) {
   const out = {}, skipped = [];
   for (const [kind, prior] of Object.entries(diagnostics)) {
-    const grounding = checkGrounding({ ...body, prompt: body.task, cwd: snapshot.resolved,
+    const grounding = checkGrounding({ ...body, cwdExplicit: typeof body.cwd === 'string' && !!body.cwd.trim(), prompt: body.task, cwd: snapshot.resolved,
       cwdIdentityHash: snapshot.cwdIdentityHash, seat: kind, seatConfig: cfg[kind] || {}, dangerous: body.dangerous === true });
     out[kind] = grounding.allowed ? { ...prior, grounding }
       : { ...prior, grounding, executionReady: false, executionDetail: grounding.reason, ready: false };
@@ -3394,6 +3468,18 @@ function invocationCapabilitiesFor(cfg, dangerous) {
     .map(([kind, entry]) => [kind, entry?.oneshot_capabilities?.[dangerous ? 'dangerous' : 'safe'] || []]));
 }
 
+const answerHealthObservations = new Map();
+const activeAnswerProbes = new Set();
+function answerObservationGeneration() {
+  return `${answerHealthEpoch}:${crypto.createHash('sha256').update(JSON.stringify(loadConfig())).digest('hex')}`;
+}
+function readAnswerHealth(kind) {
+  const stored = answerHealthObservations.get(kind);
+  if (!stored) return { status: 'unknown', checkedAt: null };
+  const current = stored.generation === answerObservationGeneration() && stored.health.expiresAt > Date.now();
+  return { ...stored.health, freshness: current ? 'current' : 'stale' };
+}
+
 function agentSummary(kind, entry) {
   const diag = lastDiagnostics?.results?.[kind] || null;
   const safeFilesystem = diag?.safeFilesystem || providerFilesystemEligibility(runtimeFilesystemPolicyEntry(entry));
@@ -3404,6 +3490,7 @@ function agentSummary(kind, entry) {
     tags: Array.isArray(entry.tags) ? entry.tags.filter((tag) => PROVIDER_TAG_RE.test(String(tag))) : [],
     autoRoute: entry.autoRoute !== false,
     usageCapability: diag?.usageCapability || providerUsageCapability(entry),
+    answerHealth: readAnswerHealth(kind),
     safeOneShot: {
       ...safeFilesystem,
       ready: diag?.safeReady ?? ((diag?.ready ?? null) === false ? false : safeFilesystem.eligible),
@@ -3488,10 +3575,43 @@ async function probeOllamaReadiness(entry, signal) {
   };
 }
 
-async function coldPlanningDiagnostics(cfg, pathDetail, signal) {
+async function probeHostedReadiness(kind, entry, signal, model = entry.model) {
+  let key, chat;
+  const capturedConfig = loadConfig();
+  if (JSON.stringify(capturedConfig[kind]) !== JSON.stringify(entry)) return { found: false, ready: false,
+    modelCatalog: { status: 'unknown', diagnosticCode: 'catalog_identity_changed', model }, detail: 'Catalog configuration changed; refresh again' };
+  const generation = diagnosticGeneration(capturedConfig);
+  try { chat = hostedChatUrl(entry); key = hostedApiKey(entry); }
+  catch (error) { return { found: false, ready: false, label: entry.label,
+    detail: error.code === 'hosted_endpoint_blocked' ? error.message : 'Hosted endpoint or credential unavailable',
+    modelCatalog: { status: 'unknown', diagnosticCode: error.code === 'hosted_endpoint_blocked' ? error.code : 'catalog_configuration_unavailable', model } }; }
+  const catalog = await hostedCatalog.check({ chatUrl: chat.href, modelsUrl: entry.models_url, key, model, generation, signal,
+    currentIdentity: () => {
+      try { const cfg = loadConfig(), fresh = cfg[kind]; const currentKey = hostedApiKey(fresh);
+        return !admissionClosed && generation === diagnosticGeneration(cfg) && currentKey.name === key.name && currentKey.value === key.value;
+      } catch { return false; }
+    },
+  });
+  return { binary: null, paths: [], found: true, ready: catalog.status === 'available', label: entry.label,
+    detail: catalog.status === 'available' ? 'Configured model appears in the authenticated catalog; quota and answers remain untested'
+      : catalog.diagnosticCode || 'model catalog unavailable', modelCatalog: catalog,
+    authFailed: catalog.status === 'auth_failed', authAuthoritative: catalog.status === 'auth_failed',
+    transientProbeFailure: false, usageCapability: providerUsageCapability(entry) };
+}
+
+async function coldPlanningDiagnostics(cfg, pathDetail, signal, intent = {}) {
   const env = buildEnv();
   const pairs = await Promise.all(Object.keys(cfg).filter((kind) => !kind.startsWith('_')).map(async (kind) => {
     const entry = cfg[kind];
+    if (entry.oneshot_adapter === 'openai_chat_api') {
+      try {
+        const controls = resolveProviderControls({ kind, entry, registry: null,
+          slot: intent.dangerous === true ? entry.oneshot_dangerous : entry.oneshot_safe,
+          taskTier: intent.taskTier, modelTier: intent.modelTier, model: intent.model, effort: intent.effort,
+          execution: intent.execution, dangerous: intent.dangerous === true, maxEffortOverride: intent.maxEffortOverride });
+        return [kind, await probeHostedReadiness(kind, entry, signal, controls.execution.model)];
+      } catch (error) { return [kind, { found: true, ready: false, detail: error.message, intentValidation: error.validation }]; }
+    }
     if (entry.oneshot_adapter === 'ollama_api') {
       return [kind, await probeOllamaReadiness(entry, signal)];
     }
@@ -3512,14 +3632,15 @@ async function coldPlanningDiagnostics(cfg, pathDetail, signal) {
 // readiness sweep has ever run. Such a partial snapshot must not make every
 // absent provider look eligible. Fill only missing configured keys with cheap
 // path/transport evidence and preserve every live result already observed.
-async function completePlanningDiagnostics(cfg, existing, pathDetail, signal) {
+async function completePlanningDiagnostics(cfg, existing, pathDetail, signal, intent = {}) {
   const preserved = existing && typeof existing === 'object' && !Array.isArray(existing)
-    ? existing : {};
+    ? { ...existing } : {};
+  for (const kind of Object.keys(preserved)) if (cfg[kind]?.oneshot_adapter === 'openai_chat_api') delete preserved[kind];
   const missingKinds = Object.keys(cfg).filter((kind) => !kind.startsWith('_')
     && !Object.prototype.hasOwnProperty.call(preserved, kind));
   if (!missingKinds.length) return preserved;
   const missingConfig = Object.fromEntries(missingKinds.map((kind) => [kind, cfg[kind]]));
-  const missing = await coldPlanningDiagnostics(missingConfig, pathDetail, signal);
+  const missing = await coldPlanningDiagnostics(missingConfig, pathDetail, signal, intent);
   return { ...missing, ...preserved };
 }
 
@@ -3603,6 +3724,46 @@ class CapturedOneShotResponse extends require('events').EventEmitter {
   }
 }
 
+// Explicit, fixed, minimal answer test. Passive diagnostics never call this.
+app.post('/api/providers/:kind/probe-answer', answerProbeRequestLimit, trackedHandler(async (req, res) => {
+  const kind = req.params.kind, body = req.body;
+  const allowed = new Set(['confirmQuotaUse', 'expectedAccountId', 'requestId', 'cwd']);
+  if (kind !== 'perplexity' || !body || typeof body !== 'object' || Array.isArray(body)
+    || Object.keys(body).some(key => !allowed.has(key)) || body.confirmQuotaUse !== true
+    || typeof body.expectedAccountId !== 'string' || !/^[a-z0-9][a-z0-9_-]{0,47}$/.test(body.expectedAccountId)) {
+    return res.status(400).json({ error: 'Explicit Perplexity answer probe requires confirmQuotaUse=true and an exact expectedAccountId.', model_invocation: false, physical_attempt_count: 0 });
+  }
+  if (activeAnswerProbes.has(kind)) return res.status(409).json({ error: 'An answer probe is still running or draining.', failureClass: 'answer_probe_busy', model_invocation: false, physical_attempt_count: 0 });
+  const cfg = loadConfig(), entry = cfg[kind];
+  if (!entry) return res.status(404).json({ error: 'Provider is not configured', model_invocation: false, physical_attempt_count: 0 });
+  const generation = answerObservationGeneration();
+  const captured = new CapturedOneShotResponse();
+  const disconnect = () => { if (!res.writableEnded) captured.cancel('answer probe caller disconnected'); };
+  activeAnswerProbes.add(kind); res.once('close', disconnect);
+  try {
+    await executeOneShot({ kind, prompt: ANSWER_PROMPT, cwd: body.cwd, requestId: body.requestId,
+      expectedAccountId: body.expectedAccountId, timeoutMs: 30000, dangerous: false }, captured);
+    const outcome = await captured.done, payload = outcome.body;
+    const health = answerHealth(payload, { provider: kind, model: payload.route?.resolved_model_identity || entry.model || null,
+      accountId: payload.route?.account || body.expectedAccountId, quotaSeat: payload.route?.quota_seat || null });
+    if (!captured.destroyed && payload.receiptPersisted === true && generation === answerObservationGeneration()) {
+      answerHealthObservations.set(kind, { generation, health });
+    } else if (generation !== answerObservationGeneration()) health.freshness = 'stale';
+    if (!res.destroyed && !res.writableEnded) res.status(outcome.statusCode).json({
+      ok: health.status === 'ready', answerHealth: health, exitCode: payload.exitCode ?? null,
+      failureClass: payload.failureClass || null, model_invocation: payload.model_invocation ?? null,
+      physical_attempt_count: payload.physical_attempt_count ?? null, usage: payload.usage || null,
+      receiptId: payload.receiptId || null, receiptPersisted: payload.receiptPersisted === true,
+      requestId: payload.requestId || null, invocationId: payload.invocationId || null, attemptId: payload.attemptId || null,
+    });
+  } finally {
+    res.removeListener('close', disconnect);
+    // Logical cancellation is not proof of physical process-tree settlement.
+    if (captured._relayLifecycle?.physicalDone) await captured._relayLifecycle.physicalDone;
+    activeAnswerProbes.delete(kind);
+  }
+}));
+
 function writeBroadcastRun(run) {
   const runId = run.runId || `run_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 8)}`;
   const record = {
@@ -3636,6 +3797,14 @@ app.get('/api/telemetry', (req, res) => {
 
 // Vetting endpoint: is that quiet run working, or is it stuck? Returns the
 // evidence rather than a guess.
+app.post('/api/runs/:runId/cancel', (req, res) => {
+  try {
+    const result = cancelActiveRun({ runId: req.params.runId, input: req.body, activeRuns, controls: continuityControls,
+      append: createDeliveryReceiptSink({ directory: RECEIPTS_DIR, append: appendBridgeReceiptRecord }) });
+    res.status(202).json(result);
+  } catch (error) { res.status(error.status || 503).json({ error: error.code || 'cancellation_receipt_unavailable', terminationVerified: false }); }
+});
+
 app.get('/api/runs/active', (req, res) => {
   const now = Date.now();
   const runs = [];
@@ -3645,6 +3814,9 @@ app.get('/api/runs/active', (req, res) => {
       runId: run.runId, kind: run.kind, route: run.route, pid: run.pid,
       startedAt: new Date(run.startedAt).toISOString(),
       ...snap,
+      processCensus: run.processCensus || null,
+      processWarnings: run.processWarnings || [],
+      nativeTransport: run.nativeTransport || null,
       ...(run.lifecycle ? { transportLifecycle: run.lifecycle.snapshot() } : {}),
       nativeUsage: subscriptionUsage.headroom(run.route.quota_seat || quotaSeatForProvider(run.kind), { model: run.route.requested_model }),
       continuity: { id: run.continuityId || null, handoffPath: run.handoffPath || null },
@@ -3699,14 +3871,15 @@ async function planTask({ task, requestedEffort = null, kind = null, requestedPr
   const router = await ROUTER_MODULE_PROMISE;
   const cfg = loadConfig();
   const generation = diagnosticGeneration(cfg);
-  let diagnostics = await completePlanningDiagnostics(cfg, lastDiagnostics?.results, 'path-only check', signal);
+  const effectiveTaskTier = taskTierOverride || router.classifyTask(task).tier;
+  let diagnostics = await completePlanningDiagnostics(cfg, lastDiagnostics?.results, 'path-only check', signal, { ...intent, taskTier: effectiveTaskTier });
   if (signal?.aborted) throw Object.assign(new Error('planning request cancelled'), { statusCode: 499 });
   if (generation !== diagnosticGeneration(loadConfig())) {
     throw Object.assign(new Error('diagnostic authority changed; refresh again'), {
       statusCode: 409, code: 'diagnostic_stale',
     });
   }
-  const effectiveTaskTier = taskTierOverride || router.classifyTask(task).tier;
+
   const gauges = usageLedger.gaugeAll(seatCostClasses());
   const routingInputs = accountAwareRoutingInputs(cfg, diagnostics, gauges, coolingQuotaStates());
   const fleetInput = applyCooldownsToDiagnostics(routingInputs.diagnostics, routingInputs.cooling, kind ? [kind] : []);
@@ -3809,7 +3982,7 @@ app.post('/api/route', planningRequestLimit, trackedHandler(async (req, res) => 
       cfg,
       supplied && typeof supplied === 'object' ? supplied : lastDiagnostics?.results,
       'path-only check; run /api/diag for auth status',
-      controller.signal,
+      controller.signal, { ...req.body, taskTier: req.body.taskTier || router.classifyTask(task).tier },
     );
     if (controller.signal.aborted) return;
     if (generation !== diagnosticGeneration(loadConfig())) {
@@ -3928,6 +4101,7 @@ app.get('/api/auth/status', diagnosticRequestLimit, trackedHandler(async (req, r
       const kinds = Object.keys(cfg).filter((k) => !k.startsWith('_') && k !== 'powershell');
       const pairs = await Promise.all(kinds.map(async (kind) => {
         const entry = cfg[kind];
+        if (entry?.oneshot_adapter === 'openai_chat_api') return [kind, await probeHostedReadiness(kind, entry, controller.signal)];
         if (entry?.oneshot_adapter === 'ollama_api') {
           return [kind, await probeOllamaReadiness(entry, controller.signal)];
         }
@@ -4027,31 +4201,7 @@ app.get('/api/diag', diagnosticRequestLimit, trackedHandler(async (req, res) => 
   const kinds = Object.keys(cfg).filter((k) => !k.startsWith('_'));
   const pairs = await Promise.all(kinds.map(async (kind) => {
     const entry = cfg[kind];
-    if (entry.oneshot_adapter === 'openai_chat_api') {
-      let ready = false;
-      let detail = '';
-      let found = false;
-      try {
-        const url = hostedChatUrl(entry);
-        const key = hostedApiKey(entry);
-        found = true;
-        ready = true;
-        detail = `API key present in ${key.name}; live quota untested for ${url.hostname}`;
-      } catch (err) {
-        detail = err.message;
-      }
-      return [kind, {
-        binary: null,
-        found,
-        ready,
-        paths: [],
-        label: entry.label,
-        detail,
-        probeExitCode: null,
-        runtimeVersion: '',
-        usageCapability: providerUsageCapability(entry),
-      }];
-    }
+    if (entry.oneshot_adapter === 'openai_chat_api') return [kind, await probeHostedReadiness(kind, entry, controller.signal)];
     // Probe the transport that actually executes. These seats run over
     // localOllamaUrl() HTTP, but their configured probe shells out to the
     // ollama binary — so a machine with the CLI installed and the daemon down
@@ -4125,7 +4275,7 @@ app.get('/api/diag', diagnosticRequestLimit, trackedHandler(async (req, res) => 
       usageCapability: providerUsageCapability(entry, { runtimeVersion }),
     }];
   }));
-  const rawResults = Object.fromEntries(pairs);
+  const rawResults = Object.fromEntries(pairs.map(([kind, value]) => [kind, { ...value, answerHealth: readAnswerHealth(kind) }]));
   const results = applyFilesystemEligibilityToDiagnostics(rawResults, cfg).diagnostics;
   if (!clientGone && generation !== diagnosticGeneration(loadConfig())) {
     return res.status(409).json({ error: 'diagnostic authority changed; refresh again', errorCode: 'diagnostic_stale' });
@@ -4148,6 +4298,7 @@ app.get('/api/diag', diagnosticRequestLimit, trackedHandler(async (req, res) => 
       const projectedResults = Object.fromEntries(Object.entries(filesystemInput.diagnostics)
         .map(([kind, info]) => [kind, info && typeof info === 'object' ? {
           ...info,
+          answerHealth: readAnswerHealth(kind),
           accountSelection: accountInputs.accountSelection[kind] || null,
         } : info]));
       routing = {
@@ -4202,8 +4353,8 @@ app.delete('/api/sessions/:id', (req, res) => {
 app.post('/api/sessions/:id/input', (req, res) => {
   const s = sessions.get(req.params.id);
   if (!s) return res.status(404).json({ error: 'not found' });
-  const ok = s.write(req.body.data || '');
-  res.json({ ok });
+  const result = s.write(req.body.data ?? '', req.body.mode || 'keystrokes');
+  res.status(result.ok ? 200 : 409).json(result);
 });
 
 app.get('/api/sessions/:id/buffer', (req, res) => {
@@ -4227,7 +4378,10 @@ app.post('/api/exec', execRequestLimit, (req, res) => {
     return res.status(400).json({ error: 'command (string) required' });
   }
   let execCwd;
-  try { execCwd = resolveAllowedCwd(cwd); }
+  try {
+    execCwd = resolveAllowedCwd(cwd);
+    ownedExecutionBackend?.assertWorkspaceLaunchAllowed({ cwd: execCwd });
+  }
   catch (err) { return res.status(400).json({ error: err.message }); }
   // Route through the platform abstraction rather than hardcoding
   // powershell.exe: off Windows that name only resolves through WSL interop,
@@ -4299,7 +4453,7 @@ app.post('/api/exec', execRequestLimit, (req, res) => {
 // How long to wait after the child's own 'exit' for the stdio pipes to reach
 // EOF before settling anyway. Matches runProbe's 2s post-kill grace.
 const ONESHOT_CLOSE_GRACE_MS = 2000;
-async function executeOneShot(body, res) {
+async function executeOneShot(body, res, privateContext = null) {
   const startedAt = Date.now();
   let releaseAdmission = null;
   const { kind, prompt, timeoutMs, cwd, dangerous } = body || {};
@@ -4345,6 +4499,9 @@ async function executeOneShot(body, res) {
   if (!kind || typeof prompt !== 'string' || !prompt.trim()) {
     return rejectBeforeAdmission(400, 'validation', { error: 'kind + non-empty prompt required' });
   }
+  try { validateWorkspaceWriteContract(body); }
+  catch (error) { return rejectBeforeAdmission(error.code === 'filesystem_contract_unsupported' ? 409 : 400,
+    error.code, { error: error.message, validation: error.validation, model_invocation: false, physical_attempt_count: 0 }); }
   let cfg;
   try {
     cfg = loadConfig();
@@ -4379,6 +4536,9 @@ async function executeOneShot(body, res) {
   // so CLIs run non-agentically (no auto tool/command execution). When the
   // caller doesn't specify, fall back to the global Full Permissions toggle.
   const useDanger = (typeof dangerous === 'boolean') ? dangerous : state.fullPermissions;
+  let childProcessPolicy;
+  try { childProcessPolicy = validateChildProcessPolicy(body.childProcessPolicy ?? entry.child_process_policy); }
+  catch (error) { return rejectBeforeAdmission(400, 'validation', { error: error.message, validation: error.validation }); }
   let filesystemPolicy;
   try {
     // Existing test fixtures predate this mandatory production contract. They
@@ -4450,6 +4610,7 @@ async function executeOneShot(body, res) {
   try {
     resolvedCwdIdentity = captureAllowedCwdIdentity(cwd);
     resolvedCwd = resolvedCwdIdentity.resolved;
+    ownedExecutionBackend?.assertWorkspaceLaunchAllowed({ cwd: resolvedCwd, privateContext, dangerous: useDanger });
     if ((expectedCwdPolicyId && expectedCwdPolicyId !== CWD_POLICY_IDENTITY)
       || (expectedCwdIdentityHash
         && expectedCwdIdentityHash !== resolvedCwdIdentity.cwdIdentityHash)) {
@@ -4479,6 +4640,19 @@ async function executeOneShot(body, res) {
     return rejectBeforeAdmission(400, err.code === 'workspace_grounding' ? 'workspace_grounding' : 'validation', {
       error: err.message, errorCode: err.code, validation: err.validation,
     });
+  }
+  if (entry.oneshot_adapter === 'openai_chat_api') {
+    const controller = new AbortController();
+    const disconnect = () => { if (!res.writableEnded) controller.abort(); };
+    res.once('close', disconnect);
+    let readiness;
+    try { readiness = await probeHostedReadiness(kind, entry, controller.signal, execution.model); }
+    finally { res.removeListener('close', disconnect); }
+    if (res.destroyed || controller.signal.aborted) return;
+    if (!readiness.ready) return rejectBeforeAdmission(409,
+      readiness.modelCatalog?.status === 'unavailable' ? 'model_unavailable' : 'model_catalog_unavailable', {
+        error: readiness.detail, modelCatalog: readiness.modelCatalog, model_invocation: false, physical_attempt_count: 0, dropped_out: true,
+      });
   }
   const hasPromptFile = preparedPrompt.evidence.transport === 'file';
   // Account selection is part of admission, not spawn setup. If every linked
@@ -4553,6 +4727,19 @@ async function executeOneShot(body, res) {
       request_id: requestId,
     });
   }
+  const selectedQuotaSeat = dispatchAccount.quotaSeat || quotaSeatForProvider(kind);
+  const providerCooldown = cooldowns.status(kind);
+  const quotaCooldown = [cooldowns.status(selectedQuotaSeat),
+    ...(providerCooldown.scope === 'model' ? [providerCooldown] : [])].find((state) => state.cooling);
+  if (quotaCooldown) return rejectBeforeAdmission(409,
+    quotaCooldown.authority === 'unknown' ? 'cooldown_authority_unavailable' : 'provider_cooldown', {
+      error: quotaCooldown.authority === 'unknown' ? 'Cooldown authority is unavailable; repair the quota state before dispatch.'
+        : 'The selected subscription is cooling; use another eligible account or wait for its reset.',
+      cooldown: quotaCooldown, retry_at: quotaCooldown.until,
+      retry_after: Number.isSafeInteger(quotaCooldown.until) && quotaCooldown.until > Date.now()
+        ? Math.max(1, Math.ceil((quotaCooldown.until - Date.now()) / 1000)) : null,
+      model_invocation: false, physical_attempt_count: 0,
+    });
   const reserveAdmission = subscriptionUsage.verdict(dispatchAccount.quotaSeat || quotaSeatForProvider(kind),
     { model: execution.model, bucket: entry.native_usage_bucket });
   if (body.expectedQuotaSeat !== undefined && body.expectedQuotaSeat !== dispatchAccount.quotaSeat) {
@@ -4653,6 +4840,7 @@ async function executeOneShot(body, res) {
   // on the wrong plan is worse than failing, so this assignment is not
   // strippable.
   Object.assign(childEnv, dispatchAccount.env);
+  if (kind === 'copilot') delete childEnv.COPILOT_ALLOW_ALL;
   const resolvedBin = resolveExecutable(bin, childEnv);
   const modelFlagSent = modelControls(slot, entry)[0]?.flag || null;
   // Return non-secret route metadata with every one-shot response.  This lets
@@ -4712,6 +4900,7 @@ async function executeOneShot(body, res) {
     requested_timeout_ms: Number.isFinite(Number(timeoutMs)) ? Math.trunc(Number(timeoutMs)) : null,
     effective_timeout_ms: supervisorOptions.hardDeadline === false ? null : supervisorOptions.hardCapMs,
     dynamic_supervision: supervisorOptions.adaptive === true,
+    child_process_policy: childProcessPolicy,
     cli_deadline: cliDeadline.deadline,
     timeout_clamped: explicitTimeout != null && Math.trunc(Number(timeoutMs)) !== explicitTimeout,
     environment_overrides: Object.keys({ ...oneShotEnv, ...(isolatedProviderHome?.env || {}) }).sort(),
@@ -4740,6 +4929,30 @@ async function executeOneShot(body, res) {
   // cancellation receipts/listeners or child admission can record an attempt.
   let launch = null;
   if (!['ollama_api', 'openai_chat_api'].includes(entry.oneshot_adapter)) {
+    if (kind === 'copilot' && useDanger) {
+      try {
+        if (body.dangerous !== true) writerPermissionArgs('', args, false);
+        const scriptPrefix = /^node(?:\.exe)?$/i.test(path.basename(resolvedBin)) && path.isAbsolute(args[0] || '') && /\.(?:c|m)?js$/i.test(args[0]) ? [args[0]] : [];
+        const helpLaunch = qualifiedProviderLaunch(resolvedBin, [...scriptPrefix, '--help'], childEnv);
+        const controller = new AbortController();
+        const onClose = () => { if (!res.writableEnded) controller.abort(); };
+        res.once('close', onClose);
+        let probe;
+        try {
+          const probeKey = crypto.createHash('sha256').update(JSON.stringify({ file: helpLaunch.file, args: helpLaunch.args, env: helpLaunch.env })).digest('hex');
+          probe = await probePool.run(`copilot_writer:${probeKey}`, signal => runPhysicalProbe(helpLaunch, 8000, signal), { signal: controller.signal });
+        } finally { res.removeListener('close', onClose); }
+        if (controller.signal.aborted || res.destroyed) { cleanupPromptFile(); cleanupProviderHome(); releaseAdmission(); return; }
+        const qualified = writerPermissionArgs(probe.exitCode === 0 && !probe.timedOut ? probe.stdout : '', args, true);
+        args.splice(0, args.length, ...qualified);
+        route.permission_policy = { id: 'copilot_noninteractive_tools_v1', source: 'installed_cli_help',
+          scope: 'vendor_tool_approval', filesystemContained: false, flags: [...COPILOT_WRITER_FLAGS] };
+      } catch (error) {
+        cleanupPromptFile(); cleanupProviderHome();
+        return rejectBeforeAdmission(409, 'permission_policy_unavailable', { error: error.validation?.reason || 'Copilot noninteractive writer controls could not be qualified.',
+          model_invocation: false, physical_attempt_count: 0 }, route);
+      }
+    }
     try { launch = qualifiedProviderLaunch(resolvedBin, args, childEnv); }
     catch (err) {
       cleanupPromptFile();
@@ -4769,11 +4982,12 @@ async function executeOneShot(body, res) {
           cancelled: true,
           timed_out: false,
           dropped_out: true,
-          model_invocation: true,
+          model_invocation: res._relayOwnedTransport ? (ownedRunSnapshot()?.modelInvocation ?? null) : true,
         };
     try {
       const receipt = appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt });
       res._relayReceiptPersisted = receipt.receiptId;
+
     } catch (error) {
       res._relayReceiptPersisted = `rcpt_unpersisted_${Date.now().toString(36)}`;
       console.error(`[RelayBridge] cancellation receipt persistence failed: ${error.message}`);
@@ -4788,6 +5002,7 @@ async function executeOneShot(body, res) {
   res.once('close', () => {
     if (res._relayLifecycle) return;
     if (res.writableEnded || res._relayReceiptPersisted) return;
+    if (res._relayOwnedTransport) { res._relayIsolationReceiptDeferred = true; return; }
     if (route.isolated_home_cleanup === 'pending') {
       res._relayIsolationReceiptDeferred = true;
       return;
@@ -4795,6 +5010,9 @@ async function executeOneShot(body, res) {
     persistCancellationReceipt();
   });
   if (['ollama_api', 'openai_chat_api'].includes(entry.oneshot_adapter)) {
+    if (privateContext?.requiresOwner) return rejectBeforeAdmission(409, 'owned_transport_unsupported', {
+      error: 'Owned workflow execution requires a qualified native transport.', model_invocation: false, physical_attempt_count: 0,
+    }, route);
     return runHttpProviderOneShot({
       entry: { ...entry, model: execution.model }, prompt, effectivePrompt, res, route, startedAt, cwd: resolvedCwd,
       supervisorOptions,
@@ -4803,6 +5021,10 @@ async function executeOneShot(body, res) {
     });
   }
   let proc;
+  let ownedHandle = null;
+  const ownedRunSnapshot = () => { try { return ownedHandle?.snapshot() || null; } catch { return null; } };
+  const runId = `run_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 8)}`;
+  route.run_id = runId;
   let writerWorkspaceBaseline = null;
   let providerInputWriteError = false;
   let gracefulFinalization = null;
@@ -4820,6 +5042,7 @@ async function executeOneShot(body, res) {
       );
     }
     resolvedCwd = spawnCwdIdentity.resolved;
+    ownedExecutionBackend?.assertWorkspaceLaunchAllowed({ cwd: resolvedCwd, privateContext, dangerous: useDanger });
     if (useDanger) writerWorkspaceBaseline = captureWriterWorkspaceSnapshot(resolvedCwd);
     const spawnOpts = {
       cwd: resolvedCwd,
@@ -4834,7 +5057,32 @@ async function executeOneShot(body, res) {
       // exitCode null (signal death) — the kill paths around a normal run have
       // to be audited before the group can be created. Tracked separately.
     };
-    proc = trackChild(spawn(launch.file, launch.args, spawnOpts));
+    if (privateContext?.requiresOwner) {
+      res._relayOwnedTransport = true;
+      if (!ownedExecutionBackend?.isExecutionContext(privateContext)) throw Object.assign(new Error('Owned task context is invalid.'), { code: 'OWNER_TASK_CONTEXT_INVALID' });
+      const identity = { provider: kind, accountId: dispatchAccount.account?.id || 'default',
+        executionHash: ownerIdentityHash(execution), cwdIdentityHash: spawnCwdIdentity.cwdIdentityHash, cwdPolicyId: CWD_POLICY_IDENTITY };
+      ownedDispatchIdentities.set(privateContext.taskId, Object.freeze(identity));
+      ownedHandle = ownedExecutionBackend.prepareLaunch(privateContext, {
+        binding: { requestId, invocationId, attemptId, runId, taskId: privateContext.taskId,
+          reservationId: privateContext.reservationId, ...identity },
+        launch: { file: launch.file, args: launch.args, cwd: resolvedCwd, env: launch.env },
+        profile: { version: 1, kind: 'linux_pid1_owner', policyId: identity.cwdPolicyId,
+          cwdIdentityHash: identity.cwdIdentityHash, executionHash: identity.executionHash, writeRoots: [] },
+      });
+      liveOwnedAdmissions.add(ownedHandle.ownerId);
+      const releasePhysicalAdmission = releaseAdmission;
+      releaseAdmission = () => {}; // Only the journal's applied marker releases this slot.
+      ownedExecutionBackend.onReleased(ownedHandle.ownerId, () => {
+        releasePhysicalAdmission(); liveOwnedAdmissions.delete(ownedHandle.ownerId);
+        ownedDispatchIdentities.delete(privateContext.taskId);
+        activeRuns.delete(runId); continuityControls.delete(runId);
+      });
+      proc = await ownedHandle.start();
+      if (!proc) throw Object.assign(new Error('Owned launch stopped before provider dispatch.'), { code: 'OWNER_START_CANCELLED' });
+      ownedChildStops.set(proc, () => ownedHandle.stop());
+      route.execution_owner = { ownerId: ownedHandle.ownerId, bindingHash: ownedHandle.bindingHash };
+    } else proc = trackChild(spawn(launch.file, launch.args, spawnOpts));
     // ChildProcess stdin errors are emitted asynchronously and are not caught
     // by try/catch around write(). Always consume them so an early provider
     // exit (EPIPE) cannot crash the bridge process.
@@ -4850,8 +5098,15 @@ async function executeOneShot(body, res) {
     // that intentional deferred response from a handler that forgot to reply.
     res._relayDeferredResponse = true;
   } catch (err) {
-    cleanupPromptFile();
-    cleanupProviderHome();
+    if (ownedHandle) {
+      ownedHandle.stop();
+      try { await ownedExecutionBackend.abortBeforePermit(ownedHandle.ownerId, 'Owned launch failed before permit.'); } catch {}
+      // Keep resources until actual physical completion, even after a writer-only abort.
+      ownedHandle.physicalDone.then(() => {
+        cleanupPromptFile(); cleanupProviderHome();
+        if (res._relayIsolationReceiptDeferred) persistCancellationReceipt();
+      }).catch(() => {});
+    } else { cleanupPromptFile(); cleanupProviderHome(); }
     releaseAdmission();
     if (err.validation) {
       return rejectBeforeAdmission(400, 'validation', {
@@ -4984,7 +5239,8 @@ async function executeOneShot(body, res) {
       quota_evidence: acceptedTerminalQuotaEvidence(parsedOutput, kind),
       rate_limited: parsedOutput.apiErrorStatus === 429,
       budget_exceeded: stopReason === 'token_budget',
-      provider_permission_denials: parsedOutput.permissionDenials,
+      provider_permission_denials: kind === 'copilot' ? copilotDenials.summary() : parsedOutput.permissionDenials,
+      permission_denied: stopReason === 'provider_permission_denied',
       provider_num_turns: parsedOutput.numTurns ?? progress.providerUsage?.turns ?? null,
       provider_duration_ms: parsedOutput.providerDurationMs,
       provider_api_duration_ms: parsedOutput.providerApiDurationMs,
@@ -5022,10 +5278,14 @@ async function executeOneShot(body, res) {
       supervisor_stop_reason: cancellationState.supervisorStopReason,
       stop_detail: stopReason ? stopDetail : 'the caller disconnected before the provider returned a usable result',
       progress,
+      process_census: continuityControl.processCensus || null,
+      process_warnings: continuityControl.processWarnings || [],
+      native_transport: continuityControl.nativeTransport || null,
+      writer_diff_summary: collectWriterDiffSummary(),
       cancelled: cancellationState.cancelled,
       timed_out: cancellationState.timedOut,
       dropped_out: true,
-      model_invocation: true,
+      model_invocation: ownedHandle ? (ownedRunSnapshot()?.modelInvocation ?? null) : true,
     };
   };
 
@@ -5035,8 +5295,7 @@ async function executeOneShot(body, res) {
   // spent on a wedged or looping stage. See lib/run-supervisor.js.
   const supervisor = new RunSupervisor({ ...supervisorOptions,
     finalizationSupported: supportsClaudeStreamFinalization });
-  const runId = `run_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 8)}`;
-  route.run_id = runId;
+  const nativeDispatchedAt = Date.now();
   supervisor.progress.runId = runId; supervisor.progress.attemptId = route.attempt_id;
   supervisor.progress.parser = entry.oneshot_output_parser || 'text';
   const continuityControl = { runId, kind, route, startedAt, supervisor, pid: proc.pid, cwd: resolvedCwd,
@@ -5050,6 +5309,8 @@ async function executeOneShot(body, res) {
   let stopDetail = '';
   let stopBudgetEnforcement = null;
   let sampling = false;
+  const censusCpu = createCensusCpuTracker();
+  const copilotDenials = createCopilotDenialObserver(kind);
   const usageObserver = createProviderUsageObserver(entry.oneshot_output_parser, supervisor, {
     onEvent: (event) => {
       const observation = parseClaudeStreamRateLimit(event, { quotaSeat: route.quota_seat || quotaSeatForProvider(kind) });
@@ -5073,14 +5334,23 @@ async function executeOneShot(body, res) {
 
   continuityControl.stop = (reason = 'quota_reserve') => {
     continuityControl.handoffPath = continuity.saveRun(continuityControl);
-    if (latchSupervisorVerdict({ action: 'kill', reason, detail: 'Checkpoint saved before controlled stop.' })) killProcessTree(proc);
+    if (latchSupervisorVerdict({ action: 'kill', reason, detail: 'Checkpoint saved before controlled stop.' })) { killProcessTree(proc); return true; }
+    return false;
   };
   const finishSupervision = () => {
     clearInterval(tick);
-    activeRuns.delete(runId);
+    if (!ownedHandle) activeRuns.delete(runId);
   };
   const tick = setInterval(() => {
     if (settled) return finishSupervision();
+    const nativeState = nativeTransportState(cliDeadline.deadline, nativeDispatchedAt);
+    continuityControl.nativeTransport = nativeState;
+    if (nativeState?.checkpointNeeded && !continuityControl.nativeCheckpointSaved) {
+      continuityControl.handoffPath = continuity.saveRun(continuityControl, { writer_diff_summary: collectWriterDiffSummary(),
+        stop_reason: 'native_transport_limit_approaching' });
+      continuityControl.nativeCheckpointSaved = true;
+    }
+    if (nativeState?.stopNeeded) continuityControl.stop('native_transport_limit');
     const applyVerdict = () => {
       const verdict = supervisor.evaluate();
       if (verdict.action === 'finalize') {
@@ -5089,13 +5359,18 @@ async function executeOneShot(body, res) {
       }
       if (latchSupervisorVerdict(verdict)) killProcessTree(proc);
     };
-    // CPU is only sampled once a run has gone quiet, so healthy runs never pay
-    // for the probe. It is what distinguishes a model thinking in silence from
-    // a process that is genuinely wedged.
-    if (!sampling && supervisor.needsCpuSample()) {
+    // Sample descendants even while model output is buffered. This is
+    // observational evidence, never termination or filesystem authority.
+    if (!sampling) {
       sampling = true;
-      sampleTreeCpuMs(proc.pid)
-        .then((cpuMs) => { supervisor.recordCpuSample(cpuMs); })
+      sampleProcessCensus(proc.pid)
+        .then((census) => {
+          if (settled) return;
+          continuityControl.processCensus = census;
+          continuityControl.processWarnings = [...new Set([...(continuityControl.processWarnings || []), ...fanoutWarnings(census, childProcessPolicy)])];
+          supervisor.recordCpuSample(censusCpu(census));
+          if (continuityControl.processWarnings.length && childProcessPolicy?.action === 'stop') continuityControl.stop(continuityControl.processWarnings[0]);
+        })
         .catch(() => { supervisor.recordCpuSample(null); })
         .finally(() => { sampling = false; if (!settled) applyVerdict(); });
       return;
@@ -5108,9 +5383,9 @@ async function executeOneShot(body, res) {
   res.on('close', () => {
     if (!res.writableEnded) {
       clientGone = true;
-      finishSupervision();
+      if (!ownedHandle) finishSupervision();
       killProcessTree(proc);
-      cleanupPromptFile();
+      if (!ownedHandle) cleanupPromptFile();
     }
   });
   proc.stdout.setEncoding('utf8');
@@ -5138,8 +5413,10 @@ async function executeOneShot(body, res) {
   });
   proc.stderr.on('data', (d) => {
     if (!stopReason && supervisor.recordOutput(d, Date.now(), 'stderr')) stderr += d;
+    if (!stopReason && copilotDenials.record(d)) continuityControl.stop('provider_permission_denied');
   });
   proc.on('error', (err) => {
+    if (ownedHandle) { ownedHandle.stop(); return; }
     if (settled) return;
     providerExited = true;
     settled = true;
@@ -5166,16 +5443,21 @@ async function executeOneShot(body, res) {
     settled = true;
     continuityControl.settled = true;
     continuity.saveRun(continuityControl);
-    continuityControls.delete(runId);
+    if (!ownedHandle) continuityControls.delete(runId);
     finishSupervision();
     cleanupPromptFile();
     const isolationCleanup = cleanupProviderHome();
     releaseAdmission();
+    if (ownedHandle) setImmediate(() => {
+      try { ownedExecutionBackend.requestFinalizeTask(ownedHandle.ownerId); }
+      catch (error) { console.error('[RelayBridge] owned result remains held:', error.code || 'OWNER_RESULT_UNCONFIRMED'); }
+    });
     if (clientGone || res.writableEnded) {
       if (res._relayIsolationReceiptDeferred) persistCancellationReceipt();
       return;
     }
     usageObserver.flush();
+    copilotDenials.flush();
     const semanticStdout = supervisorStdout ?? stdout;
     const transportStdout = stdout + lateStdout;
     let parsedOutput = parseConfiguredOneShotOutput(entry, semanticStdout, {
@@ -5297,7 +5579,7 @@ async function executeOneShot(body, res) {
       || (!nativeStructuredOutput && (code !== 0 || !cleanedStdout || parsedOutput.isError)
         && runClassification.kind === 'auth_failed')
       || (entry.oneshot_output_parser === 'codex_json' && parsedOutput.diagnosticIsProviderError === true && runClassification.kind === 'auth_failed');
-    const permission_denied = authoritativeApiFailure === 'permission'
+    const permission_denied = stopReason === 'provider_permission_denied' || copilotDenials.summary().count > 0 || authoritativeApiFailure === 'permission'
       || runClassification.kind === 'headless_command_permission_auto_denied';
     // This is a CLI-reported timeout, not proof of which timer expired.
     // Antigravity emits identical text for local context errors and trajectory
@@ -5309,6 +5591,10 @@ async function executeOneShot(body, res) {
     const retainedPartial = !!stopReason && !!parsedOutput.partialDiagnostic;
     const checkpoint = retainedPartial ? parsedOutput.partialCheckpoint : null;
     const finalFailureClass = !isolationCleanup.ok ? 'isolation_cleanup'
+      : ['owner_proof_unconfirmed', 'owner_permit_failed'].includes(stopReason) ? stopReason
+      : stopReason === 'operator_cancelled' ? 'operator_cancelled'
+      : stopReason === 'provider_permission_denied' ? 'policy'
+      : ['child_fanout', 'scope_expansion', 'native_transport_limit'].includes(stopReason) ? stopReason
       : stopReason === 'quota_reserve' ? 'quota_reserve'
       : stopReason === 'assessor_stuck' ? 'assessor_stuck'
       : stopReason === 'account_identity_changed' ? 'account_identity_changed'
@@ -5345,7 +5631,7 @@ async function executeOneShot(body, res) {
       provider_stop_reason: parsedOutput.providerStopReason,
       provider_terminal_reason: parsedOutput.terminalReason,
       provider_api_error_status: parsedOutput.apiErrorStatus,
-      provider_permission_denials: parsedOutput.permissionDenials,
+      provider_permission_denials: kind === 'copilot' ? copilotDenials.summary() : parsedOutput.permissionDenials,
       provider_num_turns: parsedOutput.numTurns ?? supervisedUsage?.turns ?? null,
       provider_duration_ms: parsedOutput.providerDurationMs,
       provider_api_duration_ms: parsedOutput.providerApiDurationMs,
@@ -5399,9 +5685,14 @@ async function executeOneShot(body, res) {
       provider_budget_enforcement: tokenBudgetExceeded ? stopBudgetEnforcement
         : (supervisor.snapshot().providerUsagePhase === 'unavailable' ? 'unavailable' : supervisor.snapshot().providerUsagePhase),
       progress: supervisor.snapshot(),
+      process_census: continuityControl.processCensus || null,
+      process_warnings: continuityControl.processWarnings || [],
+      native_transport: continuityControl.nativeTransport || null,
+      provider_state: kind === 'perplexity' ? readPerplexityState(stderr) : null,
       timed_out: providerTimedOut,
+      cancelled: stopReason === 'operator_cancelled',
       dropped_out,
-      model_invocation: true,
+      model_invocation: ownedHandle ? (ownedRunSnapshot()?.modelInvocation ?? null) : true,
     }, {
       kind, prompt, route, startedAt, cwd: resolvedCwd, transportStdout: semanticStdout,
       accountId: dispatchAccount.account?.id || null,
@@ -5412,7 +5703,30 @@ async function executeOneShot(body, res) {
       trackRunAfterResponse({ runId, kind, user: runUser, prompt, cwd: resolvedCwd, intent: runIntent });
     }
   };
-  proc.on('close', settleFromClose);
+  if (ownedHandle) {
+    ownedHandle.completion.then(observation => {
+      if (observation?.evidence === 'process_tree_settled' || settled || res.writableEnded || res.destroyed) return;
+      const physical = ownedRunSnapshot();
+      continuityControl.handoffPath = continuity.saveRun(continuityControl, { stop_reason: 'execution_uncertain' });
+      sendOneShotResult(res, { kind, route, exitCode: -1, stdout: '', stderr: '',
+        failureClass: 'execution_uncertain', dropped_out: true, model_invocation: physical?.modelInvocation ?? null,
+        physical_attempt_count: physical?.physicalAttemptCount ?? null, physical_settled: false,
+        continuity: { handoffPath: continuityControl.handoffPath },
+      }, { kind, prompt, route, startedAt, cwd: resolvedCwd, accountId: dispatchAccount.account?.id || null });
+      // The semantic failure is available to callers; resources, capacity and
+      // the active owner remain held until independent physical proof arrives.
+    }).catch(error => console.error('[RelayBridge] owned completion remains held:', error.code || 'OWNER_COMPLETION_UNCONFIRMED'));
+    ownedHandle.physicalDone.then(async () => {
+      try { await ownedHandle.confirmPhysical(); }
+      catch (error) {
+        latchSupervisorVerdict({ action: 'kill', reason: 'owner_proof_unconfirmed', detail: 'Physical result could not be committed; the reservation is retained.' });
+        console.error('[RelayBridge] owned proof remains held:', error.code || 'OWNER_PROOF_UNAVAILABLE');
+      }
+      settleFromClose(ownedRunSnapshot()?.rootExit?.code ?? proc.exitCode ?? -1);
+    }).catch(error => {
+      console.error('[RelayBridge] owned settlement remains held:', error.code || 'OWNER_PROOF_UNAVAILABLE');
+    });
+  } else proc.on('close', settleFromClose);
   // 'close' waits for every inherited stdio pipe to reach EOF, so a CLI that
   // leaves an MCP server or node shim holding stdout exits without ever firing
   // it: nothing settles, the admission slot stays taken, and the request hangs
@@ -5422,11 +5736,23 @@ async function executeOneShot(body, res) {
   // 'close' lands within microseconds of 'exit' and wins the `settled` race, so
   // this only fires when a survivor is holding the pipe open.
   proc.on('exit', (code) => {
+    if (ownedHandle) return;
     const graceful = setTimeout(() => settleFromClose(code === null ? -1 : code), ONESHOT_CLOSE_GRACE_MS);
     if (typeof graceful.unref === 'function') graceful.unref();
   });
   // Providers without a placeholder (Claude/Codex/Perplexity wrapper) read
   // stdin. Antigravity consumes {prompt}; Grok consumes {prompt_file}.
+  if (ownedHandle) {
+    try {
+      if (await ownedHandle.permit() !== true) throw Object.assign(new Error('Provider permit was declined.'), { code: 'OWNER_PERMIT_UNCONFIRMED' });
+    }
+    catch (error) {
+      latchSupervisorVerdict({ action: 'kill', reason: 'owner_permit_failed', detail: 'Provider permission was not confirmed.' });
+      ownedHandle.stop();
+      try { await ownedExecutionBackend.abortBeforePermit(ownedHandle.ownerId, 'Owned provider permit was not confirmed.'); } catch {}
+      return;
+    }
+  }
   if (promptTransport === 'stdin_stream_json') {
     try {
       proc.stdin.write(initialStreamFrame, (error) => {
@@ -5460,9 +5786,19 @@ const incidentLog = createIncidentLog({
   dataDir: path.join(DATA_DIR, 'incidents'),
   log: (m) => console.log(m),
 });
+ownedExecutionBackend = createOwnedExecutionBackend({
+  enabled: loadConfig()._ownership?.enabled === true, dataDir: DATA_DIR,
+  receiptStoreId: RECEIPT_STORE_IDENTITY.id,
+  getTaskQueue: () => taskQueue, getPipeline: () => workflowPipeline,
+  readExecutionIdentity: task => ownedDispatchIdentities.get(task.id) || null,
+});
 const taskQueue = createTaskQueue({
   dataDir: path.join(DATA_DIR, 'tasks'),
   executeOneShot, readCollab, writeCollab,
+  autoStart: false,
+  executionOwners: ownedExecutionBackend.taskAuthority,
+  requiresExecutionOwner: task => ownedExecutionBackend.requiresOwnedTask(task),
+  appendDeliveryReceipt: createDeliveryReceiptSink({ directory: RECEIPTS_DIR, append: appendBridgeReceiptRecord }),
   stopExecution: (task) => { for (const run of continuityControls.values()) {
     if (task.body?.requestId && run.route.request_id === task.body.requestId) run.stop?.('client_cancelled');
   } },
@@ -5479,6 +5815,7 @@ app.post('/api/tasks', trackedHandler(async (req, res) => {
       throw validationError('invalid_delivery', 'deliveryMode', 'deliveryMode must be queued when supplied');
     }
     const providerBudget = validateProviderBudget(input.providerBudget);
+    validateChildProcessPolicy(input.childProcessPolicy);
     const { classifyTask } = await ROUTER_MODULE_PROMISE;
     const classifiedTaskTier = typeof input.prompt === 'string'
       ? classifyTask(input.prompt).tier : undefined;
@@ -5711,7 +6048,7 @@ app.post('/api/delegations/:id/escalation', (req, res) => {
 // the single canonical-workspace writer lease.  Provider tasks stay in the
 // existing queue so they survive client disconnects and retain normal receipt,
 // quota, timeout, and filesystem-policy handling.
-const workflowPipeline = createWorkflowPipeline({ dataDir: DATA_DIR });
+const workflowPipeline = createWorkflowPipeline({ dataDir: DATA_DIR, executionOwners: ownedExecutionBackend.writerAuthority });
 const { createRequestLedger } = require('./lib/request-ledger');
 const requestLedger = createRequestLedger({ dataDir: path.join(DATA_DIR, 'requests') });
 const workflowController = createWorkflowController({
@@ -5720,7 +6057,17 @@ const workflowController = createWorkflowController({
   loadConfig,
   incidents: incidentLog,
   requestLedger,
+  ownedExecution: ownedExecutionBackend,
   log: (message) => console.log(message),
+});
+registerOwnedWorkflowRoutes({ app, pipeline: workflowPipeline, backend: ownedExecutionBackend.writerRecoveryBackend,
+  assertActionIdentity(req) {
+    if (!BRIDGE_BUILD_IDENTITY.ready || !RECEIPT_STORE_IDENTITY.ready
+      || req.get('x-relaybridge-expected-build-id') !== BRIDGE_BUILD_ID
+      || req.get('x-relaybridge-expected-receipt-store-id') !== RECEIPT_STORE_IDENTITY.id) {
+      throw Object.assign(new Error('identity mismatch'), { code: 'BRIDGE_IDENTITY_MISMATCH' });
+    }
+  },
 });
 
 const WORKFLOW_NOT_FOUND_CODES = new Set(['WORKFLOW_NOT_FOUND', 'NOT_FOUND']);
@@ -5738,6 +6085,8 @@ function sendWorkflowError(res, error) {
   const code = typeof error?.code === 'string' ? error.code : 'WORKFLOW_ERROR';
   const status = WORKFLOW_NOT_FOUND_CODES.has(code) ? 404
     : WORKFLOW_CONFLICT_CODES.has(code) ? 409
+      : code === 'ARTIFACT_TOO_LARGE' ? 413
+        : code === 'ARTIFACT_TRUNCATED' ? 409
       : code === 'PROVIDER_UNAVAILABLE' ? 503
         : code.startsWith('INVALID_') || code === 'PATH_ESCAPE' ? 400 : 500;
   return res.status(status).json({
@@ -5940,7 +6289,9 @@ function quotaSeatForProvider(provider) {
   return quotaSeatRegistry.providerToQuotaSeat[provider] || provider;
 }
 function coolingQuotaStates() {
-  return cooldowns.cooling().map((state) => {
+  const cfg = loadConfig();
+  const seats = new Set([...Object.keys(cfg).filter(kind => isAiProviderEntry(kind, cfg[kind])), ...Object.keys(currentQuotaSeatGroups()), ...Object.keys(cooldowns.all())]);
+  return [...seats].map((seat) => cooldowns.status(seat)).filter((state) => state.cooling).map((state) => {
     const quotaSeat = quotaSeatForProvider(state.seat);
     const accountScoped = state.scope !== 'model';
     return {
@@ -5963,7 +6314,7 @@ function filterCandidatesByQuotaCooldown(candidates = [], explicit = null, cooli
     const seat = typeof candidate === 'string' ? candidate : candidate.seat;
     const state = byAlias.get(seat);
     const item = typeof candidate === 'string' ? { seat } : { ...candidate };
-    if (state && seat !== explicit) skipped.push({ ...item, cooldown: state });
+    if (state) skipped.push({ ...item, cooldown: state });
     else usable.push({ ...item, cooldown: state || null });
   }
   return { usable, skipped, allCooling: usable.length === 0 && skipped.length > 0 };
@@ -6292,8 +6643,9 @@ function accountRegistry() {
   return _accountRegistryCache.value;
 }
 
-function invalidateAccountRegistry() {
+function invalidateAccountRegistry({ healthOnly = false } = {}) {
   authGeneration += 1;
+  if (!healthOnly) answerHealthEpoch += 1;
   _accountRegistryCache = { at: 0, value: { providers: {} } };
 }
 
@@ -6537,8 +6889,7 @@ function accountAwareRoutingInputs(config, diagnostics, gauges, coolingStates) {
     }
 
     // Every non-exhausted account is cooling. Normal routing blocks the
-    // provider, while the established explicit-provider override can still
-    // probe one account and clear a recovered cooldown.
+    // provider, including an explicitly selected provider.
     const cooled = nonExhausted[0];
     routeGauges[kind] = projectGauge(
       kind, byQuotaSeat[cooled.quotaSeat] || routeGauges[kind],
@@ -7517,7 +7868,10 @@ wss.on('connection', (ws, req) => {
     if (admissionClosed) { ws.close(1001, 'bridge shutting down'); return; }
     try {
       const msg = JSON.parse(raw.toString('utf8'));
-      if (msg.type === 'input') session.write(msg.data || '');
+      if (msg.type === 'input') {
+        const result = session.write(msg.data ?? '', msg.mode || 'keystrokes');
+        session._sendTo(ws, JSON.stringify({ type: 'input_status', ...result }));
+      }
       else if (msg.type === 'resize') session.resize(msg.cols || 120, msg.rows || 30);
     } catch {}
   });
@@ -7577,6 +7931,10 @@ function startupIdentityMatches(initial, current) {
 }
 
 async function startBridgeListener() {
+  const ownership = ownedExecutionBackend.status();
+  if (ownership.active) {
+    await ownedExecutionBackend.initialize(await qualifyOwnedHost({ dataDir: DATA_DIR }));
+  } else await ownedExecutionBackend.restoreAndRollForward();
   // Await every repo-local ESM module that a REST handler or the remote MCP
   // surface can use. All CJS requires above have already run synchronously.
   // After the check below, request handling may read runtime configuration and
@@ -7597,6 +7955,7 @@ async function startBridgeListener() {
     throw new Error('RelayBridge source changed while runtime modules were loading; refusing to listen');
   }
 
+  taskQueue.resume();
   server.listen(PORT, HOST, () => {
   console.log(`[RelayBridge] listening on http://${HOST}:${PORT}`);
   console.log(`[RelayBridge] open the URL above in Chrome.`);
@@ -7662,6 +8021,7 @@ function shutdown() {
   // Stop dispatch and heartbeats before terminating any worker process.
   try { taskQueue.shutdown(); } catch (error) { console.error('[RelayBridge] queue shutdown failed:', error.message); }
   try { workflowController.shutdown(); } catch (error) { console.error('[RelayBridge] workflow shutdown failed:', error.message); }
+  try { ownedExecutionBackend.stopAll(); } catch (error) { console.error('[RelayBridge] owned stop remains unconfirmed:', error.code); }
   console.log('\n[RelayBridge] shutting downâ€¦');
   for (const s of sessions.values()) s.kill();
   for (const proc of activeChildren) killProcessTree(proc);

@@ -540,43 +540,61 @@ test('bound writer recovery survives restart and releases only its own expired l
   assert.equal(recovered.startImplementation(nextId).workflow.phase, 'implementing');
 });
 
-test('every Markdown artifact is capped and content hashes are verified', (t) => {
+test('oversized instructions fail before mutation and complete artifacts retain hash checks', (t) => {
   const { pipeline, cwd, dataDir } = fixture(t, {
     pipeline: { maxArtifactChars: 96, maxHistoryEntries: 3 },
   });
   const runId = 'wf_caps_999999999999';
   const long = `BEGIN-${'x'.repeat(1000)}-END`;
-  pipeline.createWorkflow({
-    runId,
-    cwd,
-    objective: long,
-    constraints: long,
-    nonGoals: long,
-    acceptance: long,
-  });
-
-  for (const kind of ['objective', 'constraints', 'non-goals', 'acceptance']) {
-    const artifact = pipeline.readArtifact(runId, kind);
-    assert.ok(artifact.content.length <= 96);
-    assert.equal(artifact.storedChars, artifact.content.length);
-    assert.equal(artifact.originalChars, long.length);
-    assert.equal(artifact.truncated, true);
-    assert.equal(artifact.sha256, crypto.createHash('sha256').update(artifact.content).digest('hex'));
-    assert.match(artifact.content, /RelayBridge truncated/);
-  }
-
-  pipeline.completeResearch(runId, { markdown: long });
+  throwsCode(() => pipeline.createWorkflow({ runId, cwd, objective: 'valid', acceptance: long }), 'ARTIFACT_TOO_LARGE');
+  assert.equal(pipeline.get(runId), null);
+  pipeline.createWorkflow({ runId, cwd, objective: 'original', acceptance: 'accepted' });
+  const before = pipeline.get(runId);
+  throwsCode(() => pipeline.updateScope(runId, { objective: 'new', acceptance: long }), 'ARTIFACT_TOO_LARGE');
+  assert.deepEqual(pipeline.get(runId), before);
+  assert.equal(pipeline.readArtifact(runId, 'objective').content, 'original');
+  throwsCode(() => pipeline.completeResearch(runId, { markdown: long }), 'ARTIFACT_TOO_LARGE');
+  assert.deepEqual(pipeline.get(runId), before);
+  pipeline.completeResearch(runId, { markdown: 'research' });
   pipeline.startPlanning(runId);
-  pipeline.completePlanning(runId, { markdown: long });
-  const state = pipeline.get(runId);
-  assert.ok(state.history.length <= 3);
-  assert.ok(state.artifactHistory.length <= 3);
-  assert.ok(state.historyDropped > 0);
-  assert.ok(state.artifactHistoryDropped > 0);
-
+  throwsCode(() => pipeline.completePlanning(runId, { markdown: long + '\nPLAN_STATUS: READY' }), 'ARTIFACT_TOO_LARGE');
+  assert.equal(pipeline.get(runId).phase, 'planning');
+  pipeline.completePlanning(runId, { markdown: 'plan' });
+  const lease = pipeline.startImplementation(runId);
+  const held = pipeline.get(runId);
+  throwsCode(() => pipeline.completeImplementation(runId, { leaseToken: lease.lease.leaseToken, markdown: long }), 'ARTIFACT_TOO_LARGE');
+  assert.deepEqual(pipeline.get(runId), held);
+  throwsCode(() => pipeline.checkpointAndRelease(runId, { leaseToken: lease.lease.leaseToken, markdown: long }), 'ARTIFACT_TOO_LARGE');
+  assert.deepEqual(pipeline.get(runId), held);
+  pipeline.completeImplementation(runId, { leaseToken: lease.lease.leaseToken, markdown: 'implemented' });
+  pipeline.startReview(runId);
+  throwsCode(() => pipeline.completeReview(runId, { markdown: long, revisionRequested: false }), 'ARTIFACT_TOO_LARGE');
+  assert.equal(pipeline.get(runId).phase, 'reviewing');
+  pipeline.completeReview(runId, { markdown: 'review', revisionRequested: false });
+  pipeline.startFinalReview(runId);
+  throwsCode(() => pipeline.completeFinalReview(runId, { markdown: long + '\nREVIEW_VERDICT: APPROVE', approved: true }), 'ARTIFACT_TOO_LARGE');
+  assert.equal(pipeline.get(runId).phase, 'final_reviewing');
+  const artifact = pipeline.readArtifact(runId, 'research');
+  assert.equal(artifact.truncated, false);
+  assert.equal(artifact.sha256, crypto.createHash('sha256').update(artifact.content).digest('hex'));
   const researchPath = path.join(dataDir, 'workflows', runId, 'artifacts', 'research.md');
   fs.writeFileSync(researchPath, 'tampered', 'utf8');
   throwsCode(() => pipeline.readArtifact(runId, 'research'), 'ARTIFACT_INTEGRITY');
+});
+
+test('legacy truncated authority remains readable but cannot advance a workflow', (t) => {
+  const { pipeline, cwd, dataDir } = fixture(t);
+  const runId = 'wf_legacy_999999999999';
+  create(pipeline, cwd, runId);
+  pipeline.completeResearch(runId, { markdown: 'incomplete research' });
+  const statePath = path.join(dataDir, 'workflows', runId, 'state.json');
+  const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+  state.artifacts.research.truncated = true;
+  state.artifacts.research.originalChars = 50000;
+  fs.writeFileSync(statePath, JSON.stringify(state));
+  assert.equal(pipeline.readArtifact(runId, 'research').truncated, true);
+  throwsCode(() => pipeline.startPlanning(runId), 'ARTIFACT_TRUNCATED');
+  assert.equal(pipeline.get(runId).phase, 'research_ready');
 });
 
 test('provider task history is bounded and task identity/purpose are strict', (t) => {

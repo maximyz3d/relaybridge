@@ -149,7 +149,7 @@ without reinstalling. The RelayBridge registration stores the loopback URL and
 the path to the local token file, not the token value itself, and rolls back
 both client configurations after a partial registration. The PowerShell installer
 also removes recognized legacy names (`ps_bridge` and `ps-bridge`) only when
-their command is confirmed to target a RelayBridge `mcp/server.mjs`; unrelated
+their command is confirmed to target a RelayBridge `mcp/server.mjs` or `mcp/launcher.mjs`; unrelated
 lookalikes are retained. Restart Codex or Claude after registration so they
 reload MCP configuration.
 
@@ -303,12 +303,21 @@ provider home. `dangerous:true` remains the only explicit human-authorized
 writer path, and no safe rejection is automatically retried as dangerous.
 Claude and Fable safe one-shots are `read_only_enforced` only because their
 launch vectors combine `--safe-mode`, `--restricted`, an explicit empty strict
-MCP config, `--tools Read,Glob,Grep`, plan permission mode, no session
+MCP config, `--tools Read,Glob,Grep`, `dontAsk` permission mode, no session
 persistence, and a 150k auto-compact window. Restricted mode confines built-in
 file tools to the working directories and refuses bypass-permissions mode.
 Changing or removing that complete launch boundary requires returning the
 provider to `unverified_provider_policy` until the replacement is verified.
 Other unproven subscription CLIs remain unavailable for safe one-shots.
+
+`dangerous:true` authorizes the configured writer and cannot enforce file
+boundaries expressed in its prompt. Inspect the actual worktree diff before
+accepting its output. An explicit `allowedWritePaths` request currently returns
+`filesystem_contract_unsupported` before invocation; it is never silently
+discarded. The candidate-staging library preserves dirty/untracked inputs and
+quarantines forbidden final changes, but requires a qualified native filesystem,
+network and ownership executor before it can run providers. See
+[maintenance acceptance](docs/BACKLOG-2026-09-11.md) for remaining qualification.
 
 Filesystem eligibility is applied before routing, not only at execution.
 `/api/diag`, `/api/agents`, MCP provider summaries, route candidates, plans,
@@ -768,3 +777,20 @@ not a successful answer or an automatic commit.
 ## License
 
 MIT.
+
+### MCP adapter recovery
+
+New registrations run `mcp/launcher.mjs`, a persistent stdio launcher with one
+adapter child per host connection. Re-run the MCP installer and reload each
+host once to migrate an existing direct adapter registration. A replacement
+adapter replays only the protocol handshake, checks capabilities and protocol
+compatibility, and receives fresh requests. An interrupted tool call returns
+`unknown_dispatch`; inspect its task or receipt before deciding whether to
+submit new work. Tool calls are never replayed automatically.
+
+Recovery attempts are bounded to three starts per minute. The startup deadline
+applies to the adapter handshake, not to productive provider work. Cancellation
+releases launcher request capacity without claiming that provider work stopped.
+The launcher cannot repair its own terminated process or a closed host pipe;
+those require the host to reload the registration. `bridge_status` and
+`get_context_bundle` expose separate launcher, adapter, and REST build identities.
