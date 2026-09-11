@@ -18,7 +18,7 @@ async function fixture(t, { supervisor = { idleMs: 1000, hardCapMs: 3000 } } = {
     label: 'HTTP lifecycle fixture', model: 'fixture', models_static: ['fixture'], oneshot_adapter: 'ollama_api',
     safe: [process.execPath], oneshot_safe: [process.execPath], oneshot_safe_filesystem_policy: 'read_only_enforced',
     oneshot_capabilities: { safe: ['model_invocation', 'prompt_only'] },
-  } }), { env: { RELAYBRIDGE_OLLAMA_URL: `http://127.0.0.1:${upstream.address().port}` } });
+  } }), { env: { RELAYBRIDGE_MAX_ACTIVE_PER_PROVIDER: '1', RELAYBRIDGE_OLLAMA_URL: `http://127.0.0.1:${upstream.address().port}` } });
   const receipts = () => completeJsonLines(path.join(bridge.root, 'data', 'receipts', new Date().toISOString().slice(0, 10) + '.jsonl'));
   return { bridge, requests, receipts };
 }

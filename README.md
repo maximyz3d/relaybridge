@@ -502,6 +502,38 @@ New collaboration rooms preselect local seats when available. Hosted seats are o
 
 Provider entries may declare a string-only `oneshot_env` map for child-process environment overrides and use a validated `{cwd}` placeholder to bind tools to the requested workspace. This field alone is not filesystem isolation. RelayBridge applies overrides only to that provider's one-shot process and reports only the overridden variable names in route metadata. `isolated_home` adds the complete disposable provider-state tree described above. Grok one-shots disable automatic Claude/Cursor MCP discovery and bypass inherited leader processes, preventing a repository review from recursively reconnecting to RelayBridge; interactive Grok sessions retain their normal MCP configuration. Gemini one-shots receive the validated workspace explicitly so safe headless reads do not depend on launch-directory inference.
 
+## Parallel provider instances
+
+One shared bridge supports multiple Claude and Codex clients and processes.
+By default, up to four calls per provider and eight calls total can run at once
+(for example, four Claude plus four Codex calls). Background tasks share that
+provider capacity and can dispatch up to eight tasks concurrently. Excess
+background work waits in the queue; excess direct one-shots receive a retryable
+`429 admission_limit`.
+
+| Environment variable | Default | Maximum |
+| --- | ---: | ---: |
+| `RELAYBRIDGE_MAX_ACTIVE_ONESHOTS` | 8 | 16 |
+| `RELAYBRIDGE_MAX_ACTIVE_PER_PROVIDER` | 4 | 4, bounded by the global limit |
+| `RELAYBRIDGE_MAX_TASKS` | 8 | bounded by the global limit |
+
+Set these variables in the bridge process environment before starting it;
+changes require a restart after active and queued work finishes. Matching
+`PS_BRIDGE_*` names remain supported, with `RELAYBRIDGE_*` taking precedence.
+Values must be positive safe integers; invalid values use the defaults, and
+values above a ceiling are clamped. Explicit lower limits, including `1`, are
+honored. Provider subscription quotas and cooldowns still apply.
+
+`GET /api/health` reports `maxActiveOneShots`, `maxActivePerProvider`,
+`activeOneShotsByProvider`, `maxConcurrentTasks`, `activeTaskQueueCount`, and
+`queuedTaskCount`. Admission rejections also report `activeForKind` and
+`maxActivePerProvider` alongside the global count and limit.
+
+Each call has its own process, output, and receipt. Keep independent writer
+jobs in separate workspaces or Git worktrees; the exclusive writer lease for
+one canonical workspace still applies. Read-only planning and review can
+run concurrently across clients and workflows.
+
 ## REST API
 
 `GET /api/health` and same-origin `GET /api/capability` are bootstrap endpoints. Other `/api/*` routes require `X-RelayBridge-Token`. `X-PS-Bridge-Token` remains accepted for older clients.

@@ -15,6 +15,7 @@ const { createAttemptLifecycle } = require('./lib/attempt-lifecycle');
 const { readOllamaStream, readProviderBody, LIMITS: HTTP_PROVIDER_LIMITS } = require('./lib/http-provider-stream');
 const { parseHostedTerminal, classifyHttpTerminal } = require('./lib/http-provider-terminal');
 const { resolveAttemptTiming, renderCliDeadline } = require('./lib/cli-deadline');
+const { resolveConcurrencyPolicy } = require('./lib/concurrency-policy');
 const { validateProviderBudget } = require('./lib/provider-budget');
 const { promptTransportLimits, preparePrompt, renderPromptSlot } = require('./lib/prompt-transport');
 const { compileOutputProfile, listOutputProfiles, profileError } = require('./lib/output-profiles');
@@ -2344,8 +2345,9 @@ async function runHttpProviderOneShot({ entry, prompt, effectivePrompt, res, rou
 
 const activeChildren = new Set();
 const activeOneShots = new Map();
-const MAX_ACTIVE_ONESHOTS = Math.max(1, Math.min(Number(envFirst('RELAYBRIDGE_MAX_ACTIVE_ONESHOTS', 'PS_BRIDGE_MAX_ACTIVE_ONESHOTS') || 4), 16));
-const MAX_ACTIVE_PER_PROVIDER = Math.max(1, Math.min(Number(envFirst('RELAYBRIDGE_MAX_ACTIVE_PER_PROVIDER', 'PS_BRIDGE_MAX_ACTIVE_PER_PROVIDER') || 1), 4));
+const CONCURRENCY_POLICY = resolveConcurrencyPolicy();
+const MAX_ACTIVE_ONESHOTS = CONCURRENCY_POLICY.maxActiveOneShots;
+const MAX_ACTIVE_PER_PROVIDER = CONCURRENCY_POLICY.maxActivePerProvider;
 let activeOneShotCount = 0;
 
 function acquireOneShot(kind) {
@@ -2877,6 +2879,11 @@ app.get('/api/health', (req, res) => {
     activeTaskCount: activeChildren.size,
     activeOneShotCount,
     maxActiveOneShots: MAX_ACTIVE_ONESHOTS,
+    maxActivePerProvider: MAX_ACTIVE_PER_PROVIDER,
+    activeOneShotsByProvider: Object.fromEntries(activeOneShots),
+    maxConcurrentTasks: CONCURRENCY_POLICY.maxConcurrentTasks,
+    activeTaskQueueCount: taskQueue.stats().active,
+    queuedTaskCount: taskQueue.stats().queued,
     oneShotTimeoutPolicy: {
       minimumMs: TIMEOUT_POLICY.minimumMs,
       defaultMs: TIMEOUT_POLICY.oneShotDefaultMs,
@@ -4537,6 +4544,8 @@ async function executeOneShot(body, res) {
       failureClass: 'admission_limit',
       activeOneShotCount,
       maxActiveOneShots: MAX_ACTIVE_ONESHOTS,
+      activeForKind: activeOneShots.get(kind) || 0,
+      maxActivePerProvider: MAX_ACTIVE_PER_PROVIDER,
     });
   }
   let promptFileDir = null;
@@ -5382,7 +5391,7 @@ const taskQueue = createTaskQueue({
   dataDir: path.join(DATA_DIR, 'tasks'),
   executeOneShot, readCollab, writeCollab,
   receiptStoreId: RECEIPT_STORE_IDENTITY.ready ? RECEIPT_STORE_IDENTITY.id : null,
-  maxConcurrent: Number(process.env.RELAYBRIDGE_MAX_TASKS) || 3,
+  maxConcurrent: CONCURRENCY_POLICY.maxConcurrentTasks,
   onFailure: (task) => incidentLog.report(taskFailureDetails(task)),
   log: (m) => console.log(m),
 });

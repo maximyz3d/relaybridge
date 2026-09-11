@@ -31,9 +31,11 @@ Codex is the orchestrator and primary implementation writer. Use the
 6. A fresh Claude Sonnet/high final review is the closing review gate. A
    read-only Codex verifier may supply focused supplementary evidence.
 
-Never run overlapping writers or duplicate an active task. Parallelize only
-independent read-only discovery, and return compact summaries instead of raw
-transcripts. Keep each handoff bound to the run/request/receipt identifiers,
+Never run overlapping writers in the same canonical workspace or duplicate an
+active task. Independent read-only discovery and provider calls may run in
+parallel across clients, including multiple Claude or Codex instances. Parallel
+writers must use separate workspaces/worktrees with their own writer leases.
+Return compact summaries instead of raw transcripts. Keep each handoff bound to the run/request/receipt identifiers,
 file scope, base revision, decisions, risks, and acceptance evidence. Start a
 fresh session at plan and review boundaries; compact a continuing coordination
 thread around 60–70% context use.
