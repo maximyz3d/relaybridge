@@ -205,3 +205,17 @@ test('all coordinator entry points reject malformed and traversal IDs before fil
   assert.equal(access.length, 0); for (const spy of spies) spy.mock.restore();
   assert.equal(f.controller.get(source.id).id, source.id);
 });
+
+test('relative data directories resolve coordinator paths inside the same store and preserve replay filenames', (t) => {
+  const f = fixture(t), controller = createContinuity({ ...f.options, dataDir: path.relative(process.cwd(), f.dir) });
+  const input = { mode: 'external', kind: 'claude', allowedProviders: ['claude'], cwd: f.dir,
+    objective: 'Preserve the same durable store', ownerToken: 'a'.repeat(64) };
+  const source = controller.register(input);
+  const expected = path.join(f.dir, 'continuity', source.id+'.md');
+  assert.equal(source.handoffPath, expected); assert.equal(path.isAbsolute(source.handoffPath), true);
+  assert.ok(fs.existsSync(path.join(f.dir, 'continuity', source.id+'.json')));
+  fs.unlinkSync(expected);
+  const retry = createContinuity(f.options).register(input);
+  assert.equal(retry.handoffPath, expected); assert.equal(retry.id, source.id); assert.equal(retry.epoch, 1);
+  assert.ok(fs.existsSync(expected)); assert.equal(f.calls.length, 0);
+});
