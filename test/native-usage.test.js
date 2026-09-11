@@ -26,8 +26,53 @@ test('Claude stream fractions, statusline percentages and explicit denials stay 
   assert.equal(status.buckets[0].windows[0].percentRemaining, 20);
   const rejected = parseClaudeStreamRateLimit({ type: 'rate_limit_event', rate_limit_info: {
     status: 'rejected', rateLimitType: 'seven_day', utilization: 1.2, resetsAt: reset } }, context);
-  assert.equal(rejected.ordinaryUsageAllowed, false); assert.equal(rejected.buckets[0].windows[0].percentRemaining, 0);
+  // An out-of-range utilization is rejected evidence, not a fabricated 0% remaining: the
+  // explicit denial (status: 'rejected') is what protects the seat, independent of the bad window.
+  assert.equal(rejected.ordinaryUsageAllowed, false);
+  assert.equal(rejected.buckets[0].windows[0].invalid, true);
+  assert.equal(rejected.buckets[0].windows[0].percentRemaining, undefined);
   assert.equal(parseClaudeStatuslineUsage({ context_window: { used_percentage: 99 } }, context), null);
+});
+test('out-of-range usedPercent/utilization are rejected as invalid evidence, not clamped', () => {
+  const context = { quotaSeat: 'codex', observedAt: T };
+  const overRange = parseCodexRateLimits({ ordinaryUsageAllowed: true, rateLimits: { limitId: 'codex' },
+    rateLimitsByLimitId: { codex: { primary: { usedPercent: 5000, windowDurationMins: 10080, resetsAt: reset },
+      secondary: { usedPercent: 10, windowDurationMins: 300, resetsAt: reset } } } }, context);
+  assert.equal(overRange.buckets[0].windows[0].id, 'primary');
+  assert.equal(overRange.buckets[0].windows[0].invalid, true);
+  assert.equal(overRange.buckets[0].windows[0].percentRemaining, undefined);
+  // The good sibling window must not be dropped by the invalid one, nor make the bucket look
+  // fully fresh on its own: subscription-usage.js poisons the whole bucket instead.
+  assert.equal(overRange.buckets[0].windows[1].id, 'secondary');
+  assert.equal(overRange.buckets[0].windows[1].percentRemaining, 90);
+  const negative = parseCodexRateLimits({ ordinaryUsageAllowed: true, rateLimits: { limitId: 'codex' },
+    rateLimitsByLimitId: { codex: { primary: { usedPercent: -5, windowDurationMins: 10080, resetsAt: reset } } } }, context);
+  assert.equal(negative.buckets[0].windows[0].invalid, true);
+  const badUtilization = parseClaudeStreamRateLimit({ type: 'rate_limit_event', rate_limit_info: {
+    status: 'allowed', unifiedWindows: { five_hour: { utilization: -0.2, resetsAt: reset } } } },
+    { quotaSeat: 'claude', observedAt: T });
+  assert.equal(badUtilization.buckets[0].windows[0].invalid, true);
+});
+test('a malformed Codex individualLimit is marked invalid, not silently dropped', () => {
+  const context = { quotaSeat: 'codex', observedAt: T };
+  const base = (individualLimit) => parseCodexRateLimits({ ordinaryUsageAllowed: true, rateLimits: { limitId: 'codex' },
+    rateLimitsByLimitId: { codex: { primary: { usedPercent: 10, windowDurationMins: 10080, resetsAt: reset }, individualLimit } } }, context);
+  const overRange = base({ remainingPercent: 150 });
+  const individualOverRange = overRange.buckets[0].windows.find((w) => w.id === 'individual');
+  assert.equal(individualOverRange.invalid, true);
+  assert.equal(individualOverRange.percentRemaining, undefined);
+  const badReset = base({ remainingPercent: 40, resetsAt: -5 });
+  assert.equal(badReset.buckets[0].windows.find((w) => w.id === 'individual').invalid, true);
+  // A missing/null reset is legitimate for a spend limit and must not be treated as invalid.
+  const noReset = base({ remainingPercent: 40 });
+  const noResetWindow = noReset.buckets[0].windows.find((w) => w.id === 'individual');
+  assert.equal(noResetWindow.invalid, undefined);
+  assert.equal(noResetWindow.percentRemaining, 40);
+  assert.equal(noResetWindow.resetsAt, null);
+  const nullReset = base({ remainingPercent: 40, resetsAt: null });
+  assert.equal(nullReset.buckets[0].windows.find((w) => w.id === 'individual').invalid, undefined);
+  // A valid sibling window must still be present alongside the invalid individual marker.
+  assert.equal(overRange.buckets[0].windows.find((w) => w.id === 'primary').percentRemaining, 90);
 });
 test('native quota RPC performs initialization and account read only, then closes its process', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rb-quota-rpc-'));

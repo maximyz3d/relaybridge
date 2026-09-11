@@ -48,14 +48,42 @@ test('native quota stops only after a durable checkpoint and launches one physic
   assert.equal(created.status, 201, JSON.stringify(created.body));
   const id = created.body.id;
   await waitFor(() => completeJsonLines(bridge.events).some((e) => e.kind === 'claude' && e.type === 'started'));
+  // Capture the durable handoff BEFORE the low-quota signal is injected, so this
+  // proves the checkpoint pre-dated the quota drop rather than merely proving the
+  // successor later wrote a (any) .md into the same directory.
+  const runsDir = path.join(bridge.root, 'data', 'continuity', 'runs');
+  const preHandoffFiles = await waitFor(() => {
+    const files = fs.existsSync(runsDir) ? fs.readdirSync(runsDir).filter((n) => n.endsWith('.md')) : [];
+    return files.length ? files : false;
+  });
+  assert.ok(preHandoffFiles.length, 'a durable checkpoint handoff must exist before quota drops toward reserve');
   await observe(97);
   const changed = await waitFor(async () => { const v = (await bridge.request('/api/continuity/'+id)).body; return v.owner.kind === 'codex' && v.tasks.length === 2 && v; }, 18000);
   await waitFor(() => completeJsonLines(bridge.events).some((e) => e.kind === 'codex' && e.type === 'started'));
-  const events = completeJsonLines(bridge.events), stopped = events.find((e) => e.kind === 'claude' && e.type === 'finished');
-  const successor = events.find((e) => e.kind === 'codex' && e.type === 'started');
-  assert.ok(stopped && successor.at >= stopped.at);
+  const events = completeJsonLines(bridge.events);
   assert.equal(events.filter((e) => e.kind === 'codex' && e.type === 'started').length, 1);
-  assert.equal(events.find((e) => e.type === 'stopping').handoffExists, true);
+  // Windows does not deliver a real SIGTERM to the fixture child, so its own
+  // 'stopping'/'finished' self-report never fires there. The physical order that
+  // actually matters (predecessor durably settled before the successor started, and
+  // a handoff existed first) is proven platform-neutrally from the queue's own
+  // durable task settlement timestamps instead of the child's signal handler.
+  const predecessorTaskId = changed.tasks.find((t) => t.kind === 'claude').taskId;
+  const successorTaskId = changed.tasks.find((t) => t.kind === 'codex').taskId;
+  const predecessorTask = (await bridge.request('/api/tasks/'+predecessorTaskId)).body;
+  const successorTask = await waitFor(async () => { const v = (await bridge.request('/api/tasks/'+successorTaskId)).body; return v.startedAt != null && v; });
+  // finishedAt alone can also represent cancellation intent; require the task's own
+  // execution record to have actually settled (not merely reached a terminal status).
+  assert.equal(predecessorTask.execution?.state, 'settled', 'predecessor coordinator task must durably settle');
+  assert.ok(predecessorTask.execution?.settledAt, 'predecessor coordinator task must record a settlement timestamp');
+  assert.ok(successorTask.startedAt >= predecessorTask.execution.settledAt, 'successor must not start before the predecessor physically settles');
+  assert.ok(fs.existsSync(runsDir) && fs.readdirSync(runsDir).some((n) => n.endsWith('.md')),
+    'a durable checkpoint handoff must exist by the time the predecessor settles');
+  if (process.platform !== 'win32') {
+    const stopped = events.find((e) => e.kind === 'claude' && e.type === 'finished');
+    const successor = events.find((e) => e.kind === 'codex' && e.type === 'started');
+    assert.ok(stopped && successor.at >= stopped.at);
+    assert.equal(events.find((e) => e.type === 'stopping').handoffExists, true);
+  }
   assert.match(fs.readFileSync(changed.handoffPath, 'utf8'), /Keep public contracts stable/);
   assert.equal(changed.epoch, 2);
   assert.deepEqual(events.filter((e) => e.type === 'rpc').map((e) => e.method), ['initialize', 'initialized', 'account/rateLimits/read']);

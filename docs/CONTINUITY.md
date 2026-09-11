@@ -23,6 +23,24 @@ Unknown capacity allows ordinary calls, but cannot qualify an automatic
 successor or assessor. Local token counts and operator estimates do not become
 subscription percentages.
 
+A window's `usedPercent`/`utilization` outside its valid 0-100/0-1 range is
+rejected as invalid evidence, not clamped into a fabricated in-range value.
+An invalid window is never silently dropped either: it poisons headroom for
+its whole bucket to unknown, so a good sibling window cannot make the bucket
+read as fully fresh. This applies to Codex's per-model `individualLimit` spend
+window too — a supplied but unusable `remainingPercent` or `resetsAt` is
+marked invalid rather than dropped (a missing/null reset is still allowed,
+since spend limits may not carry one). An explicit native denial
+(`ordinaryUsageAllowed:false`, spend-control reached, or a Claude `rejected`
+status) still protects the seat even when every window in the same payload is
+malformed. The last valid `percentRemaining`/reset for a window is retained
+per window id (including across a restart) when a later reading for that same
+window turns invalid, so a cached status-line reading cannot silently
+supersede it and protection keeps being re-evaluated against the *current*
+reserve setting rather than a snapshot taken under an earlier one, until an
+affirmative valid reading of that window shows capacity above the reserve
+again.
+
 Measured percentage depletion per hour can trigger checkpointing before the
 reserve is reached. The bridge persists a handoff before requesting finalization
 or stopping a process. A finalization-capable Claude stream gets up to 90 seconds;
@@ -127,6 +145,15 @@ failures, stale useful progress, no active retry window, and a current assessmen
 that cites the exact supplied evidence. New useful progress or a distinct tool
 operation invalidates an older assessment. An assessment alone cannot approve
 an implementation or replace the pipeline's fresh review gates.
+
+Turning off `dynamicSupervision` or `assessorEnabled` while adaptive supervision
+stays on (no explicit `timeoutMs`) does not restore a fixed elapsed-time kill or
+add an idle-only stop: the assessor simply never runs, so an automatic stuck
+stop can never be corroborated. The run's assessor state reports
+`assessor_disabled` so this is visible on the dashboard and in `/api/runs/active`
+instead of silently doing nothing; token/output budgets, quota reserve admission
+and any deadline actually supplied (queued `timeoutMs`, a per-provider
+`hardCapMs`, or `_supervisor.hardDeadline:true`) remain fully enforced.
 
 ## REST and MCP collection
 

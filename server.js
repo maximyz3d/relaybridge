@@ -3647,12 +3647,15 @@ app.get('/api/runs/active', (req, res) => {
       ...(run.lifecycle ? { transportLifecycle: run.lifecycle.snapshot() } : {}),
       nativeUsage: subscriptionUsage.headroom(run.route.quota_seat || quotaSeatForProvider(run.kind), { model: run.route.requested_model }),
       continuity: { id: run.continuityId || null, handoffPath: run.handoffPath || null },
-      assessment: snap.phase === 'streaming' ? 'producing output right now â€” leave it alone'
+      assessment: (snap.phase === 'streaming' ? 'producing output right now â€” leave it alone'
         : snap.phase === 'working' ? 'recently active â€” still working'
           : snap.phase === 'suspect_loop' ? 'repeating itself â€” watch this one'
             : snap.phase === 'quiet' || snap.phase === 'quiet_start'
               ? 'Quiet; useful progress is unverified'
-              : 'starting up',
+              : 'starting up')
+        + (snap.adaptive && snap.assessor?.state === 'assessor_disabled' && snap.hardCapRemainingMs == null
+          ? ' â€” automatic stuck detection is unavailable (assessor disabled); token/output budgets, quota reserve and any explicit deadline still apply'
+          : ''),
     });
   }
   res.json({ ok: true, count: runs.length, runs });
@@ -6025,8 +6028,16 @@ function observeRunContinuity(run) {
     // accept a finalization message or no model budget remains.
     if (usage.floorReached || usage.freshness !== 'fresh' || !run.finalizeSupported || at - run.reserveRequestedAt >= 90000) run.stop?.('quota_reserve');
   }
-  if (isAssessor || !settings.dynamicSupervision || !settings.assessorEnabled || run.settled) return;
+  if (isAssessor || run.settled) return;
   const supervisor = run.supervisor;
+  // Adaptive supervision keeps every other guard (token/output budgets, quota
+  // reserve, an explicit deadline) fully enforced with the assessor off; it
+  // just cannot corroborate a stall, so make that explicit instead of leaving
+  // the constructor's transient "not_due" state visible forever.
+  if (!settings.dynamicSupervision || !settings.assessorEnabled) {
+    if (supervisor.opts.adaptive === true && !supervisor.assessor.taskId) supervisor.assessor.state = 'assessor_disabled';
+    return;
+  }
   if (at < supervisor.nextAssessmentAt || supervisor.assessor.taskId || supervisor.assessor.count >= 3) return;
   if (Object.values(assessorRecords).some((r) => !r.finished)) {
     supervisor.assessor.state = 'waiting_for_assessor'; return;
