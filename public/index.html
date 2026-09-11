@@ -437,6 +437,19 @@
       <span id="operator-quota-status" class="muted" style="font-size:11px;"></span>
       <div class="muted" style="flex-basis:100%;font-size:10px;">Manual, expiring quota-seat observation only. Credentials, dashboard content, and free-form notes are never accepted or stored.</div>
     </div>
+    <fieldset style="margin-bottom:12px;padding:10px;border:1px solid var(--border);">
+      <legend>Usage protection and continuity</legend>
+      <label><input id="continuity-protect" type="checkbox" checked> Protect remaining allowance</label>
+      <label style="margin-left:12px;">Reserve <input id="continuity-reserve" type="number" min="2" max="5" step="0.1" value="5" style="width:60px;">%</label><br>
+      <label><input id="continuity-handoff" type="checkbox" checked> Automatically hand off managed coordination</label><br>
+      <label><input id="continuity-dynamic" type="checkbox" checked> Let productive jobs continue beyond default timers</label><br>
+      <label><input id="continuity-assessor" type="checkbox" checked> Use bounded low-tier progress assessments</label>
+      <div><button class="btn" id="continuity-save">Save settings</button> <button class="btn" id="native-usage-refresh">Refresh native usage</button> <span id="continuity-save-status" class="muted"></span></div>
+      <p class="muted">Checkpoints are saved while work runs. External chat agents must register and explicitly yield; native usage can be unavailable or delayed.</p>
+      <div id="continuity-usage"></div>
+      <div id="continuity-projects"></div>
+      <div id="continuity-progress"></div>
+    </fieldset>
     <div id="fuel-totals" style="margin-bottom:10px;"></div>
     <div id="fuel-gauges">Loading…</div>
     <div class="muted" style="margin-top:10px; font-size:11px;">
@@ -765,10 +778,12 @@ async function refreshHealthStatus() {
         const kb = (worst.bytes / 1024).toFixed(1);
         const label = worst.phase === 'streaming' ? `streaming ${kb} KB`
           : worst.phase === 'suspect_loop' ? `repeating — ${worst.repeatPeak}x line`
-            : `quiet ${secs}s${worst.cpuMs != null ? ' (CPU active)' : ''}`;
+            : `quiet ${secs}s`;
         const el = $('#status-liveness');
         el.textContent = `${worst.kind}: ${label}`;
-        el.title = `${worst.assessment}\nlines: ${worst.lines} | stops in ${Math.round(Math.min(worst.idleBudgetMs, worst.hardCapRemainingMs) / 1000)}s if nothing changes`;
+        el.title = worst.hardCapRemainingMs == null
+          ? `${worst.assessment}\nLast progress: ${Math.round((worst.progress?.staleProgressMs || 0) / 1000)}s ago; assessment: ${worst.assessor?.state || 'not due'}. No elapsed-time deadline.`
+          : `${worst.assessment}\nExplicit deadline in ${Math.round(worst.hardCapRemainingMs / 1000)}s`;
         el.className = 'status-pill ' + (worst.phase === 'streaming' || worst.phase === 'working' ? 'ok' : 'warn');
       }
     } else {
@@ -1827,7 +1842,7 @@ function createCollab(participants, opts) {
         <button class="phase-btn" data-phase="blind" title="Each AI answers independently, without seeing the others.">1 · Blind takes</button>
         <button class="phase-btn" data-phase="discuss" title="Each AI sees everyone's takes and reacts.">2 · Discuss</button>
         <button class="phase-btn" data-phase="divide" title="Each AI proposes what it will own.">3 · Split work</button>
-        <button class="phase-btn round-cancel" data-cancel disabled title="Cancel the current round and stop its provider processes">■ Cancel round</button>
+        <button class="phase-btn round-cancel" data-cancel disabled title="Stop waiting for this round; background tasks remain recoverable">■ Stop waiting</button>
         <span style="flex:1"></span>
         <button class="phase-btn" data-phase="pplx-web" title="Open the current message at perplexity.ai in your browser (free, uses your session).">🔍 Web search</button>
         <button class="phase-btn" data-phase="pplx-help" title="How Perplexity works in this chat">ℹ️ Perplexity</button>
@@ -2124,6 +2139,23 @@ function appendMsg(collab, m, transient) {
     body.textContent = m.text || '';
   }
   bubble.appendChild(body);
+  if (/^t_[A-Za-z0-9_]{1,120}$/.test(m.meta?.pendingTaskId || '')) {
+    const collect = document.createElement('button'); collect.className = 'btn'; collect.textContent = 'Check result';
+    collect.addEventListener('click', async () => {
+      collect.disabled = true;
+      try {
+        const handle = await api(`/api/tasks/${m.meta.pendingTaskId}/result`);
+        if (handle.resultState === 'pending') body.textContent = `Task ${handle.taskId} is ${handle.status}. It remains available after closing this page.`;
+        else {
+          m.text = handle.result || `Task ${handle.status}: ${handle.unavailableReason || 'no complete result'}`;
+          m.error = !handle.metadata?.complete; m.meta.taskId = m.meta.pendingTaskId; delete m.meta.pendingTaskId;
+          body.textContent = m.text; collect.remove(); scheduleSave(collab);
+        }
+      } catch (error) { body.textContent = error.message; }
+      finally { collect.disabled = false; }
+    });
+    bubble.appendChild(collect);
+  }
   if (m.meta && m.who !== 'system') {
     const route = m.meta.route || {};
     const values = [
@@ -2168,7 +2200,7 @@ function buildSharedHeader(collab) {
 
 function buildTranscriptText(collab) {
   return collab.transcript
-    .filter(m => m.who !== 'system' && !m.error && !m.thinking)
+    .filter(m => m.who !== 'system' && !m.error && !m.thinking && !m.meta?.pendingTaskId)
     .map(m => {
       if (m.who === 'user') return `## User${m.phase ? ' ['+m.phase+']' : ''}:\n${m.text}`;
       const cfg = state.config[m.who] || {};
@@ -2178,7 +2210,30 @@ function buildTranscriptText(collab) {
     }).join('\n\n');
 }
 
-async function callOneshot(kind, prompt, timeoutMs = ONE_SHOT_DEFAULT_TIMEOUT_MS, signal) {
+async function callOneshot(kind, prompt, timeoutMs, signal) {
+  if (timeoutMs === undefined) {
+    const taskId = `t_ui_${crypto.randomUUID().replaceAll('-', '')}`;
+    let handle = { taskId, resultState: 'pending' };
+    try {
+      const submitted = await bridgeFetch('/api/tasks', { method: 'POST', signal,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ deliveryMode: 'queued', taskId, kind, prompt, dangerous: false, source: 'ui' }) });
+      if (!submitted.ok) return { kind, exitCode: -1, dropped_out: true, stderr: (await submitted.json()).error || 'Task submission failed' };
+      handle = await submitted.json();
+      const until = Date.now() + 10000;
+      while (handle.resultState === 'pending' && Date.now() < until && !signal?.aborted) {
+        await new Promise(resolve => setTimeout(resolve, 250));
+        handle = await api(`/api/tasks/${taskId}/result`, { signal });
+      }
+      if (handle.resultState === 'pending' || signal?.aborted) return { kind, pending: true, taskId };
+      const task = await api(`/api/tasks/${taskId}`);
+      return { kind, stdout: handle.result || '', exitCode: task.exitCode, route: task.route, usage: task.usage,
+        receiptId: task.receiptId, dropped_out: !handle.metadata?.complete, stderr: task.error || '', taskId };
+    } catch (error) {
+      // The POST may have reached the bridge. Preserve its exact ID for recovery.
+      return { kind, pending: true, taskId, collectionError: error.message };
+    }
+  }
   try {
     const r = await bridgeFetch('/api/oneshot', {
       method: 'POST',
@@ -2215,6 +2270,7 @@ async function runTurn(c, targets, phaseLabel, promptFor) {
   const roundId = `ui_run_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 8)}`;
   let completedCount = 0;
   let cancelledCount = 0;
+  let pendingCount = 0;
   setBusyButtons(c, true);
   const placeholders = new Map();
   for (const kind of targets) {
@@ -2226,14 +2282,18 @@ async function runTurn(c, targets, phaseLabel, promptFor) {
     const jobs = targets.map(async (kind) => {
       let response;
       try {
-        response = await callOneshot(kind, promptFor(kind), ONE_SHOT_DEFAULT_TIMEOUT_MS, signal);
+        response = await callOneshot(kind, promptFor(kind), undefined, signal);
       } catch (error) {
         response = { kind, exitCode: -1, stdout: '', stderr: error.message, dropped_out: true, cancelled: signal.aborted };
       }
       const ph = placeholders.get(kind);
       if (ph) ph.remove();
       const meta = { roundId, route: response.route || {}, usage: response.usage || null, receiptId: response.receiptId || null };
-      if (response.cancelled) {
+      if (response.pending) {
+        pendingCount++;
+        appendMsg(c, { who: kind, phase: phaseLabel, text: 'Work continues in the background. Check this task for its result.',
+          meta: { ...meta, pendingTaskId: response.taskId } });
+      } else if (response.cancelled) {
         cancelledCount++;
         appendMsg(c, { who: 'system', phase: phaseLabel, text: `${state.config[kind]?.label || kind} was cancelled.` });
       } else if (response.dropped_out || response.exitCode !== 0) {
@@ -2262,7 +2322,7 @@ async function runTurn(c, targets, phaseLabel, promptFor) {
     c.busy = false;
     setBusyButtons(c, false);
     renderChips(c);
-    appendMsg(c, { who: 'system', phase: phaseLabel, text: `${roundId}: ${completedCount}/${targets.length} seats completed${cancelledCount ? `, ${cancelledCount} cancelled` : ''}. Route metadata is attached to each response and saved for MCP handoff.` });
+    appendMsg(c, { who: 'system', phase: phaseLabel, text: `${roundId}: ${completedCount}/${targets.length} seats completed${cancelledCount ? `, ${cancelledCount} cancelled` : ''}${pendingCount ? `, ${pendingCount} still running in the background` : ''}. Route metadata is attached to each response and saved for MCP handoff.` });
     scheduleSave(c);
   }
 }
@@ -2272,7 +2332,7 @@ function cancelCollabRound(collabId) {
   if (!c?.busy || !c.abortController) return;
   c.abortController.abort();
   const button = c.paneEl.querySelector('[data-cancel]');
-  if (button) { button.disabled = true; button.textContent = 'Cancelling…'; }
+  if (button) { button.disabled = true; button.textContent = 'Stopping collection…'; }
 }
 
 // Per-AI prompt for a normal group-chat message.
@@ -2419,7 +2479,7 @@ function setBusyButtons(c, busy) {
   const cancel = c.paneEl.querySelector('[data-cancel]');
   if (cancel) {
     cancel.disabled = !busy;
-    cancel.textContent = busy ? '■ Cancel round' : '■ Cancel round';
+    cancel.textContent = '■ Stop waiting';
   }
 }
 
@@ -2791,7 +2851,54 @@ function fuelBar(pct, basis){
   const c = basis === 'unmetered' ? '#64748b' : p > 50 ? '#4ade80' : p > 20 ? '#facc15' : '#f87171';
   return `<div style="background:#1e293b;border-radius:3px;height:14px;width:130px;display:inline-block;vertical-align:middle;overflow:hidden;"><div style="width:${p}%;height:100%;background:${c};"></div></div> <span style="font-size:11px;">${basis==='unmetered'?'∞':p+'%'}</span>`;
 }
+let continuitySettingsDirty = false, continuityRefreshGeneration = 0;
+for (const id of ['continuity-protect','continuity-reserve','continuity-handoff','continuity-dynamic','continuity-assessor']) {
+  document.getElementById(id)?.addEventListener('input', () => { continuitySettingsDirty = true; });
+}
+async function refreshContinuityPanel() {
+  const generation = ++continuityRefreshGeneration;
+  try {
+    const [config, usage, projects, active] = await Promise.all([
+      api('/api/settings/continuity'), api('/api/usage/native'), api('/api/continuity'), api('/api/runs/active')]);
+    if (!fuelDialog.open || generation !== continuityRefreshGeneration) return;
+    if (!continuitySettingsDirty) {
+      const values = config.settings;
+      $('#continuity-protect').checked = values.usageProtection;
+      $('#continuity-reserve').value = values.reservePercent;
+      $('#continuity-handoff').checked = values.autoHandoff;
+      $('#continuity-dynamic').checked = values.dynamicSupervision;
+      $('#continuity-assessor').checked = values.assessorEnabled;
+    }
+    $('#continuity-usage').innerHTML = '<h4>Native allowance</h4>' + (usage.observations.length ? usage.observations.map(q =>
+      `<div><b>${esc(q.quotaSeat)}</b>: ${q.percentRemaining == null ? 'unknown' : esc(q.percentRemaining.toFixed(1)) + '% remaining'} · ${esc(q.freshness)} · ${esc(q.source || 'unavailable')} ${q.protected ? '· reserve protected' : ''}<br><small>${esc(q.bucket || '')} ${(q.windows || []).map(w => `${esc(w.id)}: ${esc(w.percentRemaining)}%${w.resetsAt ? ' · resets ' + esc(new Date(w.resetsAt).toLocaleString()) : ''}`).join(' / ')}${q.percentPerHour ? ' · measured depletion ' + esc(q.percentPerHour.toFixed(2)) + '%/hour' : ''}</small></div>`).join('') : '<div class="muted">No native quota observation yet. Local token counts do not reveal subscription allowance.</div>');
+    $('#continuity-projects').innerHTML = '<h4>Project handoffs</h4>' + (projects.coordinators.length ? projects.coordinators.map(c =>
+      `<div><b>${esc(c.owner.kind)}</b> · ${esc(c.state)} · generation ${esc(c.epoch)}<br>${esc(c.objective)}<br><small>${esc(c.nextAction || '')}</small> <button class="btn" data-handoff="${esc(c.id)}">Download handoff</button></div>`).join('') : '<div class="muted">A connected agent can register this project using register_coordinator.</div>');
+    for (const button of $('#continuity-projects').querySelectorAll('[data-handoff]')) button.addEventListener('click', async () => {
+      const response = await bridgeFetch(`/api/continuity/${button.dataset.handoff}/handoff`);
+      if (!response.ok) return;
+      const url = URL.createObjectURL(new Blob([await response.text()], { type: 'text/markdown' }));
+      const link = document.createElement('a'); link.href = url; link.download = `${button.dataset.handoff}-handoff.md`; link.click(); URL.revokeObjectURL(url);
+    });
+    $('#continuity-progress').innerHTML = '<h4>Live progress</h4>' + (!(active.runs || []).length ? '<div class="muted">No active work.</div>' : '') + (active.runs || []).map(run =>
+      `<details><summary>${esc(run.kind)} · ${esc(run.assessor?.state || 'observing')} · ${run.hardCapRemainingMs == null ? 'adaptive' : 'explicit deadline'}</summary><div>${esc(run.progress?.summary || 'No public checkpoint yet; useful progress is unverified.')}</div><small>${esc(JSON.stringify(run.progress?.counts || {}))}</small><div>${esc(run.assessor?.verdict?.reason || '')}</div></details>`).join('');
+  } catch (error) { $('#continuity-save-status').textContent = error.message; }
+}
+$('#continuity-save')?.addEventListener('click', async () => {
+  continuityRefreshGeneration++;
+  try {
+    await api('/api/settings/continuity', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
+      usageProtection: $('#continuity-protect').checked, reservePercent: Number($('#continuity-reserve').value),
+      autoHandoff: $('#continuity-handoff').checked, dynamicSupervision: $('#continuity-dynamic').checked,
+      assessorEnabled: $('#continuity-assessor').checked }) });
+    continuitySettingsDirty = false; $('#continuity-save-status').textContent = 'Saved'; refreshContinuityPanel();
+  } catch (error) { $('#continuity-save-status').textContent = error.message; }
+});
+$('#native-usage-refresh')?.addEventListener('click', async () => {
+  try { await api('/api/usage/native/refresh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); refreshContinuityPanel(); }
+  catch (error) { $('#continuity-save-status').textContent = error.message; }
+});
 async function refreshFuel(){
+  refreshContinuityPanel();
   try {
     const { gauges, balance, totals, quotaSeats = {}, providerUsageCapabilities = {} } = await api('/api/usage/gauges?windowMs=' + $('#fuel-window').value);
     const quotaSeatSelect = $('#operator-quota-seat');

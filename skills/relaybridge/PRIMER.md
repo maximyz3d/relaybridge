@@ -48,13 +48,11 @@ never invent a flag.
 
 **Four rules that matter more than the table:**
 
-1. **Never send `timeoutMs`.** Runs are supervised by progress, not a clock. A
-   call producing new content is left alone to finish; one that goes silent or
-   repeats itself is stopped early. Sending `timeoutMs` reinstates a fixed
-   guillotine that kills long work mid-task.
-2. **Check `stop_reason` before trusting `stdout`.** `loop_detected` means the
-   CLI repeated itself and was stopped — do **not** resubmit the same prompt;
-   narrow the task or switch providers. `idle_stall` means it wedged.
+1. **Omit `timeoutMs` unless an explicit deadline is intended.** Adaptive work
+   continues while evidence does not justify stopping; silence alone is unknown.
+2. **Check completion and stop reason.** A pending task is unfinished work to
+   collect by exact ID. Quota reserve and stuck stops retain partial handoffs;
+   neither proves successful completion or authorizes duplicate work.
 3. **Escalate on evidence, not on a hunch.** A wrong answer, empty output, or
    `dropped_out: true` justifies a bigger model. "Feels hard" does not.
 4. **Never auto-execute destructive or high-stakes work.** Return the

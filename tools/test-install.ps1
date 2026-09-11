@@ -202,7 +202,7 @@ function Test-RequiredStripEnvMigration([string]$InstalledStripEnvJson) {
 }
 
 . ([scriptblock]::Create((Get-InstallerFunctionText @(
-  'Test-ExactJsonStringArray', 'Restore-ShippedCredentialRelocation', 'Restore-ShippedManagedLoginCommands',
+  'Test-ExactJsonStringArray', 'Restore-ShippedCodexProtocol', 'Merge-JsonDefaults', 'Restore-ShippedCredentialRelocation', 'Restore-ShippedManagedLoginCommands',
   'Restore-ShippedRequiredStripEnv',
   'Test-RetiredJsonNumber', 'Format-JsonScalar', 'Restore-ShippedManagedSupervisorBudget',
   'Test-ReleasePathExcluded', 'Test-SecretLikeReleasePath', 'Assert-ReleaseItemSafe',
@@ -211,6 +211,28 @@ function Test-RequiredStripEnvMigration([string]$InstalledStripEnvJson) {
   'Move-InstallDirectoryOnce', 'Move-InstallRootForCutover',
   'Get-BridgeShutdownProcessHandle', 'Stop-BridgeForCutover'
 ))))
+
+# Exercise the real grouped JSONL migration independently of a release cutover.
+& {
+  $defaults = Get-Content -LiteralPath (Join-Path $repoRoot 'cli-config.json') -Raw | ConvertFrom-Json
+  $legacy = [pscustomobject]@{ codex = [pscustomobject]@{
+    oneshot_safe = $defaults._config_merge.codex_json_protocol_v1.oneshot_safe
+    oneshot_dangerous = $defaults._config_merge.codex_json_protocol_v1.oneshot_dangerous
+  } }
+  $merged = Restore-ShippedCodexProtocol (Merge-JsonDefaults $defaults $legacy) $defaults $legacy
+  Assert-True ($merged.codex.oneshot_output_parser -eq 'codex_json') 'legacy Codex parser migrates with argv'
+  Assert-True ($merged.codex.oneshot_safe -contains '--json') 'legacy safe Codex receives JSONL flag'
+  Assert-True ($merged.codex.oneshot_dangerous -contains '--json') 'legacy writer Codex receives JSONL flag'
+  $again = Restore-ShippedCodexProtocol (Merge-JsonDefaults $defaults $merged) $defaults $merged
+  Assert-True ((Test-ExactJsonStringArray $again.codex.oneshot_safe $merged.codex.oneshot_safe)) 'JSONL merge is idempotent'
+  foreach ($customJson in @('{"oneshot_safe":["wrapper"],"oneshot_dangerous":[]}', '{"oneshot_safe":["codex"],"oneshot_output_parser":"text"}', '{"oneshot_safe":[]}')) {
+    $existing = [pscustomobject]@{ codex = ($customJson | ConvertFrom-Json) }
+    $custom = Restore-ShippedCodexProtocol (Merge-JsonDefaults $defaults $existing) $defaults $existing
+    foreach ($key in @('oneshot_safe', 'oneshot_dangerous', 'oneshot_output_parser', 'usage_capability')) {
+      Assert-True (($custom.codex.PSObject.Properties[$key] | ConvertTo-Json -Depth 20 -Compress) -eq ($existing.codex.PSObject.Properties[$key] | ConvertTo-Json -Depth 20 -Compress)) "custom Codex preserves $key including absence"
+    }
+  }
+}
 
 # Test the real no-replace primitive, then deterministic bounded retry paths.
 # Mocks live only in child scopes and cannot affect the full transaction below.

@@ -426,3 +426,10 @@ with its explicit button before reloading when continuing in another client;
 it is never placed in browser storage or review text. A masked field accepts a
 token obtained elsewhere. Renewal explicitly requests four hours. Failed or
 expired ownership stays held; a missing task is not release evidence.
+
+## Usage-aware coordination
+
+Use the [continuity protocol](CONTINUITY.md) to checkpoint meaningful milestones and explicitly yield
+an unfinished project before native allowance runs out. A coordinator transfer
+preserves provider restrictions, writer exclusivity and fresh review gates.
+Managed successors do not acquire implementation authority automatically.

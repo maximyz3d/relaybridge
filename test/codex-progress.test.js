@@ -63,3 +63,19 @@ test('background task and MCP preserve the completed answer without forwarding p
   const done = await waitFor(async () => { const item = (await bridge.request(`/api/tasks/${task.id}`)).body; return item.status === 'done' ? item : false; });
   assert.match(done.result, /^Completed advisory/); assert.equal(done.stderr, ''); assert.equal(done.failureClass, null);
 });
+test('Codex JSONL native errors retain auth/quota classification without private stderr', async (t) => {
+  for (const [message, expected] of [['Authentication failed.', 'auth'], ['You have hit your usage limit.', 'rate_limit']]) {
+    await t.test(expected, async (t) => {
+      const bridge = await startTestBridge(t, (root) => {
+        const script = path.join(root, 'codex-error.cjs');
+        fs.writeFileSync(script, `process.stderr.write('PRIVATE_REASONING_TOOL_OUTPUT');console.log(JSON.stringify({type:'turn.failed',error:{message:${JSON.stringify(message)}}}));process.exitCode=1;`);
+        return { codex: { label: 'Codex JSONL fixture', safe: [process.execPath], probe: [process.execPath, '--version'],
+          oneshot_safe: [process.execPath, script], oneshot_output_parser: 'codex_json',
+          oneshot_safe_filesystem_policy: 'read_only_enforced', oneshot_capabilities: { safe: ['model_invocation'] } } };
+      });
+      const result = (await bridge.request('/api/oneshot', { kind: 'codex', prompt: 'Explain a cache', dangerous: false })).body;
+      assert.equal(result.failureClass, expected, JSON.stringify(result)); assert.equal(result.dropped_out, true);
+      assert.equal(result.model_invocation, true); assert.doesNotMatch(JSON.stringify(result), /PRIVATE_REASONING_TOOL_OUTPUT/);
+    });
+  }
+});

@@ -61,10 +61,33 @@
       "claude_fable",
       "codex",
       "copilot"
-    ]
+    ],
+    "codex_json_protocol_v1": {
+      "oneshot_safe": [
+        "codex",
+        "exec",
+        "--skip-git-repo-check",
+        "--sandbox",
+        "read-only",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--ephemeral",
+        "-"
+      ],
+      "oneshot_dangerous": [
+        "codex",
+        "exec",
+        "--skip-git-repo-check",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--ephemeral",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "-"
+      ]
+    }
   },
   "_supervisor": {
-    "_note": "Liveness policy for provider runs. Runs are judged by progress, not by the clock: while new content keeps arriving a run is left alone to finish, and it is stopped early with a reason when it goes silent or starts repeating. idleMs is generous because print-mode CLIs buffer their whole answer and emit nothing until the end. providerBudget gates on authoritative provider-reported usage only; null disables one dimension. maxTurns ships as null because an agentic CLI spends a turn per tool call, so a turn count measures neither cost nor liveness. Set a positive number here, on a provider entry, or per request when you do want a turn ceiling. Any provider entry may override these with its own \"supervisor\" object.",
+    "_note": "Liveness policy for provider runs. Runs are judged by progress, not by the clock: while new content keeps arriving a run is left alone to finish, and it is stopped early with a reason when it goes silent or starts repeating. idleMs is generous because print-mode CLIs buffer their whole answer and emit nothing until the end. providerBudget gates on authoritative provider-reported usage only; null disables one dimension. maxTurns ships as null because an agentic CLI spends a turn per tool call, so a turn count measures neither cost nor liveness. Set a positive number here, on a provider entry, or per request when you do want a turn ceiling. Any provider entry may override these with its own \"supervisor\" object. Default elapsed time is an assessment point when dynamic supervision is enabled. Explicit timeoutMs and custom hardCapMs remain deadlines.",
     "idleMs": 1200000,
     "hardCapMs": 2700000,
     "graceExtensions": 3,
@@ -504,7 +527,11 @@
       ]
     },
     "_effort_note": "Explicit ultra is supported only for gpt-6-astra with a compatible Codex CLI. It is never downgraded. The historical cross-provider max alias still maps to xhigh.",
-    "effort_model_allowlist": { "ultra": ["gpt-6-astra"] },
+    "effort_model_allowlist": {
+      "ultra": [
+        "gpt-6-astra"
+      ]
+    },
     "login_command": [
       "codex",
       "login"
@@ -554,6 +581,7 @@
     "oneshot_safe": [
       "codex",
       "exec",
+      "--json",
       "--skip-git-repo-check",
       "--sandbox",
       "read-only",
@@ -565,6 +593,7 @@
     "oneshot_dangerous": [
       "codex",
       "exec",
+      "--json",
       "--skip-git-repo-check",
       "--ignore-user-config",
       "--ignore-rules",
@@ -589,7 +618,14 @@
       "CODEX_ACCESS_TOKEN",
       "OPENAI_BASE_URL"
     ],
-    "npm_package": "@openai/codex"
+    "npm_package": "@openai/codex",
+    "oneshot_output_parser": "codex_json",
+    "usage_capability": {
+      "tokens": "authoritative",
+      "turns": "unavailable",
+      "verified_runtime_version": "0.154.0",
+      "evidence": "Codex exec --json turn.completed usage; terminal-only, cached input is included in input tokens."
+    }
   },
   "copilot": {
     "oneshot_capabilities": {

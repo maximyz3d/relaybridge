@@ -174,3 +174,10 @@ For local MCP smoke testing against a running bridge:
 $env:RELAYBRIDGE_URL = 'http://127.0.0.1:8787'
 npm run smoke:mcp -- --committee
 ```
+
+## Usage-aware coordination
+
+Use the [continuity protocol](docs/CONTINUITY.md) to checkpoint meaningful milestones and explicitly yield
+an unfinished project before native allowance runs out. A coordinator transfer
+preserves provider restrictions, writer exclusivity and fresh review gates.
+Managed successors do not acquire implementation authority automatically.

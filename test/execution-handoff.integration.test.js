@@ -88,7 +88,10 @@ test('output guidance survives REST, queued execution and MCP cache as frozen pr
       ...(req.method === 'GET' ? {} : { body:raw }) });
     const body = await upstream.json();
     if (tamper === 'admission' && req.url === '/api/workspace/validate' && body.promptEvidence) body.promptEvidence.effectiveHash = '0'.repeat(64);
-    if (tamper === 'actual' && req.url === '/api/oneshot' && body.route) delete body.route.prompt_evidence;
+    if (tamper === 'actual') {
+      if (req.url === '/api/oneshot' && body.route) delete body.route.prompt_evidence;
+      if (req.url.startsWith('/api/tasks/') && body.route) delete body.route.prompt_evidence;
+    }
     res.writeHead(upstream.status, { 'Content-Type':'application/json' }); res.end(JSON.stringify(body));
   });
   await new Promise(resolve => proxy.listen(0,'127.0.0.1',resolve));

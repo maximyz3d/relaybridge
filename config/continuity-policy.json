@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "usageProtection": true,
+  "reservePercent": 5,
+  "autoHandoff": true,
+  "dynamicSupervision": true,
+  "assessorEnabled": true
+}

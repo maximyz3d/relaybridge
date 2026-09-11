@@ -16,19 +16,19 @@ test('Gemini safe/writer print wait is derived from the effective cap plus bound
     for (const slot of [config.gemini.oneshot_safe, config.gemini.oneshot_dangerous]) {
       const value = renderCliDeadline({ entry: config.gemini, slot, supervisorOptions });
       assert.ok(value.deadline.marginMs >= 30000 && value.deadline.marginMs < 31000);
-      assert.equal(value.deadline.hardCapMs, supervisorOptions.hardCapMs);
+      assert.equal(value.deadline.hardCapMs, supervisorOptions.hardDeadline === false ? 86400000 : supervisorOptions.hardCapMs);
       assert.ok(value.slot.includes(value.deadline.printTimeout)); assert.equal(value.slot.includes(PRINT_TIMEOUT_TOKEN), false);
       if (prior) assert.deepEqual(value.deadline, prior); prior = value.deadline;
     }
   }
   const normal = renderCliDeadline({ entry: config.gemini, slot: config.gemini.oneshot_safe, supervisorOptions: resolveAttemptTiming() });
-  assert.equal(normal.deadline.printTimeout, '2730s'); //45min +30sec, not15min
+  assert.equal(normal.deadline.printTimeout, '86430s'); // Adaptive transport ceiling plus bounded drain margin
   const late = new RunSupervisor({ ...resolveAttemptTiming(), startedAt: 0 });
   late.recordOutput('continued semantic progress', 16 * 60000);
   assert.notEqual(late.evaluate(16 * 60000).action, 'kill');
 });
 
-test('progress completes beyond the former 15min boundary; silent starts stop before print wait', () => {
+test('progress completes beyond the former 15min boundary; silence alone does not stop adaptive work', () => {
   const options = resolveAttemptTiming({ startedAt: 0 });
   const active = new RunSupervisor(options);
   for (let at = 30000; at <= 16 * 60000; at += 30000) {
@@ -41,8 +41,9 @@ test('progress completes beyond the former 15min boundary; silent starts stop be
   silent.recordCpuSample(0, 0);
   silent.recordCpuSample(0, options.idleMs);
   const verdict = silent.evaluate(options.idleMs);
-  assert.equal(verdict.action, 'kill');
-  assert.match(verdict.reason, /idle/);
+  assert.equal(verdict.action, 'continue');
+  const legacy = new RunSupervisor(resolveAttemptTiming({ startedAt: 0, globals: { adaptive: false } }));
+  assert.equal(legacy.evaluate(options.idleMs).action, 'kill');
   const rendered = renderCliDeadline({ entry: config.gemini, slot: config.gemini.oneshot_safe, supervisorOptions: options });
   assert.ok(options.idleMs < rendered.deadline.printTimeoutMs);
 });
@@ -57,7 +58,7 @@ test('malformed/duplicate/literal/unlimited print flags and overflow fail before
     assert.throws(() => renderCliDeadline({ entry, slot, supervisorOptions }), { code: 'invalid_print_timeout' });
   }
   const slot = ['agy', '--print-timeout=' + PRINT_TIMEOUT_TOKEN];
-  assert.equal(renderCliDeadline({ entry, slot, supervisorOptions }).slot[1], '--print-timeout=2730s');
+  assert.equal(renderCliDeadline({ entry, slot, supervisorOptions }).slot[1], '--print-timeout=86430s');
   assert.throws(() => renderCliDeadline({ entry: {}, slot, supervisorOptions }), { code: 'invalid_print_timeout' });
   for (const hardCapMs of [Infinity, NaN, -1, 0, Number.MAX_SAFE_INTEGER]) {
     assert.throws(() => renderCliDeadline({ entry, slot, supervisorOptions: { hardCapMs } }), { code: 'invalid_print_timeout' });
