@@ -1,3 +1,6 @@
+## v2.3.2 - 2026-09-11
+- #129 fix: allow parallel Claude and Codex provider instances
+
 ## v2.3.1 - 2026-09-09
 - #128 fix: refine workflow context, provider readiness, and shutdown reliability
 
