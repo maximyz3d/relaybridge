@@ -19,8 +19,8 @@ test('closed launch descriptor binds execution and cwd policy without accepting 
   assert.throws(() => validateProfile({ ...profile, policyId: hash('other') }, binding), { code: 'OWNER_LAUNCH_PROFILE_INVALID' });
   assert.throws(() => validateProfile({ ...profile, kind: 'unqualified_backend' }, binding), { code: 'OWNER_LAUNCH_PROFILE_INVALID' });
 });
-test('canonical identity and v2 fixed event bound are deterministic', () => {
+test('canonical identity and v3 fixed event bound are deterministic', () => {
   assert.equal(canonical({ b: 2, a: 1 }), canonical({ a: 1, b: 2 }));
   assert.equal(hash({ a: 1, b: 2 }), hash({ b: 2, a: 1 }));
-  assert.equal(VERSION, 2); assert.equal(MAX_OWNER_EVENTS, 6); assert.equal(MAX_JOURNAL_FILES, 2048);
+  assert.equal(VERSION, 3); assert.equal(MAX_OWNER_EVENTS, 6); assert.equal(MAX_JOURNAL_FILES, 2048);
 });

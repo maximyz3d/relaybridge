@@ -3467,11 +3467,12 @@ export function buildServer() {
     inputSchema: z.object({
       runId: workflowIdSchema,
       leaseMs: z.number().int().min(60000).max(86400000).optional(),
+      ownedLease: z.boolean().optional().describe('Require a deployment-qualified execution owner; unsupported providers refuse before dispatch.'),
     }),
     annotations: DESTRUCTIVE,
-  }, safeHandler(async ({ runId, leaseMs }, context) => result(await bridgeRequest(
+  }, safeHandler(async ({ runId, leaseMs, ownedLease }, context) => result(await bridgeRequest(
     `/api/workflows/${encodeURIComponent(runId)}/revision/start`, {
-      method: 'POST', body: leaseMs == null ? {} : { leaseMs },
+      method: 'POST', body: { ...(leaseMs == null ? {} : { leaseMs }), ...(ownedLease === undefined ? {} : { ownedLease }) },
       signal: context?.mcpReq?.signal, actionIdentity: true,
     },
   ))));

@@ -45,6 +45,10 @@ const {
 const { buildTaskPlan, costClassFor } = require('./lib/task-plan');
 const { createWorkflowPipeline } = require('./lib/workflow-pipeline');
 const { createWorkflowController } = require('./lib/workflow-controller');
+const { createOwnedExecutionBackend } = require('./lib/owned-execution-backend');
+const { qualifyOwnedHost } = require('./lib/owned-host-qualification');
+const { registerOwnedWorkflowRoutes } = require('./lib/owned-workflow-routes');
+const { hash: ownerIdentityHash } = require('./lib/execution-owner');
 const { createIncidentLog, taskFailureDetails } = require('./lib/incident-log');
 const { createDeliveryReceiptSink } = require('./lib/delivery-receipts');
 const { usageAmplification } = require('./lib/usage-amplification');
@@ -2388,6 +2392,10 @@ async function runHttpProviderOneShot({ entry, prompt, effectivePrompt, res, rou
 }
 
 const activeChildren = new Set();
+const ownedChildStops = new WeakMap();
+const liveOwnedAdmissions = new Set();
+const ownedDispatchIdentities = new Map();
+let ownedExecutionBackend = null;
 const activeOneShots = new Map();
 const CONCURRENCY_POLICY = resolveConcurrencyPolicy();
 const MAX_ACTIVE_ONESHOTS = CONCURRENCY_POLICY.maxActiveOneShots;
@@ -2396,7 +2404,9 @@ let activeOneShotCount = 0;
 
 function acquireOneShot(kind) {
   const providerCount = activeOneShots.get(kind) || 0;
-  if (activeOneShotCount >= MAX_ACTIVE_ONESHOTS || providerCount >= MAX_ACTIVE_PER_PROVIDER) return null;
+  const restored = (ownedExecutionBackend?.reservationSnapshot() || []).filter(row => row.held && !liveOwnedAdmissions.has(row.ownerId));
+  if (activeOneShotCount + restored.length >= MAX_ACTIVE_ONESHOTS
+    || providerCount + restored.filter(row => row.provider === kind).length >= MAX_ACTIVE_PER_PROVIDER) return null;
   activeOneShotCount++;
   activeOneShots.set(kind, providerCount + 1);
   let released = false;
@@ -2422,6 +2432,8 @@ function trackChild(proc) {
 // shims can leave the actual AI CLI running and consuming quota.  Kill the
 // verified wrapper tree on timeout or client disconnect.
 function killProcessTree(proc) {
+  const ownedStop = proc && ownedChildStops.get(proc);
+  if (ownedStop) { ownedStop(); return; }
   // Delegated to lib/platform.js. The old POSIX branch was proc.kill('SIGTERM')
   // — the CLI died but the subprocesses it spawned (node shims, MCP servers)
   // survived, holding ports and file locks. killTree signals the whole tree,
@@ -2523,6 +2535,7 @@ class Session {
     this.command = command;
     this.args = args;
     this.cwd = cwd || USER_HOME || ROOT;
+    ownedExecutionBackend?.assertWorkspaceLaunchAllowed({ cwd: this.cwd });
     this.buffer = []; // ring buffer of recent output
     this.bufferMax = 2000; // lines
     this.clients = new Set(); // WebSocket clients
@@ -4365,7 +4378,10 @@ app.post('/api/exec', execRequestLimit, (req, res) => {
     return res.status(400).json({ error: 'command (string) required' });
   }
   let execCwd;
-  try { execCwd = resolveAllowedCwd(cwd); }
+  try {
+    execCwd = resolveAllowedCwd(cwd);
+    ownedExecutionBackend?.assertWorkspaceLaunchAllowed({ cwd: execCwd });
+  }
   catch (err) { return res.status(400).json({ error: err.message }); }
   // Route through the platform abstraction rather than hardcoding
   // powershell.exe: off Windows that name only resolves through WSL interop,
@@ -4437,7 +4453,7 @@ app.post('/api/exec', execRequestLimit, (req, res) => {
 // How long to wait after the child's own 'exit' for the stdio pipes to reach
 // EOF before settling anyway. Matches runProbe's 2s post-kill grace.
 const ONESHOT_CLOSE_GRACE_MS = 2000;
-async function executeOneShot(body, res) {
+async function executeOneShot(body, res, privateContext = null) {
   const startedAt = Date.now();
   let releaseAdmission = null;
   const { kind, prompt, timeoutMs, cwd, dangerous } = body || {};
@@ -4594,6 +4610,7 @@ async function executeOneShot(body, res) {
   try {
     resolvedCwdIdentity = captureAllowedCwdIdentity(cwd);
     resolvedCwd = resolvedCwdIdentity.resolved;
+    ownedExecutionBackend?.assertWorkspaceLaunchAllowed({ cwd: resolvedCwd, privateContext, dangerous: useDanger });
     if ((expectedCwdPolicyId && expectedCwdPolicyId !== CWD_POLICY_IDENTITY)
       || (expectedCwdIdentityHash
         && expectedCwdIdentityHash !== resolvedCwdIdentity.cwdIdentityHash)) {
@@ -4965,7 +4982,7 @@ async function executeOneShot(body, res) {
           cancelled: true,
           timed_out: false,
           dropped_out: true,
-          model_invocation: true,
+          model_invocation: res._relayOwnedTransport ? (ownedRunSnapshot()?.modelInvocation ?? null) : true,
         };
     try {
       const receipt = appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt });
@@ -4985,6 +5002,7 @@ async function executeOneShot(body, res) {
   res.once('close', () => {
     if (res._relayLifecycle) return;
     if (res.writableEnded || res._relayReceiptPersisted) return;
+    if (res._relayOwnedTransport) { res._relayIsolationReceiptDeferred = true; return; }
     if (route.isolated_home_cleanup === 'pending') {
       res._relayIsolationReceiptDeferred = true;
       return;
@@ -4992,6 +5010,9 @@ async function executeOneShot(body, res) {
     persistCancellationReceipt();
   });
   if (['ollama_api', 'openai_chat_api'].includes(entry.oneshot_adapter)) {
+    if (privateContext?.requiresOwner) return rejectBeforeAdmission(409, 'owned_transport_unsupported', {
+      error: 'Owned workflow execution requires a qualified native transport.', model_invocation: false, physical_attempt_count: 0,
+    }, route);
     return runHttpProviderOneShot({
       entry: { ...entry, model: execution.model }, prompt, effectivePrompt, res, route, startedAt, cwd: resolvedCwd,
       supervisorOptions,
@@ -5000,6 +5021,10 @@ async function executeOneShot(body, res) {
     });
   }
   let proc;
+  let ownedHandle = null;
+  const ownedRunSnapshot = () => { try { return ownedHandle?.snapshot() || null; } catch { return null; } };
+  const runId = `run_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 8)}`;
+  route.run_id = runId;
   let writerWorkspaceBaseline = null;
   let providerInputWriteError = false;
   let gracefulFinalization = null;
@@ -5017,6 +5042,7 @@ async function executeOneShot(body, res) {
       );
     }
     resolvedCwd = spawnCwdIdentity.resolved;
+    ownedExecutionBackend?.assertWorkspaceLaunchAllowed({ cwd: resolvedCwd, privateContext, dangerous: useDanger });
     if (useDanger) writerWorkspaceBaseline = captureWriterWorkspaceSnapshot(resolvedCwd);
     const spawnOpts = {
       cwd: resolvedCwd,
@@ -5031,7 +5057,32 @@ async function executeOneShot(body, res) {
       // exitCode null (signal death) — the kill paths around a normal run have
       // to be audited before the group can be created. Tracked separately.
     };
-    proc = trackChild(spawn(launch.file, launch.args, spawnOpts));
+    if (privateContext?.requiresOwner) {
+      res._relayOwnedTransport = true;
+      if (!ownedExecutionBackend?.isExecutionContext(privateContext)) throw Object.assign(new Error('Owned task context is invalid.'), { code: 'OWNER_TASK_CONTEXT_INVALID' });
+      const identity = { provider: kind, accountId: dispatchAccount.account?.id || 'default',
+        executionHash: ownerIdentityHash(execution), cwdIdentityHash: spawnCwdIdentity.cwdIdentityHash, cwdPolicyId: CWD_POLICY_IDENTITY };
+      ownedDispatchIdentities.set(privateContext.taskId, Object.freeze(identity));
+      ownedHandle = ownedExecutionBackend.prepareLaunch(privateContext, {
+        binding: { requestId, invocationId, attemptId, runId, taskId: privateContext.taskId,
+          reservationId: privateContext.reservationId, ...identity },
+        launch: { file: launch.file, args: launch.args, cwd: resolvedCwd, env: launch.env },
+        profile: { version: 1, kind: 'linux_pid1_owner', policyId: identity.cwdPolicyId,
+          cwdIdentityHash: identity.cwdIdentityHash, executionHash: identity.executionHash, writeRoots: [] },
+      });
+      liveOwnedAdmissions.add(ownedHandle.ownerId);
+      const releasePhysicalAdmission = releaseAdmission;
+      releaseAdmission = () => {}; // Only the journal's applied marker releases this slot.
+      ownedExecutionBackend.onReleased(ownedHandle.ownerId, () => {
+        releasePhysicalAdmission(); liveOwnedAdmissions.delete(ownedHandle.ownerId);
+        ownedDispatchIdentities.delete(privateContext.taskId);
+        activeRuns.delete(runId); continuityControls.delete(runId);
+      });
+      proc = await ownedHandle.start();
+      if (!proc) throw Object.assign(new Error('Owned launch stopped before provider dispatch.'), { code: 'OWNER_START_CANCELLED' });
+      ownedChildStops.set(proc, () => ownedHandle.stop());
+      route.execution_owner = { ownerId: ownedHandle.ownerId, bindingHash: ownedHandle.bindingHash };
+    } else proc = trackChild(spawn(launch.file, launch.args, spawnOpts));
     // ChildProcess stdin errors are emitted asynchronously and are not caught
     // by try/catch around write(). Always consume them so an early provider
     // exit (EPIPE) cannot crash the bridge process.
@@ -5047,8 +5098,15 @@ async function executeOneShot(body, res) {
     // that intentional deferred response from a handler that forgot to reply.
     res._relayDeferredResponse = true;
   } catch (err) {
-    cleanupPromptFile();
-    cleanupProviderHome();
+    if (ownedHandle) {
+      ownedHandle.stop();
+      try { await ownedExecutionBackend.abortBeforePermit(ownedHandle.ownerId, 'Owned launch failed before permit.'); } catch {}
+      // Keep resources until actual physical completion, even after a writer-only abort.
+      ownedHandle.physicalDone.then(() => {
+        cleanupPromptFile(); cleanupProviderHome();
+        if (res._relayIsolationReceiptDeferred) persistCancellationReceipt();
+      }).catch(() => {});
+    } else { cleanupPromptFile(); cleanupProviderHome(); }
     releaseAdmission();
     if (err.validation) {
       return rejectBeforeAdmission(400, 'validation', {
@@ -5227,7 +5285,7 @@ async function executeOneShot(body, res) {
       cancelled: cancellationState.cancelled,
       timed_out: cancellationState.timedOut,
       dropped_out: true,
-      model_invocation: true,
+      model_invocation: ownedHandle ? (ownedRunSnapshot()?.modelInvocation ?? null) : true,
     };
   };
 
@@ -5237,8 +5295,6 @@ async function executeOneShot(body, res) {
   // spent on a wedged or looping stage. See lib/run-supervisor.js.
   const supervisor = new RunSupervisor({ ...supervisorOptions,
     finalizationSupported: supportsClaudeStreamFinalization });
-  const runId = `run_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 8)}`;
-  route.run_id = runId;
   const nativeDispatchedAt = Date.now();
   supervisor.progress.runId = runId; supervisor.progress.attemptId = route.attempt_id;
   supervisor.progress.parser = entry.oneshot_output_parser || 'text';
@@ -5283,7 +5339,7 @@ async function executeOneShot(body, res) {
   };
   const finishSupervision = () => {
     clearInterval(tick);
-    activeRuns.delete(runId);
+    if (!ownedHandle) activeRuns.delete(runId);
   };
   const tick = setInterval(() => {
     if (settled) return finishSupervision();
@@ -5327,9 +5383,9 @@ async function executeOneShot(body, res) {
   res.on('close', () => {
     if (!res.writableEnded) {
       clientGone = true;
-      finishSupervision();
+      if (!ownedHandle) finishSupervision();
       killProcessTree(proc);
-      cleanupPromptFile();
+      if (!ownedHandle) cleanupPromptFile();
     }
   });
   proc.stdout.setEncoding('utf8');
@@ -5360,6 +5416,7 @@ async function executeOneShot(body, res) {
     if (!stopReason && copilotDenials.record(d)) continuityControl.stop('provider_permission_denied');
   });
   proc.on('error', (err) => {
+    if (ownedHandle) { ownedHandle.stop(); return; }
     if (settled) return;
     providerExited = true;
     settled = true;
@@ -5386,11 +5443,15 @@ async function executeOneShot(body, res) {
     settled = true;
     continuityControl.settled = true;
     continuity.saveRun(continuityControl);
-    continuityControls.delete(runId);
+    if (!ownedHandle) continuityControls.delete(runId);
     finishSupervision();
     cleanupPromptFile();
     const isolationCleanup = cleanupProviderHome();
     releaseAdmission();
+    if (ownedHandle) setImmediate(() => {
+      try { ownedExecutionBackend.requestFinalizeTask(ownedHandle.ownerId); }
+      catch (error) { console.error('[RelayBridge] owned result remains held:', error.code || 'OWNER_RESULT_UNCONFIRMED'); }
+    });
     if (clientGone || res.writableEnded) {
       if (res._relayIsolationReceiptDeferred) persistCancellationReceipt();
       return;
@@ -5530,6 +5591,7 @@ async function executeOneShot(body, res) {
     const retainedPartial = !!stopReason && !!parsedOutput.partialDiagnostic;
     const checkpoint = retainedPartial ? parsedOutput.partialCheckpoint : null;
     const finalFailureClass = !isolationCleanup.ok ? 'isolation_cleanup'
+      : ['owner_proof_unconfirmed', 'owner_permit_failed'].includes(stopReason) ? stopReason
       : stopReason === 'operator_cancelled' ? 'operator_cancelled'
       : stopReason === 'provider_permission_denied' ? 'policy'
       : ['child_fanout', 'scope_expansion', 'native_transport_limit'].includes(stopReason) ? stopReason
@@ -5630,7 +5692,7 @@ async function executeOneShot(body, res) {
       timed_out: providerTimedOut,
       cancelled: stopReason === 'operator_cancelled',
       dropped_out,
-      model_invocation: true,
+      model_invocation: ownedHandle ? (ownedRunSnapshot()?.modelInvocation ?? null) : true,
     }, {
       kind, prompt, route, startedAt, cwd: resolvedCwd, transportStdout: semanticStdout,
       accountId: dispatchAccount.account?.id || null,
@@ -5641,7 +5703,30 @@ async function executeOneShot(body, res) {
       trackRunAfterResponse({ runId, kind, user: runUser, prompt, cwd: resolvedCwd, intent: runIntent });
     }
   };
-  proc.on('close', settleFromClose);
+  if (ownedHandle) {
+    ownedHandle.completion.then(observation => {
+      if (observation?.evidence === 'process_tree_settled' || settled || res.writableEnded || res.destroyed) return;
+      const physical = ownedRunSnapshot();
+      continuityControl.handoffPath = continuity.saveRun(continuityControl, { stop_reason: 'execution_uncertain' });
+      sendOneShotResult(res, { kind, route, exitCode: -1, stdout: '', stderr: '',
+        failureClass: 'execution_uncertain', dropped_out: true, model_invocation: physical?.modelInvocation ?? null,
+        physical_attempt_count: physical?.physicalAttemptCount ?? null, physical_settled: false,
+        continuity: { handoffPath: continuityControl.handoffPath },
+      }, { kind, prompt, route, startedAt, cwd: resolvedCwd, accountId: dispatchAccount.account?.id || null });
+      // The semantic failure is available to callers; resources, capacity and
+      // the active owner remain held until independent physical proof arrives.
+    }).catch(error => console.error('[RelayBridge] owned completion remains held:', error.code || 'OWNER_COMPLETION_UNCONFIRMED'));
+    ownedHandle.physicalDone.then(async () => {
+      try { await ownedHandle.confirmPhysical(); }
+      catch (error) {
+        latchSupervisorVerdict({ action: 'kill', reason: 'owner_proof_unconfirmed', detail: 'Physical result could not be committed; the reservation is retained.' });
+        console.error('[RelayBridge] owned proof remains held:', error.code || 'OWNER_PROOF_UNAVAILABLE');
+      }
+      settleFromClose(ownedRunSnapshot()?.rootExit?.code ?? proc.exitCode ?? -1);
+    }).catch(error => {
+      console.error('[RelayBridge] owned settlement remains held:', error.code || 'OWNER_PROOF_UNAVAILABLE');
+    });
+  } else proc.on('close', settleFromClose);
   // 'close' waits for every inherited stdio pipe to reach EOF, so a CLI that
   // leaves an MCP server or node shim holding stdout exits without ever firing
   // it: nothing settles, the admission slot stays taken, and the request hangs
@@ -5651,11 +5736,23 @@ async function executeOneShot(body, res) {
   // 'close' lands within microseconds of 'exit' and wins the `settled` race, so
   // this only fires when a survivor is holding the pipe open.
   proc.on('exit', (code) => {
+    if (ownedHandle) return;
     const graceful = setTimeout(() => settleFromClose(code === null ? -1 : code), ONESHOT_CLOSE_GRACE_MS);
     if (typeof graceful.unref === 'function') graceful.unref();
   });
   // Providers without a placeholder (Claude/Codex/Perplexity wrapper) read
   // stdin. Antigravity consumes {prompt}; Grok consumes {prompt_file}.
+  if (ownedHandle) {
+    try {
+      if (await ownedHandle.permit() !== true) throw Object.assign(new Error('Provider permit was declined.'), { code: 'OWNER_PERMIT_UNCONFIRMED' });
+    }
+    catch (error) {
+      latchSupervisorVerdict({ action: 'kill', reason: 'owner_permit_failed', detail: 'Provider permission was not confirmed.' });
+      ownedHandle.stop();
+      try { await ownedExecutionBackend.abortBeforePermit(ownedHandle.ownerId, 'Owned provider permit was not confirmed.'); } catch {}
+      return;
+    }
+  }
   if (promptTransport === 'stdin_stream_json') {
     try {
       proc.stdin.write(initialStreamFrame, (error) => {
@@ -5689,9 +5786,18 @@ const incidentLog = createIncidentLog({
   dataDir: path.join(DATA_DIR, 'incidents'),
   log: (m) => console.log(m),
 });
+ownedExecutionBackend = createOwnedExecutionBackend({
+  enabled: loadConfig()._ownership?.enabled === true, dataDir: DATA_DIR,
+  receiptStoreId: RECEIPT_STORE_IDENTITY.id,
+  getTaskQueue: () => taskQueue, getPipeline: () => workflowPipeline,
+  readExecutionIdentity: task => ownedDispatchIdentities.get(task.id) || null,
+});
 const taskQueue = createTaskQueue({
   dataDir: path.join(DATA_DIR, 'tasks'),
   executeOneShot, readCollab, writeCollab,
+  autoStart: false,
+  executionOwners: ownedExecutionBackend.taskAuthority,
+  requiresExecutionOwner: task => ownedExecutionBackend.requiresOwnedTask(task),
   appendDeliveryReceipt: createDeliveryReceiptSink({ directory: RECEIPTS_DIR, append: appendBridgeReceiptRecord }),
   stopExecution: (task) => { for (const run of continuityControls.values()) {
     if (task.body?.requestId && run.route.request_id === task.body.requestId) run.stop?.('client_cancelled');
@@ -5942,7 +6048,7 @@ app.post('/api/delegations/:id/escalation', (req, res) => {
 // the single canonical-workspace writer lease.  Provider tasks stay in the
 // existing queue so they survive client disconnects and retain normal receipt,
 // quota, timeout, and filesystem-policy handling.
-const workflowPipeline = createWorkflowPipeline({ dataDir: DATA_DIR });
+const workflowPipeline = createWorkflowPipeline({ dataDir: DATA_DIR, executionOwners: ownedExecutionBackend.writerAuthority });
 const { createRequestLedger } = require('./lib/request-ledger');
 const requestLedger = createRequestLedger({ dataDir: path.join(DATA_DIR, 'requests') });
 const workflowController = createWorkflowController({
@@ -5951,7 +6057,17 @@ const workflowController = createWorkflowController({
   loadConfig,
   incidents: incidentLog,
   requestLedger,
+  ownedExecution: ownedExecutionBackend,
   log: (message) => console.log(message),
+});
+registerOwnedWorkflowRoutes({ app, pipeline: workflowPipeline, backend: ownedExecutionBackend.writerRecoveryBackend,
+  assertActionIdentity(req) {
+    if (!BRIDGE_BUILD_IDENTITY.ready || !RECEIPT_STORE_IDENTITY.ready
+      || req.get('x-relaybridge-expected-build-id') !== BRIDGE_BUILD_ID
+      || req.get('x-relaybridge-expected-receipt-store-id') !== RECEIPT_STORE_IDENTITY.id) {
+      throw Object.assign(new Error('identity mismatch'), { code: 'BRIDGE_IDENTITY_MISMATCH' });
+    }
+  },
 });
 
 const WORKFLOW_NOT_FOUND_CODES = new Set(['WORKFLOW_NOT_FOUND', 'NOT_FOUND']);
@@ -7815,6 +7931,10 @@ function startupIdentityMatches(initial, current) {
 }
 
 async function startBridgeListener() {
+  const ownership = ownedExecutionBackend.status();
+  if (ownership.active) {
+    await ownedExecutionBackend.initialize(await qualifyOwnedHost({ dataDir: DATA_DIR }));
+  } else await ownedExecutionBackend.restoreAndRollForward();
   // Await every repo-local ESM module that a REST handler or the remote MCP
   // surface can use. All CJS requires above have already run synchronously.
   // After the check below, request handling may read runtime configuration and
@@ -7835,6 +7955,7 @@ async function startBridgeListener() {
     throw new Error('RelayBridge source changed while runtime modules were loading; refusing to listen');
   }
 
+  taskQueue.resume();
   server.listen(PORT, HOST, () => {
   console.log(`[RelayBridge] listening on http://${HOST}:${PORT}`);
   console.log(`[RelayBridge] open the URL above in Chrome.`);
@@ -7900,6 +8021,7 @@ function shutdown() {
   // Stop dispatch and heartbeats before terminating any worker process.
   try { taskQueue.shutdown(); } catch (error) { console.error('[RelayBridge] queue shutdown failed:', error.message); }
   try { workflowController.shutdown(); } catch (error) { console.error('[RelayBridge] workflow shutdown failed:', error.message); }
+  try { ownedExecutionBackend.stopAll(); } catch (error) { console.error('[RelayBridge] owned stop remains unconfirmed:', error.code); }
   console.log('\n[RelayBridge] shutting downâ€¦');
   for (const s of sessions.values()) s.kill();
   for (const proc of activeChildren) killProcessTree(proc);

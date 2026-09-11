@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { startTestBridge, waitFor, completeJsonLines } = require('./helpers/temporary-bridge');
 
-test('buffered parallel workers expose fanout; exact cancellation leaves the other worker running', { timeout: 30000 }, async t => {
+test('buffered parallel workers expose fanout; exact cancellation leaves the other worker running', { timeout: 60000 }, async t => {
   const bridge = await startTestBridge(t, root => {
     const helper = path.join(root, 'worker.cjs');
     fs.writeFileSync(helper, `const fs=require('node:fs'),{spawn}=require('node:child_process');const label=process.argv[2];
@@ -19,10 +19,21 @@ test('buffered parallel workers expose fanout; exact cancellation leaves the oth
   const first = bridge.request('/api/oneshot', { kind: 'fixture', prompt: 'A', cwd: bridge.root, dangerous: false,
     requestId: 'fixture-a', childProcessPolicy: { maxChildren: 1, action: 'warn' } });
   const second = bridge.request('/api/oneshot', { kind: 'fixture', prompt: 'B', cwd: bridge.root, dangerous: false, requestId: 'fixture-b' });
+  let latest = null, firstTerminal = null, secondTerminal = null;
+  const terminal = value => ({ status: value.status, failureClass: value.body.failureClass || null,
+    exitCode: value.body.exitCode, modelInvocation: value.body.model_invocation });
+  first.then(value => { firstTerminal = terminal(value); }, () => { firstTerminal = { requestFailed: true }; });
+  second.then(value => { secondTerminal = terminal(value); }, () => { secondTerminal = { requestFailed: true }; });
   const active = await waitFor(async () => {
     const value = await bridge.request('/api/runs/active');
+    latest = value.body.runs?.map(run => ({ requestId: run.route.request_id,
+      coverage: run.processCensus?.coverage, descendantCount: run.processCensus?.descendantCount }));
     return value.body.runs?.find(run => run.route.request_id === 'fixture-a' && run.processCensus?.descendantCount >= 2) && value.body;
-  }, 15000);
+    // Sampling starts on the five-second tick; a bounded eight-second Windows
+    // CIM timeout needs a second observation window before this test fails.
+  }, process.platform === 'win32' ? 26000 : 15000).catch(error => {
+    throw new Error(`${error.message}: ${JSON.stringify({ latest, firstTerminal, secondTerminal })}`);
+  });
   const a = active.runs.find(run => run.route.request_id === 'fixture-a');
   assert.ok(a.processWarnings.includes('child_fanout')); assert.doesNotMatch(JSON.stringify(a.processCensus), /secret-census-fixture/);
   const tuple = { requestId: a.route.request_id, invocationId: a.route.invocation_id, attemptId: a.route.attempt_id };
