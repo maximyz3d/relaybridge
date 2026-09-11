@@ -183,3 +183,25 @@ test('retryable resume of an unknown continuity id fails without acquiring owner
   const f = fixture(t);
   assert.throws(() => f.controller.resume('ct_'+'0'.repeat(24), { kind: 'codex', ownerToken: 'a'.repeat(64), expectedEpoch: 1 }), /generation or token changed/);
 });
+
+test('all coordinator entry points reject malformed and traversal IDs before filesystem access', (t) => {
+  const f = fixture(t), source = f.register({ mode: 'external', ownerToken: 'a'.repeat(64) });
+  const invalid = ['../../outside', '/tmp/outside', '..\\outside', '%2e%2e%2foutside', source.id+'\n',
+    source.id+'\0', [source.id], { toString: () => source.id }, null, 42];
+  const access = [];
+  const spies = ['readFileSync', 'writeFileSync', 'openSync', 'mkdirSync', 'renameSync'].map((method) => {
+    const original = fs[method];
+    return t.mock.method(fs, method, (...args) => { access.push({ method, path: args[0] }); return original(...args); });
+  });
+  for (const id of invalid) {
+    for (const invoke of [() => f.controller.get(id), () => f.controller.handoff(id),
+      () => f.controller.resume(id, { kind: 'codex', ownerToken: 'b'.repeat(64), expectedEpoch: 1 }),
+      () => f.controller.checkpoint(id, { ownerToken: source.ownerToken, epoch: 1, checkpoint: {} }),
+      () => f.controller.yieldOwner(id, { ownerToken: source.ownerToken, epoch: 1, checkpoint: {}, releaseEvidence: 'Stopped' }),
+      () => f.controller.cancel(id), () => f.controller.advance(id)]) {
+      assert.throws(invoke, /invalid continuity id/);
+    }
+  }
+  assert.equal(access.length, 0); for (const spy of spies) spy.mock.restore();
+  assert.equal(f.controller.get(source.id).id, source.id);
+});
