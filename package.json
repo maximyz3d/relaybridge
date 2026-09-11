@@ -6,12 +6,12 @@
   "scripts": {
     "start": "node server.js",
     "start:no-pty": "node -e \"process.env.PTY_MODE='none'; require('./server.js')\"",
-    "mcp": "node mcp/server.mjs",
-    "mcp:check": "node --check mcp/server.mjs",
+    "mcp": "node mcp/launcher.mjs",
+    "mcp:check": "node --check mcp/launcher.mjs && node --check mcp/server.mjs",
     "smoke:mcp": "node tools/mcp-smoke.mjs",
     "test:install": "powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File tools/test-install.ps1",
     "test:install-mcp": "powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File tools/test-install-mcp.ps1",
-    "test": "node --test --test-concurrency=1 test/*.test.js"
+    "test": "node --test --test-concurrency=1 test/*.test.js test/*.test.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/node": "^2.0.0",

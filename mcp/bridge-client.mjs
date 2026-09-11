@@ -25,6 +25,14 @@ function envFirst(...names) {
 const TOKEN_FILE = path.resolve(envFirst('RELAYBRIDGE_TOKEN_FILE', 'PS_BRIDGE_TOKEN_FILE') || path.join(BRIDGE_ROOT, '.bridge-token'));
 const DATA_DIR = path.resolve(envFirst('RELAYBRIDGE_DATA_DIR', 'PS_BRIDGE_DATA_DIR') || path.join(BRIDGE_ROOT, 'data'));
 const EXPECTED_RECEIPT_STORE_IDENTITY = receiptStoreIdentity(DATA_DIR);
+// Process-local diagnostics only; these values never authorize bridge actions.
+export const localAdapterIdentity = Object.freeze({
+  adapterPid: process.pid,
+  launcherPid: /^\d+$/.test(process.env.RELAYBRIDGE_LAUNCHER_PID || '') ? Number(process.env.RELAYBRIDGE_LAUNCHER_PID) : null,
+  generation: /^\d+$/.test(process.env.RELAYBRIDGE_LAUNCHER_GENERATION || '') ? Number(process.env.RELAYBRIDGE_LAUNCHER_GENERATION) : null,
+  expectedBuildId: EXPECTED_BUILD_ID,
+  expectedReceiptStoreIdentity: EXPECTED_RECEIPT_STORE_IDENTITY,
+});
 const START_LOCK = path.join(BRIDGE_ROOT, '.mcp-start.lock');
 const OUT_LOG = path.join(BRIDGE_ROOT, 'bridge.mcp.out.log');
 const ERR_LOG = path.join(BRIDGE_ROOT, 'bridge.mcp.err.log');

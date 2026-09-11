@@ -201,6 +201,10 @@ function Test-RequiredStripEnvMigration([string]$InstalledStripEnvJson) {
   return (Restore-ShippedRequiredStripEnv $merged $defaults).copilot.strip_env
 }
 
+& (Join-Path $PSScriptRoot 'test-install-holders.ps1') -RepositoryRoot (Split-Path $PSScriptRoot -Parent)
+& (Join-Path $PSScriptRoot 'test-install-holder-contracts.ps1') -RepositoryRoot (Split-Path $PSScriptRoot -Parent)
+& (Join-Path $PSScriptRoot 'test-install-holder-lifecycle.ps1') -RepositoryRoot (Split-Path $PSScriptRoot -Parent)
+
 . ([scriptblock]::Create((Get-InstallerFunctionText @(
   'Test-ExactJsonStringArray', 'Restore-ShippedCodexProtocol', 'Merge-JsonDefaults', 'Restore-ShippedCredentialRelocation', 'Restore-ShippedManagedLoginCommands',
   'Restore-ShippedRequiredStripEnv',
@@ -274,7 +278,10 @@ Assert-True (-not (Test-Path -LiteralPath (Join-Path $cutoverDestination 'source
   }
   $rejected = $false
   try { Move-InstallRootForCutover $cutoverSource $cutoverDestination }
-  catch { $rejected = $true }
+  catch {
+    $rejected = $true
+    Assert-True ($_.Exception.Message -match 'install_root_locked') 'persistent sharing failure must carry a typed diagnostic'
+  }
   Assert-True ($rejected -and $counter.attempts -eq 50 -and $counter.pauses -eq 49) 'persistent sharing retries must exhaust exactly the bounded attempt count'
 }
 & {

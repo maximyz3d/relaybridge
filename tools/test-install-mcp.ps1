@@ -116,6 +116,7 @@ try {
   Copy-Item -LiteralPath (Join-Path $repoRoot 'tools\prepare-build-info.cjs') -Destination (Join-Path $bridgeRoot 'tools\prepare-build-info.cjs')
   Copy-Item -LiteralPath (Join-Path $repoRoot 'package.json') -Destination (Join-Path $bridgeRoot 'package.json')
   [IO.File]::WriteAllText((Join-Path $bridgeRoot 'mcp\server.mjs'), "// fake MCP entrypoint`n", [Text.UTF8Encoding]::new($false))
+  [IO.File]::WriteAllText((Join-Path $bridgeRoot 'mcp\launcher.mjs'), "// fake MCP entrypoint`n", [Text.UTF8Encoding]::new($false))
   [IO.File]::WriteAllText((Join-Path $bridgeRoot 'server.js'), "require('fs').writeFileSync('server-started.marker', 'unexpected');`n", [Text.UTF8Encoding]::new($false))
   [IO.File]::WriteAllText((Join-Path $bridgeRoot 'node_modules\express\package.json'), "{}`n", [Text.UTF8Encoding]::new($false))
   [IO.File]::WriteAllText((Join-Path $bridgeRoot '.gitignore'), "node_modules/`nbuild-info.json`n.build-info.*.tmp`n.bridge-token`n.mcp-install.lock/`n", [Text.UTF8Encoding]::new($false))
@@ -327,7 +328,7 @@ require('./fake-mcp-client.js');
     Assert-True ($raceCodexAfter -match '\[mcp_servers\.unrelated\]') 'the cross-checkout race must preserve unrelated Codex bytes'
     Assert-True ([string]::Equals([string]$raceClaudeAfter.mcpServers.relaybridge.env.RELAYBRIDGE_TOKEN_FILE, $tokenFileB, [StringComparison]::OrdinalIgnoreCase)) 'A rollback must not clobber B successful Claude token ownership from another checkout'
     Assert-True (@($raceClaudeAfter.mcpServers.relaybridge.args | Where-Object {
-      try { [string]::Equals([IO.Path]::GetFullPath([string]$_), [IO.Path]::GetFullPath((Join-Path $bridgeRootB 'mcp\server.mjs')), [StringComparison]::OrdinalIgnoreCase) }
+      try { [string]::Equals([IO.Path]::GetFullPath([string]$_), [IO.Path]::GetFullPath((Join-Path $bridgeRootB 'mcp\launcher.mjs')), [StringComparison]::OrdinalIgnoreCase) }
       catch { $false }
     }).Count -gt 0) 'the surviving Claude registration must belong to checkout B'
     Assert-True ($null -ne $raceClaudeAfter.mcpServers.unrelated) 'the cross-checkout race must preserve unrelated Claude configuration'

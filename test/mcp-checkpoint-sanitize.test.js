@@ -4,6 +4,22 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('crypto');
 
+test('MCP preserves safe descendant observations and finite native limits', async () => {
+  const { sanitizeProviderResponse } = await import('../mcp/server.mjs');
+  const { projectCensus } = require('../lib/process-census');
+  const census = projectCensus(7, { rows: [{ pid: 7, ppid: 1, birth: 'fixture', cpuMs: 10, command: 'private command' }] }, 1000);
+  census.processes[0].rawCommand = 'SECRET';
+  const result = sanitizeProviderResponse({ kind: 'fixture', failureClass: 'child_fanout', process_census: census,
+    process_warnings: ['child_fanout', 'private command'], native_transport: { finite: true, renewable: false,
+      remainingMs: 20000, checkpointNeeded: true, stopNeeded: true } });
+  assert.equal(result.failureClass, 'child_fanout');
+  assert.equal(result.processCensus.terminationEvidence, false);
+  assert.equal(result.processCensus.processes[0].rawCommand, undefined);
+  assert.deepEqual(result.processWarnings, ['child_fanout']);
+  assert.equal(result.nativeTransport.remainingMs, 20000);
+  assert.equal(sanitizeProviderResponse({ process_census: { ...census, terminationEvidence: true } }).processCensus, null);
+});
+
 test('MCP preserves bounded checkpoint reserve metadata and omits secret path hashes', async () => {
   const { sanitizeProviderResponse } = await import('../mcp/server.mjs');
   const checkpoint = 'final checkpoint';

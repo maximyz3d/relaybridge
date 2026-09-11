@@ -44,6 +44,8 @@ export function classifyTask(task) {
     /```/, /\b(implement|debug|refactor|compile|test failure|stack trace|function|class|typescript|javascript|python|rust|golang|repository|codebase|pull request|\bpr\b)\b/,
     /\.(?:js|mjs|cjs|ts|tsx|jsx|py|rs|go|java|cs|cpp|h|ps1|json|toml|ya?ml)\b/,
     /\b(?:render calls?|binder calls?|placeholder scanner|(?:mutation|regression) tests?|schema validation|cli isolation|fail[- ]closed gates?|races?|architecture)\b/,
+    /\b(?:source(?:[ -](?:placement|code|files?|test|ranges?))?|implementation plan)\b[^\n]{0,120}\b(?:operation|pipeline|diagnostics?|tests?|ownership|files?)\b/,
+    /\b(?:read|inspect|review)\b[^\n]{0,120}[\w/-]+\.md\b[\s\S]{0,180}\b(?:source|tests?|implementation)\b/,
     /\b(?:code review|git diff|worktree)\b/,
     /\b(?:review|audit|inspect|debug|refactor)\b[^.\n]{0,60}\bcode\b/,
   ]);
@@ -124,16 +126,29 @@ export function classifyTask(task) {
   const substantiveDecision = !wordComparison && /^(?:compare|evaluate|diagnose|choose|decide|recommend)\b/.test(requestedWork)
     && /\b(?:constraints?|tradeoffs?|trade-offs?|competing alternatives|failure modes?|correctness|intermittent\b[^.!?\n]{0,60}\bbug)\b/.test(text);
   const substantiveReasoning = substantivePlanning || substantiveCollaboration || substantiveDecision;
-  const destructive = hasAny(text, [
+  // Separate subject matter from requested operations. A local code review can
+  // discuss a diagnostic or overwrite policy without executing that operation.
+  // This normalization is narrow: a trailing "read-only" never erases an actual
+  // request to delete data, reveal a secret, or diagnose a patient's symptoms.
+  const riskText = looksLikeCode ? text
+    .replace(/\b(?:performance|runtime|profiler|latency|memory|crash|network|bug|failure) diagnosis\b/g, 'software analysis')
+    .replace(/\b(?:collision\/)?overwrite (?:behavior|handling|policy|semantics)\b/g, 'collision behavior') : text;
+  const destructive = hasAny(riskText, [
     /\b(remove recursively|wipe|erase|drop database|force push|reset --hard|overwrite|terminate all|kill all|factory reset)\b/,
     /\b(?:delete|remove)\s+(?:all\s+|the\s+)?(?:files?|directories|folders|databases?|records?|credentials?|keys?|branches)\b/,
     /\brotate\s+(?:the\s+)?(?:production\s+)?(?:signing|encryption|api|access)?\s*keys?\b/,
     /\b(?:deploy\b.*\bproduction|production\b.*\bdeploy)\b/,
   ]);
-  const medical = /\b(medical|diagnosis|patient|prescription|dosage)\b/.test(text);
+  const medical = /\b(medical|diagnosis|patient|prescription|dosage)\b/.test(riskText);
   const legal = /\b(legal|lawsuit|attorney|criminal charge|court filing)\b/.test(text);
   const financial = /\b(financial advice|investment decision|trade execution|retirement allocation)\b/.test(text);
-  const secrets = /\b(credentials?|api keys?|access tokens?|passwords?|secrets?|signing keys?|encryption keys?)\b/.test(text);
+  const secretSubject = /\b(credentials?|api keys?|access tokens?|passwords?|secrets?|signing keys?|encryption keys?)\b/;
+  const secretActions = text.split(/[;\n]|(?<=[.!?])\s+|\b(?:then|also)\b/)
+    .map((clause) => clause.trim()).filter((clause) => !/^(?:no\b|do not\b|don't\b|without\b)/.test(clause));
+  const requestsSecretAccess = secretActions.some((clause) =>
+    /\b(?:read|inspect|extract|print|reveal|expose|dump|retrieve|fetch|send|upload|rotate|replace|delete|decrypt)\b[^.!?;\n]{0,100}\b(?:credentials?|api keys?|access tokens?|passwords?|secrets?|signing keys?|encryption keys?)\b/.test(clause)
+    || /\b(?:review|audit|change|update)\s+(?:(?:the|all|production|stored)\s+){0,3}(?:credentials?|api keys?|access tokens?|passwords?|secrets?|signing keys?|encryption keys?)\b/.test(clause));
+  const secrets = secretSubject.test(text) && (!looksLikeCode || requestsSecretAccess);
   const safetyCritical = /\b(airworthy|flight[- ]ready|life safety|safety[- ]critical|production release|fabrication release)\b/.test(text);
   const highStakes = medical || legal || financial || secrets || safetyCritical;
   const semanticClause = /\b(?:explain|summari[sz]e|interpret|describe|recommend|compare|evaluate|improve|optimi[sz]e|write|create|build|compose|decide|plan|translate|reason|purpose|why|how)\b/.test(text);

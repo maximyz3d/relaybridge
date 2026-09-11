@@ -14,7 +14,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $bridgeRoot = (Resolve-Path -LiteralPath $PSScriptRoot).Path
-$mcpServer = Join-Path $bridgeRoot 'mcp\server.mjs'
+$mcpServer = Join-Path $bridgeRoot 'mcp\launcher.mjs'
 $tokenFile = Join-Path $bridgeRoot '.bridge-token'
 $timeoutPolicyPath = Join-Path $bridgeRoot 'config\timeout-policy.json'
 $buildInfoTool = Join-Path $bridgeRoot 'tools\prepare-build-info.cjs'
@@ -173,9 +173,12 @@ function Test-LegacyRelayBridgeRegistration([ValidateSet('codex', 'claude')] [st
     else { $output = (& claude mcp get $LegacyName 2>$null | Out-String) }
     $exitCode = $LASTEXITCODE
   } finally { $ErrorActionPreference = $savedErrorActionPreference }
-  return $exitCode -eq 0 -and $output -match '(?i)mcp[\\/]+server\.mjs'
+  return $exitCode -eq 0 -and $output -match '(?i)mcp[\\/]+(?:server|launcher)\.mjs'
 }
 
+if (-not (Test-Path -LiteralPath (Join-Path $bridgeRoot 'mcp\server.mjs') -PathType Leaf)) {
+  throw 'MCP adapter not found'
+}
 if (-not (Test-Path -LiteralPath $mcpServer -PathType Leaf)) {
   throw "MCP server not found: $mcpServer"
 }
@@ -263,9 +266,9 @@ if (-not $SkipCodex) {
     'read_session_output', 'list_collabs', 'read_collab', 'list_projects',
     'list_runs', 'get_run', 'list_receipts', 'get_receipt', 'get_context_bundle', 'start_bridge', 'restart_bridge',
     'stop_bridge', 'start_safe_session', 'send_session_input', 'stop_session',
-    'ask_provider', 'route_and_ask', 'run_committee',
+    'ask_provider', 'probe_provider_answer', 'route_and_ask', 'run_committee',
     'list_agents', 'set_agent_tags', 'broadcast',
-    'submit_task', 'get_task', 'list_tasks', 'cancel_task',
+    'submit_task', 'get_task', 'list_tasks', 'cancel_task', 'cancel_active_run',
     'provider_cooldowns', 'usage_gauges', 'usage_totals', 'usage_advise',
     # The GitHub tools landed after this list was last extended, so a Codex user
     # installed through this script silently lost the whole integration: the
@@ -330,7 +333,7 @@ if (-not $SkipClaude) {
     $claudeVerified = $claudeServerVerified -and [string]$claudeEntry.env.RELAYBRIDGE_URL -eq $BridgeUrl -and
       [string]::Equals([string]$claudeEntry.env.RELAYBRIDGE_TOKEN_FILE, $tokenFile, [StringComparison]::OrdinalIgnoreCase)
   } catch {
-    $claudeVerified = $claudeAdded -match '(?i)mcp[\\/]+server\.mjs' -and
+    $claudeVerified = $claudeAdded -match '(?i)mcp[\\/]+(?:server|launcher)\.mjs' -and
       $claudeAdded -match [regex]::Escape($BridgeUrl) -and $claudeAdded -match [regex]::Escape($tokenFile)
   }
   if ($claudeAddedExitCode -ne 0 -or -not $claudeVerified) {

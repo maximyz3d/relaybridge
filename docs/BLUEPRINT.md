@@ -12,7 +12,7 @@ prompt** at peak token efficiency. One principle drives everything:
 |---|---|---|---|
 | **Memory** | The PRIMER block written into every agent's always-loaded memory file | `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.gemini/GEMINI.md`, `~/.cursor/rules/relaybridge.mdc`, `~/.config/relaybridge/AGENTS.md` | **Every session, every prompt** — this is the layer that guarantees the bridge is considered on each turn |
 | **Skill** | Full on-demand playbook (SKILL.md + reference.md) | `skills/relaybridge/`, installed to `~/.claude/skills/relaybridge/` | Only when a task touches delegation — costs zero tokens otherwise |
-| **MCP** | 35+ typed tools + `psbridge://` resources over stdio | `mcp/server.mjs`, registered by `install-mcp.ps1` into Codex + Claude | When the host lists tools; call `get_context_bundle` first |
+| **MCP** | 35+ typed tools + `psbridge://` resources over stdio | `mcp/launcher.mjs` → `mcp/server.mjs`, registered by `install-mcp.ps1` into Codex + Claude | When the host lists tools; call `get_context_bundle` first |
 | **Plugin surface** | Dashboard panels (terminals, 📡 Broadcast, 🧩 Agents, 🐙 GitHub) + REST | `public/index.html`, `http://127.0.0.1:8787` | Human-driven |
 | **Connectors** | Provider seats (Claude, Codex, Copilot, Cursor, Gemini, Grok, Perplexity, Ollama) + the GitHub integration (`gh`-backed) | `cli-config.json`, ignored `data/github-repos.json` | Per delegated call |
 
