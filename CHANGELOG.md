@@ -1,3 +1,6 @@
+## v2.3.3 - 2026-09-11
+- #130 Add subscription reserve handoffs and adaptive progress supervision
+
 ## v2.3.2 - 2026-09-11
 - #129 fix: allow parallel Claude and Codex provider instances
 
