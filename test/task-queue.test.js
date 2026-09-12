@@ -545,6 +545,56 @@ function durableFixture(t, overrides = {}) {
   };
 }
 
+for (const clockReads of [[99, 100, 100], [99, 99, 100, 100]]) {
+  test(`a deferred task retains a wake when the clock crosses its due instant (${clockReads.join(',')})`, async (t) => {
+    const f = durableFixture(t);
+    f.clock.value = 0;
+    let reads = [];
+    const q = f.open({ now: () => reads.length ? reads.shift() : f.clock.value });
+    const task = q.submit({ kind: 'claude', prompt: 'wake without unrelated work', notBefore: 100 });
+    await flushQueue();
+    assert.equal(f.calls.length, 0);
+    assert.equal(f.timers.size, 1);
+    const [id, timer] = [...f.timers][0];
+    assert.equal(timer.at, 100);
+    f.timers.delete(id);
+    f.clock.value = 100;
+    reads = [...clockReads];
+    timer.fn();
+    await flushQueue();
+    await f.advance(1);
+    assert.equal(f.calls.length, 1, 'the original timer chain must dispatch without another submission or manual pump');
+    assert.ok(q.get(task.id).startedAt >= 100);
+    assert.equal(q.get(task.id).status, 'done');
+    assert.equal(f.timers.size, 0);
+  });
+}
+
+test('a deferred task behind an occupied slot does not spin once its due time arrives', async (t) => {
+  let occupyingResponse;
+  const f = durableFixture(t, { maxConcurrent: 1 });
+  const q = f.open({ executeOneShot: async (body, res) => {
+    f.calls.push(body);
+    if (body.prompt === 'occupier') { res._relayDeferredResponse = true; occupyingResponse = res; }
+    else res.json({ stdout: 'done', exitCode: 0 });
+  } });
+  q.submit({ kind: 'claude', prompt: 'occupier' });
+  const deferred = q.submit({ kind: 'claude', prompt: 'deferred', notBefore: f.clock.value + 60000 });
+  await flushQueue();
+  assert.equal(f.timers.size, 1);
+  assert.equal([...f.timers.values()][0].at, 70000);
+  await f.advance(59999);
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.timers.size, 1);
+  await f.advance(1);
+  assert.equal(q.get(deferred.id).status, 'queued');
+  assert.equal(f.timers.size, 0, 'occupied capacity resumes on physical completion, not a polling timer');
+  occupyingResponse.json({ stdout: 'finished', exitCode: 0 });
+  await flushQueue();
+  assert.equal(f.calls.length, 2);
+  assert.equal(q.get(deferred.id).status, 'done');
+});
+
 test('deferred recovery preserves the deadline, controls and dependency ordering without duplicate dispatch', async (t) => {
   const f = durableFixture(t);
   const first = f.open();
