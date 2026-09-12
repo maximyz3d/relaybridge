@@ -2846,11 +2846,12 @@ app.use((req, res, next) => {
 });
 
 const INDEX_TEMPLATE = fs.readFileSync(path.join(ROOT, 'public', 'index.html'), 'utf8');
+const WORKSPACE_TEMPLATE = fs.readFileSync(path.join(ROOT, 'public', 'control-center.html'), 'utf8');
 app.use('/vendor/xterm', express.static(path.join(ROOT, 'node_modules', '@xterm', 'xterm'), { index: false, dotfiles: 'deny', maxAge: '1y', immutable: true }));
 app.use('/vendor/xterm-addon-fit', express.static(path.join(ROOT, 'node_modules', '@xterm', 'addon-fit'), { index: false, dotfiles: 'deny', maxAge: '1y', immutable: true }));
-app.get(['/', '/index.html'], (req, res) => {
+app.get(['/', '/control-center.html', '/terminal', '/index.html'], (req, res) => {
   const nonce = crypto.randomBytes(18).toString('base64');
-  const html = INDEX_TEMPLATE
+  const html = (['/terminal', '/index.html'].includes(req.path) ? INDEX_TEMPLATE : WORKSPACE_TEMPLATE)
     .replace('<style>', `<style nonce="${nonce}">`)
     .replace('<script>', `<script nonce="${nonce}">`)
     .replace('__ONE_SHOT_DEFAULT_TIMEOUT_MS__', String(TIMEOUT_POLICY.oneShotDefaultMs));
@@ -2881,7 +2882,7 @@ app.get(['/', '/index.html'], (req, res) => {
 app.use((req, res, next) => {
   let requested = req.path;
   try { requested = decodeURIComponent(req.path); } catch { /* malformed escape: judge the raw path */ }
-  if (/(?:^|[\\/])index\.html$/i.test(requested)) return res.status(404).json({ error: 'not found' });
+  if (/(?:^|[\\/])(?:index|control-center)\.html$/i.test(requested)) return res.status(404).json({ error: 'not found' });
   next();
 });
 app.use(express.static(path.join(ROOT, 'public'), { index: false, dotfiles: 'deny' }));
@@ -6003,6 +6004,47 @@ function continuityCandidate({ kind, cwd, modelTier, effort, model, accountId, w
 }
 const continuity = createContinuity({ dataDir: DATA_DIR, quota: subscriptionUsage, queue: taskQueue,
   resolveCandidate: continuityCandidate, activeControls: () => [...continuityControls.values()] });
+const { createProjectWorkspace } = require('./lib/project-workspace');
+const projectWorkspace = createProjectWorkspace({ dataDir: DATA_DIR, queue: taskQueue, quota: subscriptionUsage,
+  workflows: workflowController,
+  validateCwd: (cwd) => ({ ...captureAllowedCwdIdentity(cwd), cwdPolicyId: CWD_POLICY_IDENTITY }),
+  resolveIntent: (body, snapshot) => {
+    const cfg = loadConfig();
+    const providerBudget = { maxOutputTokens: 10000, maxTotalTokens: 500000, maxCacheReadTokens: 400000, maxCacheCreationTokens: 100000, maxTurns: null };
+    const controls = validateProviderIntent({ ...body, providerBudget, requiresWorkspaceAccess: true }, cfg, snapshot);
+    if (controls.execution.resolvedModelTier !== body.modelTier || controls.execution.appliedEffort !== body.effort
+      || !controls.execution.model || controls.promptEvidence?.truncated) {
+      throw new Error('Requested model controls are unavailable. Check the configured provider tiers in Advanced tools.');
+    }
+    const account = resolveDispatchAccount(body.kind, cfg[body.kind], { model: controls.execution.model, ignoreNativeReserve: true });
+    if (account.exhausted || !account.quotaSeat) throw new Error('Provider account is unavailable. Check its connection in Advanced tools.');
+    return { ...body, providerBudget, requiresWorkspaceAccess: true, execution: controls.execution,
+      expectedAccountId: account.account?.id || providerAccounts.DEFAULT_ACCOUNT_ID, expectedQuotaSeat: account.quotaSeat,
+      expectedCwdIdentityHash: snapshot.cwdIdentityHash, expectedCwdPolicyId: CWD_POLICY_IDENTITY,
+      expectedPromptHash: controls.promptEvidence.effectiveHash };
+  },
+  activeRuns: () => [...activeRuns.values()].map((run) => ({ route: { request_id: run.route.request_id },
+    ...run.supervisor.snapshot(Date.now()),
+    nativeUsage: subscriptionUsage.headroom(run.route.quota_seat || quotaSeatForProvider(run.kind), { model: run.route.requested_model }) })),
+  log: (message) => console.log(`[RelayBridge] project workspace: ${message}`),
+});
+app.get('/api/project-workspace/state', (req, res) => {
+  try { res.setHeader('Cache-Control', 'no-store'); res.json(projectWorkspace.view(req.query)); }
+  catch (error) { res.status(error.status || 400).json({ error: error.message }); }
+});
+app.get('/api/project-workspace/tasks/:id', (req, res) => {
+  try { res.setHeader('Cache-Control', 'no-store'); res.json(projectWorkspace.getTask(req.params.id)); }
+  catch (error) { res.status(error.status || 400).json({ error: error.message }); }
+});
+for (const [route, operation] of Object.entries({ projects: 'createProject', threads: 'createThread', messages: 'sendMessage', tasks: 'createTask', resume: 'resume', 'resume-task': 'resumeTask' })) {
+  app.post(`/api/project-workspace/${route}`, (req, res) => {
+    try {
+      const result = projectWorkspace[operation](req.body || {});
+      res.status(result.idempotent ? 200 : 202).json(result);
+      setImmediate(() => { if (!admissionClosed) projectWorkspace.tick(); });
+    } catch (error) { res.status(error.status || 400).json({ error: error.name === 'ZodError' ? 'Check the request fields and their length limits.' : error.message }); }
+  });
+}
 const progressAssessor = createProgressAssessor({ dataDir: DATA_DIR, queue: taskQueue, controls: continuityControls,
   getSettings: () => subscriptionUsage.getSettings(),
   hasCapacity: () => taskQueue.stats().active < taskQueue.stats().maxConcurrent && activeOneShotCount < MAX_ACTIVE_ONESHOTS,
@@ -6043,7 +6085,10 @@ async function tickContinuity() {
     for (const run of continuityControls.values()) observeRunContinuity(run);
     continuity.tick();
   } catch { /* preserve durable state; failure cannot authorize a replacement */ }
-  finally { continuityTickBusy = false; }
+  finally {
+    try { projectWorkspace.tick(); } catch { /* a workspace fault cannot stop continuity supervision */ }
+    continuityTickBusy = false;
+  }
 }
 setInterval(tickContinuity, 5000).unref();
 
