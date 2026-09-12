@@ -25,6 +25,27 @@ jobs:
           node-version: 24
           cache: npm
 
+      - name: Install and qualify Linux namespace test dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y bubblewrap
+          /usr/bin/bwrap --version
+          # Exercise the boundary on this ephemeral CI VM before the native tests.
+          # The read-only root bind is a feature probe, not a provider launch profile.
+          check_boundary_namespace() {
+            timeout 10s /usr/bin/bwrap --unshare-all --unshare-user --as-pid-1 \
+              --die-with-parent --cap-drop ALL --disable-userns --assert-userns-disabled \
+              --ro-bind / / --proc /proc --dev /dev -- /bin/true
+          }
+          if ! check_boundary_namespace; then
+            # Ubuntu 24.04 may restrict userns setup capabilities through AppArmor.
+            # This runner-only policy change must not enter installers or runtime.
+            if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+              sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+            fi
+            check_boundary_namespace
+          fi
+
       - name: Install dependencies
         run: npm ci
 

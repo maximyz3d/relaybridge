@@ -96,8 +96,11 @@ async function runFixture(t, { mode = 'once' } = {}) {
   assert.equal(fs.existsSync(path.join(f.dirs.workspace, 'started')), false, 'gate must withhold all provider code');
   assert.equal(await owner.allowProvider(), true);
   if (mode === 'hang') {
-    for (let i = 0; i < 200 && !fs.existsSync(path.join(f.dirs.workspace, 'descendant')); i++) await wait(5);
+    // The descendant marker precedes the report; wait for both before stopping
+    // the helper so cancellation cannot race its final observation output.
+    for (let i = 0; i < 200 && (!fs.existsSync(path.join(f.dirs.workspace, 'descendant')) || !stdout.endsWith('\n')); i++) await wait(5);
     assert.equal(fs.existsSync(path.join(f.dirs.workspace, 'descendant')), true, stderr);
+    assert.equal(stdout.endsWith('\n'), true, 'boundary fixture must report its observations before cancellation');
     owner.requestStop();
   }
   const physical = await owner.physicalDone;
@@ -147,9 +150,14 @@ linuxTest('forged host-service brokers and closed genuine brokers refuse before 
 test('private writable roots refuse nested file/directory mount aliases', () => {
   const root = '/private/work';
   const line = target => `1 0 8:1 / ${target} rw - ext4 /dev/sda rw\n`;
-  assert.doesNotThrow(() => assertNoPrivateMounts([root], line('/')));
-  for (const target of [root, root + '/alias', root + '/dir']) {
+  for (const target of ['/', '/usr/local/lib', '/private/work-other']) {
+    assert.doesNotThrow(() => assertNoPrivateMounts([root], line(target)));
+  }
+  for (const target of [root, root + '/alias', root + '/dir', root + '/nested/deep']) {
     assert.throws(() => assertNoPrivateMounts([root], line(target)), { code: 'BOUNDARY_PRIVATE_MOUNT_PRESENT' });
+  }
+  for (const target of ['/private/../work', '/private//work', '/private/./work', 'private/work', '/private\\work']) {
+    assert.throws(() => assertNoPrivateMounts([root], line(target)), { code: 'BOUNDARY_MOUNT_CENSUS_INVALID' });
   }
   assert.throws(() => assertNoPrivateMounts([root], 'truncated'), { code: 'BOUNDARY_MOUNT_CENSUS_INVALID' });
 });
