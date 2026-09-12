@@ -1,7 +1,7 @@
 // Speaks the real MCP stdio handshake, exactly as Cursor/Claude Desktop would:
 // initialize -> tools/list. If this works, a client can use the server.
 import { spawn } from 'node:child_process';
-const child = spawn(process.execPath, ['mcp/server.mjs'], { stdio: ['pipe','pipe','pipe'], env: { ...process.env, RELAYBRIDGE_PORT: '8817' } });
+const child = spawn(process.execPath, ['mcp/launcher.mjs'], { stdio: ['pipe','pipe','pipe'], env: { ...process.env, RELAYBRIDGE_PORT: '8817' } });
 let buf = '';
 const seen = [];
 child.stdout.on('data', (d) => {

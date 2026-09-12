@@ -73,12 +73,13 @@ case "$bridge_url" in
 esac
 
 script_dir=$(CDPATH= cd "$(dirname "$0")" && pwd -P)
-mcp_server=$script_dir/mcp/server.mjs
+mcp_server=$script_dir/mcp/launcher.mjs
 token_file=$script_dir/.bridge-token
 timeout_policy=$script_dir/config/timeout-policy.json
 build_info_tool=$script_dir/tools/prepare-build-info.cjs
 
-[ -f "$mcp_server" ] || fail "MCP server not found: $mcp_server"
+[ -f "$mcp_server" ] || fail "MCP launcher not found: $mcp_server"
+[ -f "$script_dir/mcp/server.mjs" ] || fail "MCP adapter not found"
 [ -f "$timeout_policy" ] || fail "timeout policy not found: $timeout_policy"
 [ -f "$build_info_tool" ] || fail "build identity tool not found: $build_info_tool"
 node_path=$(command -v node 2>/dev/null || true)

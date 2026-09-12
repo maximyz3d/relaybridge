@@ -89,3 +89,29 @@ test('MCP projections preserve unknown counts and effective reset, and UI cannot
   const label=require('../public/dashboard-state').qualitativeQuotaLabel(observation);
   assert.match(label,/allowance unknown/); assert.doesNotMatch(label,/0\/0|tokens|%/);
 });
+
+
+test('full native upgrade diagnostic retains the exact reported reset', () => {
+  const stderr = 'Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 9h10m20s.';
+  const value = parse({ ...run, stderr });
+  assert.equal(value.reset.durationMs, 33020000);
+  assert.equal(value.percentRemaining, null);
+  for (const extra of ['Example: ', 'The documentation says ']) assert.equal(parse({ ...run, stderr: extra + stderr }), null);
+  assert.equal(parse({ ...run, stderr: stderr + ' More instructions.' })?.reset.kind, 'conservative_expiry');
+});
+
+
+test('terminal quota observer accepts complete chunked diagnostics only at native failure', () => {
+  const { createTerminalQuotaObserver } = require('../lib/terminal-quota');
+  const text = '\x1b[31mIndividual quota reached. Please upgrade your subscription to increase your limits. Resets in 9h10m20s.\x1b[0m\r\n';
+  const observer = createTerminalQuotaObserver('gemini');
+  for (let n = 0; n < text.length; n += 3) observer.output(text.slice(n, n + 3));
+  assert.equal(observer.finish(1).reset.durationMs, 33020000);
+  assert.equal(observer.finish(0), null); assert.equal(observer.finish(1, 'operator_cancelled'), null);
+  for (const provider of ['powershell', 'claude', 'login']) {
+    const other = createTerminalQuotaObserver(provider); other.output(text); assert.equal(other.finish(1), null);
+  }
+  const quoted = createTerminalQuotaObserver('gemini'); quoted.output('Example: ' + text); assert.equal(quoted.finish(1), null);
+  const echoed = createTerminalQuotaObserver('gemini'); echoed.input(text); echoed.output(text); assert.equal(echoed.finish(1), null);
+  const overflow = createTerminalQuotaObserver('gemini'); overflow.output('x'.repeat(4097)); overflow.output(text); assert.equal(overflow.finish(1), null);
+});

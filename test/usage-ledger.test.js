@@ -492,14 +492,14 @@ test('cooling seats are made unavailable to normal route diagnostics', () => {
   assert.deepEqual(result.skipped, ['claude']);
 });
 
-test('an explicitly requested cooling seat remains available', () => {
+test('an explicitly requested cooling seat remains blocked', () => {
   const result = applyCooldownsToDiagnostics(
     { claude: { found: true, ready: true } },
     [{ seat: 'claude', cooling: true, reason: 'rate_limited', remainingSec: 120 }],
     ['claude'],
   );
-  assert.equal(result.diagnostics.claude.ready, true);
-  assert.deepEqual(result.skipped, []);
+  assert.equal(result.diagnostics.claude.ready, false);
+  assert.deepEqual(result.skipped, ['claude']);
 });
 
 test('normal route selections are reordered by fuel without widening capability', () => {

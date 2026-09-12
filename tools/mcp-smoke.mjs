@@ -430,7 +430,7 @@ export async function runSmoke({
 export function createDefaultSmoke() {
   const transport = new StdioClientTransport({
     command: process.execPath,
-    args: [path.join(ROOT, 'mcp', 'server.mjs')],
+    args: [path.join(ROOT, 'mcp', 'launcher.mjs')],
     cwd: ROOT,
     env: { ...process.env },
     stderr: 'pipe',

@@ -156,7 +156,8 @@ test('a corrupt cooldown file does not stop the bridge starting', () => {
   fs.writeFileSync(file, '{ this is not json');
   const logs = [];
   const s = createCooldownStore({ file, log: (m) => logs.push(m) });
-  assert.equal(s.status('claude').cooling, false);
+  assert.equal(s.status('claude').cooling, true);
+  assert.equal(s.status('claude').authority, 'unknown');
   assert.ok(logs.some((l) => /unreadable/.test(l)), 'the reset must be announced, not silent');
   fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -177,14 +178,14 @@ test('cooling seats are filtered out of routing, with a reason', () => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test('an explicitly requested seat is never silently withheld', () => {
+test('an explicitly requested seat obeys cooldown authority', () => {
   const nowRef = { t: 1_000_000 };
   const { s, dir } = store(nowRef);
   s.noteFailure('claude', 'rate_limited');
   const { usable, skipped } = s.filterCandidates([{ seat: 'claude', rank: 0 }], { explicit: 'claude' });
-  assert.equal(usable.length, 1, 'the user asked for this seat by name');
-  assert.equal(skipped.length, 0);
-  assert.equal(usable[0].cooldown.cooling, true, 'but the state is still reported');
+  assert.equal(usable.length, 0);
+  assert.equal(skipped.length, 1);
+  assert.equal(skipped[0].cooldown.cooling, true);
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -219,4 +220,68 @@ test('an HTTP-date Retry-After is converted to seconds', () => {
 test('a Retry-After already in the past is ignored rather than trusted', () => {
   assert.equal(parseRetryAfter('', new Date(Date.now() - 60000).toUTCString()), null);
   assert.equal(parseRetryAfter('', -5), null);
+});
+
+
+test('unknown authority cannot be repaired by success, expiry or an unrelated failure', () => {
+  const nowRef = { t: 1_000_000 };
+  const { s, dir, file } = store(nowRef);
+  s.noteFailure('claude', 'rate_limited');
+  fs.writeFileSync(file, '{invalid');
+  assert.equal(s.status('claude').authority, 'unknown');
+  assert.equal(s.status('codex').authority, 'unknown');
+  const bad = fs.readFileSync(file, 'utf8');
+  s.noteSuccess('claude'); s.noteFailure('codex', 'rate_limited');
+  nowRef.t += 999999999;
+  assert.equal(s.status('claude').cooling, true);
+  assert.equal(fs.readFileSync(file, 'utf8'), bad);
+  fs.writeFileSync(file, '{}');
+  assert.equal(s.status('codex').authority, undefined);
+  fs.unlinkSync(file);
+  assert.equal(s.status('codex').authority, 'unknown');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('invalid rows retain unknown authority and provenance is attached to the exact observation', () => {
+  const nowRef = { t: 1_000_000 };
+  const { s, dir, file } = store(nowRef);
+  const first = s.noteFailure('claude', 'rate_limited');
+  const second = s.noteFailure('claude', 'rate_limited');
+  assert.equal(s.attachReceipt(first, 'rcpt_old'), false);
+  assert.equal(s.attachReceipt(second, 'rcpt_exact'), true);
+  assert.equal(createCooldownStore({ file, now: () => nowRef.t }).status('claude').sourceReceiptId, 'rcpt_exact');
+  const raw = JSON.parse(fs.readFileSync(file, 'utf8')); raw.codex = { until: 'bad' };
+  fs.writeFileSync(file, JSON.stringify(raw));
+  assert.equal(s.status('codex').authority, 'unknown');
+  assert.equal(s.status('claude').sourceReceiptId, 'rcpt_exact');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+
+test('invalid-row isolation preserves newly observed failures across restart', () => {
+  const nowRef = { t: 1_000_000 }; const { s, dir, file } = store(nowRef);
+  fs.writeFileSync(file, JSON.stringify({ codex: { until: 'invalid' } }));
+  const observation = s.noteFailure('claude', 'rate_limited');
+  assert.equal(s.attachReceipt(observation, 'rcpt_claude'), true);
+  const reopened = createCooldownStore({ file, now: () => nowRef.t });
+  assert.equal(reopened.status('claude').cooling, true);
+  assert.equal(reopened.status('claude').sourceReceiptId, 'rcpt_claude');
+  assert.equal(reopened.status('codex').authority, 'unknown');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('shorter failure and earlier in-flight success cannot rewrite newer quota authority', () => {
+  const nowRef = { t: 1_000_000 }; const { s, dir } = store(nowRef);
+  const first = s.noteFailure('claude', 'rate_limited', { retryAfterSec: 900 });
+  s.attachReceipt(first, 'rcpt_original');
+  nowRef.t += 1000;
+  const second = s.noteFailure('claude', 'overloaded');
+  assert.equal(s.attachReceipt(second, 'rcpt_overload'), false);
+  assert.equal(s.status('claude').sourceReceiptId, 'rcpt_original');
+  assert.equal(s.noteSuccess('claude', { startedAt: 999999 }), null);
+  assert.equal(s.status('claude').cooling, true);
+  nowRef.t += 1000;
+  s.noteSuccess('claude', { startedAt: nowRef.t });
+  assert.equal(s.status('claude').cooling, false);
+  fs.rmSync(dir, { recursive: true, force: true });
 });

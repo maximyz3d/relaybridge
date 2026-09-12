@@ -278,6 +278,14 @@ test('reasoning and mutation signals avoid the known under- and over-routing cas
   assert.ok(!cssCleanup.tags.includes('destructive'));
 });
 
+test('deploy/production destructive gate is clause-scoped, not prompt-wide', () => {
+  const unrelated = router.classifyTask('We should deploy the new docs site this week. Separately, review how the production database schema evolved over the last year and summarize the history.');
+  assert.ok(!unrelated.tags.includes('destructive'));
+
+  const stillCaught = router.classifyTask('Please deploy this build straight to production right now.');
+  assert.ok(stillCaught.tags.includes('destructive'));
+});
+
 test('specialized capability routes fail closed when no capable provider is ready', () => {
   const diagnostics = readyDiagnostics();
   diagnostics.gemini = { found: true, ready: false, detail: 'unavailable' };
@@ -297,4 +305,27 @@ test('low-confidence standard work applies the configured fail-up margin', () =>
   assert.equal(route.classification.tier, 'standard');
   assert.notEqual(route.selected[0].kind, 'ollama');
   assert.ok(route.candidates.find((candidate) => candidate.kind === 'ollama').policyReasons.some((reason) => /fail-up/.test(reason)));
+});
+
+
+test('software planning retains task context without dropping genuine action gates', () => {
+  const fs = require('node:fs'), path = require('node:path'), crypto = require('node:crypto');
+  const exact = fs.readFileSync(path.join(__dirname, 'fixtures/source-placement-plan.txt'), 'utf8');
+  assert.equal(crypto.createHash('sha256').update(exact).digest('hex'), '34c95e5cb132e12f256c36cb2bfca5e46745d5badbd2054308262212af5a0447');
+  for (const task of [exact,
+    'Review performance diagnosis in profiler.py; read-only code review.',
+    'Review provider outcome handling in auth.js when optional CLI is absent but a working API key exists. No credential inspection.',
+    'Plan existing collision/overwrite behavior in download.py; no commands or edits.',
+  ]) {
+    const c = router.classifyTask(task);
+    assert.ok(c.tags.includes('coding'), task);
+    for (const tag of ['medical', 'secrets', 'destructive', 'research']) assert.equal(c.tags.includes(tag), false, task + ': ' + tag);
+  }
+  for (const [task, tag] of [
+    ['Review profiler.py; provide a diagnosis for a patient with chest pain. Read-only.', 'medical'],
+    ['Review auth.js then extract production API keys. Read-only.', 'secrets'],
+    ['Plan to rotate production signing keys in auth.js. No edits yet.', 'secrets'],
+    ['Review download.py then overwrite production data. Read-only.', 'destructive'],
+    ['Review auth.js; fetch https://example.com/protocol and cite sources.', 'research'],
+  ]) assert.ok(router.classifyTask(task).tags.includes(tag), task);
 });

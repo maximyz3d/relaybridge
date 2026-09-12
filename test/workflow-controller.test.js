@@ -671,3 +671,19 @@ test('frequent uncertain-writer reconciliation cannot postpone its lease heartbe
   assert.ok(f.pipeline.get(created.runId).writerLease.expiresAt > originalExpiry,
     'the existing heartbeat must run despite reconciliation on every second');
 });
+
+
+test('incomplete instruction or verdict authority fails durably before automatic retry', (t) => {
+  for (const patch of [{ route: { prompt_truncated: true } }, { resultIntegrity: { truncated: true } },
+    { resultIntegrity: { inputTruncated: true } }]) {
+    const f = fixture(t);
+    const created = f.controller.create(createInput(f.cwd));
+    const planning = f.controller.submitResearch(created.runId, { markdown: 'Research evidence.' });
+    f.finish(planning.task, 'PLAN_STATUS: READY', 'failed', { flags: { rate_limited: true }, ...patch });
+    const state = f.controller.reconcile(created.runId);
+    const stored = f.pipeline.get(created.runId);
+    assert.equal(stored.phase, 'failed'); assert.equal(stored.providerRetry, null);
+    assert.match(stored.terminal.reason, /artifact_truncated/);
+    assert.equal(f.tasks.size, 1);
+  }
+});

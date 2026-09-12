@@ -1267,7 +1267,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   const narrationResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST',
     headers: jsonAuth,
-    body: JSON.stringify({ kind: 'narration_only', prompt: 'Audit this repository and return concrete findings.', dangerous: false }),
+    body: JSON.stringify({ kind: 'narration_only', cwd: tempRoot, prompt: 'Audit this repository and return concrete findings.', dangerous: false }),
   });
   assert.equal(narrationResponse.status, 200);
   const narrationResult = await narrationResponse.json();
@@ -1330,7 +1330,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   const safeReviewPrompt = 'Review the repository without modifying it.';
   const safeReviewResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST', headers: jsonAuth,
-    body: JSON.stringify({ kind: 'headless_readonly_success', prompt: safeReviewPrompt, dangerous: false }),
+    body: JSON.stringify({ kind: 'headless_readonly_success', prompt: safeReviewPrompt, cwd: tempRoot, dangerous: false }),
   });
   const safeReview = await safeReviewResponse.json();
   assert.equal(safeReview.exitCode, 0);
@@ -1355,7 +1355,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
 
   const denialResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST', headers: jsonAuth,
-    body: JSON.stringify({ kind: 'headless_permission_denial', prompt: safeReviewPrompt, dangerous: false }),
+    body: JSON.stringify({ kind: 'headless_permission_denial', cwd: tempRoot, prompt: safeReviewPrompt, dangerous: false }),
   });
   const denial = await denialResponse.json();
   assert.equal(denial.exitCode, 0, 'matches receipt rcpt_mt6ucssr_287ca02b');
@@ -1416,8 +1416,8 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   });
   assert.equal(routeResponse.status, 200);
   const routeResult = await routeResponse.json();
-  assert.ok(!routeResult.fleetState.cooldownSkipped.includes('grok'),
-    'explicit preference may bypass the heuristic cooldown');
+  assert.ok(routeResult.fleetState.cooldownSkipped.includes('grok'),
+    'explicit preference still obeys the active account cooldown');
   assert.ok(!routeResult.selected.some((item) => item.kind === 'grok'),
     'authoritative unexpired vendor exhaustion cannot be bypassed by preference');
   const grokQuotaSkip = routeResult.fleetState.vendorQuotaSkipped.find((item) => item.kind === 'grok');
@@ -1538,6 +1538,10 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   const cursorCooldown = cursorCooldowns.cooling.find((item) => item.seat === 'cursor');
   assert.ok(cursorCooldown);
   assert.equal(cursorCooldown.reason, 'quota_exhausted');
+  const cursorCooldownFile = path.join(tempRoot, 'data', 'cooldowns.json');
+  const repairedCursorCooldown = JSON.parse(fs.readFileSync(cursorCooldownFile, 'utf8'));
+  for (const key of ['cursor', cursorUsage.route.quota_seat]) if (repairedCursorCooldown[key]) repairedCursorCooldown[key].until = 0;
+  fs.writeFileSync(cursorCooldownFile, JSON.stringify(repairedCursorCooldown));
 
   const cursorUnknownResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST', headers: jsonAuth,
@@ -2410,6 +2414,14 @@ test('prompt-file transport preserves long special-character prompts and cleans 
     assert.equal(result.failureClass, failureClass);
     assert.equal(result.dropped_out, true);
     assert.equal(result.usage.total_tokens, 4);
+    // Each case exercises parsing independently; api_error legitimately cools
+    // this fixture seat and must not prevent the next parser case dispatching.
+    const cooldownFile = path.join(tempRoot, 'data', 'cooldowns.json');
+    const cooldownRows = JSON.parse(fs.readFileSync(cooldownFile, 'utf8'));
+    for (const key of ['usage_json_terminal_from_prompt', result.route.quota_seat]) {
+      if (cooldownRows[key]) cooldownRows[key].until = 0;
+    }
+    fs.writeFileSync(cooldownFile, JSON.stringify(cooldownRows));
   }
 
   const cappedTimeoutResponse = await fetch(baseUrl + '/api/oneshot', {
@@ -2607,7 +2619,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   assert.equal(completedRateTask.status, 'failed');
-  assert.equal(completedRateTask.failureClass, 'rate_limit');
+  assert.equal(completedRateTask.failureClass, 'provider_cooldown');
   assert.ok(completedRateTask.retryAfterSec > 0);
   assert.ok(Number.isSafeInteger(completedRateTask.retryAt));
   const liveRateCooldown = await (await fetch(baseUrl + '/api/cooldowns', { headers: auth })).json();
@@ -3553,6 +3565,15 @@ test('linked provider accounts fail closed, isolate cooldowns, and refresh mutat
     method: 'POST', headers, body: JSON.stringify({ enabled: true }),
   });
   assert.equal(enableResponse.status, 200);
+  // Enabling an account does not bypass a provider-wide model cooldown.
+  const stillCooling = await fetch(`${baseUrl}/api/oneshot`, {
+    method: 'POST', headers, body: JSON.stringify({ kind: 'toggle_pool', prompt: 'cooldown must still gate', dangerous: false }),
+  });
+  assert.equal(stillCooling.status, 409);
+  assert.equal((await stillCooling.json()).failureClass, 'provider_cooldown');
+  const repairedCooldowns = JSON.parse(fs.readFileSync(path.join(dataDir, 'cooldowns.json'), 'utf8'));
+  repairedCooldowns.toggle_pool.until = 0;
+  fs.writeFileSync(path.join(dataDir, 'cooldowns.json'), JSON.stringify(repairedCooldowns));
   const enabledResponse = await fetch(`${baseUrl}/api/oneshot`, {
     method: 'POST', headers,
     body: JSON.stringify({ kind: 'toggle_pool', prompt: 'use the newly enabled account', dangerous: false }),
@@ -3612,7 +3633,7 @@ test('linked provider accounts fail closed, isolate cooldowns, and refresh mutat
       diagnostics: { pooled_rate: { found: true, ready: true } },
     }),
   })).json();
-  assert.equal(explicitCoolingRoute.fleetState.cooldownSkipped.includes('pooled_rate'), false);
+  assert.equal(explicitCoolingRoute.fleetState.cooldownSkipped.includes('pooled_rate'), true);
 
   const route = await (await fetch(`${baseUrl}/api/route`, {
     method: 'POST', headers,
@@ -4100,10 +4121,10 @@ test('hosted OpenAI-compatible adapter blocks China-hosted endpoints before netw
     body: JSON.stringify({ kind: 'blocked', prompt: 'test prompt', dangerous: false }),
   });
   const result = await response.json();
-  assert.equal(result.exitCode, -1);
+  assert.equal(response.status, 409);
   assert.equal(result.dropped_out, true);
   assert.equal(result.model_invocation, false);
-  assert.match(result.stderr, /blocked by geo\/supply-chain policy/);
+  assert.equal(result.modelCatalog.diagnosticCode, 'hosted_endpoint_blocked');
   const receiptFile = path.join(tempRoot, 'data', 'receipts', `${new Date().toISOString().slice(0, 10)}.jsonl`);
   const receipt = fs.readFileSync(receiptFile, 'utf8').trim().split(/\r?\n/)
     .map((line) => JSON.parse(line)).find((row) => row.receiptId === result.receiptId);
