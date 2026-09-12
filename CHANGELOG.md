@@ -1,3 +1,6 @@
+## v2.4.0 - 2026-09-12
+- #131 Refine parallel execution, usage evidence, transport recovery, and provider safety
+
 ## v2.3.3 - 2026-09-11
 - #130 Add subscription reserve handoffs and adaptive progress supervision
 
