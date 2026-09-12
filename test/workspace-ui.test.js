@@ -4,4 +4,13 @@ const S=require('../public/workspace-state');
 test('workspace groups actual states and keeps pending writers out of active work',()=>{const groups=S.taskGroups([{id:'a',state:'running'},{id:'b',state:'awaiting_writer'},{id:'c',state:'needs_attention'},{id:'d',state:'completed'}]);assert.deepEqual(groups.active.map(t=>t.id),['a']);assert.deepEqual(groups.queued.map(t=>t.id),['b']);assert.deepEqual(groups.blocked.map(t=>t.id),['c']);assert.equal(S.status('awaiting_writer'),'Ready for writer');});
 test('unknown or stale usage never becomes a percentage',()=>{for(const usage of [null,{}, {freshness:'stale',percentRemaining:50},{freshness:'fresh',percentRemaining:null}])assert.equal(S.formatUsage(usage),'Usage not reported');assert.equal(S.formatUsage({freshness:'fresh',percentRemaining:42}),'42% remaining');});
 test('state merge preserves selection and unsent draft',()=>{const prior={projectId:'p',threadId:'t',draft:'Unsent work',scroll:150};assert.deepEqual(S.mergeSelection(prior,{projects:[{id:'p'}],threads:[{id:'t'}],project:{id:'p'},thread:{id:'t'}}),prior);});
+test('project activity survives conversation selection and prioritizes running work',()=>{
+ const running={id:'other',title:'Earlier conversation',state:'consulting',role:'advisor',queueTaskId:'active',model:'heavy',progress:{ageMs:1234}};
+ const queued={id:'selected',title:'Current conversation',state:'queued',queueTaskId:'waiting'};
+ for(const thread of [{id:'idle',state:'idle'},queued]){
+  const work=S.currentWork({thread,activity:[queued,running],tasks:[]});
+  assert.equal(work.threadId,'other');assert.equal(work.conversationTitle,running.title);assert.equal(work.queueTaskId,'active');assert.deepEqual(work.progress,running.progress);
+ }
+ assert.equal(S.currentWork({thread:queued,activity:[queued],tasks:[{id:'worker',state:'running'}]}).id,'worker');
+});
 test('workspace shell has accessible controls and external scripts without unsafe rendering',()=>{const html=fs.readFileSync(path.join(__dirname,'../public/control-center.html'),'utf8');const js=fs.readFileSync(path.join(__dirname,'../public/workspace.js'),'utf8');assert.match(html,/<nav aria-label="Projects">/);assert.match(html,/role="log"/);assert.match(html,/aria-label="Send message"/);assert.match(html,/href="\/terminal"/);assert.doesNotMatch(html,/<script(?![^>]*\bsrc=)[^>]*>/);assert.doesNotMatch(html,/\son\w+=/);assert.doesNotMatch(js,/\.innerHTML\s*=/);assert.match(js,/rb:workspace:pending/);});

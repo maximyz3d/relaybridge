@@ -77,6 +77,7 @@
     if(task.result)box.append(el('hr'),el('div','task-details',task.result));$('task-detail-dialog').showModal();}
   function renderWork(){const current=S.currentWork(state),box=$('current-work');box.replaceChildren();
     if(current){box.append(el('span','status-orbit','◌'),el('h3','',current.title),el('p','',current.model||current.provider||'Your project team'),el('span','status-pill',S.status(current.state)));
+      if(current.threadId){const conversation=el('button','text-button',current.conversationTitle);conversation.setAttribute('aria-label',`Open conversation: ${current.conversationTitle}`);conversation.onclick=()=>select(selection.projectId,current.threadId);box.append(conversation);}
       if(current.progress){const duration=S.duration(current.progress.ageMs);box.append(el('p','',`${duration?duration+' elapsed · ':''}${current.progress.phase||'Working'}`),el('p','',S.formatUsage(current.progress.nativeUsage)));}}
     else box.append(el('span','status-orbit','○'),el('h3','','Room for your next idea'),el('p','','No work is running in this project.'));
     $('task-total').textContent=state.tasks.filter(t=>t.state!=='completed').length;

@@ -18,6 +18,36 @@ test('recovery after persistence-before-submit uses the exact prior intent once'
 test('separate projects cannot read each other’s conversation through selection',t=>{const f=fixture(t);f.workspace.sendMessage({actionId:'message_0001',threadId:f.created.threadId,text:'Private to project A'});const second=f.workspace.createProject({actionId:'project_0002',name:'Project B',cwd:f.dataDir});assert.equal(f.workspace.view({projectId:second.projectId}).thread.messages.length,0);assert.throws(()=>f.workspace.view({projectId:second.projectId,threadId:f.created.threadId}),/not found in this project/);assert.throws(()=>f.workspace.createProject({actionId:'project_0003',name:'Invalid',cwd:'/outside'}),/outside/);});
 test('corrupt storage is preserved and cannot silently reset project history',t=>{const f=fixture(t),file=path.join(f.dataDir,'project-workspace','workspace.json');fs.writeFileSync(file,'{broken');const recovered=createProjectWorkspace(f.options);assert.ok(recovered.view().storageError);assert.throws(()=>recovered.createProject({actionId:'project_0002',name:'Would erase history',cwd:f.dataDir}));assert.equal(fs.readFileSync(file,'utf8'),'{broken');});
 test('read paths never submit or settle tasks',t=>{const f=fixture(t);f.workspace.sendMessage({actionId:'message_0001',threadId:f.created.threadId,text:'Wait for tick'});for(let i=0;i<3;i++)f.workspace.view();assert.equal(f.submissions.length,0);});
+test('project activity includes other conversations with exact progress and remains project scoped',t=>{
+ const f=fixture(t),idle=f.workspace.createThread({actionId:'thread_00002',projectId:f.created.projectId,title:'Idle conversation'});
+ f.workspace.sendMessage({actionId:'message_0001',threadId:f.created.threadId,text:'Keep working'});f.workspace.tick();
+ const id=f.submissions[0].id;f.tasks.get(id).status='running';
+ const progress={route:{request_id:'queued:'+id},ageMs:1234,phase:'provider_running'};
+ const workspace=createProjectWorkspace({...f.options,activeRuns:()=>[progress]});
+ const view=workspace.view({projectId:f.created.projectId,threadId:idle.threadId});
+ assert.equal(view.thread.state,'idle');assert.equal(view.activity.length,1);assert.equal(view.activity[0].id,f.created.threadId);
+ assert.equal(view.activity[0].queueTaskId,id);assert.equal(view.activity[0].state,'running');assert.deepEqual(view.activity[0].progress,progress);
+ assert.equal(view.activity[0].messages,undefined);assert.equal(view.activity[0].job,undefined);
+ const other=workspace.createProject({actionId:'project_0002',name:'Other project',cwd:f.dataDir});assert.deepEqual(workspace.view({projectId:other.projectId}).activity,[]);
+ assert.equal(f.submissions.length,1);
+});
+test('task projection preserves refusals and never treats unverified queue completion as completed work',t=>{
+ const f=fixture(t);f.workspace.createTask({actionId:'task_00001',threadId:f.created.threadId,title:'Inspect',prompt:'Inspect files',kind:'read_only'});f.workspace.tick();
+ f.complete(f.submissions[0].id,'A result');assert.notEqual(f.workspace.view().tasks[0].state,'completed');
+ f.queue.getResult=()=>({resultPersisted:false});f.workspace.tick();
+ const task=f.workspace.view().tasks[0];assert.equal(task.state,'needs_attention');assert.equal(task.executionStatus,'done');
+ const coding=f.workspace.createTask({actionId:'task_00002',threadId:f.created.threadId,title:'Code',prompt:'Make the change',kind:'coding'});f.workspace.tick();
+ const file=path.join(f.dataDir,'project-workspace','workspace.json'),saved=JSON.parse(fs.readFileSync(file));
+ saved.tasks.find(t=>t.id===coding.taskId).state='needs_attention';fs.writeFileSync(file,JSON.stringify(saved));
+ const blocked=f.workspace.getTask(coding.taskId);assert.equal(blocked.state,'needs_attention');assert.equal(blocked.workflowPhase,'planning');
+});
+test('completed coding workflow status agrees in task cards project counts and coordinator context',t=>{
+ const f=fixture(t);f.workspace.createTask({actionId:'task_00001',threadId:f.created.threadId,title:'Completed code',prompt:'Implement',kind:'coding'});f.workspace.tick();
+ assert.equal(f.workspace.view().projects[0].taskCount,1);[...f.workflowRecords.values()][0].phase='complete';
+ const view=f.workspace.view();assert.equal(view.tasks[0].state,'completed');assert.equal(view.projects[0].taskCount,0);
+ f.workspace.sendMessage({actionId:'message_0001',threadId:f.created.threadId,text:'What is next?'});f.workspace.tick();
+ assert.match(f.submissions[0].intent.prompt,/"title":"Completed code","kind":"coding","state":"completed"/);
+});
 test('unavailable or partial delivery never becomes advisor evidence or completed work',t=>{const f=fixture(t);f.workspace.sendMessage({actionId:'message_0001',threadId:f.created.threadId,text:'Consult'});f.workspace.tick();f.complete(f.submissions[0].id,{action:'consult',question:'Review this'});f.workspace.tick();f.complete(f.submissions[1].id,'');f.queue.getResult=()=>({resultPersisted:false,metadata:null,result:null});f.workspace.tick();assert.equal(f.submissions.length,2);assert.equal(f.workspace.view().thread.state,'needs_attention');assert.equal(f.workspace.view().tasks.length,0);});
 test('explicit resume recovers absent saved task identity rather than generating another',t=>{const f=fixture(t),submit=f.queue.submitDurable;f.queue.submitDurable=()=>{throw new Error('temporarily unavailable');};f.workspace.sendMessage({actionId:'message_0001',threadId:f.created.threadId,text:'Preserve the intent'});f.workspace.tick();const blocked=f.workspace.view().thread;assert.equal(blocked.canResume,true);assert.ok(blocked.queueTaskId);f.queue.submitDurable=submit;const restarted=createProjectWorkspace(f.options);restarted.resume({actionId:'resume_00001',threadId:f.created.threadId});restarted.tick();assert.equal(f.submissions.length,1);assert.equal(f.submissions[0].id,blocked.queueTaskId);});
 test('second consultation never consumes stale first-advisor evidence after quota pause',t=>{const f=fixture(t);let blocked=false;f.options.quota.verdict=()=>({admit:!blocked});f.workspace.sendMessage({actionId:'message_0001',threadId:f.created.threadId,text:'Plan'});f.workspace.tick();f.complete(f.submissions[0].id,{action:'consult',question:'FIRST QUESTION'});f.workspace.tick();f.complete(f.submissions[1].id,'FIRST ANSWER');f.workspace.tick();f.complete(f.submissions[2].id,{action:'consult',question:'SECOND QUESTION'});blocked=true;f.workspace.tick();assert.equal(f.workspace.view().thread.state,'waiting_for_quota');blocked=false;f.workspace.resume({actionId:'resume_00001',threadId:f.created.threadId});f.workspace.tick();assert.equal(f.submissions[3].intent.kind,'claude');assert.match(f.submissions[3].intent.prompt,/SECOND QUESTION/);assert.doesNotMatch(f.submissions[3].intent.prompt,/FIRST ANSWER/);});

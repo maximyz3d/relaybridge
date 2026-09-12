@@ -22,6 +22,8 @@ Limits are explicit: 64 projects, 100 conversations per project, 500 messages pe
 
 Activity is matched using the exact `queued:<taskId>` request identity. The UI shows real phases, elapsed time and fresh native usage when available. Missing or stale allowance displays “Usage not reported.” There is no estimated completion percentage. Global usage protection, the 2–5% reserve, automatic continuity handoffs, and dynamic supervision settings are available in Workspace settings.
 
+The activity panel includes work in every conversation in the selected project. Switching conversations keeps running work visible, with a link back to its conversation; active work takes priority over queued work.
+
 Project chat checkpoints are durable before each dispatch and can be downloaded with **Save conversation handoff**. Its Codex coordinator pauses at the protected reserve and can resume when capacity is available. Automatic provider ownership transfer continues to belong to the existing managed continuity protocol; this UI does not silently transfer a Codex project conversation or grant a successor a writer lease.
 
 ## Verification
