@@ -12,6 +12,8 @@ import { normalizeGenericValidation } from '../lib/validation-contract.js';
 import { promptTransportLimits, preparePrompt } from '../lib/prompt-transport.js';
 import { normalizeGrounding, prepareGroundedPrompt } from '../lib/workspace-grounding.js';
 import { normalizeTransportLifecycle } from '../lib/attempt-lifecycle.js';
+import { normalizeProcessCensus, normalizeProcessWarnings, normalizeNativeTransport } from '../lib/run-observation.js';
+import { normalizePerplexityState } from '../lib/perplexity-diagnostics.js';
 import { compileOutputProfile } from '../lib/output-profiles.js';
 import { redactCheckpointSecrets } from '../lib/partial-checkpoint.js';
 import { normalizeQualitativeQuotaExhaustion } from '../lib/vendor-quota.js';
@@ -36,6 +38,7 @@ import {
   BridgeError,
   bridgeRequest,
   health,
+  localAdapterIdentity,
   restartBridge,
   startBridge,
   stopBridge,
@@ -285,6 +288,7 @@ function providerSummaries(diagnostics = {}) {
       transport: cli.transport || (kind === 'powershell' ? 'local:process' : 'cli'),
       configuredModel: cli.model || item.modelIdentity,
       usageCapability: diag.usageCapability || null,
+      answerHealth: diag.answerHealth || null,
       safeOneShot: diag.safeFilesystem ? {
         ...diag.safeFilesystem,
         ready: diag.safeReady ?? null,
@@ -297,6 +301,7 @@ function providerSummaries(diagnostics = {}) {
         detail: diag.detail || '',
         path: Array.isArray(diag.paths) ? diag.paths[0] || null : null,
         runtimeVersion: diag.runtimeVersion || null,
+        modelCatalog: diag.modelCatalog || null,
       },
       costClass: item.costClass,
       privacyBoundary: item.privacyBoundary,
@@ -546,7 +551,7 @@ async function buildContextBundle({
   const bundle = {
     schemaVersion: 1,
     generatedAt: new Date().toISOString(),
-    bridge: { baseUrl: BASE_URL.href, health: live },
+    bridge: { baseUrl: BASE_URL.href, health: live, adapter: localAdapterIdentity },
     registries: {
       fingerprints: routing.fingerprints,
       evidenceUpdatedAt: routing.evidence.updatedAt,
@@ -853,7 +858,10 @@ const PROVIDER_FAILURE_CLASSES = new Set([
   'validation', 'configuration', 'safe_filesystem_unverified',
   'safe_isolation_setup', 'isolation_cleanup', 'workspace_grounding',
   'account_registry_invalid', 'account_configuration_invalid',
-  'account_unavailable', 'vendor_quota_exhausted',
+  'account_unavailable', 'vendor_quota_exhausted', 'provider_cooldown', 'cooldown_authority_unavailable',
+  'model_unavailable', 'model_catalog_unavailable', 'ungrounded_audit', 'answer_probe_busy',
+  'operator_cancelled', 'child_fanout', 'scope_expansion', 'native_transport_limit', 'permission_policy_unavailable',
+  'filesystem_contract_unsupported', 'invalid_write_contract',
 ]);
 
 const PROVIDER_BUDGET_SCHEMA = z.object({
@@ -1166,6 +1174,13 @@ export function normalizeQuotaEvidence(value) {
   };
 }
 
+export function normalizeAuditUsability(value) {
+  if (!value || typeof value !== 'object' || value.required !== true
+    || ![true, false, null].includes(value.usable)
+    || !['likely-fabricated', 'suspect', 'partial', 'ok', 'unverifiable', 'no-paths-cited'].includes(value.confidence)) return null;
+  return { required: true, usable: value.usable, confidence: value.confidence, reason: strictBoundedString(value.reason) };
+}
+
 export function normalizeProviderCooldown(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)
     || !validQuotaSeat(value.seat)
@@ -1174,7 +1189,9 @@ export function normalizeProviderCooldown(value) {
     || !['retry-after', 'retry-after-capped', 'backoff', 'overload-default'].includes(value.source)
     || strictTokenCount(value.until) === null || strictTokenCount(value.offences) === null) return null;
   return { seat: value.seat, scope: value.scope, reason: value.reason, source: value.source,
-    until: value.until, offences: value.offences };
+    until: value.until, offences: value.offences,
+    ...(typeof value.sourceReceiptId === 'string' && /^rcpt_[a-z0-9_]{1,100}$/.test(value.sourceReceiptId)
+      ? { sourceReceiptId: value.sourceReceiptId } : {}) };
 }
 
 export function normalizeOutputDetector(value) {
@@ -1237,6 +1254,10 @@ export function sanitizeProviderResponse(response) {
     physicalAttemptCount: strictTokenCount(response.physical_attempt_count),
     providerRunId: normalizeTransportLifecycle(response.transport_lifecycle)?.runId || null,
     transportLifecycle: normalizeTransportLifecycle(response.transport_lifecycle),
+    processCensus: normalizeProcessCensus(response.process_census),
+    processWarnings: normalizeProcessWarnings(response.process_warnings),
+    nativeTransport: normalizeNativeTransport(response.native_transport),
+    providerState: response.kind === 'perplexity' ? normalizePerplexityState(response.provider_state) : null,
     transportDiagnosticCode: strictBoundedString(response.transport_diagnostic_code),
     providerTerminalCompatibility: response.provider_terminal_compatibility === 'ollama_done_without_reason_v1' ? response.provider_terminal_compatibility : null,
     exitCode: response.exitCode,
@@ -1365,6 +1386,11 @@ export function sanitizeProviderResponse(response) {
     vendorQuota: normalizeVendorQuota(response.vendor_quota),
     quotaEvidence: normalizeQuotaEvidence(response.quota_evidence),
     grounding: normalizeGrounding(response.grounding),
+    auditUsability: normalizeAuditUsability(response.audit_usability),
+    groundingCitations: response.grounding_citations && typeof response.grounding_citations === 'object'
+      ? { confidence: strictBoundedString(response.grounding_citations.confidence),
+        citations: Array.isArray(response.grounding_citations.citations) ? response.grounding_citations.citations.slice(0, 60).map(c => ({
+          reference: strictBoundedString(c.reference), status: strictBoundedString(c.status), relativePath: strictBoundedString(c.relativePath), duplicate: c.duplicate === true })) : [] } : null,
     cooldown: normalizeProviderCooldown(response.cooldown),
     retryAt: strictTokenCount(response.retry_at),
     retryAfterSec: strictTokenCount(response.retry_after),
@@ -1383,7 +1409,7 @@ export function sanitizeProviderResponse(response) {
 
 function providerSucceeded(response) {
   return !!response && response.pending !== true && response.terminal !== false && !response.partialResult &&
-    response.exitCode === 0 &&
+    response.exitCode === 0 && response.auditUsability?.usable !== false &&
     !response.droppedOut &&
     !response.rateLimited &&
     !response.budgetExceeded &&
@@ -1545,6 +1571,10 @@ export function reconcileTransportReceipt({ requestId, sanitized, transportRecei
     physicalAttemptCount: transportReceipt.physicalAttemptCount ?? 1,
     providerRunId: normalizeTransportLifecycle(transportReceipt.transportLifecycle)?.runId || null,
     transportLifecycle: normalizeTransportLifecycle(transportReceipt.transportLifecycle),
+    processCensus: normalizeProcessCensus(transportReceipt.processCensus),
+    processWarnings: normalizeProcessWarnings(transportReceipt.processWarnings),
+    nativeTransport: normalizeNativeTransport(transportReceipt.nativeTransport),
+    providerState: transportReceipt.provider === 'perplexity' ? normalizePerplexityState(transportReceipt.providerState) : null,
     transportDiagnosticCode: strictBoundedString(transportReceipt.transportDiagnosticCode),
     providerTerminalCompatibility: transportReceipt.providerTerminalCompatibility === 'ollama_done_without_reason_v1' ? transportReceipt.providerTerminalCompatibility : null,
   };
@@ -1568,6 +1598,8 @@ async function callProvider({
   purpose = 'ask_provider',
   signal,
   providerBudget,
+  childProcessPolicy,
+  allowedWritePaths,
   taskTier,
   modelTier,
   model,
@@ -1615,7 +1647,7 @@ async function callProvider({
       method: 'POST',
       body: { kind, prompt, outputProfile, cwd, requestId, model, execution, requiresWorkspaceAccess, inlineEvidence,
         taskTier: effectiveTaskTier, modelTier: effectiveModelTier,
-        effort, maxEffortOverride, providerBudget, dangerous: false },
+        effort, maxEffortOverride, providerBudget, childProcessPolicy, allowedWritePaths, dangerous: false },
       timeoutMs: durableTaskId ? collectionRemaining() : TIMEOUT_POLICY.transportTimeoutMs(timeoutMs),
       signal,
       actionIdentity: true,
@@ -1641,6 +1673,8 @@ async function callProvider({
     configFingerprint,
     purpose,
     providerBudget: providerBudget || null,
+    childProcessPolicy: childProcessPolicy || null,
+    allowedWritePaths: allowedWritePaths ?? null,
     execution: workspaceAdmission?.execution || execution || null,
     grounding: workspaceAdmission?.grounding || null,
     semanticMaxChars: semanticMaxChars ?? null,
@@ -1746,7 +1780,7 @@ async function callProvider({
           requestId, outerReceiptId, continuityId, continuityEpoch, expectedCwdIdentityHash: workspaceAdmission.cwdIdentityHash,
           expectedCwdPolicyId: workspaceAdmission.cwdPolicyId,
           ...(admittedPromptHash ? { expectedPromptHash: admittedPromptHash } : {}),
-          providerBudget, budgetTaskTier: effectiveTaskTier, taskTier: effectiveTaskTier,
+          providerBudget, childProcessPolicy, allowedWritePaths, budgetTaskTier: effectiveTaskTier, taskTier: effectiveTaskTier,
           modelTier: effectiveModelTier, model, execution: workspaceAdmission.execution,
           effort, maxEffortOverride, dangerous: false } });
       submission = handle;
@@ -1769,7 +1803,7 @@ async function callProvider({
       try { task = await bridgeRequest(`/api/tasks/${durableTaskId}`, { timeoutMs: Math.min(3000, collectionRemaining()) }); } catch { return pending(); }
       const stored = task.task || task;
       const complete = handle.resultState === 'persisted' && handle.status === 'done' && handle.metadata?.complete === true && handle.metadata?.partial !== true;
-      sanitized = sanitizeProviderResponse({ ...stored.providerMetadata, kind, stdout: handle.result || '', stderr: redactCheckpointSecrets(stored.stderr || '', 4000),
+      sanitized = sanitizeProviderResponse({ ...stored.providerMetadata, audit_usability: stored.auditUsability, grounding_citations: stored.groundingCitations, kind, stdout: handle.result || '', stderr: redactCheckpointSecrets(stored.stderr || '', 4000),
         actionPreflight: submission?.actionPreflight,
         dropped_out: !complete, exitCode: stored.exitCode, route: stored.route, usage: stored.usage,
         receiptId: handle.metadata?.providerReceiptId || stored.receiptId,
@@ -1798,7 +1832,7 @@ async function callProvider({
         expectedCwdPolicyId: workspaceAdmission.cwdPolicyId,
         ...(admittedPromptHash ? { expectedPromptHash:admittedPromptHash } : {}),
         timeoutMs: TIMEOUT_POLICY.normalizeOneShotTimeoutMs(timeoutMs),
-        providerBudget,
+        providerBudget, childProcessPolicy, allowedWritePaths,
         budgetTaskTier: effectiveTaskTier,
         taskTier: effectiveTaskTier,
         modelTier: effectiveModelTier,
@@ -1856,6 +1890,8 @@ async function callProvider({
     vendorQuota: sanitized.vendorQuota ?? null,
     quotaEvidence: sanitized.quotaEvidence ?? null,
     grounding: sanitized.grounding ?? null,
+    auditUsability: sanitized.auditUsability ?? null,
+    groundingCitations: sanitized.groundingCitations ?? null,
     providerRunId: sanitized.providerRunId ?? null,
     transportLifecycle: sanitized.transportLifecycle ?? null,
     transportDiagnosticCode: sanitized.transportDiagnosticCode ?? null,
@@ -2155,7 +2191,7 @@ export function buildServer() {
   }, safeHandler(async ({ includeDiagnostics }, context) => {
     const live = await health({ signal: context?.mcpReq?.signal });
     const diagnostics = includeDiagnostics ? await getDiagnostics(context?.mcpReq?.signal) : {};
-    return result({ ok: true, baseUrl: BASE_URL.href, health: live, providers: providerSummaries(diagnostics) });
+    return result({ ok: true, baseUrl: BASE_URL.href, health: live, adapter: localAdapterIdentity, providers: providerSummaries(diagnostics) });
   }));
 
   server.registerTool('list_providers', {
@@ -2272,6 +2308,16 @@ export function buildServer() {
     const runs = await bridgeRequest('/api/runs/active', { timeoutMs: 10000, signal: context?.mcpReq?.signal });
     return result(runs);
   }));
+
+  server.registerTool('cancel_active_run', {
+    title: 'Cancel one active provider run',
+    description: 'Request cancellation of the exact live run/request/invocation/attempt from list_active_runs. Returns stop intent, never proof of whole-tree termination. Other parallel runs remain active.',
+    inputSchema: z.object({ runId: z.string().regex(/^run_[A-Za-z0-9_-]{1,100}$/),
+      requestId: z.string().min(1).max(200), invocationId: z.string().min(1).max(200), attemptId: z.string().min(1).max(200) }).strict(),
+    annotations: ACTION,
+  }, safeHandler(async ({ runId, ...body }, context) => result(await bridgeRequest(`/api/runs/${encodeURIComponent(runId)}/cancel`, {
+    method: 'POST', body, actionIdentity: true, signal: context?.mcpReq?.signal,
+  }))));
 
   server.registerTool('bridge_activity', {
     title: 'Read bridge activity telemetry',
@@ -2517,15 +2563,25 @@ export function buildServer() {
     method: 'POST', body: { url, browser: 'chrome' }, signal: context?.mcpReq?.signal, actionIdentity: true,
   }))));
 
+  server.registerTool('probe_provider_answer', {
+    title: 'Test a provider answer',
+    description: 'Explicitly spend one minimal Perplexity subscription request to test answer delivery. Authentication-only diagnostics never run this test. Requires an exact account; preserves normal filesystem, quota and cooldown gates. No retries or paid fallback.',
+    inputSchema: z.object({ kind: z.literal('perplexity'), expectedAccountId: z.string().min(1).max(48),
+      confirmQuotaUse: z.literal(true), cwd: z.string().optional(), requestId: z.string().optional() }).strict(),
+    annotations: { ...DESTRUCTIVE, openWorldHint: true },
+  }, safeHandler(async ({ kind, ...body }) => result(await bridgeRequest(`/api/providers/${kind}/probe-answer`, {
+    method: 'POST', body, actionIdentity: true,
+  }))));
+
   server.registerTool('send_session_input', {
     title: 'Send terminal input',
     description: 'Send bounded text to an existing terminal. For a PowerShell session this executes the text as a real host command with your account\'s privileges and no sandbox; for an AI CLI session it drives that CLI interactively. Always requires host approval and human review.',
-    inputSchema: z.object({ sessionId: z.string().min(1).max(64), data: z.string().min(1).max(8192), appendNewline: z.boolean().default(true) }),
+    inputSchema: z.object({ sessionId: z.string().min(1).max(64), data: z.string().min(1).max(8192), mode: z.enum(['keystrokes', 'prompt']).default('keystrokes'), appendNewline: z.boolean().default(true) }),
     annotations: { ...DESTRUCTIVE, openWorldHint: true },
-  }, safeHandler(async ({ sessionId, data, appendNewline }) => {
+  }, safeHandler(async ({ sessionId, data, mode, appendNewline }) => {
     const sent = data + (appendNewline ? '\r' : '');
-    const response = await bridgeRequest(`/api/sessions/${encodeURIComponent(sessionId)}/input`, { method: 'POST', body: { data: sent }, actionIdentity: true });
-    const receipt = appendReceipt({ event: 'session_input', sessionId, inputHash: stableHash(data), inputChars: data.length, appendNewline, status: response.ok ? 'sent' : 'rejected' });
+    const response = await bridgeRequest(`/api/sessions/${encodeURIComponent(sessionId)}/input`, { method: 'POST', body: { data: sent, mode }, actionIdentity: true });
+    const receipt = appendReceipt({ event: 'session_input', sessionId, inputHash: stableHash(data), inputChars: data.length, appendNewline, status: response.status || 'rejected', deliveryVerified: false, modelConsumption: 'unverified' });
     return result({ ...response, sessionId, receiptId: receipt.receiptId });
   }));
 
@@ -2555,6 +2611,10 @@ export function buildServer() {
       useCache: z.boolean().default(true),
       cacheTtlMs: z.number().int().min(0).max(86400000).optional(),
       providerBudget: PROVIDER_BUDGET_SCHEMA.nullish(),
+      childProcessPolicy: z.object({ maxChildren: z.number().int().min(1).max(256).optional(),
+        maxConcurrentTests: z.number().int().min(0).max(256).optional(), action: z.enum(['warn', 'stop']).optional() }).strict().optional(),
+      allowedWritePaths: z.array(z.string().min(1).max(1024)).max(128).optional()
+        .describe('Optional exact write boundary. Requires a qualified executor; unsupported installations refuse before invocation.'),
       taskTier: z.enum(TASK_TIERS).optional(),
       modelTier: z.enum(MODEL_TIERS).optional(),
       model: z.string().min(1).max(160).optional(),
@@ -3407,11 +3467,12 @@ export function buildServer() {
     inputSchema: z.object({
       runId: workflowIdSchema,
       leaseMs: z.number().int().min(60000).max(86400000).optional(),
+      ownedLease: z.boolean().optional().describe('Require a deployment-qualified execution owner; unsupported providers refuse before dispatch.'),
     }),
     annotations: DESTRUCTIVE,
-  }, safeHandler(async ({ runId, leaseMs }, context) => result(await bridgeRequest(
+  }, safeHandler(async ({ runId, leaseMs, ownedLease }, context) => result(await bridgeRequest(
     `/api/workflows/${encodeURIComponent(runId)}/revision/start`, {
-      method: 'POST', body: leaseMs == null ? {} : { leaseMs },
+      method: 'POST', body: { ...(leaseMs == null ? {} : { leaseMs }), ...(ownedLease === undefined ? {} : { ownedLease }) },
       signal: context?.mcpReq?.signal, actionIdentity: true,
     },
   ))));
@@ -3854,4 +3915,5 @@ export function buildServer() {
 if (path.resolve(process.argv[1] || '') === fileURLToPath(import.meta.url)) {
   console.error(`[RelayBridge-mcp] stdio adapter ${PACKAGE.version} -> ${BASE_URL.href}`);
   serveStdio(() => buildServer());
+  if (process.send) process.send({ type: 'relaybridge_adapter_ready' });
 }

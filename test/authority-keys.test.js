@@ -120,9 +120,13 @@ test('cooldown startup and refresh normalize own keys and reject malformed numer
   });
   fs.writeFileSync(file, JSON.stringify(raw));
   const store = createCooldownStore({ file, now: () => 2000 });
-  assert.deepEqual(Object.keys(store._state()), ['claude']);
+  assert.equal(store.status('claude').authority, 'unknown');
+  assert.deepEqual(Object.keys(store._state()), []);
+  for (const key of HOSTILE_KEYS) delete raw[key];
+  fs.writeFileSync(file, JSON.stringify(raw));
   assert.equal(store.status('claude').cooling, true);
   assert.equal(Object.hasOwn(store._state().claude, 'untrustedExtra'), false);
+  assert.equal(store.status('negative').authority, 'unknown');
   raw.codex = { ...good, lastOffenceAt: 3000 };
   fs.writeFileSync(file, JSON.stringify(raw));
   assert.equal(store.status('codex').cooling, true);

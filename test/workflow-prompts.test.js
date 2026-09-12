@@ -51,12 +51,12 @@ test('phase prompts keep roles and handoff contracts explicit', () => {
   assert.match(revision, /REVISION_STATUS: APPLIED/);
 });
 
-test('phase prompts cap oversized handoffs deterministically', () => {
-  const prompt = buildReviewPrompt({ ...brief, plan: 'p'.repeat(200000), implementation: 'i'.repeat(200000) });
-  assert.ok(prompt.length <= TOTAL_PROMPT_CHARS);
-  assert.match(prompt, /RelayBridge omitted/);
-  assert.match(prompt, /# Required output contract/);
-  assert.match(prompt, /REVIEW_VERDICT: APPROVE/);
+test('oversized fields, instruction lists and combined prompts reject without truncation', () => {
+  assert.throws(() => buildReviewPrompt({ ...brief, plan: 'p'.repeat(200000) }), { code: 'ARTIFACT_TOO_LARGE' });
+  assert.throws(() => buildPlanningPrompt({ ...brief, constraints: Array(41).fill('required') }), { code: 'ARTIFACT_TOO_LARGE' });
+  assert.throws(() => buildReviewPrompt({ ...brief, plan: 'p'.repeat(32000), implementation: 'i'.repeat(24000),
+    review: 'r'.repeat(24000), revision: 'v'.repeat(16000) }), { code: 'ARTIFACT_TOO_LARGE' });
+  assert.ok(buildReviewPrompt(brief).length < TOTAL_PROMPT_CHARS);
 });
 
 test('marker parsers use the last valid standalone marker and fail closed', () => {
@@ -75,7 +75,7 @@ const phases = [
 ];
 
 for (const [name, build, blockingMarker, readOnly] of phases) {
-  test(`${name} reserves a self-contained final-delivery contract even when body is clipped`, () => {
+  test(`${name} preserves final-delivery contracts and rejects oversized bodies`, () => {
     const normal = build(brief);
     const heading = '# Required output contract';
     const contract = normal.slice(normal.lastIndexOf(heading));
@@ -98,11 +98,7 @@ for (const [name, build, blockingMarker, readOnly] of phases) {
       constraints: Array(40).fill(huge), nonGoals: Array(40).fill(huge),
       fileScope: Array(80).fill(huge), acceptanceCriteria: Array(60).fill(huge),
     });
-    const clipped = build(overloaded);
-    assert.ok(clipped.length <= TOTAL_PROMPT_CHARS);
-    assert.match(clipped, /RelayBridge omitted/);
-    assert.equal(clipped.slice(clipped.lastIndexOf(heading)), contract);
-    if (!readOnly) assert.match(clipped, /exclusive writer lease/);
+    assert.throws(() => build(overloaded), { code: 'ARTIFACT_TOO_LARGE' });
   });
 }
 

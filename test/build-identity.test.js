@@ -536,6 +536,7 @@ posixOnly('POSIX MCP registration cannot strand a new token on snapshot or build
   const installer = path.join(root, 'install-mcp.sh');
   fs.copyFileSync(path.join(ROOT, 'install-mcp.sh'), installer);
   write(path.join(root, 'mcp', 'server.mjs'), '// fixture\n');
+  write(path.join(root, 'mcp', 'launcher.mjs'), '// fixture\n');
   write(path.join(root, 'config', 'timeout-policy.json'), JSON.stringify({
     oneShotMaxMs: 1000, transportGraceMs: 1000, mcpHostGraceMs: 1000,
   }));
@@ -637,6 +638,7 @@ posixOnly('POSIX MCP registrations from distinct worktrees serialize global conf
     fs.mkdirSync(root, { recursive: true });
     fs.copyFileSync(path.join(ROOT, 'install-mcp.sh'), path.join(root, 'install-mcp.sh'));
     write(path.join(root, 'mcp', 'server.mjs'), '// concurrent fixture\n');
+    write(path.join(root, 'mcp', 'launcher.mjs'), '// concurrent fixture\n');
     write(path.join(root, 'config', 'timeout-policy.json'), JSON.stringify({
       oneShotMaxMs: 1000, transportGraceMs: 1000, mcpHostGraceMs: 1000,
     }));
@@ -686,7 +688,7 @@ exit 2
         PATH: `${fakeBin}${path.delimiter}${process.env.PATH}`,
         RELAYBRIDGE_TEST_ROLE: role,
         RELAYBRIDGE_TEST_CONTROL: control,
-        RELAYBRIDGE_TEST_MCP_SERVER: path.join(checkoutRoot, 'mcp', 'server.mjs'),
+        RELAYBRIDGE_TEST_MCP_SERVER: path.join(checkoutRoot, 'mcp', 'launcher.mjs'),
         RELAYBRIDGE_TEST_TOKEN_FILE: checkoutToken,
       },
       stdio: ['ignore', 'pipe', 'pipe'],

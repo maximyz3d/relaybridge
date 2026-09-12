@@ -55,3 +55,12 @@ test('client cancellation state is typed and stable when no supervisor verdict e
     assert.deepEqual(resolveCancellationTerminalState({ disconnectClass: failureClass }), expected);
   }
 });
+
+test('non-time supervision causes survive a disconnect race without becoming timeouts', () => {
+  for (const reason of ['quota_reserve', 'quota_unknown', 'assessor_stuck', 'child_fanout', 'scope_expansion', 'native_transport_limit']) {
+    const terminal = resolveCancellationTerminalState({ stopReason: reason, timedOut: true });
+    assert.equal(terminal.failureClass, reason);
+    assert.equal(terminal.timedOut, false);
+    assert.equal(terminal.cancelled, false);
+  }
+});

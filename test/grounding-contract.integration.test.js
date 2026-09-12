@@ -213,3 +213,31 @@ test('grounding is a zero-spend gate across plans, REST, CLI, queue, broadcast a
   assert.match(memberPrompt, /permitted read-only inspection tools/); assert.match(memberPrompt, /Do not edit files/);
   assert.doesNotMatch(memberPrompt, /Do not edit files, run tools/);
 });
+
+test('explicit project identity and audit usability survive REST and durable queue boundaries', { timeout: 20000 }, async t => {
+  let marker;
+  const bridge = await startTestBridge(t, root => {
+    marker = path.join(root, 'calls');
+    fs.mkdirSync(path.join(root, 'src')); fs.writeFileSync(path.join(root, 'src', 'a.js'), 'export const a = 1;');
+    const script = path.join(root, 'provider.cjs');
+    fs.writeFileSync(script, "const fs=require('fs');const p=fs.readFileSync(process.argv[2],'utf8');fs.appendFileSync(process.argv[3],'call\\n');process.stdout.write(p.includes('missing-case')?'Verified missing-file.js.\\nREVIEW_VERDICT: APPROVE':'Verified a.js and ./src/a.js.\\nREVIEW_VERDICT: APPROVE');");
+    return { claude: { safe: [process.execPath], oneshot_safe: [process.execPath, script, '{prompt_file}', marker],
+      oneshot_safe_filesystem_policy: 'read_only_enforced', oneshot_capabilities: { safe: ['model_invocation', 'workspace_read', 'tool_use'] } } };
+  });
+  const base = { kind: 'claude', prompt: 'Review the repository', dangerous: false, requiresWorkspaceAccess: true };
+  const omitted = await bridge.request('/api/oneshot', base);
+  assert.equal(omitted.body.model_invocation, false); assert.match(omitted.body.error, /explicit validated cwd/);
+  assert.equal(fs.existsSync(marker), false);
+  const positive = await bridge.request('/api/oneshot', { ...base, cwd: bridge.root });
+  assert.equal(positive.body.exitCode, 0); assert.equal(positive.body.audit_usability.usable, true);
+  assert.equal(positive.body.grounding_citations.present.length, 1);
+  const negative = await bridge.request('/api/oneshot', { ...base, cwd: bridge.root, prompt: 'Review the repository missing-case' });
+  assert.equal(negative.body.exitCode, 0); assert.equal(negative.body.audit_usability.usable, false);
+  assert.match(negative.body.stdout, /REVIEW_VERDICT: APPROVE/);
+  const queued = await bridge.request('/api/tasks', { ...base, cwd: bridge.root, prompt: 'Review the repository missing-case' });
+  const settled = await waitFor(async () => {
+    const task = (await bridge.request('/api/tasks/' + queued.body.id)).body;
+    return task.status === 'failed' ? task : false;
+  });
+  assert.equal(settled.failureClass, 'ungrounded_audit'); assert.equal(settled.auditUsability.usable, false);
+});

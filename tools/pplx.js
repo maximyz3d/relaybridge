@@ -30,6 +30,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const readline = require('readline');
+const { PREFIX, providerVersion, classifyAnswer } = require('../lib/perplexity-diagnostics');
 
 const IS_WIN = process.platform === 'win32';
 const ONCE = process.argv.includes('--once');
@@ -47,7 +48,7 @@ function findPwm() {
   if (_pwmCache !== undefined) return _pwmCache;
   const ok = (p) => { try { return p && fs.existsSync(p) ? p : null; } catch { return null; } };
   try {
-    const r = spawnSync(IS_WIN ? 'where' : 'which', ['pwm'], { encoding: 'utf8' });
+    const r = spawnSync(IS_WIN ? 'where' : 'which', ['pwm'], { encoding: 'utf8', timeout: 3000, maxBuffer: 8192 });
     if (r.status === 0) {
       const hit = (r.stdout || '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean)[0];
       if (ok(hit)) return (_pwmCache = hit);
@@ -72,11 +73,11 @@ function checkSubscription() {
     return { ok: false, detail: 'pwm must resolve to an .exe on Windows; refusing an unsafe shell shim' };
   }
   const env = { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' };
-  const versionRun = spawnSync(pwm, ['--version'], { encoding: 'utf8', windowsHide: true, env });
+  const versionRun = spawnSync(pwm, ['--version'], { encoding: 'utf8', windowsHide: true, env, timeout: 3000, maxBuffer: 8192 });
   const authRun = spawnSync(pwm, ['login', '--check'], {
-    encoding: 'utf8', windowsHide: true, env, timeout: 15000,
+    encoding: 'utf8', windowsHide: true, env, timeout: 15000, maxBuffer: 8192,
   });
-  const version = ((versionRun.stdout || versionRun.stderr || '').replace(ANSI, '').trim().split(/\r?\n/)[0] || 'pwm');
+  const version = providerVersion(versionRun.stdout || versionRun.stderr) || 'unknown';
   if (authRun.error) return { ok: false, version, detail: authRun.error.message };
   if (authRun.status !== 0) return { ok: false, version, detail: 'pwm is installed but not authenticated; run pwm login' };
   return { ok: true, version, detail: 'subscription CLI authenticated' };
@@ -118,6 +119,8 @@ function askPwm(prompt) {
     }
     const args = ['ask', capForArgv(prompt), '--source', 'all'];
     if (MODEL && MODEL.toLowerCase() !== 'auto') args.push('-m', MODEL);
+    const versionRun = spawnSync(pwm, ['--version'], { encoding: 'utf8', windowsHide: true, timeout: 3000, maxBuffer: 8192 });
+    const version = versionRun.status === 0 ? providerVersion(versionRun.stdout || versionRun.stderr) : null;
     let proc;
     try {
       // Spawn the resolved executable directly. Never put a user prompt through
@@ -144,6 +147,8 @@ function askPwm(prompt) {
     proc.on('close', (code) => {
       const rawText = (out || '').replace(ANSI, '').trim();
       const text = cleanPwmOutput(rawText);
+      process.stderr.write(PREFIX + JSON.stringify({ schema: 1, backend: 'pwm_subscription', version,
+        diagnosticCode: classifyAnswer({ stdout: text, stderr: err.replace(ANSI, ''), exitCode: code }) }) + '\n');
       const semanticError = /^(?:error\s*\(|responseparsingerror\b)|failed to parse api response/i.test(rawText);
       if (code === 0 && text && !semanticError) return resolve(text);
       const tail = ((err || '') + '\n' + (out || '')).replace(ANSI, '').trim();

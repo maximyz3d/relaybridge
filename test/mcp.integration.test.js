@@ -773,22 +773,18 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   });
   assert.equal(explicitCoolingPreview.isError, undefined,
     JSON.stringify(explicitCoolingPreview.structuredContent));
-  assert.equal(explicitCoolingPreview.structuredContent.selected[0].kind, 'claude');
+  assert.equal(explicitCoolingPreview.structuredContent.selected.some(row => row.kind === 'claude'), false);
   assert.equal(explicitCoolingPreview.structuredContent.fleetState.accountSelection.claude.reason, 'cooling');
-  assert.equal(explicitCoolingPreview.structuredContent.fleetState.accountSelection.claude.account, 'work');
   const explicitCoolingDispatch = await client.callTool({
-    name: 'route_and_ask',
-    arguments: {
-      task: 'Review this JavaScript function despite the explicitly accepted cooldown probe.',
-      preferredProviders: ['claude'],
-      maxEscalations: 0,
-      useCache: false,
-    },
+    name: 'ask_provider',
+    arguments: { kind: 'claude', prompt: 'Check that explicit selection still obeys the subscription cooldown.', useCache: false },
   });
-  assert.equal(explicitCoolingDispatch.isError, undefined,
-    JSON.stringify(explicitCoolingDispatch.structuredContent));
-  assert.equal(explicitCoolingDispatch.structuredContent.winner.kind, 'claude');
-  assert.equal(explicitCoolingDispatch.structuredContent.winner.route.account, 'work');
+  assert.equal(explicitCoolingDispatch.structuredContent.modelInvocation, false);
+  assert.equal(explicitCoolingDispatch.structuredContent.failureClass, 'provider_cooldown');
+  // Restore this fixture's healthy linked seat before unrelated routing tests.
+  const repairedClaudeCooldowns = JSON.parse(fs.readFileSync(cooldownsPath, 'utf8'));
+  repairedClaudeCooldowns['subscription:test:mcp-claude#work'].until = 0;
+  fs.writeFileSync(cooldownsPath, JSON.stringify(repairedClaudeCooldowns, null, 2));
 
   const datasheetPreview = await client.callTool({
     name: 'route_preview',
@@ -1034,7 +1030,7 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
 
   const narrationOnly = await client.callTool({
     name: 'ask_provider',
-    arguments: { kind: 'narration_only', prompt: 'Audit this repository and return concrete findings.', useCache: false },
+    arguments: { kind: 'narration_only', prompt: 'Audit this repository and return concrete findings.', cwd: allowedRootA, useCache: false },
   });
   assert.equal(narrationOnly.structuredContent.modelInvocation, true);
   assert.equal(narrationOnly.structuredContent.droppedOut, true);

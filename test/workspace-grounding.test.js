@@ -151,7 +151,7 @@ test('Markdown targets, file URIs and canonical containment never reparse labels
   const file = path.join(root, '.rb-wt', 'space dir', 'real.js'); fs.writeFileSync(file, 'real');
   const uri = pathToFileURL(file).href;
   const result = verifyReferencedPaths(`[absent-label.js](${uri}#L3) and [other.js](<${file}:4>)`, root);
-  assert.equal(result.confidence, 'ok'); assert.equal(result.present.length, 2); assert.deepEqual(result.missing, []);
+  assert.equal(result.confidence, 'ok'); assert.equal(result.present.length, 1); assert.deepEqual(result.missing, []);
   assert.equal(result.citations.every((row) => row.status === 'present'), true);
   const invalid = verifyReferencedPaths('[label.js](file://remote-host/a.js) and [label.js](file:///bad%XX/a.js)', root);
   assert.equal(invalid.citations.every((row) => row.status === 'invalid_uri'), true);
@@ -276,4 +276,30 @@ test('verification degrades honestly when there is no cwd to check against', () 
   const v = verifyReferencedPaths('src/a.js changed', null);
   assert.equal(v.checked, false);
   assert.match(v.reason, /no readable cwd/);
+});
+
+
+test('bare citations use a bounded unique index and canonical aliases count once', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rb-citation-index-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(root, 'src')); fs.writeFileSync(path.join(root, 'src', 'a.js'), '');
+  const unique = verifyReferencedPaths('a.js and src/a.js and ./src/a.js and src\\a.js', root);
+  assert.equal(unique.confidence, 'ok'); assert.equal(unique.present.length, 1);
+  assert.equal(unique.citations.length, 4); assert.equal(unique.citations.filter(c => c.duplicate).length, 3);
+  fs.mkdirSync(path.join(root, 'tests')); fs.writeFileSync(path.join(root, 'tests', 'a.js'), '');
+  const ambiguous = verifyReferencedPaths('a.js', root);
+  assert.equal(ambiguous.confidence, 'unverifiable'); assert.equal(ambiguous.citations[0].status, 'ambiguous');
+  assert.equal(ambiguous.missing.length, 0);
+  const bounded = verifyReferencedPaths('absent.js', root, { maxEntries: 1 });
+  assert.equal(bounded.basenameScan.complete, false); assert.equal(bounded.confidence, 'unverifiable');
+  assert.equal(bounded.missing.length, 0);
+});
+
+test('workspace-reading capabilities cannot substitute a default cwd for explicit project identity', () => {
+  const seatConfig = { oneshot_safe: ['fixture'], oneshot_capabilities: { safe: ['model_invocation', 'workspace_read', 'tool_use'] } };
+  const request = { seat: 'claude', seatConfig, prompt: 'Review the repository', cwd: process.cwd(), cwdExplicit: false };
+  assert.equal(checkGrounding(request).allowed, false);
+  assert.match(checkGrounding(request).reason, /explicit validated cwd/);
+  assert.equal(checkGrounding({ ...request, cwdExplicit: true }).allowed, true);
+  assert.equal(checkGrounding({ ...request, prompt: 'Explain this supplied expression: 1 + 2' }).allowed, true);
 });

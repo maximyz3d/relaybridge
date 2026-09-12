@@ -25,8 +25,71 @@ jobs:
           node-version: 24
           cache: npm
 
+      - name: Provision trusted Node executable copy
+        run: |
+          rb_node_source="$(node -p 'require("node:fs").realpathSync(process.execPath)')"
+          rb_node_cache="$(realpath "$RUNNER_TOOL_CACHE/node")"
+          case "$rb_node_source" in
+            "$rb_node_cache"/*) ;;
+            *) echo 'Selected Node is outside the setup-node tool cache' >&2; exit 1 ;;
+          esac
+          node --version
+          stat --format='Selected Node: uid=%u mode=%a links=%h bytes=%s type=%F' "$rb_node_source"
+          head -c 4 "$rb_node_source" | od -An -tx1
+          # Preserve the selected runtime bytes without trusting or changing cache modes.
+          rb_node_prefix="$(mktemp -d "$RUNNER_TEMP/rb-node.XXXXXX")"
+          chmod 700 "$rb_node_prefix"
+          install -m 0755 -- "$rb_node_source" "$rb_node_prefix/node"
+          cmp -- "$rb_node_source" "$rb_node_prefix/node"
+          sha256sum -- "$rb_node_source" "$rb_node_prefix/node"
+          printf '%s\n' "$rb_node_prefix" >> "$GITHUB_PATH"
+          printf 'RB_CI_NODE_EXECUTABLE=%s\n' "$rb_node_prefix/node" >> "$GITHUB_ENV"
+
+      - name: Verify provisioned Node executable
+        run: |
+          node <<'NODE'
+          const assert = require('node:assert/strict'), fs = require('node:fs');
+          const executable = fs.realpathSync(process.execPath);
+          assert.equal(executable, process.env.RB_CI_NODE_EXECUTABLE);
+          const stat = fs.lstatSync(executable);
+          assert.ok(stat.isFile());
+          assert.equal(stat.uid, process.getuid());
+          assert.equal(stat.mode & 0o7777, 0o755);
+          assert.equal(stat.nlink, 1);
+          assert.ok(stat.size > 0 && stat.size <= 256 * 1024 * 1024);
+          const fd = fs.openSync(executable, 'r'), magic = Buffer.alloc(4);
+          try { assert.equal(fs.readSync(fd, magic, 0, 4, 0), 4); }
+          finally { fs.closeSync(fd); }
+          assert.equal(magic.toString('hex'), '7f454c46');
+          console.log({ node: process.version, uid: stat.uid, mode: (stat.mode & 0o7777).toString(8), links: stat.nlink, bytes: stat.size });
+          NODE
+
+      - name: Install and qualify Linux namespace test dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y bubblewrap
+          /usr/bin/bwrap --version
+          # Exercise the boundary on this ephemeral CI VM before the native tests.
+          # The read-only root bind is a feature probe, not a provider launch profile.
+          check_boundary_namespace() {
+            timeout 10s /usr/bin/bwrap --unshare-all --unshare-user --as-pid-1 \
+              --die-with-parent --cap-drop ALL --disable-userns --assert-userns-disabled \
+              --ro-bind / / --proc /proc --dev /dev -- /bin/true
+          }
+          if ! check_boundary_namespace; then
+            # Ubuntu 24.04 may restrict userns setup capabilities through AppArmor.
+            # This runner-only policy change must not enter installers or runtime.
+            if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+              sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+            fi
+            check_boundary_namespace
+          fi
+
       - name: Install dependencies
         run: npm ci
+
+      - name: Verify native boundary accepts provisioned Node
+        run: node -e "const fs = require('node:fs'); require('./lib/linux-filesystem-boundary').pinPath(fs.realpathSync(process.execPath), 'file'); console.log('Provisioned Node passes unchanged boundary trust checks')"
 
       - name: Test
         run: npm test
@@ -52,10 +115,20 @@ jobs:
       - name: Test
         run: npm test
 
+      - name: Verify Windows PowerShell installer environment
+        shell: powershell
+        run: |
+          if ($PSVersionTable.PSEdition -ne 'Desktop' -or $PSVersionTable.PSVersion -lt [version]'5.1') {
+            throw 'Installer coverage requires Windows PowerShell 5.1'
+          }
+          Get-Command Get-FileHash -ErrorAction Stop | Select-Object Name, Source
+
       - name: Test Windows MCP registration lifecycle
+        shell: powershell
         run: npm run test:install-mcp
 
       - name: Test Windows installer lifecycle
+        shell: powershell
         run: npm run test:install
 
       - name: Audit production dependencies
