@@ -1,3 +1,6 @@
+## v2.5.0 - 2026-09-13
+- #132 Build a project chat workspace with Codex delegation
+
 ## v2.4.0 - 2026-09-12
 - #131 Refine parallel execution, usage evidence, transport recovery, and provider safety
 

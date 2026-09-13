@@ -1,6 +1,6 @@
 {
   "name": "relaybridge",
-  "version": "2.4.0",
+  "version": "2.5.0",
   "description": "Local PowerShell and multi-AI control plane with browser, REST, and MCP adapters",
   "main": "server.js",
   "scripts": {
