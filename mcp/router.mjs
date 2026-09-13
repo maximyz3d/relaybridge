@@ -139,7 +139,15 @@ export function classifyTask(task) {
     /\brotate\s+(?:the\s+)?(?:production\s+)?(?:signing|encryption|api|access)?\s*keys?\b/,
     /\b(?:deploy\b[^.!?;\n]{0,40}\bproduction|production\b[^.!?;\n]{0,40}\bdeploy)\b/,
   ]);
-  const medical = /\b(medical|diagnosis|patient|prescription|dosage)\b/.test(riskText);
+  // Local report/source filenames in a code task identify evidence, not a
+  // medical subject. Normalize only this predicate: paths can still contain
+  // material evidence for the destructive, secrets, and other risk checks.
+  // Token boundaries exclude URLs and leave all surrounding prose intact.
+  const medicalText = looksLikeCode ? riskText.replace(
+    /(^|[\s`"'([{])(?:[a-z]:[\\/])?[\w./\\-]+\.(?:md|txt|log|jsonl?|csv|ya?ml|py)(?=$|[\s`"'\])},;:!?]|\.(?:$|\s))/g,
+    '$1local artifact',
+  ) : riskText;
+  const medical = /\b(medical|diagnosis|patient|prescription|dosage)\b/.test(medicalText);
   const legal = /\b(legal|lawsuit|attorney|criminal charge|court filing)\b/.test(text);
   const financial = /\b(financial advice|investment decision|trade execution|retirement allocation)\b/.test(text);
   const secretSubject = /\b(credentials?|api keys?|access tokens?|passwords?|secrets?|signing keys?|encryption keys?)\b/;

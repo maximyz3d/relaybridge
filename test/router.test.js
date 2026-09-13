@@ -329,3 +329,40 @@ test('software planning retains task context without dropping genuine action gat
     ['Review auth.js; fetch https://example.com/protocol and cite sources.', 'research'],
   ]) assert.ok(router.classifyTask(task).tags.includes(tag), task);
 });
+
+test('local code artifacts do not supply a medical subject or change task identity', () => {
+  const crypto = require('node:crypto');
+  for (const artifact of [
+    'HARVESTER-OUTBOX-DIAGNOSIS.md',
+    '/home/upton/work/HARVESTER-OUTBOX-DIAGNOSIS.md',
+    './reports/HARVESTER-OUTBOX-DIAGNOSIS.md',
+    'C:\\work\\reports\\HARVESTER-OUTBOX-DIAGNOSIS.md',
+    ...['txt', 'log', 'json', 'jsonl', 'csv', 'yaml', 'yml', 'py'].map(ext => `reports/patient-diagnosis.${ext}`),
+  ]) {
+    const task = `Review Python test isolation using \`${artifact}\`; plan a bounded code repair.`;
+    const route = router.routeTask({ task, diagnostics: readyDiagnostics() });
+    assert.ok(route.classification.tags.includes('coding'), artifact);
+    assert.equal(route.classification.tags.includes('medical'), false, artifact);
+    assert.equal(route.humanGateRequired, false, artifact);
+    assert.equal(route.classification.task, task);
+    assert.equal(route.classification.taskHash, crypto.createHash('sha256').update(task).digest('hex'));
+  }
+});
+
+test('artifact normalization retains substantive subjects and other risk predicates', () => {
+  for (const [task, tag] of [
+    ['Review Python test failures in DIAGNOSIS.md; recommend a patient dosage.', 'medical'],
+    ['Provide a diagnosis. Review test fixtures in DIAGNOSIS.md.', 'medical'],
+    ['Summarize DIAGNOSIS.md.', 'medical'],
+    ['Review Python code and https://example.com/patient.json.', 'medical'],
+    ['Review Python code using DIAGNOSIS.md; advise on a court filing.', 'legal'],
+    ['Review Python code using DIAGNOSIS.md; make an investment decision.', 'financial'],
+    ['Review Python code using /work/erase/DIAGNOSIS.md.', 'destructive'],
+    ['Review Python code using DIAGNOSIS.md; extract production API keys.', 'secrets'],
+  ]) {
+    const route = router.routeTask({ task, diagnostics: readyDiagnostics() });
+    assert.ok(route.classification.tags.includes(tag), task);
+    assert.ok(route.humanGateReasons.includes(tag), task);
+    assert.equal(route.humanGateRequired, true, task);
+  }
+});
