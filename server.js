@@ -6361,7 +6361,19 @@ const projectWorkspace = createProjectWorkspace({ dataDir: DATA_DIR, queue: task
   validateCwd: (cwd) => ({ ...captureAllowedCwdIdentity(cwd), cwdPolicyId: CWD_POLICY_IDENTITY }),
   resolveIntent: (body, snapshot) => {
     const cfg = loadConfig();
-    const providerBudget = { maxOutputTokens: 10000, maxTotalTokens: 500000, maxCacheReadTokens: 400000, maxCacheCreationTokens: 100000, maxTurns: null };
+    // Resolve controls first so the configured provider/task-tier budget is
+    // pinned into this durable intent. Project tasks must use the same budget
+    // resolution as direct and queued one-shots; a local literal here would
+    // both bypass configured complex-work ceilings and make retries diverge.
+    const preliminary = validateProviderIntent({ ...body, requiresWorkspaceAccess: true }, cfg, snapshot);
+    const budgetTaskTier = body.budgetTaskTier || (body.modelTier === 'heavy' ? 'complex'
+      : body.modelTier === 'light' ? 'utility' : preliminary.execution.resolvedTaskTier);
+    const providerBudget = resolveAttemptTiming({
+      entry: cfg[body.kind],
+      globals: { ...(cfg._supervisor || {}), adaptive: subscriptionUsage.getSettings().dynamicSupervision },
+      timeoutMs: body.timeoutMs,
+      taskTier: budgetTaskTier,
+    }).providerBudget;
     const controls = validateProviderIntent({ ...body, providerBudget, requiresWorkspaceAccess: true }, cfg, snapshot);
     if (controls.execution.resolvedModelTier !== body.modelTier || controls.execution.appliedEffort !== body.effort
       || !controls.execution.model || controls.promptEvidence?.truncated) {
@@ -6369,7 +6381,7 @@ const projectWorkspace = createProjectWorkspace({ dataDir: DATA_DIR, queue: task
     }
     const account = resolveDispatchAccount(body.kind, cfg[body.kind], { model: controls.execution.model, ignoreNativeReserve: true });
     if (account.exhausted || !account.quotaSeat) throw new Error('Provider account is unavailable. Check its connection in Advanced tools.');
-    return { ...body, providerBudget, requiresWorkspaceAccess: true, execution: controls.execution,
+    return { ...body, providerBudget, budgetTaskTier, requiresWorkspaceAccess: true, execution: controls.execution,
       expectedAccountId: account.account?.id || providerAccounts.DEFAULT_ACCOUNT_ID, expectedQuotaSeat: account.quotaSeat,
       expectedCwdIdentityHash: snapshot.cwdIdentityHash, expectedCwdPolicyId: CWD_POLICY_IDENTITY,
       expectedPromptHash: controls.promptEvidence.effectiveHash };
