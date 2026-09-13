@@ -530,6 +530,122 @@ test('concurrent source preparations publish one complete deterministic manifest
   assert.ok(!fs.readdirSync(root).some((name) => /^\.build-info\..*\.tmp$/.test(name)));
 });
 
+function manifestVerificationFixture(root, { at, injections = 1, afterPublish } = {}) {
+  const target = path.join(root, 'build-info.json');
+  const fsApi = Object.create(fs);
+  const state = { attempts: 0, replacements: 0, published: false };
+  const handles = new Map();
+  function replace(bytes = fs.readFileSync(target)) {
+    const temporary = path.join(root, '.build-info.fixture.tmp');
+    fs.writeFileSync(temporary, bytes, { flag: 'wx', mode: 0o600 });
+    fs.renameSync(temporary, target);
+    state.replacements += 1;
+  }
+  fsApi.lstatSync = (file, ...args) => {
+    if (file === path.join(root, '.git')) state.attempts += 1;
+    return fs.lstatSync(file, ...args);
+  };
+  fsApi.openSync = (file, ...args) => {
+    if (file === target && at === 'before-open' && state.replacements < injections) replace();
+    const fd = fs.openSync(file, ...args);
+    handles.set(fd, file);
+    return fd;
+  };
+  fsApi.closeSync = (fd) => {
+    handles.delete(fd);
+    return fs.closeSync(fd);
+  };
+  fsApi.readFileSync = (file, ...args) => {
+    if (state.published && at === 'source-error' && handles.get(file) === path.join(root, 'lib', 'feature.js')) {
+      throw Object.assign(new Error('injected source read failure'), { code: 'EIO' });
+    }
+    const bytes = fs.readFileSync(file, ...args);
+    if (handles.get(file) === target && at === 'after-read' && state.replacements < injections) replace();
+    return bytes;
+  };
+  fsApi.renameSync = (from, to) => {
+    fs.renameSync(from, to);
+    if (to === target && !state.published) {
+      state.published = true;
+      if (afterPublish) afterPublish({ target, replace });
+    }
+  };
+  return { fsApi, state };
+}
+
+for (const at of ['before-open', 'after-read']) {
+  test(`a concurrent same-buildId replacement ${at} is rejected once and verified on retry`, (t) => {
+    const root = makeSourceRepo(t);
+    const expected = prepareBuildInfo(root, { env: {} }).identity.buildId;
+    const strict = manifestVerificationFixture(root, { at });
+    assert.equal(loadBuildIdentity(root, { fsApi: strict.fsApi, env: {} }).reason, 'build_info_invalid');
+    assert.equal(strict.state.attempts, 1);
+    assert.equal(strict.state.replacements, 1);
+
+    const retry = manifestVerificationFixture(root, { at });
+    const prepared = prepareBuildInfo(root, { fsApi: retry.fsApi, env: {} });
+    assert.equal(prepared.updated, true);
+    assert.equal(prepared.identity.ready, true);
+    assert.equal(prepared.identity.buildId, expected);
+    assert.equal(prepared.info.buildId, expected);
+    assert.equal(retry.state.attempts, 2);
+    assert.equal(retry.state.replacements, 1);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'build-info.json'), 'utf8')).buildId, expected);
+    assert.equal(loadBuildIdentity(root, { env: {} }).ready, true);
+    assert.ok(!fs.readdirSync(root).some((name) => /^\.build-info\..*\.tmp$/.test(name)));
+  });
+}
+
+test('persistent manifest churn exhausts bounded verification and fails closed', (t) => {
+  const root = makeSourceRepo(t);
+  const fixture = manifestVerificationFixture(root, { at: 'before-open', injections: Infinity });
+  assert.throws(() => prepareBuildInfo(root, { fsApi: fixture.fsApi, env: {} }), /generated build-info\.json did not verify/);
+  assert.equal(fixture.state.attempts, 4);
+  assert.equal(fixture.state.replacements, 4);
+  assert.equal(loadBuildIdentity(root, { env: {} }).ready, true);
+  assert.ok(!fs.readdirSync(root).some((name) => /^\.build-info\..*\.tmp$/.test(name)));
+});
+
+test('a ready identity with a different buildId fails immediately without retry', (t) => {
+  const root = makeSourceRepo(t);
+  const expected = buildSourceInfo(root).buildId;
+  const wrongId = `${expected.slice(0, -1)}${expected.endsWith('a') ? 'b' : 'a'}`;
+  const fixture = manifestVerificationFixture(root);
+  assert.throws(() => prepareBuildInfo(root, {
+    fsApi: fixture.fsApi,
+    env: { NODE_ENV: 'test', RELAYBRIDGE_TEST_BUILD_ID: wrongId },
+  }), /generated build-info\.json did not verify/);
+  assert.equal(fixture.state.attempts, 1);
+});
+
+test('stale, version-mismatched and missing published manifests are not retried', (t) => {
+  for (const reason of ['build_info_stale', 'build_info_version_mismatch', 'build_info_missing']) {
+    const root = makeSourceRepo(t);
+    const fixture = manifestVerificationFixture(root, { afterPublish: ({ target, replace }) => {
+      if (reason === 'build_info_missing') { fs.unlinkSync(target); return; }
+      const manifest = JSON.parse(fs.readFileSync(target, 'utf8'));
+      if (reason === 'build_info_stale') {
+        manifest.buildId = `${manifest.buildId.slice(0, -1)}${manifest.buildId.endsWith('a') ? 'b' : 'a'}`;
+      } else {
+        manifest.version = '9.9.9';
+        manifest.buildId = '9.9.9+0123456789abcdef';
+      }
+      replace(JSON.stringify(manifest));
+    } });
+    assert.throws(() => prepareBuildInfo(root, { fsApi: fixture.fsApi, env: {} }), /generated build-info\.json did not verify/);
+    assert.equal(fixture.state.attempts, 1, reason);
+    assert.equal(loadBuildIdentity(root, { env: {} }).reason, reason);
+  }
+});
+
+test('a source read failure during verification is not retried', (t) => {
+  const root = makeSourceRepo(t);
+  const fixture = manifestVerificationFixture(root, { at: 'source-error' });
+  assert.throws(() => prepareBuildInfo(root, { fsApi: fixture.fsApi, env: {} }),
+    /source checkout changed while build identity was being computed/);
+  assert.equal(fixture.state.attempts, 1);
+});
+
 posixOnly('POSIX MCP registration cannot strand a new token on snapshot or build preparation failure', (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relaybridge-mcp-token-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
