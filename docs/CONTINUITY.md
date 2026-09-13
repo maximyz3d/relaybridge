@@ -49,14 +49,32 @@ capacity update is rejected, without refreshing capacity timestamps. An older or
 same-time affirmative event cannot clear that denial.
 
 Native fractional reset instants retain their original ISO/nanosecond precision.
-Fresh native readings and a stream's integer-second reset identify the same
-window only at a fixed next-second ceiling. Fractional native refresh jitter
-within that key is accepted; no sliding time tolerance is used. Both ingestion
-orders and restarts preserve the earliest conservative expiry and depletion
-anchor. Same-window increases, refreshes at or after that earliest expiry, and
-different keys before rollover are rejected; a new window requires an
-observation after the prior fixed reset boundary. Invalid
-intervening samples retain prior protection and cannot restore capacity.
+Native reset estimates may cross a whole-second boundary on successive fetches.
+A versioned immutable reset anchor admits fresh native estimates within one
+second in either direction, inclusive. This radius is a conservative local
+reconciliation policy covering observed jitter, not a vendor-guaranteed window
+identifier. Repeated updates and restarts cannot move the anchor or accumulate
+more tolerance. Older native records bootstrap once from validated retained
+provenance; millisecond precision and retained origin are labeled explicitly.
+Caller-supplied anchor metadata and inconsistent persisted anchors are refused.
+Retained native provenance is recognized even when its raw millisecond field is
+missing. Malformed native state cannot become fresh headroom on reads or be
+replaced through stream migration; existing low-capacity and denial protection
+remains in force while its allowance is unavailable.
+
+Streams still match only the anchor's original next-second ceiling. Unequal
+stream reset values whose nearest-second rounding cell overlaps the anchored
+band cannot establish a new window. Both ingestion orders and restarts retain
+the earliest conservative expiry and depletion anchor. Same-window increases,
+refreshes at or after that earliest expiry, and out-of-band resets before the
+original rollover boundary are rejected. A genuine later window requires the
+original boundary to have elapsed and independent unambiguous reset evidence.
+Invalid intervening samples retain prior protection and cannot restore capacity.
+
+In CLI2.1.270, `/usage` displays freshly fetched utilization even when its
+five-minute cache-write throttle suppresses a disk update. The bridge still
+requires a persisted fetch within three minutes. A fresh display alone cannot
+renew that evidence, and this repair does not extend its freshness lifetime.
 
 The configuration snapshot that supplies the launch command fixes whether native
 identity is required. A changed selected entry or quota seat refuses admission;
