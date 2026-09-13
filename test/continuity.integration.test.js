@@ -97,6 +97,41 @@ test('default native Claude cache refresh is non-generating, independent of Code
   assert.equal(rejected.body.observed, false, 'unbound statusline cannot relabel the selected login');
 });
 
+test('verified native adapter refreshes stale counters while preserving unadmitted reset authority', async t => {
+  const { createSubscriptionUsage } = require('../lib/subscription-usage');
+  const { parseClaudeNativeCache } = require('../lib/native-usage');
+  let priorProfile, priorState;
+  const bridge = await nativeClaudeFixture(t, {
+    mutate(profile) {
+      priorProfile = structuredClone(profile); priorProfile.cachedUsageUtilization.fetchedAtMs -= 180001;
+      for (const w of Object.values(profile.cachedUsageUtilization.utilization)) {
+        w.resets_at = new Date(Date.parse(w.resets_at) + 3000).toISOString();
+      }
+    },
+    changeConfig(cfg, root) {
+      const dataDir = path.join(root, 'data', 'usage'), at = priorProfile.cachedUsageUtilization.fetchedAtMs;
+      const store = createSubscriptionUsage({ dataDir, now: () => at });
+      const observation = parseClaudeNativeCache(priorProfile, { quotaSeat: 'claude', now: at });
+      assert.ok(observation); store.bindIdentity('claude', observation.accountFingerprint); assert.equal(store.observe(observation), true);
+      priorState = JSON.parse(fs.readFileSync(path.join(dataDir, 'native-usage.json'))).claude;
+    },
+  });
+  await waitFor(() => JSON.parse(fs.readFileSync(bridge.usageFile)).claude.observedAt > priorState.observedAt);
+  const after = JSON.parse(fs.readFileSync(bridge.usageFile)).claude;
+  assert.equal(after.observedAt, bridge.initial.cachedUsageUtilization.fetchedAtMs);
+  assert.equal(completeJsonLines(bridge.events).length, 0, 'refresh must not invoke the synthetic provider');
+  for (const id of ['five_hour', 'seven_day']) {
+    const w = after.buckets.account.windows[id], old = priorState.buckets.account.windows[id];
+    for (const field of ['resetsAt', 'nativeResetMs', 'nativeResetNs', 'nativeResetIso', 'nativeResetAnchor', 'resetBoundaryMs']) {
+      assert.deepEqual(w[field], old[field], `${id}.${field}`);
+    }
+    assert.equal(w.nativeCounterRefresh.resetIdentityAccepted, false);
+    assert.equal(w.nativeCounterRefresh.retainedFromEvidenceHash, priorState.evidenceHash);
+  }
+  const reply = await bridge.ask(); assert.equal(reply.status, 200, JSON.stringify(reply.body));
+  assert.equal(reply.body.model_invocation, true, 'fresh bound counter evidence authorizes only the isolated synthetic provider');
+});
+
 test('stale, future, mismatched and incomplete native caches never authorize a fake model start', async t => {
   for (const [name, mutate] of Object.entries({ stale: p => p.cachedUsageUtilization.fetchedAtMs -= 180001,
     future: p => p.cachedUsageUtilization.fetchedAtMs += 60000, mismatch: p => p.cachedUsageUtilization.accountUuid = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',

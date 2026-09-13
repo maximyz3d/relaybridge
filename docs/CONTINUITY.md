@@ -67,9 +67,25 @@ stream reset values whose nearest-second rounding cell overlaps the anchored
 band cannot establish a new window. Both ingestion orders and restarts retain
 the earliest conservative expiry and depletion anchor. Same-window increases,
 refreshes at or after that earliest expiry, and out-of-band resets before the
-original rollover boundary are rejected. A genuine later window requires the
+original rollover boundary are rejected by ordinary observation. A genuine later window requires the
 original boundary to have elapsed and independent unambiguous reset evidence.
 Invalid intervening samples retain prior protection and cannot restore capacity.
+
+The verified default native-profile adapter has a separate counter-refresh path
+for an out-of-band reset estimate. It requires a complete fresh authenticated
+two-window fetch and complete valid prior native authority bound to that same
+account. Both counters must stay equal or decrease; both original effective
+deadlines must remain future at fetch and processing time. Any decrease within
+one second of its prior observation rejects the complete counter refresh so
+the rate estimator cannot clear existing depletion protection. An incoming reset
+earlier than either retained expiry disqualifies this path. Reset ISO/ms/ns,
+immutable anchor, boundary and effective expiry remain unchanged. A separate
+`nativeCounterRefresh` record labels the incoming reset claim as unadmitted and
+binds its fetch/evidence to the retained record. Counter freshness and depletion
+rates advance normally; this never proves reset equivalence or replenishment.
+Replay, expiry, identity, denial and reserve protections still apply. Generic
+observations, streams and statusline ingress cannot select this path or supply
+its marker. Repeated drift cannot slide an anchor or extend its deadline.
 
 In CLI2.1.270, `/usage` displays freshly fetched utilization even when its
 five-minute cache-write throttle suppresses a disk update. The bridge still

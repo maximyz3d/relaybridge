@@ -6536,7 +6536,7 @@ function observeClaudeNativeSnapshot(captured) {
     run.handoffPath = continuity.saveRun(run); run.stop?.('account_identity_changed');
   }
   if (!subscriptionUsage.bindIdentity(captured.identity.quotaSeat, captured.identity.accountFingerprint)) return false;
-  return !!captured.observation && subscriptionUsage.observe(captured.observation);
+  return !!captured.observation && subscriptionUsage.observeNativeCache(captured.observation);
 }
 function validateClaudeLaunchAdmission(captured, actualEnv = null) {
   if (!captured?.required) return true;
