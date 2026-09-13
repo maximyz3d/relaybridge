@@ -49,10 +49,13 @@ capacity update is rejected, without refreshing capacity timestamps. An older or
 same-time affirmative event cannot clear that denial.
 
 Native fractional reset instants retain their original ISO/nanosecond precision.
-They can match a stream's integer-second reset only at the exact next-second
-ceiling. Both ingestion orders preserve the earliest conservative expiry and
-depletion anchor. Same-window increases and shifted reset guesses are rejected;
-a new window requires an observation after the prior reset boundary. Invalid
+Fresh native readings and a stream's integer-second reset identify the same
+window only at a fixed next-second ceiling. Fractional native refresh jitter
+within that key is accepted; no sliding time tolerance is used. Both ingestion
+orders and restarts preserve the earliest conservative expiry and depletion
+anchor. Same-window increases, refreshes at or after that earliest expiry, and
+different keys before rollover are rejected; a new window requires an
+observation after the prior fixed reset boundary. Invalid
 intervening samples retain prior protection and cannot restore capacity.
 
 The configuration snapshot that supplies the launch command fixes whether native

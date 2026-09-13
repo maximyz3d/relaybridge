@@ -103,15 +103,17 @@ test('fractional reset equivalence retains rate anchor in both orders and reject
     f.advance(150000); assert.equal(f.store.observe(native(f, 11)), true);
     const usage = f.store.headroom('claude'); assert.equal(usage.windows[0].rateAnchorObservedAt, anchor); assert.ok(usage.percentPerHour < 30); assert.equal(usage.protected, false);
     f.advance(1000); assert.equal(f.store.observe(native(f, 12)), false, 'same window cannot restore capacity');
-    assert.equal(f.store.observe(native(f, 11, T + 86400000 - 436)), false, 'do not chain fractional tolerance');
+    assert.equal(f.store.observe(native(f, 11, T + 86400000 - 436)), true, 'jitter within the fixed key is one window');
+    assert.equal(f.store.headroom('claude').windows[0].resetsAt, T + 86400000 - 437, 'jitter must not extend expiry');
+    f.advance(1000);
     assert.equal(f.store.observe(native(f, 11, T + 86400000 + 1000)), false, 'future reset drift is not rollover');
     f.advance(86400000); assert.equal(f.store.observe(native(f, 90, f.at() + 86400000)), true);
     assert.equal(f.store.headroom('claude').percentPerHour, null);
   }
 });
-function fixture(t) {
+function fixture(t, initialAt = T) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rb-native-store-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  let at = T; const store = createSubscriptionUsage({ dataDir: dir, now: () => at });
+  let at = initialAt; const store = createSubscriptionUsage({ dataDir: dir, now: () => at });
   const codex = (remaining, extra = {}, seat = 'codex') => parseCodexRateLimits({ ordinaryUsageAllowed: true, rateLimits: { limitId: 'codex' },
     rateLimitsByLimitId: { codex: { primary: { usedPercent: 100 - remaining, windowDurationMins: 10080, resetsAt: T / 1000 + 86400 } } }, ...extra }, { quotaSeat: seat, observedAt: at });
   return { store, dir, codex, advance: (ms) => { at += ms; }, at: () => at };
@@ -139,7 +141,7 @@ test('selected identity and seat high-water mark cannot be replaced by stream cl
   assert.equal(f.store.observe(second), false, 'account isolation retains the prior seat observation barrier');
   f.advance(1000); assert.equal(f.store.observe(native(f, 90, T + 86400000, 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee')), true);
 });
-test('submillisecond reset precision rejects early stream boundaries and same-millisecond native drift', t => {
+test('submillisecond reset precision rejects early stream boundaries but accepts fixed-key native jitter', t => {
   const f = fixture(t), reset = T + 86400000;
   const exact = suffix => parseClaudeNativeCache({ oauthAccount: { accountUuid: uuid }, cachedUsageUtilization: {
     accountUuid: uuid, fetchedAtMs: f.at(), utilization: Object.fromEntries(['five_hour', 'seven_day'].map(id =>
@@ -150,8 +152,263 @@ test('submillisecond reset precision rejects early stream boundaries and same-mi
   { quotaSeat: 'claude', accountFingerprint: value.accountFingerprint, observedAt: f.at() });
   assert.equal(f.store.observe(stream(reset / 1000)), false);
   assert.equal(f.store.observe(stream(reset / 1000 + 1)), true); f.advance(1000);
-  assert.equal(f.store.observe(exact('.000002Z')), false); assert.equal(f.store.observe(exact('.000001Z')), true);
+  assert.equal(f.store.observe(exact('.000002Z')), true); f.advance(1000);
+  assert.equal(f.store.observe(exact('.000001Z')), true);
   assert.equal(f.store.headroom('claude').windows[0].resetsAt, reset, 'expiry uses the conservative original raw millisecond');
+});
+
+function preciseNative(f, resets, remaining = [11, 11], { at = f.at(), accountUuid = uuid } = {}) {
+  return parseClaudeNativeCache({ oauthAccount: { accountUuid }, cachedUsageUtilization: {
+    accountUuid, fetchedAtMs: at, utilization: Object.fromEntries(['five_hour', 'seven_day'].map((id, i) =>
+      [id, { utilization: 100 - remaining[i], resets_at: resets[i] }])) } }, { quotaSeat: 'claude', now: at });
+}
+function preciseIso(ns) {
+  return new Date(Number(ns / 1000000n)).toISOString().replace(/\.\d{3}Z$/, `.${String(ns % 1000000000n).padStart(9, '0')}Z`);
+}
+function storeBytes(f) { return fs.readFileSync(path.join(f.dir, 'native-usage.json'), 'utf8'); }
+function storedSeat(f) { return JSON.parse(storeBytes(f)).claude; }
+
+test('captured native reset jitter refreshes exact fetch time without capacity uplift or expiry extension', t => {
+  const f = fixture(t, 1789316910862);
+  const firstResets = ['2026-09-13T17:59:59.584712+00:00', '2026-09-13T23:59:59.584741+00:00'];
+  const refreshedResets = ['2026-09-13T17:59:59.925436+00:00', '2026-09-13T23:59:59.925462+00:00'];
+  const first = preciseNative(f, firstResets, [91, 10]);
+  assert.ok(first); f.store.bindIdentity('claude', first.accountFingerprint);
+  assert.equal(f.store.observe(first), true);
+  f.advance(1789317230534 - f.at());
+  assert.equal(f.store.headroom('claude').freshness, 'stale');
+  const refreshed = preciseNative(f, refreshedResets, [91, 10]);
+  assert.equal(f.store.observe(refreshed), true);
+  const after = storedSeat(f), windows = Object.values(after.buckets.account.windows);
+  assert.equal(after.observedAt, 1789317230534);
+  assert.equal(after.nativeFetchWatermarks[first.accountFingerprint], 1789317230534);
+  assert.equal(f.store.headroom('claude', { accountFingerprint: first.accountFingerprint }).freshness, 'fresh');
+  assert.deepEqual(windows.map(w => w.percentRemaining), [91, 10]);
+  assert.deepEqual(windows.map(w => w.resetsAt), firstResets.map(Date.parse));
+  assert.deepEqual(windows.map(w => w.resetBoundaryMs), [1789322400000, 1789344000000]);
+  f.advance(6000); assert.equal(f.store.observe(preciseNative(f, refreshedResets, [90, 9])), true);
+  const decreased = f.store.headroom('claude').windows;
+  assert.deepEqual(decreased.map(w => w.rateAnchorObservedAt), [1789317230534, 1789317230534]);
+  assert.deepEqual(decreased.map(w => w.percentPerHour), [600, 600]);
+  f.advance(1000); const beforeUplift = storeBytes(f);
+  assert.equal(f.store.observe(preciseNative(f, firstResets, [90, 10])), false, 'one replenished sibling rejects the entire fetch');
+  assert.equal(storeBytes(f), beforeUplift);
+});
+
+test('fixed native keys survive jitter chains restart and whole-second stream roundtrips with earliest expiry', t => {
+  const f = fixture(t), boundary = T + 86400000, baseNs = BigInt(boundary - 1000) * 1000000n;
+  const observation = fraction => preciseNative(f, [preciseIso(baseNs + fraction), preciseIso(baseNs + fraction)]);
+  const initial = observation(584712000n); f.store.bindIdentity('claude', initial.accountFingerprint);
+  assert.equal(f.store.observe(initial), true);
+  let earliest = boundary - 416;
+  for (const fraction of [925436000n, 100000001n, 999999999n, 1n, 800000000n]) {
+    f.advance(1000);
+    f.store = createSubscriptionUsage({ dataDir: f.dir, now: f.at });
+    assert.equal(f.store.observe(observation(fraction)), true);
+    earliest = Math.min(earliest, Number((baseNs + fraction) / 1000000n));
+    const stream = parseClaudeStreamRateLimit({ type: 'rate_limit_event', rate_limit_info: { status: 'allowed',
+      unifiedWindows: Object.fromEntries(['five_hour', 'seven_day'].map(id => [id, { utilization: .89, resetsAt: boundary / 1000 }])) } },
+      { quotaSeat: 'claude', observedAt: f.at() + 1000, accountFingerprint: initial.accountFingerprint });
+    f.advance(1000); assert.equal(f.store.observe(stream), true);
+    for (const w of f.store.headroom('claude').windows) {
+      assert.equal(w.resetBoundaryMs, boundary);
+      assert.equal(w.resetsAt, earliest);
+      assert.equal(Number(BigInt(w.nativeResetNs) / 1000000n), w.nativeResetMs);
+      assert.equal(Date.parse(w.nativeResetIso), w.nativeResetMs);
+      assert.ok(w.resetsAt <= w.nativeResetMs, 'effective expiry never follows raw provenance');
+    }
+  }
+  f.advance(1000); const before = storeBytes(f);
+  const nextKey = preciseIso(BigInt(boundary) * 1000000n + 1n);
+  assert.equal(f.store.observe(preciseNative(f, [nextKey, nextKey])), false, 'a one-nanosecond crossing cannot extend the fixed key');
+  assert.equal(storeBytes(f), before);
+});
+
+test('earliest same-key expiry blocks replenishment until actual fixed-boundary rollover', t => {
+  const f = fixture(t), boundary = T + 60000;
+  const resets = ms => [new Date(ms).toISOString(), new Date(ms).toISOString()];
+  const first = preciseNative(f, resets(boundary - 416), [4, 4]);
+  f.store.bindIdentity('claude', first.accountFingerprint); assert.equal(f.store.observe(first), true);
+  f.advance(1000); assert.equal(f.store.observe(preciseNative(f, resets(boundary - 75), [4, 4])), true);
+  f.advance(boundary - 416 - f.at());
+  const expired = storeBytes(f);
+  assert.equal(f.store.observe(preciseNative(f, resets(boundary - 75), [4, 4])), false, 'equal capacity cannot renew an expired earliest reset');
+  assert.equal(storeBytes(f), expired);
+  assert.equal(f.store.headroom('claude').freshness, 'stale');
+  assert.equal(f.store.headroom('claude').protected, true);
+  const stream = parseClaudeStreamRateLimit({ type: 'rate_limit_event', rate_limit_info: { status: 'allowed',
+    unifiedWindows: Object.fromEntries(['five_hour', 'seven_day'].map(id => [id, { utilization: .96, resetsAt: boundary / 1000 }])) } },
+    { quotaSeat: 'claude', observedAt: f.at(), accountFingerprint: first.accountFingerprint });
+  assert.equal(f.store.observe(stream), false, 'a whole-second stream cannot bypass the earliest native expiry');
+  assert.equal(storeBytes(f), expired);
+  f.advance(boundary - 1 - f.at());
+  assert.equal(f.store.observe(preciseNative(f, resets(boundary + 18000000), [90, 90])), false);
+  assert.equal(storeBytes(f), expired, 'the full fixed boundary must pass before a new key is eligible');
+  f.advance(1); assert.equal(f.store.observe(preciseNative(f, resets(boundary + 18000000), [90, 90])), true);
+  assert.equal(f.store.headroom('claude').freshness, 'fresh');
+  assert.equal(f.store.headroom('claude').percentRemaining, 90);
+  assert.ok(f.store.headroom('claude').windows.every(w => w.percentPerHour === null));
+});
+
+test('jitter preserves identity-bound denial and rate anchors across refresh restart and replay', t => {
+  const f = fixture(t), boundary = T + 86400000;
+  const resets = delta => [new Date(boundary - delta).toISOString(), new Date(boundary - delta).toISOString()];
+  const first = preciseNative(f, resets(416), [12, 12]);
+  f.store.bindIdentity('claude', first.accountFingerprint); f.store.observe(first);
+  f.advance(6000); assert.equal(f.store.observe(preciseNative(f, resets(75))), true);
+  const anchor = f.store.headroom('claude').windows[0].rateAnchorObservedAt;
+  assert.equal(anchor, T); assert.equal(f.store.headroom('claude').percentPerHour, 600);
+  f.advance(1000);
+  const denial = parseClaudeStreamRateLimit({ type: 'rate_limit_event', rate_limit_info: { status: 'rejected',
+    unifiedWindows: Object.fromEntries(['five_hour', 'seven_day'].map(id => [id, { utilization: .89, resetsAt: boundary / 1000 }])) } },
+    { quotaSeat: 'claude', observedAt: f.at(), accountFingerprint: first.accountFingerprint });
+  assert.equal(f.store.observe(denial), true);
+  f.advance(150000); const fresh = preciseNative(f, resets(250)); assert.equal(f.store.observe(fresh), true);
+  f.store = createSubscriptionUsage({ dataDir: f.dir, now: f.at });
+  const current = f.store.headroom('claude');
+  assert.equal(current.ordinaryUsageAllowed, false); assert.equal(current.protected, true);
+  assert.equal(current.windows[0].rateAnchorObservedAt, anchor);
+  assert.ok(current.percentPerHour > 0 && current.percentPerHour < 30);
+  const before = storeBytes(f);
+  f.advance(1000); assert.equal(f.store.observe(fresh), false);
+  assert.equal(storeBytes(f), before, 'restart must not renew a persisted fetch watermark');
+  f.advance(180001);
+  assert.ok(f.at() - 180001 > storedSeat(f).nativeFetchWatermarks[first.accountFingerprint],
+    'the expired fetch must exceed the watermark so TTL rejection is independently exercised');
+  for (const options of [{ at: f.at() - 180001 }, { at: f.at() + 1 },
+    { accountUuid: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' }]) {
+    assert.equal(f.store.observe(preciseNative(f, resets(100), [11, 11], options)), false);
+    assert.equal(storeBytes(f), before);
+  }
+});
+
+test('one-nanosecond and adjacent two-nanosecond boundary crossings remain distinct native windows', t => {
+  const point = BigInt(T + 86400000) * 1000000n;
+  for (const [firstNs, otherNs] of [[point, point + 1n], [point + 1n, point],
+    [point - 1n, point + 1n]]) {
+    const f = fixture(t), firstIso = preciseIso(firstNs), otherIso = preciseIso(otherNs);
+    const first = preciseNative(f, [firstIso, firstIso]);
+    f.store.bindIdentity('claude', first.accountFingerprint); assert.equal(f.store.observe(first), true);
+    f.advance(1000); const before = storeBytes(f);
+    assert.equal(f.store.observe(preciseNative(f, [otherIso, otherIso])), false);
+    assert.equal(storeBytes(f), before);
+  }
+});
+
+test('native millisecond fallback preserves the fixed key and earliest expiry with consistent provenance', t => {
+  const f = fixture(t), boundary = T + 86400000;
+  const withoutPrecision = reset => {
+    const value = native(f, 11, reset);
+    for (const w of value.buckets[0].windows) delete w.nativeResetNs;
+    return value;
+  };
+  const first = withoutPrecision(boundary - 437);
+  f.store.bindIdentity('claude', first.accountFingerprint); assert.equal(f.store.observe(first), true);
+  f.advance(1000); assert.equal(f.store.observe(withoutPrecision(boundary - 436)), true);
+  f.store = createSubscriptionUsage({ dataDir: f.dir, now: f.at });
+  for (const w of f.store.headroom('claude').windows) {
+    assert.equal(w.resetBoundaryMs, boundary); assert.equal(w.resetsAt, boundary - 437);
+    assert.ok([boundary - 437, boundary - 436].includes(w.nativeResetMs));
+    assert.equal(Date.parse(w.nativeResetIso), w.nativeResetMs);
+    if (w.nativeResetNs != null) assert.equal(BigInt(w.nativeResetNs), BigInt(w.nativeResetMs) * 1000000n);
+  }
+  f.advance(1000); const before = storeBytes(f);
+  assert.equal(f.store.observe(withoutPrecision(boundary + 1)), false);
+  assert.equal(storeBytes(f), before);
+});
+
+test('captured fractional ISO without nanoseconds retains conservative identity across restart and refresh', t => {
+  const f = fixture(t, 1789316910862);
+  const firstResets = ['2026-09-13T17:59:59.584712+00:00', '2026-09-13T23:59:59.584741+00:00'];
+  const nextResets = ['2026-09-13T17:59:59.925436+00:00', '2026-09-13T23:59:59.925462+00:00'];
+  const withoutNs = resets => {
+    const observation = preciseNative(f, resets, [91, 10]);
+    for (const w of observation.buckets[0].windows) delete w.nativeResetNs;
+    return observation;
+  };
+  const first = withoutNs(firstResets);
+  f.store.bindIdentity('claude', first.accountFingerprint); assert.equal(f.store.observe(first), true);
+  f.store = createSubscriptionUsage({ dataDir: f.dir, now: f.at });
+  f.advance(1789317230534 - f.at());
+  assert.equal(f.store.observe(withoutNs(nextResets)), true);
+  const windows = f.store.headroom('claude').windows;
+  assert.equal(f.store.headroom('claude').freshness, 'fresh');
+  for (const [i, w] of windows.entries()) {
+    assert.equal(w.nativeResetNs, undefined, 'fallback must not invent nanosecond provenance');
+    assert.ok([firstResets[i], nextResets[i]].includes(w.nativeResetIso));
+    assert.equal(Date.parse(w.nativeResetIso), w.nativeResetMs);
+    assert.equal(w.resetsAt, Date.parse(firstResets[i]));
+    assert.equal(w.resetBoundaryMs, [1789322400000, 1789344000000][i]);
+  }
+  f.advance(1000); const inconsistent = withoutNs(nextResets), before = storeBytes(f);
+  inconsistent.buckets[0].windows[0].nativeResetIso = firstResets[0];
+  assert.equal(f.store.observe(inconsistent), false, 'missing ns must not disable ISO/ms consistency');
+  assert.equal(storeBytes(f), before);
+});
+
+test('missing native boundaries are materialized and cannot replenish before the fixed key after restart', t => {
+  const boundary = 1789322400000;
+  for (const mode of ['current', 'restart', 'legacy-restart']) {
+    const f = fixture(t, boundary - 60000);
+    const first = preciseNative(f, ['2026-09-13T17:59:59.584712+00:00',
+      '2026-09-13T17:59:59.584712+00:00'], [4, 4]);
+    for (const w of first.buckets[0].windows) delete w.resetBoundaryMs;
+    f.store.bindIdentity('claude', first.accountFingerprint); assert.equal(f.store.observe(first), true);
+    assert.deepEqual(f.store.headroom('claude').windows.map(w => w.resetBoundaryMs), [boundary, boundary]);
+    if (mode === 'legacy-restart') {
+      const persisted = JSON.parse(storeBytes(f));
+      for (const w of Object.values(persisted.claude.buckets.account.windows)) delete w.resetBoundaryMs;
+      fs.writeFileSync(path.join(f.dir, 'native-usage.json'), JSON.stringify(persisted));
+    }
+    if (mode !== 'current') f.store = createSubscriptionUsage({ dataDir: f.dir, now: f.at });
+    f.advance(boundary - 200 - f.at());
+    const before = storeBytes(f), futureReset = new Date(boundary + 18000000).toISOString();
+    assert.equal(f.store.observe(preciseNative(f, [futureReset, futureReset], [90, 90])), false,
+      `${mode}: fractional expiry must not substitute for the fixed boundary`);
+    assert.equal(storeBytes(f), before);
+    assert.equal(f.store.headroom('claude').protected, true);
+    f.advance(201);
+    assert.equal(f.store.observe(preciseNative(f, [futureReset, futureReset], [90, 90])), true);
+    assert.equal(f.store.headroom('claude').percentRemaining, 90);
+    assert.equal(f.store.headroom('claude').freshness, 'fresh');
+    assert.ok(f.store.headroom('claude').windows.every(w => w.resetBoundaryMs === boundary + 18000000 && w.percentPerHour === null));
+  }
+});
+
+test('corrupted persisted native identity refuses rollover without replacing protection or evidence', t => {
+  for (const mutate of [w => { w.nativeResetNs = 'invalid'; },
+    w => { w.resetBoundaryMs += 1000; }, w => { w.nativeResetIso = new Date(w.nativeResetMs + 1).toISOString(); }]) {
+    const f = fixture(t), first = native(f, 4);
+    f.store.bindIdentity('claude', first.accountFingerprint); assert.equal(f.store.observe(first), true);
+    const persisted = JSON.parse(storeBytes(f)); mutate(persisted.claude.buckets.account.windows.five_hour);
+    fs.writeFileSync(path.join(f.dir, 'native-usage.json'), JSON.stringify(persisted));
+    f.store = createSubscriptionUsage({ dataDir: f.dir, now: f.at });
+    f.advance(86400001); const before = storeBytes(f);
+    assert.equal(f.store.observe(native(f, 90, f.at() + 86400000)), false);
+    assert.equal(storeBytes(f), before);
+    assert.equal(f.store.headroom('claude').protected, true);
+  }
+});
+
+test('inconsistent precise native reset metadata fails closed before initial or existing-window persistence', t => {
+  const mutations = [
+    w => { w.nativeResetNs = 'not-an-integer'; },
+    w => { w.nativeResetNs = '-1'; },
+    w => { w.nativeResetNs = Number(w.nativeResetNs); },
+    w => { w.nativeResetNs = String(BigInt(w.nativeResetNs) + 1n); },
+    w => { w.nativeResetNs = String(BigInt(w.nativeResetNs) + 1000000n); },
+    w => { w.resetBoundaryMs += 1000; },
+    w => { w.nativeResetMs += 1; w.resetsAt += 1; },
+  ];
+  for (const adopted of [false, true]) for (const mutate of mutations) {
+    const f = fixture(t), first = native(f);
+    f.store.bindIdentity('claude', first.accountFingerprint);
+    if (adopted) assert.equal(f.store.observe(first), true);
+    f.advance(1000); const next = native(f), before = storeBytes(f);
+    mutate(next.buckets[0].windows[0]);
+    assert.equal(f.store.observe(next), false, 'malformed metadata must return refusal rather than throw or overwrite');
+    assert.equal(storeBytes(f), before);
+  }
 });
 test('reserve settings default on, validate floor, persist, and never infer allowance from absence', (t) => {
   const { store, dir } = fixture(t);
