@@ -320,7 +320,8 @@ function Test-RequiredStripEnvMigration([string]$InstalledStripEnvJson) {
   'Test-LocalPortInUse', 'Start-StagedBridge',
   'Move-InstallDirectoryOnce', 'Move-InstallRootForCutover',
   'Get-BridgeShutdownProcessHandle', 'Stop-BridgeForCutover',
-  'New-BoundedTestOutputCollector', 'Add-BoundedTestOutputLine', 'Format-BoundedTestOutput', 'Invoke-BoundedTestCapture'
+  'New-BoundedTestOutputCollector', 'Add-BoundedTestOutputLine', 'Format-BoundedTestOutput', 'Invoke-BoundedTestCapture',
+  'Get-InstallTestCaptureFailureMessage'
 ))))
 
 # Exercise the real grouped JSONL migration independently of a release cutover.
@@ -956,6 +957,10 @@ Write-Host '[RelayBridge] Stop-BridgeForCutover clean-exit success case passed.'
     Assert-True ($successCapture.ExitCode -eq 0 -and $successCapture.Text.Contains('success-stderr')) 'stderr alone does not turn native success into failure'
     $missing = Invoke-BoundedTestCapture { & (Join-Path $captureRoot 'missing-command.cmd') }
     Assert-True ($null -eq $missing.ExitCode) 'a command that never launches cannot inherit a prior successful native exit'
+
+    Assert-True ($null -eq (Get-InstallTestCaptureFailureMessage ([pscustomobject]@{ ExitCode = 0; CaptureError = 'injected collector failure' }))) 'a real exit 0 is never overridden into failure by an unrelated collector fault'
+    Assert-True ((Get-InstallTestCaptureFailureMessage ([pscustomobject]@{ ExitCode = $null; CaptureError = '' })) -eq 'npm test capture ended without a native exit code') 'a missing native exit still fails the staged install'
+    Assert-True ((Get-InstallTestCaptureFailureMessage ([pscustomobject]@{ ExitCode = 7; CaptureError = '' })) -eq 'npm test failed in staging') 'a real non-zero exit still fails the staged install'
 
     $diagnosticPath = Join-Path $captureRoot 'error.txt'
     [IO.File]::WriteAllText($diagnosticPath, ('original-exception' + ('z' * 1000000) + $text), [Text.UTF8Encoding]::new($false))

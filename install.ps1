@@ -1277,6 +1277,14 @@ function Format-BoundedTestOutput($Collector) {
     "--- final output tail ---`n" + ($Collector.Tail.ToArray() -join ''))
 }
 
+function Get-InstallTestCaptureFailureMessage($Capture) {
+  if ($null -eq $Capture.ExitCode) { return 'npm test capture ended without a native exit code' }
+  if ($Capture.ExitCode -ne 0) { return 'npm test failed in staging' }
+  # A real exit 0 is authoritative even if the bounded collector itself faulted;
+  # CaptureError is still surfaced in the diagnostic file, not treated as a test failure.
+  return $null
+}
+
 function Invoke-BoundedTestCapture([scriptblock]$Command) {
   $collector = New-BoundedTestOutputCollector
   $previousPreference = $script:ErrorActionPreference
@@ -1396,9 +1404,8 @@ try {
       $env:RELAYBRIDGE_SKIP_INSTALL_TEST = '1'
       if ($env:RELAYBRIDGE_INSTALL_TEST_ERROR_FILE) {
         $installTestCapture = Invoke-BoundedTestCapture { npm test }
-        if ($null -eq $installTestCapture.ExitCode) { throw 'npm test capture ended without a native exit code' }
-        if ($installTestCapture.ExitCode -ne 0) { throw 'npm test failed in staging' }
-        if ($installTestCapture.CaptureError) { throw 'npm test diagnostics could not be captured reliably' }
+        $captureFailureMessage = Get-InstallTestCaptureFailureMessage $installTestCapture
+        if ($captureFailureMessage) { throw $captureFailureMessage }
       } else {
         npm test
         if ($LASTEXITCODE -ne 0) { throw 'npm test failed in staging' }
