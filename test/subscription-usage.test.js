@@ -29,6 +29,84 @@ test('applicable window, aliases, distinct accounts, reserve and measured deplet
   f.advance(60000); f.store.observe(f.codex(4.5)); assert.equal(f.store.verdict('codex').admit, false);
   f.store.setSettings({ usageProtection: false }); assert.equal(f.store.verdict('codex').admit, true);
 });
+test('unchanged fresh readings decay a measured rate and never borrow another window rate', (t) => {
+  const f = fixture(t), fiveHourReset = T / 1000 + 18000, weekReset = T / 1000 + 604800;
+  const stream = (fiveHour, week) => parseClaudeStreamRateLimit({ type: 'rate_limit_event', rate_limit_info: { status: 'allowed',
+    unifiedWindows: { five_hour: { utilization: (100 - fiveHour) / 100, resetsAt: fiveHourReset },
+      seven_day: { utilization: (100 - week) / 100, resetsAt: weekReset } } } }, { quotaSeat: 'claude', observedAt: f.at() });
+  f.store.observe(stream(85, 20));
+  // Two points 5.592 seconds apart produce the observed 1287.55%/hour burst.
+  f.advance(5592); f.store.observe(stream(83, 18));
+  assert.equal(Math.round(f.store.headroom('claude').percentPerHour * 100) / 100, 1287.55);
+  assert.equal(f.store.verdict('claude').admit, false, 'a recent drop in the weekly bucket is protective');
+  // A later stream observation with unchanged percentages is fresh evidence, but
+  // the old burst is now only a 2-point depletion over the longer anchor interval.
+  f.advance(150000); f.store.observe(stream(83, 18));
+  const decayed = f.store.headroom('claude');
+  assert.ok(decayed.percentPerHour < 50);
+  assert.ok(decayed.triggerPercent < 8);
+  assert.equal(decayed.percentRemaining, 18);
+  assert.equal(f.store.verdict('claude').admit, true);
+
+  const independent = fixture(t);
+  const independentStream = (fiveHour, week) => parseClaudeStreamRateLimit({ type: 'rate_limit_event', rate_limit_info: { status: 'allowed',
+    unifiedWindows: { five_hour: { utilization: (100 - fiveHour) / 100, resetsAt: fiveHourReset },
+      seven_day: { utilization: (100 - week) / 100, resetsAt: weekReset } } } }, { quotaSeat: 'claude', observedAt: independent.at() });
+  independent.store.observe(independentStream(90, 18));
+  independent.advance(60000); independent.store.observe(independentStream(80, 18));
+  const weeklyBinding = independent.store.headroom('claude');
+  assert.equal(weeklyBinding.bindingWindow, 'seven_day');
+  assert.equal(weeklyBinding.percentPerHour, null);
+  assert.equal(weeklyBinding.triggerPercent, 5);
+  assert.equal(independent.store.verdict('claude').admit, true, 'a fast high-remaining 5h bucket cannot protect the weekly bucket');
+});
+test('legacy rates without a depletion anchor do not become timeless on fresh unchanged evidence', (t) => {
+  const f = fixture(t), reset = T / 1000 + 86400;
+  f.store.observe(f.codex(18));
+  const storeFile = path.join(f.dir, 'native-usage.json');
+  const persisted = JSON.parse(fs.readFileSync(storeFile, 'utf8'));
+  persisted.codex.buckets.codex.windows.primary.percentPerHour = 1287.55;
+  fs.writeFileSync(storeFile, JSON.stringify(persisted, null, 2));
+  const reopened = createSubscriptionUsage({ dataDir: f.dir, now: f.at });
+  f.advance(1000);
+  reopened.observe(parseCodexRateLimits({ ordinaryUsageAllowed: true, rateLimits: { limitId: 'codex' },
+    rateLimitsByLimitId: { codex: { primary: { usedPercent: 82, windowDurationMins: 10080, resetsAt: reset } } } },
+  { quotaSeat: 'codex', observedAt: f.at() }));
+  const headroom = reopened.headroom('codex');
+  assert.equal(headroom.percentPerHour, null);
+  assert.equal(headroom.triggerPercent, 5);
+  assert.equal(reopened.verdict('codex').admit, true);
+});
+test('malformed persisted rates never weaken reserve protection or become numeric metadata', (t) => {
+  const f = fixture(t);
+  f.store.observe(f.codex(4));
+  const storeFile = path.join(f.dir, 'native-usage.json');
+  const persisted = JSON.parse(fs.readFileSync(storeFile, 'utf8'));
+  for (const malformed of [-100, '600', 'NaN', {}, null]) {
+    persisted.codex.buckets.codex.windows.primary.percentPerHour = malformed;
+    fs.writeFileSync(storeFile, JSON.stringify(persisted));
+    const headroom = createSubscriptionUsage({ dataDir: f.dir, now: f.at }).verdict('codex');
+    assert.equal(headroom.admit, false);
+    assert.equal(headroom.triggerPercent, 5);
+    assert.equal(headroom.percentPerHour, null);
+    assert.equal(headroom.protectionWindow.percentPerHour, null);
+  }
+});
+test('protection names the triggering window when it differs from the lowest remaining window', (t) => {
+  const f = fixture(t);
+  const stream = (fiveHour) => parseClaudeStreamRateLimit({ type: 'rate_limit_event', rate_limit_info: { status: 'allowed',
+    unifiedWindows: { five_hour: { utilization: (100 - fiveHour) / 100, resetsAt: T / 1000 + 18000 },
+      seven_day: { utilization: .86, resetsAt: T / 1000 + 604800 } } } }, { quotaSeat: 'claude', observedAt: f.at() });
+  f.store.observe(stream(25));
+  f.advance(60000); f.store.observe(stream(15));
+  const headroom = f.store.verdict('claude');
+  assert.equal(headroom.admit, false);
+  assert.equal(headroom.bindingWindow, 'seven_day');
+  assert.equal(headroom.percentRemaining, 14);
+  assert.equal(headroom.triggerPercent, 5);
+  assert.deepEqual(headroom.protectionWindow, { id: 'five_hour', percentRemaining: 15,
+    percentPerHour: 600, triggerPercent: 20 });
+});
 test('denial and spend-control nulls cannot fabricate recovery', (t) => {
   const f = fixture(t); f.store.observe(f.codex(90, { ordinaryUsageAllowed: false }));
   assert.equal(f.store.verdict('codex').admit, false);
