@@ -961,7 +961,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal((await requestPost(requestPayload)).status, 409);
   assert.equal((await fetch(baseUrl + '/api/requests/rest-coverage?revision=main', { headers: auth })).status, 400);
   assert.equal((await fetch(baseUrl + '/api/requests/missing', { headers: auth })).status, 404);
-  const dashboard = await fetch(baseUrl + '/');
+  const dashboard = await fetch(baseUrl + '/terminal');
   assert.equal(dashboard.headers.get('x-frame-options'), 'DENY');
   assert.match(dashboard.headers.get('content-security-policy') || '', /frame-ancestors 'none'/);
   assert.match(dashboard.headers.get('content-security-policy') || '', /script-src-attr 'none'/);

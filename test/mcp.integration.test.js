@@ -129,6 +129,134 @@ function isLiveProcess(pid) {
   catch { return false; }
 }
 
+// Keep failed CI responses identifiable without logging provider text or credentials.
+const EXIT_DIAGNOSTIC_MAX_STRING = 128;
+const EXIT_DIAGNOSTIC_MAX_TOTAL = 4096;
+const EXIT_DIAGNOSTIC_FIELDS = [
+  'ok', 'pending', 'terminal', 'status', 'resultState', 'collectionExpired',
+  'collectionStopReason', 'submissionConfirmed', 'taskId', 'unavailableReason',
+  'code', 'errorCode', 'failureClass', 'modelInvocation', 'receiptId',
+  'transportReceiptId', 'requestId', 'invocationId', 'stopReason',
+];
+
+function exitDiagnosticScalar(value) {
+  if (value === null || typeof value === 'boolean') return value;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : undefined;
+  // Only bounded machine identifiers/enums, never arbitrary diagnostic text.
+  if (typeof value === 'string' && value.length <= EXIT_DIAGNOSTIC_MAX_STRING
+      && /^[A-Za-z0-9_][A-Za-z0-9_.:-]*$/.test(value)) return value;
+  return undefined;
+}
+
+function describeMissingExit(response) {
+  const prefix = 'Perplexity exitCode assertion failed: ';
+  try {
+    const structured = response?.structuredContent;
+    const own = (object, key) => !!object && typeof object === 'object'
+      && !Array.isArray(object) && Object.prototype.hasOwnProperty.call(object, key);
+    const hasExitCode = own(structured, 'exitCode');
+    const hasError = own(structured, 'error');
+    const entries = [
+      ['hasExitCode', hasExitCode],
+      ['exitCodeType', hasExitCode ? typeof structured.exitCode : 'absent'],
+      ['structuredType', Array.isArray(structured) ? 'array' : structured === null ? 'null' : typeof structured],
+      ['isError', exitDiagnosticScalar(response?.isError)],
+      ['errorPresent', hasError],
+      ['errorType', !hasError ? 'absent' : structured.error === null ? 'null' : Array.isArray(structured.error) ? 'array' : typeof structured.error],
+      ['exitCode', hasExitCode ? exitDiagnosticScalar(structured.exitCode) : undefined],
+    ];
+    for (const key of EXIT_DIAGNOSTIC_FIELDS) {
+      if (own(structured, key)) entries.push([key, exitDiagnosticScalar(structured[key])]);
+    }
+    for (const [container, fields] of [
+      ['route', ['code']], ['detail', ['code', 'errorCode', 'failureClass']], ['validation', ['code']],
+    ]) {
+      if (!own(structured, container)) continue;
+      for (const key of fields) {
+        if (own(structured[container], key)) entries.push([`${container}.${key}`, exitDiagnosticScalar(structured[container][key])]);
+      }
+    }
+    const summary = {};
+    // Reserve room for the truncation marker; serializing only selected scalars
+    // avoids cycles, custom toJSON methods and unbounded nested response objects.
+    const budget = EXIT_DIAGNOSTIC_MAX_TOTAL - prefix.length - 20;
+    for (const [key, value] of entries) {
+      if (value === undefined) continue;
+      summary[key] = value;
+      if (JSON.stringify(summary).length > budget) {
+        delete summary[key];
+        summary.truncated = true;
+        break;
+      }
+    }
+    return prefix + JSON.stringify(summary);
+  } catch {
+    return prefix + '{"diagnosticUnavailable":true}';
+  }
+}
+
+test('MCP missing-exit diagnostic is bounded and names the failing shape', () => {
+  const diagnostic = (response) => JSON.parse(describeMissingExit(response).split(': ').slice(1).join(': '));
+  const pending = { structuredContent: { pending: true, terminal: false, status: 'running',
+    resultState: 'pending', collectionExpired: true, collectionStopReason: 'collection_deadline',
+    submissionConfirmed: true, taskId: 't_fixture_pending' } };
+  assert.throws(() => assert.equal(pending.structuredContent.exitCode, 0, describeMissingExit(pending)),
+    (error) => error.actual === undefined && error.expected === 0 && error.message.includes('"taskId":"t_fixture_pending"'));
+  const pendingSummary = diagnostic(pending);
+  assert.equal(pendingSummary.hasExitCode, false);
+  assert.equal(pendingSummary.pending, true);
+  assert.equal(pendingSummary.collectionExpired, true);
+  assert.equal(pendingSummary.collectionStopReason, 'collection_deadline');
+  assert.equal(pendingSummary.submissionConfirmed, true);
+
+  const errorSummary = diagnostic({ isError: true, structuredContent: { ok: false, status: 503,
+    error: 'PRIVATE_ERROR_TEXT', message: 'PRIVATE_MESSAGE_TEXT', errorCode: 'BRIDGE_UNREACHABLE',
+    route: { code: 'oneshot', reason: 'PRIVATE_ROUTE_TEXT' },
+    detail: { code: 'TRANSPORT_TIMEOUT', reason: 'PRIVATE_DETAIL_TEXT' } } });
+  assert.equal(errorSummary.isError, true);
+  assert.equal(errorSummary.errorPresent, true);
+  assert.equal(errorSummary.errorType, 'string');
+  assert.equal(errorSummary.errorCode, 'BRIDGE_UNREACHABLE');
+  assert.equal(errorSummary['route.code'], 'oneshot');
+  assert.equal(errorSummary['detail.code'], 'TRANSPORT_TIMEOUT');
+  assert.doesNotMatch(JSON.stringify(errorSummary), /PRIVATE_|"message"|"error"|reason/);
+
+  const failedSummary = diagnostic({ structuredContent: { status: 'failed', resultState: 'unavailable',
+    unavailableReason: 'no_recoverable_result', failureClass: 'queue_failure', modelInvocation: false,
+    transportReceiptId: 'rcpt_fixture', stopReason: 'task_failed' } });
+  assert.equal(failedSummary.resultState, 'unavailable');
+  assert.equal(failedSummary.unavailableReason, 'no_recoverable_result');
+  assert.equal(failedSummary.modelInvocation, false);
+  assert.equal(failedSummary.transportReceiptId, 'rcpt_fixture');
+  assert.equal(diagnostic({ structuredContent: { exitCode: null } }).hasExitCode, true);
+  assert.equal(diagnostic({ structuredContent: { exitCode: null } }).exitCode, null);
+  assert.equal(diagnostic({ structuredContent: { exitCode: -1 } }).exitCode, -1);
+
+  const oversized = { structuredContent: {} };
+  for (const key of EXIT_DIAGNOSTIC_FIELDS) oversized.structuredContent[key] = 'x'.repeat(100000);
+  oversized.structuredContent.stdout = 'PRIVATE_STDOUT';
+  oversized.structuredContent.stderr = 'PRIVATE_STDERR';
+  oversized.structuredContent.partialDiagnostic = 'PRIVATE_PARTIAL';
+  oversized.structuredContent.self = oversized;
+  oversized.structuredContent.route = { code: { toJSON() { throw new Error('must not serialize objects'); } } };
+  oversized.structuredContent.detail = new Array(5000).fill('PRIVATE_ARRAY');
+  assert.ok(describeMissingExit(oversized).length <= EXIT_DIAGNOSTIC_MAX_TOTAL);
+  assert.doesNotMatch(describeMissingExit(oversized), /PRIVATE_|stdout|stderr|partialDiagnostic/);
+  assert.equal(exitDiagnosticScalar('x'.repeat(128)).length, 128);
+  assert.equal(exitDiagnosticScalar('x'.repeat(129)), undefined);
+  for (const value of [Infinity, NaN, 1n, {}, [], () => {}, Symbol('secret'), 'token=secret', 'Bearer secret']) {
+    assert.equal(exitDiagnosticScalar(value), undefined);
+  }
+  const full = { structuredContent: { exitCode: -1 } };
+  for (const key of EXIT_DIAGNOSTIC_FIELDS) full.structuredContent[key] = 'x'.repeat(128);
+  full.structuredContent.route = { code: 'x'.repeat(128) };
+  full.structuredContent.detail = { code: 'x'.repeat(128), errorCode: 'x'.repeat(128), failureClass: 'x'.repeat(128) };
+  full.structuredContent.validation = { code: 'x'.repeat(128) };
+  assert.ok(describeMissingExit(full).length <= EXIT_DIAGNOSTIC_MAX_TOTAL);
+  assert.doesNotThrow(() => diagnostic(full));
+  assert.equal(diagnostic({ get structuredContent() { throw new Error('PRIVATE_GETTER'); } }).diagnosticUnavailable, true);
+});
+
 test('MCP stdio exposes resources, safe tools, routing, and provider receipts', {
   timeout: process.platform === 'win32' ? 120000 : 30000,
 }, async (t) => {
@@ -1044,7 +1172,8 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
     name: 'ask_provider',
     arguments: { kind: 'perplexity', prompt: 'MCP_PERPLEXITY_SENTINEL_MARKER', useCache: false },
   });
-  assert.equal(perplexityPartial.structuredContent.exitCode, 0);
+  assert.equal(perplexityPartial.structuredContent.exitCode, 0,
+    perplexityPartial.structuredContent.exitCode === 0 ? undefined : describeMissingExit(perplexityPartial));
   assert.equal(perplexityPartial.structuredContent.stdout, '');
   assert.equal(perplexityPartial.structuredContent.droppedOut, true);
   assert.equal(perplexityPartial.structuredContent.partialResult, true);
