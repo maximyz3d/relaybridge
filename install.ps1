@@ -1228,6 +1228,88 @@ function Assert-NoInjectedInstallFailure([string]$Point) {
   }
 }
 
+function New-BoundedTestOutputCollector {
+  return @{
+    Head = [Text.StringBuilder]::new(); Failures = [Text.StringBuilder]::new()
+    Tail = [Collections.Generic.Queue[string]]::new(); TailChars = 0
+    Lines = 0L; LongLines = 0L; TailEvictions = 0L; FailureLinesLeft = 0
+    FailureBlocks = 0; CaptureError = ''
+  }
+}
+
+function Add-BoundedTestOutputLine($Collector, [object]$Value) {
+  $line = if ($Value -is [Management.Automation.ErrorRecord]) {
+    $detail = if ($null -ne $Value.TargetObject) { [string]$Value.TargetObject } else { $Value.Exception.Message }
+    '[stderr] ' + $detail
+  } else { [string]$Value }
+  $Collector.Lines++
+  if ($line.Length -gt 2000) {
+    $Collector.LongLines++
+    $line = $line.Substring(0, 1950) + ' [line truncated]'
+  }
+  $line = [regex]::Replace($line, '\x1b\[[0-?]*[ -/]*[@-~]', '')
+  $line = $line.TrimEnd("`r", "`n") + "`n"
+  if ($Collector.Head.Length -lt 1024) {
+    $null = $Collector.Head.Append($line.Substring(0, [Math]::Min($line.Length, 1024 - $Collector.Head.Length)))
+  }
+  $failurePattern = '^\s*(?:\[stderr\]\s*)?(?:not ok(?:\s|$)|' + [regex]::Escape([string][char]0x2716) + '|#\s*(?:fail|failed)\b|(?:AssertionError|Error):)|failing tests:'
+  if ($line -match $failurePattern -and $Collector.FailureBlocks -lt 8) {
+    $Collector.FailureBlocks++
+    $Collector.FailureLinesLeft = 12
+  }
+  if ($Collector.FailureLinesLeft -gt 0) {
+    $Collector.FailureLinesLeft--
+    if ($Collector.Failures.Length -lt 4096) {
+      $null = $Collector.Failures.Append($line.Substring(0, [Math]::Min($line.Length, 4096 - $Collector.Failures.Length)))
+    }
+  }
+  $Collector.Tail.Enqueue($line); $Collector.TailChars += $line.Length
+  while ($Collector.Tail.Count -gt 80 -or $Collector.TailChars -gt 3072) {
+    $Collector.TailChars -= $Collector.Tail.Dequeue().Length
+    $Collector.TailEvictions++
+  }
+}
+
+function Format-BoundedTestOutput($Collector) {
+  return ("lines=$($Collector.Lines); longLines=$($Collector.LongLines); tailEvictions=$($Collector.TailEvictions); failureBlocks=$($Collector.FailureBlocks)`n" +
+    "--- first output ---`n" + $Collector.Head.ToString() +
+    "--- retained failure context ---`n" + $Collector.Failures.ToString() +
+    "--- final output tail ---`n" + ($Collector.Tail.ToArray() -join ''))
+}
+
+function Invoke-BoundedTestCapture([scriptblock]$Command) {
+  $collector = New-BoundedTestOutputCollector
+  $previousPreference = $script:ErrorActionPreference
+  $previousEncoding = $null
+  $exitCode = $null
+  try {
+    try { $previousEncoding = [Console]::OutputEncoding; [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) } catch {}
+    # The command is defined in script scope. A function-local preference alone
+    # does not protect it from PS5.1's redirected-stderr NativeCommandError.
+    $script:ErrorActionPreference = 'Continue'
+    $ErrorActionPreference = 'Continue'
+    $global:LASTEXITCODE = $null
+    & $Command 2>&1 | ForEach-Object {
+      try { Add-BoundedTestOutputLine $collector $_ }
+      catch {
+        if (-not $collector.CaptureError) { $collector.CaptureError = ([string]$_.Exception.Message).Substring(0, [Math]::Min(512, ([string]$_.Exception.Message).Length)) }
+        # Continue draining the native command so its real exit remains known.
+      }
+    }
+    $exitCode = $global:LASTEXITCODE
+  } catch {
+    $collector.CaptureError = ([string]$_.Exception.Message).Substring(0, [Math]::Min(512, ([string]$_.Exception.Message).Length))
+    $exitCode = $global:LASTEXITCODE
+  } finally {
+    $script:ErrorActionPreference = $previousPreference
+    if ($null -ne $previousEncoding) { try { [Console]::OutputEncoding = $previousEncoding } catch {} }
+  }
+  return [pscustomobject]@{
+    ExitCode = $exitCode; Text = Format-BoundedTestOutput $collector
+    CaptureError = $collector.CaptureError; Lines = $collector.Lines; TailEvictions = $collector.TailEvictions
+  }
+}
+
 # ---------- Core install ----------
 
 $InstallDir = Get-NormalizedPath $InstallDir
@@ -1253,6 +1335,7 @@ $oldRenamed = $false
 $oldHealth = $null
 $candidate = $null
 $buildInfo = $null
+$installTestCapture = $null
 $preserveRecoveryArtifacts = $false
 
 if ($MigrateFrom) {
@@ -1311,8 +1394,15 @@ try {
     $previousSkipInstallTest = $env:RELAYBRIDGE_SKIP_INSTALL_TEST
     try {
       $env:RELAYBRIDGE_SKIP_INSTALL_TEST = '1'
-      npm test
-      if ($LASTEXITCODE -ne 0) { throw 'npm test failed in staging' }
+      if ($env:RELAYBRIDGE_INSTALL_TEST_ERROR_FILE) {
+        $installTestCapture = Invoke-BoundedTestCapture { npm test }
+        if ($null -eq $installTestCapture.ExitCode) { throw 'npm test capture ended without a native exit code' }
+        if ($installTestCapture.ExitCode -ne 0) { throw 'npm test failed in staging' }
+        if ($installTestCapture.CaptureError) { throw 'npm test diagnostics could not be captured reliably' }
+      } else {
+        npm test
+        if ($LASTEXITCODE -ne 0) { throw 'npm test failed in staging' }
+      }
     } finally {
       $env:RELAYBRIDGE_SKIP_INSTALL_TEST = $previousSkipInstallTest
     }
@@ -1407,6 +1497,11 @@ try {
         $_.Exception.ToString()
         $_.ScriptStackTrace
       ) -join "`r`n"
+      if ($installTestCapture) {
+        $diagnostic += "`r`n--- inner npm test output (bounded); exit=$($installTestCapture.ExitCode) ---`r`n"
+        if ($installTestCapture.CaptureError) { $diagnostic += "capture error: $($installTestCapture.CaptureError)`r`n" }
+        $diagnostic += $installTestCapture.Text + "`r`n--- end inner npm test output ---"
+      }
       [IO.File]::WriteAllText($env:RELAYBRIDGE_INSTALL_TEST_ERROR_FILE, ($diagnostic + "`r`n"), [Text.UTF8Encoding]::new($false))
     } catch {
       # Test-only diagnostics must never interfere with the production rollback.

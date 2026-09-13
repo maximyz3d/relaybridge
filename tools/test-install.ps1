@@ -58,6 +58,111 @@ function Test-ProcessRunning([int]$ProcessId) {
   } catch { return $false }
 }
 
+$script:fixtureBridges = @{}
+
+function Register-FixtureBridgeLaunch([int]$Port) {
+  if ($Port -le 0 -or $script:fixtureBridges.ContainsKey($Port)) { throw 'invalid or duplicate fixture launch port' }
+  $script:fixtureBridges[$Port] = @{
+    Port = $Port; Pinned = $false; ProcessHandle = $null; Pid = 0; BuildId = ''; InstanceId = ''
+    ShutdownAttempted = $false; Reason = 'launch registered; candidate identity not yet pinned'
+  }
+}
+
+function Confirm-FixtureBridgeIdentity([int]$Port, [string]$ExpectedBuildId) {
+  $entry = $script:fixtureBridges[$Port]
+  if (-not $entry -or $entry.Pinned) { throw 'fixture launch must be registered exactly once before pinning' }
+  $health = Get-BridgeHealth $Port
+  $candidatePid = 0
+  if (-not $health -or -not $health.capabilityAuth -or
+      $health.instanceId -isnot [string] -or -not $health.instanceId.Trim() -or
+      -not [int]::TryParse([string]$health.pid, [ref]$candidatePid) -or $candidatePid -le 0 -or
+      -not $ExpectedBuildId -or [string]$health.buildId -cne $ExpectedBuildId) {
+    $entry.Reason = 'candidate health or expected build identity unavailable'
+    throw $entry.Reason
+  }
+  $handle = Get-BridgeShutdownProcessHandle $candidatePid
+  if (-not $handle) { $entry.Reason = 'candidate process could not be pinned'; throw $entry.Reason }
+  $entry.ProcessHandle = $handle; $entry.Pid = $candidatePid
+  $entry.BuildId = $ExpectedBuildId; $entry.InstanceId = [string]$health.instanceId
+  $entry.Health = $health; $entry.Pinned = $true; $entry.Reason = 'original candidate handle retained'
+  if ($handle.HasExited) { $entry.Reason = 'candidate exited before identity confirmation'; throw $entry.Reason }
+  return $health
+}
+
+function Stop-TrackedFixtureBridge([int]$Port, [string]$TokenPath) {
+  $entry = $script:fixtureBridges[$Port]
+  if (-not $entry -or -not $entry.Pinned -or -not $entry.ProcessHandle) {
+    throw 'fixture ownership is uncertain; preserve its files'
+  }
+  try {
+    $health = Get-BridgeHealth $Port
+    if ($health) {
+      if ($entry.ProcessHandle.HasExited -or -not $health.capabilityAuth -or
+          [string]$health.pid -cne [string]$entry.Pid -or [string]$health.buildId -cne $entry.BuildId -or
+          ([string]$health.instanceId -cne $entry.InstanceId)) {
+        throw 'replacement identity occupies the fixture port'
+      }
+      if ($entry.ShutdownAttempted) { throw 'fixture shutdown already attempted; preserve unsettled ownership' }
+      $token = (Get-Content -LiteralPath $TokenPath -Raw -ErrorAction Stop).Trim()
+      if ($token -notmatch '^[A-Fa-f0-9]{64}$') { throw 'fixture capability token is unavailable or invalid' }
+      $entry.ShutdownAttempted = $true
+      try {
+        $reply = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/admin/shutdown" -Method Post -Headers @{ 'X-RelayBridge-Token' = $token } -ContentType 'application/json' -Body '{}' -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
+      } catch {
+        $detail = [string]$_.ErrorDetails.Message
+        if ($detail -match 'BRIDGE_BUSY') { throw ('BRIDGE_BUSY: ' + $detail.Substring(0, [Math]::Min(768, $detail.Length))) }
+        throw 'authenticated fixture shutdown was refused; original process remains tracked'
+      } finally { $token = $null }
+      if (-not $reply.ok -or [string]$reply.pid -cne [string]$entry.Pid -or
+          ([string]$reply.instanceId -cne $entry.InstanceId)) {
+        if ([string]$reply.code -eq 'BRIDGE_BUSY') { throw 'BRIDGE_BUSY: fixture still has active work' }
+        throw 'fixture shutdown response did not acknowledge the pinned identity'
+      }
+    } elseif (-not $entry.ProcessHandle.HasExited) {
+      throw 'missing health with a live pinned fixture process'
+    }
+    # A free port alone is never process-death proof. Wait on the ORIGINAL
+    # handle, using the same bound as production Stop-BridgeForCutover.
+    if (-not $entry.ProcessHandle.WaitForExit(10000)) { throw 'original fixture process did not exit after shutdown' }
+    $quiet = $false
+    for ($attempt = 0; $attempt -lt 50; $attempt++) {
+      if (-not (Test-LocalPortInUse $Port)) { $quiet = $true; break }
+      Start-Sleep -Milliseconds 100
+    }
+    if (-not $quiet -or (Test-LocalPortInUse $Port)) { throw 'fixture port remains occupied after original process exit' }
+    $entry.ProcessHandle.Dispose()
+    $script:fixtureBridges.Remove($Port)
+  } catch {
+    $entry.Reason = [string]$_.Exception.Message
+    throw
+  }
+}
+
+function Get-PreservedFixtureBridgeReasons {
+  return @($script:fixtureBridges.Values | ForEach-Object { "port=$($_.Port) pid=$($_.Pid): $($_.Reason)" })
+}
+
+function Read-BoundedInstallDiagnostic([string]$Path) {
+  if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return '' }
+  $stream = [IO.File]::OpenRead($Path)
+  try {
+    # Bound the read itself, including an unexpectedly large/corrupt diagnostic.
+    $bytes = New-Object byte[] ([int][Math]::Min(48000, $stream.Length))
+    if ($stream.Length -le 48000) {
+      $read = $stream.Read($bytes, 0, $bytes.Length)
+      $text = [Text.Encoding]::UTF8.GetString($bytes, 0, $read)
+      if ($text.Length -le 12000) { return $text.Trim() }
+      return ($text.Substring(0, 1500) + "`n[diagnostic middle omitted]`n" + $text.Substring($text.Length - 10400)).Trim()
+    }
+    $headRead = $stream.Read($bytes, 0, 6000)
+    $head = [Text.Encoding]::UTF8.GetString($bytes, 0, $headRead)
+    $null = $stream.Seek(-42000, [IO.SeekOrigin]::End)
+    $tailRead = $stream.Read($bytes, 0, 42000)
+    $tail = [Text.Encoding]::UTF8.GetString($bytes, 0, $tailRead)
+    return ($head.Substring(0, [Math]::Min(1500, $head.Length)) + "`n[diagnostic middle omitted]`n" + $tail.Substring([Math]::Max(0, $tail.Length - 10400))).Trim()
+  } finally { $stream.Dispose() }
+}
+
 function Invoke-TestInstall(
   [string]$FailAt = '',
   [switch]$Start,
@@ -76,6 +181,7 @@ function Invoke-TestInstall(
   $previousGitHubRegistry = $env:RELAYBRIDGE_GITHUB_REPOS
   $previousDataDir = $env:RELAYBRIDGE_DATA_DIR
   $previousPsDataDir = $env:PS_BRIDGE_DATA_DIR
+  $previousWarmDiag = $env:RELAYBRIDGE_WARM_DIAG
   $errorFile = Join-Path $testRoot ('install-error-' + [Guid]::NewGuid().ToString('N') + '.txt')
   try {
     $env:RELAYBRIDGE_INSTALL_TEST_FAIL_AT = $FailAt
@@ -87,6 +193,7 @@ function Invoke-TestInstall(
     $env:RELAYBRIDGE_GITHUB_REPOS = $null
     $env:RELAYBRIDGE_DATA_DIR = $null
     $env:PS_BRIDGE_DATA_DIR = $null
+    $env:RELAYBRIDGE_WARM_DIAG = '0'
     $arguments = @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $installer,
       '-SourceDir', $InstallSource, '-InstallDir', $TargetInstallDir, '-SkipProviderSetup', '-SkipCliPathRegistration', '-NoBrowser', '-Port', [string]$Port)
     if ($MigrationSource) { $arguments += @('-MigrateFrom', $MigrationSource) }
@@ -99,12 +206,10 @@ function Invoke-TestInstall(
     $proc.WaitForExit()
     $exitCode = [int]$proc.ExitCode
     $proc.Dispose()
-    $diagnostic = if (Test-Path -LiteralPath $errorFile -PathType Leaf) {
-      [IO.File]::ReadAllText($errorFile, [Text.UTF8Encoding]::new($false)).Trim()
-    } else { '' }
+    $diagnostic = Read-BoundedInstallDiagnostic $errorFile
     if ($exitCode -ne 0) {
-      $boundedDiagnostic = if ($diagnostic) { $diagnostic.Substring(0, [Math]::Min(12000, $diagnostic.Length)) } else { '(child installer produced no diagnostic file)' }
-      Write-Host "[RelayBridge test] installer exit=$exitCode failpoint=$FailAt port=$Port`n$boundedDiagnostic"
+      $displayDiagnostic = if ($diagnostic) { $diagnostic } else { '(child installer produced no diagnostic file)' }
+      Write-Host "[RelayBridge test] installer exit=$exitCode failpoint=$FailAt port=$Port`n$displayDiagnostic"
     }
     return [pscustomobject]@{ ExitCode = $exitCode; Port = $Port; Diagnostic = $diagnostic }
   } finally {
@@ -114,6 +219,7 @@ function Invoke-TestInstall(
     $env:RELAYBRIDGE_GITHUB_REPOS = $previousGitHubRegistry
     $env:RELAYBRIDGE_DATA_DIR = $previousDataDir
     $env:PS_BRIDGE_DATA_DIR = $previousPsDataDir
+    $env:RELAYBRIDGE_WARM_DIAG = $previousWarmDiag
   }
 }
 
@@ -213,7 +319,8 @@ function Test-RequiredStripEnvMigration([string]$InstalledStripEnvJson) {
   'Copy-ReleaseSource', 'Get-ReleaseIdentityFiles', 'Get-BridgeHealth',
   'Test-LocalPortInUse', 'Start-StagedBridge',
   'Move-InstallDirectoryOnce', 'Move-InstallRootForCutover',
-  'Get-BridgeShutdownProcessHandle', 'Stop-BridgeForCutover'
+  'Get-BridgeShutdownProcessHandle', 'Stop-BridgeForCutover',
+  'New-BoundedTestOutputCollector', 'Add-BoundedTestOutputLine', 'Format-BoundedTestOutput', 'Invoke-BoundedTestCapture'
 ))))
 
 # Exercise the real grouped JSONL migration independently of a release cutover.
@@ -810,6 +917,123 @@ Write-Host '[RelayBridge] Stop-BridgeForCutover authenticated-shutdown-failure c
 }
 Write-Host '[RelayBridge] Stop-BridgeForCutover clean-exit success case passed.' -ForegroundColor DarkGray
 
+# Exercise bounded diagnostics with the actual PS5.1 native stderr behavior,
+# both Node reporters, and an early failure outside the retained head/tail.
+& {
+  $collector = New-BoundedTestOutputCollector
+  for ($i = 0; $i -lt 100; $i++) { Add-BoundedTestOutputLine $collector "ok $i - padding before failure" }
+  Add-BoundedTestOutputLine $collector 'not ok 101 - early TAP regression'
+  Add-BoundedTestOutputLine $collector '  error: expected pinned original handle'
+  Add-BoundedTestOutputLine $collector ([string][char]0x2716 + ' early SPEC regression')
+  for ($i = 0; $i -lt 1400; $i++) { Add-BoundedTestOutputLine $collector "ok $i - later passing subtest" }
+  Add-BoundedTestOutputLine $collector '# tests 1503'
+  Add-BoundedTestOutputLine $collector '# fail 2'
+  $text = Format-BoundedTestOutput $collector
+  Assert-True ($text.Contains('early TAP regression') -and $text.Contains('expected pinned original handle')) 'early TAP failure context survives later passing tests'
+  Assert-True ($text.Contains('early SPEC regression') -and $text.Contains('# fail 2')) 'SPEC failures and final summary survive capture'
+  Assert-True ($text.Length -lt 9000 -and $collector.TailEvictions -gt 1000) 'retained diagnostic memory/output is bounded'
+  Add-BoundedTestOutputLine $collector ('x' * 100000)
+  Assert-True ($collector.LongLines -eq 1 -and (Format-BoundedTestOutput $collector).Length -lt 9000) 'a huge single line is truncated before retention'
+
+  $captureRoot = Join-Path ([IO.Path]::GetTempPath()) ('relaybridge-output-fixture-' + [Guid]::NewGuid().ToString('N'))
+  New-Item -ItemType Directory -Path $captureRoot | Out-Null
+  try {
+    $commandPath = Join-Path $captureRoot 'npm.cmd'
+    [IO.File]::WriteAllText($commandPath, "@echo off`r`necho stdout-marker`r`necho stderr-marker 1>&2`r`nexit /b 7`r`n")
+    $beforePreference = $script:ErrorActionPreference
+    $beforeEncoding = [Console]::OutputEncoding.CodePage
+    $result = Invoke-BoundedTestCapture { & $commandPath }
+    Assert-True ($result.ExitCode -eq 7 -and -not $result.CaptureError) 'native stderr cannot mask the authoritative exit 7'
+    Assert-True ($result.Text.Contains('stdout-marker') -and $result.Text.Contains('stderr-marker')) 'both native streams are retained'
+    Assert-True ($script:ErrorActionPreference -eq $beforePreference -and [Console]::OutputEncoding.CodePage -eq $beforeEncoding) 'capture restores preference and console encoding'
+    & {
+      function Add-BoundedTestOutputLine { throw 'injected collector failure' }
+      $failedCapture = Invoke-BoundedTestCapture { & $commandPath }
+      Assert-True ($failedCapture.ExitCode -eq 7 -and $failedCapture.CaptureError -match 'injected collector failure') 'a collector failure keeps draining and preserves native exit'
+    }
+    [IO.File]::WriteAllText($commandPath, "@echo off`r`necho success-stderr 1>&2`r`nexit /b 0`r`n")
+    $successCapture = Invoke-BoundedTestCapture { & $commandPath }
+    Assert-True ($successCapture.ExitCode -eq 0 -and $successCapture.Text.Contains('success-stderr')) 'stderr alone does not turn native success into failure'
+    $missing = Invoke-BoundedTestCapture { & (Join-Path $captureRoot 'missing-command.cmd') }
+    Assert-True ($null -eq $missing.ExitCode) 'a command that never launches cannot inherit a prior successful native exit'
+
+    $diagnosticPath = Join-Path $captureRoot 'error.txt'
+    [IO.File]::WriteAllText($diagnosticPath, ('original-exception' + ('z' * 1000000) + $text), [Text.UTF8Encoding]::new($false))
+    $printed = Read-BoundedInstallDiagnostic $diagnosticPath
+    Assert-True ($printed.Length -le 12000 -and $printed.Contains('original-exception') -and $printed.Contains('early TAP regression') -and $printed.Contains('# fail 2')) 'bounded file reads retain original error, early failure and final summary within printed cap'
+  } finally { Remove-Item -LiteralPath $captureRoot -Recurse -Force }
+}
+Write-Host '[RelayBridge] Bounded native staging-output diagnostics passed.' -ForegroundColor DarkGray
+
+# Mocks are confined to this child scope. Every failure retains the original
+# handle; only its physical exit plus listener quiescence permits disposal.
+& {
+  $savedFixtureBridges = $script:fixtureBridges
+  try {
+    foreach ($scenario in @('clean', 'busy', 'replyBusy', 'replacedPid', 'replacedBuild', 'replacedInstance', 'noHealthLive', 'noHealthExited', 'noExit', 'occupied', 'reacquired', 'invalidToken', 'unpinned')) {
+      $script:fixtureBridges = @{}
+      $counter = @{ posts = 0; waits = 0; disposals = 0; ports = 0; captured = 0 }
+      $health = [pscustomobject]@{ pid = 4242; buildId = 'fixture-build'; instanceId = 'fixture-instance'; capabilityAuth = $true }
+      $process = [pscustomobject]@{ Counter = $counter; HasExited = $false; WaitResult = ($scenario -ne 'noExit') }
+      $process | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {
+        param($Milliseconds)
+        if ($Milliseconds -ne 10000) { throw 'changed production wait bound' }
+        $this.Counter.waits++; return $this.WaitResult
+      }
+      $process | Add-Member -MemberType ScriptMethod -Name Dispose -Value { $this.Counter.disposals++ }
+      function Get-BridgeHealth { return $health }
+      function Get-BridgeShutdownProcessHandle { $counter.captured++; return $process }
+      function Get-Content { if ($scenario -eq 'invalidToken') { return 'invalid' }; return ('a' * 64) }
+      function Invoke-RestMethod {
+        $counter.posts++
+        if ($scenario -eq 'busy') {
+          $errorRecord = [Management.Automation.ErrorRecord]::new([InvalidOperationException]::new('busy'), 'BusyFixture', [Management.Automation.ErrorCategory]::ResourceBusy, $null)
+          $errorRecord.ErrorDetails = [Management.Automation.ErrorDetails]::new('{"code":"BRIDGE_BUSY","children":1,"probes":1}')
+          throw $errorRecord
+        }
+        if ($scenario -eq 'replyBusy') { return [pscustomobject]@{ ok = $false; code = 'BRIDGE_BUSY' } }
+        return [pscustomobject]@{ ok = $true; pid = 4242; instanceId = 'fixture-instance' }
+      }
+      function Test-LocalPortInUse {
+        $counter.ports++
+        return ($scenario -eq 'occupied' -or ($scenario -eq 'reacquired' -and $counter.ports -gt 1))
+      }
+      function Start-Sleep {}
+      Register-FixtureBridgeLaunch 43210
+      if ($scenario -ne 'unpinned') { $null = Confirm-FixtureBridgeIdentity 43210 'fixture-build' }
+      switch ($scenario) {
+        'replacedPid' { $health.pid = 4243 }
+        'replacedBuild' { $health.buildId = 'replacement-build' }
+        'replacedInstance' { $health.instanceId = 'replacement-instance' }
+        'noHealthLive' { $health = $null }
+        'noHealthExited' { $health = $null; $process.HasExited = $true }
+      }
+      $failure = ''
+      try { Stop-TrackedFixtureBridge 43210 'C:\fixture-token' } catch { $failure = $_.Exception.Message }
+      $settled = $scenario -in @('clean', 'noHealthExited')
+      Assert-True (($failure -eq '') -eq $settled) "$scenario has the expected settlement result"
+      Assert-True (($script:fixtureBridges.Count -eq 0) -eq $settled) "$scenario releases tracking only after physical settlement"
+      Assert-True ($counter.disposals -eq [int]$settled) "$scenario disposes the original handle only after physical settlement"
+      if ($scenario -in @('replacedPid', 'replacedBuild', 'replacedInstance', 'noHealthLive', 'noHealthExited', 'invalidToken', 'unpinned')) {
+        Assert-True ($counter.posts -eq 0) "$scenario does not send a shutdown to an unverified identity"
+      }
+      if ($scenario -in @('busy', 'replyBusy')) {
+        Assert-True ($failure -match 'BRIDGE_BUSY' -and $counter.waits -eq 0 -and $counter.ports -eq 0) "$scenario preserves busy evidence without treating listener closure as proof"
+        try { Stop-TrackedFixtureBridge 43210 'C:\fixture-token' } catch {}
+        Assert-True ($counter.posts -eq 1 -and $counter.disposals -eq 0) "$scenario cleanup never repeats the refused shutdown or disposes the held handle"
+      }
+      if ($settled) { Assert-True ($counter.waits -eq 1 -and $counter.ports -eq 2) "$scenario verifies original handle and stable listener closure" }
+    }
+    $script:fixtureBridges = @{}
+    $health = [pscustomobject]@{ pid = 4242; buildId = 'fixture-build'; instanceId = ''; capabilityAuth = $true }
+    Register-FixtureBridgeLaunch 43210
+    $rejectedIncompleteIdentity = $false
+    try { $null = Confirm-FixtureBridgeIdentity 43210 'fixture-build' } catch { $rejectedIncompleteIdentity = $true }
+    Assert-True ($rejectedIncompleteIdentity -and -not $script:fixtureBridges[43210].Pinned) 'missing instance identity cannot downgrade exact-candidate tracking'
+  } finally { $script:fixtureBridges = $savedFixtureBridges }
+}
+Write-Host '[RelayBridge] Tracked fixture shutdown/quiescence cases passed.' -ForegroundColor DarkGray
+
 if ($SafetyOnly) {
   if (Test-Path -LiteralPath $testRoot) { Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue }
   Write-Host '[RelayBridge] Windows install safety-only tests passed.' -ForegroundColor Green
@@ -871,6 +1095,7 @@ server.listen(port, '127.0.0.1');
   [IO.File]::WriteAllText((Join-Path $installRoot 'data\receipts\preserved.jsonl'), "{`"receiptId`":`"old`"}`n", [Text.UTF8Encoding]::new($false))
 
   $operatorConfig = [ordered]@{
+    _models = [ordered]@{ discoverOnBoot = $false }
     _comment = "operator-owned config $emDash UTF-8 survives every merge"
     _supervisor = [ordered]@{
       providerBudget = [ordered]@{
@@ -994,11 +1219,15 @@ server.listen(port, '127.0.0.1');
   Assert-True (-not (Get-NetTCPConnection -State Listen -LocalPort $legacyPort -ErrorAction SilentlyContinue)) 'restored legacy bridge must shut down cleanly after rollback verification'
   $legacyPort = 0
 
-  $success = Invoke-TestInstall -Start
+  $startPort = Get-FreePort
+  Register-FixtureBridgeLaunch $startPort
+  $success = Invoke-TestInstall -Start -Port $startPort
   if ($success.ExitCode -ne 0) {
     throw "Installer success case failed with exit code $($success.ExitCode). $($success.Diagnostic)"
   }
   $startedPort = $success.Port
+  $candidateBuild = [IO.File]::ReadAllText((Join-Path $installRoot 'build-info.json')) | ConvertFrom-Json
+  $pinnedCandidateHealth = Confirm-FixtureBridgeIdentity $startPort ([string]$candidateBuild.buildId)
   Assert-True (Test-Path -LiteralPath (Join-Path $installRoot 'server.js') -PathType Leaf) 'new server.js must be promoted'
   Assert-True (Test-Path -LiteralPath (Join-Path $installRoot 'relaybridge.cmd') -PathType Leaf) 'Windows CLI shim must be promoted'
   # WSL may launch this harness from a UNC checkout. cmd.exe cannot use that
@@ -1072,6 +1301,8 @@ server.listen(port, '127.0.0.1');
   Assert-True (@($merged.claude.safe) -contains '--operator-flag') 'managed-argument migration must preserve unrelated operator flags'
   Assert-True ($merged.claude_fable.safe[[Array]::IndexOf(@($merged.claude_fable.safe), '--model') + 1] -eq 'operator-fable-model') 'managed-argument migration must preserve the Fable model choice'
   Assert-True ($merged.cursor.tags[0] -eq 'custom-routing') 'operator routing tags must be preserved'
+  Assert-True ($merged._models.discoverOnBoot -eq $false) 'operator discovery opt-out must survive the release merge'
+  Assert-True ($merged._models.discoveryMaxAgeMs -eq $shippedConfig._models.discoveryMaxAgeMs) 'operator discovery opt-out must preserve shipped sibling defaults'
   Assert-True ($merged.cursor.probe_expect -eq 'Logged in as') 'missing release fields must be added to existing providers'
   Assert-True ($merged.copilot.credential_env -ceq 'COPILOT_HOME') 'the installed retired Copilot environment variable must migrate end-to-end'
   Assert-True ((Test-ExactJsonStringArray $merged.copilot.credential_markers @('config.json'))) 'the installed retired Copilot marker must migrate end-to-end'
@@ -1091,16 +1322,10 @@ server.listen(port, '127.0.0.1');
 
   $build = [IO.File]::ReadAllText((Join-Path $installRoot 'build-info.json'), [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
   Assert-True ([string]$build.buildId -match $releaseBuildIdPattern) 'installed release must have an exact code-hash build identity'
-  $health = Invoke-RestMethod -Uri "http://127.0.0.1:$($success.Port)/api/health" -TimeoutSec 3 -UseBasicParsing
+  $health = $pinnedCandidateHealth
   Assert-True ([string]$health.buildId -eq [string]$build.buildId) 'promoted server health must report the exact staged build identity'
   Assert-True ($health.buildIdentityReady -eq $true) 'promoted server must report a ready exact build identity before install succeeds'
-  $token = (Get-Content -LiteralPath (Join-Path $installRoot '.bridge-token') -Raw).Trim()
-  Invoke-RestMethod -Uri "http://127.0.0.1:$($success.Port)/api/admin/shutdown" -Method Post -Headers @{ 'X-RelayBridge-Token' = $token } -ContentType 'application/json' -Body '{}' -TimeoutSec 3 -UseBasicParsing | Out-Null
-  for ($attempt = 0; $attempt -lt 50; $attempt++) {
-    try { Invoke-RestMethod -Uri "http://127.0.0.1:$($success.Port)/api/health" -TimeoutSec 1 -UseBasicParsing | Out-Null }
-    catch { break }
-    Start-Sleep -Milliseconds 100
-  }
+  Stop-TrackedFixtureBridge $startPort (Join-Path $installRoot '.bridge-token')
   $startedPort = 0
 
   # Exercise the distinct-root migration contract end to end. Runtime files
@@ -1142,6 +1367,9 @@ server.listen(port, '127.0.0.1');
   Assert-True ((Get-ChildItem -LiteralPath $testRoot -Directory | Where-Object { $_.Name -match '\.(stage|rollback|failed)\.' }).Count -eq 0) 'temporary release directories must be cleaned'
 
   Write-Host '[RelayBridge] Transactional install/rollback preservation test passed.' -ForegroundColor Green
+} catch {
+  $script:fixtureError = $_
+  throw
 } finally {
   if ($legacyPort -and (Test-Path -LiteralPath (Join-Path $installRoot '.bridge-token') -PathType Leaf)) {
     try {
@@ -1150,16 +1378,20 @@ server.listen(port, '127.0.0.1');
     } catch {}
   }
   if ($legacyProcess -and -not $legacyProcess.HasExited) { Stop-Process -Id $legacyProcess.Id -Force -ErrorAction SilentlyContinue }
-  if ($startedPort -and (Test-Path -LiteralPath (Join-Path $installRoot '.bridge-token') -PathType Leaf)) {
-    try {
-      $cleanupToken = (Get-Content -LiteralPath (Join-Path $installRoot '.bridge-token') -Raw).Trim()
-      Invoke-RestMethod -Uri "http://127.0.0.1:$startedPort/api/admin/shutdown" -Method Post -Headers @{ 'X-RelayBridge-Token' = $cleanupToken } -ContentType 'application/json' -Body '{}' -TimeoutSec 2 -UseBasicParsing | Out-Null
-      Start-Sleep -Milliseconds 500
-    } catch {}
+  foreach ($trackedPort in @($script:fixtureBridges.Keys)) {
+    try { Stop-TrackedFixtureBridge $trackedPort (Join-Path $installRoot '.bridge-token') }
+    catch { $script:fixtureBridges[$trackedPort].Reason = [string]$_.Exception.Message }
   }
-  $resolvedTestRoot = [IO.Path]::GetFullPath($testRoot)
-  $resolvedTempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
-  if ($resolvedTestRoot.StartsWith($resolvedTempRoot, [StringComparison]::OrdinalIgnoreCase) -and (Split-Path -Leaf $resolvedTestRoot) -like 'relaybridge-install-test-*') {
-    Remove-Item -LiteralPath $resolvedTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+  if ($script:fixtureBridges.Count -gt 0) {
+    $reasons = Get-PreservedFixtureBridgeReasons
+    Write-Host "Fixture files preserved at $testRoot`n$($reasons -join "`n")"
+    # Preserve the primary ErrorRecord/stack already being rethrown by catch.
+    if (-not $script:fixtureError) { throw "Fixture process quiescence is unproven. $($reasons -join '; ')" }
+  } else {
+    $resolvedTestRoot = [IO.Path]::GetFullPath($testRoot)
+    $resolvedTempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
+    if ($resolvedTestRoot.StartsWith($resolvedTempRoot, [StringComparison]::OrdinalIgnoreCase) -and (Split-Path -Leaf $resolvedTestRoot) -like 'relaybridge-install-test-*') {
+      Remove-Item -LiteralPath $resolvedTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
   }
 }
