@@ -37,6 +37,140 @@ async function fixture(t) {
   }, { env: { ...unsetBridgeEnv, RELAYBRIDGE_WARM_DIAG: '0', RELAYBRIDGE_REMOTE_MCP: '0' } });
   return { ...bridge, events };
 }
+// Explicitly declared native protocol with a disposable metadata profile and
+// an inert Node transport. No installed Claude binary/account is used here.
+async function nativeClaudeFixture(t, { mutate = () => {}, registry = null, changeConfig = () => {}, env = {}, interleaveConfig = null } = {}) {
+  let profile, events, initial;
+  const nodeArgs = [];
+  const bridge = await startTestBridge(t, root => {
+    if (interleaveConfig) {
+      const preload = path.join(root, 'interleave-config.cjs');
+      fs.writeFileSync(preload, `const fs=require('node:fs'),path=require('node:path');
+        const read=fs.readFileSync,configPath=path.join(${JSON.stringify(root)},'config.json');
+        const arm=path.join(${JSON.stringify(root)},'arm-config-change'),done=path.join(${JSON.stringify(root)},'config-change-done');
+        fs.readFileSync=function(file,...args){const bytes=read.call(this,file,...args);
+          if(file===configPath&&fs.existsSync(arm)&&!fs.existsSync(done)&&new Error().stack.includes('executeOneShot')){
+            const config=JSON.parse(bytes);(${interleaveConfig.toString()})(config);
+            fs.writeFileSync(configPath,JSON.stringify(config));fs.writeFileSync(done,'changed');
+          }return bytes;};`);
+      nodeArgs.push('--require', preload);
+    }
+    profile = path.join(root, 'native-home', '.claude.json'); events = path.join(root, 'native-events.jsonl');
+    const accountUuid = '11111111-2222-3333-4444-555555555555', at = Date.now(), reset = Math.floor(at / 1000) * 1000 + 86400000;
+    initial = { oauthAccount: { accountUuid }, cachedUsageUtilization: { accountUuid, fetchedAtMs: at, utilization:
+      Object.fromEntries(['five_hour', 'seven_day'].map(name => [name, { utilization: 20, resets_at: new Date(reset - 437).toISOString() }])) } };
+    mutate(initial); fs.writeFileSync(profile, JSON.stringify(initial));
+    if (registry) { fs.mkdirSync(path.join(root, 'data')); fs.writeFileSync(path.join(root, 'data', 'accounts.json'), JSON.stringify({ providers: registry })); }
+    const script = path.join(root, 'native-fixture.cjs');
+    fs.writeFileSync(script, `const fs=require('node:fs');let input='';const event=type=>fs.appendFileSync(${JSON.stringify(events)},JSON.stringify({type,at:Date.now()})+'\\n');
+      const usage=()=>console.log(JSON.stringify({type:'rate_limit_event',rate_limit_info:{status:'allowed',unifiedWindows:{five_hour:{utilization:.2,resetsAt:${reset / 1000}},seven_day:{utilization:.2,resetsAt:${reset / 1000}}}}}));
+      process.stdin.on('data',c=>input+=c);process.stdin.on('end',()=>{event('started');
+        if(input.includes('HOLD')){if(!input.includes('TICK'))usage();const timer=setInterval(()=>{if(!input.includes('TICK'))usage();},100);
+          process.on('SIGTERM',()=>{clearInterval(timer);event('stopped');process.exit(0);});}
+        else {usage();console.log(JSON.stringify({type:'result',subtype:'success',result:'Synthetic native protocol completed.'}));event('finished');}});`);
+    const entry = { label: 'Synthetic native Claude', npm_package: '@anthropic-ai/claude-code', credential_env: 'CLAUDE_CONFIG_DIR', quota_seat: 'claude',
+      safe: [process.execPath], probe: [process.execPath, '--version'], version_probe: [process.execPath, '--version'],
+      model: 'fixture-model', model_tiers: { standard: { model: 'fixture-model', args: ['--model', 'fixture-model'] } },
+      oneshot_safe: [process.execPath, script, '--model', 'fixture-model'], oneshot_output_parser: 'claude_json',
+      oneshot_safe_filesystem_policy: 'read_only_enforced', oneshot_capabilities: { safe: ['model_invocation', 'workspace_read', 'tool_use'] } };
+    const cfg = { _models: { discoverOnBoot: false }, claude: entry, claude_fable: { ...entry } }; changeConfig(cfg, root); return cfg;
+  }, { nodeArgs, env: { ...unsetBridgeEnv, RELAYBRIDGE_WARM_DIAG: '0', RELAYBRIDGE_REMOTE_MCP: '0', ...env } });
+  return { ...bridge, profile, events, initial, usageFile: path.join(bridge.root, 'data', 'usage', 'native-usage.json'),
+    ask: (prompt = 'Complete synthetic protocol.', kind = 'claude') => bridge.request('/api/oneshot',
+      { kind, cwd: bridge.root, prompt, dangerous: false, modelTier: 'standard', effort: 'medium', useCache: false }) };
+}
+
+test('default native Claude cache refresh is non-generating, independent of Codex and deduplicates eligible aliases', async t => {
+  const bridge = await nativeClaudeFixture(t);
+  await waitFor(() => fs.existsSync(bridge.usageFile));
+  const before = JSON.parse(fs.readFileSync(bridge.usageFile)).claude;
+  assert.equal(before.source, 'claude_native_cache_v1'); assert.equal(before.observedAt, bridge.initial.cachedUsageUtilization.fetchedAtMs);
+  assert.equal(before.history.length, 1); assert.equal(completeJsonLines(bridge.events).length, 0);
+  assert.equal((await bridge.request('/api/usage/native/refresh', {})).status, 200);
+  assert.equal(JSON.parse(fs.readFileSync(bridge.usageFile)).claude.history.length, 1);
+  const reply = await bridge.ask(); assert.equal(reply.status, 200, JSON.stringify(reply.body)); assert.equal(reply.body.model_invocation, true);
+  const after = JSON.parse(fs.readFileSync(bridge.usageFile)).claude;
+  assert.equal(after.source, 'claude_stream_v1'); assert.equal(after.accountFingerprint, before.accountFingerprint);
+  assert.equal(after.buckets.account.windows.five_hour.accountFingerprint, before.accountFingerprint);
+  assert.equal(after.buckets.account.windows.five_hour.nativeResetNs, before.buckets.account.windows.five_hour.nativeResetNs);
+  const rejected = await bridge.request('/api/usage/native', { kind: 'claude', rate_limits: { five_hour: { used_percentage: 0, resets_at: Math.floor(Date.now() / 1000) + 86400 } } });
+  assert.equal(rejected.body.observed, false, 'unbound statusline cannot relabel the selected login');
+});
+
+test('stale, future, mismatched and incomplete native caches never authorize a fake model start', async t => {
+  for (const [name, mutate] of Object.entries({ stale: p => p.cachedUsageUtilization.fetchedAtMs -= 180001,
+    future: p => p.cachedUsageUtilization.fetchedAtMs += 60000, mismatch: p => p.cachedUsageUtilization.accountUuid = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+    incomplete: p => delete p.cachedUsageUtilization.utilization.seven_day })) await t.test(name, async sub => {
+    const bridge = await nativeClaudeFixture(sub, { mutate }); const reply = await bridge.ask();
+    assert.equal(reply.body.failureClass, 'quota_unknown', JSON.stringify(reply.body)); assert.equal(reply.body.model_invocation, false);
+    assert.equal(completeJsonLines(bridge.events).length, 0);
+    const stored = JSON.parse(fs.readFileSync(bridge.usageFile)).claude;
+    assert.ok(stored.selectedFingerprint); assert.equal(stored.observedAt, undefined);
+  });
+});
+test('inherited and explicit authentication overrides cannot authorize default-profile native launches', async t => {
+  for (const explicit of [false, true]) for (const key of require('../cli-config.json').claude_fable.strip_env) {
+    await t.test(`${explicit ? 'explicit' : 'inherited'} ${key}`, async sub => {
+      const bridge = await nativeClaudeFixture(sub, { env: explicit ? {} : { [key]: 'synthetic-selector' },
+        changeConfig: cfg => { cfg.claude.strip_env = []; cfg.claude_fable.enabled = false;
+          if (explicit) cfg.claude.oneshot_env = { [key]: 'synthetic-selector' }; } });
+      const reply = await bridge.ask(); assert.equal(reply.body.model_invocation, false, JSON.stringify(reply.body));
+      assert.equal(completeJsonLines(bridge.events).length, 0);
+    });
+  }
+});
+
+test('dispatch config snapshot cannot lose native identity requirements before capture', async t => {
+  for (const [name, interleaveConfig] of [
+    ['removed native markers', cfg => { delete cfg.claude.npm_package; delete cfg.claude.credential_env; }],
+    ['changed launch environment', cfg => { cfg.claude.oneshot_env = { SYNTHETIC_LAUNCH_CHANGE: 'changed' }; }],
+    ['changed quota seat', cfg => { cfg.claude.quota_seat = 'replacement-seat'; }],
+  ]) await t.test(name, async sub => {
+    const bridge = await nativeClaudeFixture(sub, { interleaveConfig,
+      mutate: p => { delete p.cachedUsageUtilization.utilization.seven_day; },
+      changeConfig: cfg => { cfg.claude_fable.enabled = false; } });
+    fs.writeFileSync(path.join(bridge.root, 'arm-config-change'), 'armed');
+    const reply = await bridge.ask();
+    assert.ok(fs.existsSync(path.join(bridge.root, 'config-change-done')), 'initial dispatch read returned the old native entry before the on-disk change');
+    assert.equal(reply.body.failureClass, 'account_identity_unavailable', JSON.stringify(reply.body));
+    assert.equal(reply.body.model_invocation, false);
+    assert.equal(completeJsonLines(bridge.events).length, 0);
+  });
+});
+
+test('native profile relocation and disabled or tombstoned aliases cannot silently use default capacity', async t => {
+  for (const [name, options, kind] of [
+    ['relocated', { changeConfig: (cfg, root) => { cfg.claude.oneshot_env = { CLAUDE_CONFIG_DIR: root }; cfg.claude_fable.enabled = false; } }, 'claude'],
+    ['home', { changeConfig: (cfg, root) => { cfg.claude.oneshot_env = { HOME: root }; cfg.claude_fable.enabled = false; } }, 'claude'],
+    ['disabled', { registry: { claude: { accounts: [{ id: 'default', enabled: false }] } } }, 'claude'],
+    ['tombstone', { registry: { claude_fable: { accounts: [] } } }, 'claude_fable'],
+  ]) await t.test(name, async sub => {
+    const bridge = await nativeClaudeFixture(sub, options); const reply = await bridge.ask('Complete synthetic protocol.', kind);
+    assert.equal(reply.body.model_invocation, false, JSON.stringify(reply.body)); assert.ok(reply.status >= 400);
+    assert.equal(completeJsonLines(bridge.events).length, 0);
+    if (fs.existsSync(bridge.usageFile)) assert.equal(JSON.parse(fs.readFileSync(bridge.usageFile)).claude.history.length, 1,
+      'only the remaining eligible alias can contribute one account observation');
+  });
+});
+
+test('native profile change stops an active stream without accepting quota under the new login', async t => {
+  for (const [name, mode, change] of [
+    ['quota event', 'HOLD', bridge => { const changed = structuredClone(bridge.initial); changed.oauthAccount.accountUuid = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'; fs.writeFileSync(bridge.profile, JSON.stringify(changed)); }],
+    ['silent tick', 'HOLD TICK', bridge => { const changed = structuredClone(bridge.initial); changed.oauthAccount.accountUuid = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'; fs.writeFileSync(bridge.profile, JSON.stringify(changed)); }],
+    ['disabled registry', 'HOLD', bridge => { fs.writeFileSync(path.join(bridge.root, 'data', 'accounts.json'), JSON.stringify({ providers: { claude: { accounts: [{ id: 'default', enabled: false }] } } })); }],
+    ['native configuration removed', 'HOLD TICK', bridge => { const cfg = JSON.parse(fs.readFileSync(bridge.configPath)); delete cfg.claude.npm_package; delete cfg.claude.credential_env; fs.writeFileSync(bridge.configPath, JSON.stringify(cfg)); }],
+  ]) await t.test(name, async sub => {
+    const bridge = await nativeClaudeFixture(sub), pending = bridge.ask(mode);
+    await waitFor(() => completeJsonLines(bridge.events).some(e => e.type === 'started'));
+    const before = JSON.parse(fs.readFileSync(bridge.usageFile)).claude;
+    change(bridge);
+    const reply = await pending; assert.equal(reply.body.supervisor_stop_reason, 'account_identity_changed', JSON.stringify(reply.body));
+    const after = JSON.parse(fs.readFileSync(bridge.usageFile)).claude;
+    assert.equal(after.accountFingerprint, before.accountFingerprint);
+    assert.equal(completeJsonLines(bridge.events).filter(e => e.type === 'started').length, 1);
+    assert.ok(fs.readdirSync(path.join(bridge.root, 'data', 'continuity', 'runs')).some(name => name.endsWith('.md')));
+  });
+});
 test('native quota stops only after a durable checkpoint and launches one physically fenced successor', { timeout: 30000 }, async (t) => {
   const bridge = await fixture(t);
   await waitFor(async () => (await bridge.request('/api/usage/native')).body.observations.some((o) => o.quotaSeat === 'codex' && o.freshness === 'fresh'));

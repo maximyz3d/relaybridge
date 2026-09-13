@@ -24,7 +24,7 @@ const { resolveConcurrencyPolicy } = require('./lib/concurrency-policy');
 const { createSubscriptionUsage } = require('./lib/subscription-usage');
 const { createContinuity } = require('./lib/continuity');
 const { createProgressAssessor } = require('./lib/progress-assessor');
-const { parseCodexRateLimits, parseClaudeStreamRateLimit, parseClaudeStatuslineUsage, readCodexRateLimits } = require('./lib/native-usage');
+const { parseCodexRateLimits, parseClaudeStreamRateLimit, parseClaudeStatuslineUsage, readCodexRateLimits, readClaudeNativeUsage } = require('./lib/native-usage');
 const { parseCodexOutput } = require('./lib/codex-output');
 const { validateProviderBudget } = require('./lib/provider-budget');
 const { promptTransportLimits, preparePrompt, renderPromptSlot } = require('./lib/prompt-transport');
@@ -2395,6 +2395,7 @@ const activeChildren = new Set();
 const ownedChildStops = new WeakMap();
 const liveOwnedAdmissions = new Set();
 const ownedDispatchIdentities = new Map();
+const ownedNativeAdmissions = new Map();
 let ownedExecutionBackend = null;
 const activeOneShots = new Map();
 const CONCURRENCY_POLICY = resolveConcurrencyPolicy();
@@ -4511,6 +4512,10 @@ async function executeOneShot(body, res, privateContext = null) {
   }
   const entry = cfg[kind];
   if (!entry) return rejectBeforeAdmission(400, 'validation', { error: 'unknown kind: ' + kind });
+  // Keep native admission tied to the entry that supplies the launch argv.
+  // A later config read must never downgrade an already-selected native launch.
+  const nativeDispatchConfig = Object.freeze({ required: isNativeClaudeEntry(entry),
+    entryGeneration: claudeEntryGeneration(entry) });
   let requestedProviderBudget;
   try {
     requestedProviderBudget = validateProviderBudget(body?.providerBudget);
@@ -4729,6 +4734,15 @@ async function executeOneShot(body, res, privateContext = null) {
     });
   }
   const selectedQuotaSeat = dispatchAccount.quotaSeat || quotaSeatForProvider(kind);
+  const nativeLaunchIdentity = captureClaudeLaunchIdentity(kind, dispatchAccount.account?.id || 'default', null,
+    Object.freeze({ ...nativeDispatchConfig, quotaSeat: selectedQuotaSeat }));
+  if (nativeLaunchIdentity.required) {
+    if (!nativeLaunchIdentity.identity) return rejectBeforeAdmission(409, 'account_identity_unavailable', {
+      error: 'The selected native Claude profile identity is unavailable.', model_invocation: false, physical_attempt_count: 0 });
+    observeClaudeNativeSnapshot(nativeLaunchIdentity);
+    if (!validateClaudeLaunchAdmission(nativeLaunchIdentity)) return rejectBeforeAdmission(409, 'quota_unknown', {
+      error: 'Native Claude requires fresh capacity bound to the selected profile and protected reserve.', model_invocation: false, physical_attempt_count: 0 });
+  }
   const providerCooldown = cooldowns.status(kind);
   const quotaCooldown = [cooldowns.status(selectedQuotaSeat),
     ...(providerCooldown.scope === 'model' ? [providerCooldown] : [])].find((state) => state.cooling);
@@ -5045,6 +5059,7 @@ async function executeOneShot(body, res, privateContext = null) {
     resolvedCwd = spawnCwdIdentity.resolved;
     ownedExecutionBackend?.assertWorkspaceLaunchAllowed({ cwd: resolvedCwd, privateContext, dangerous: useDanger });
     if (useDanger) writerWorkspaceBaseline = captureWriterWorkspaceSnapshot(resolvedCwd);
+    if (!validateClaudeLaunchAdmission(nativeLaunchIdentity, launch.env)) throw Object.assign(new Error('Native Claude launch identity or capacity changed.'), { code: 'NATIVE_LAUNCH_ADMISSION_CHANGED' });
     const spawnOpts = {
       cwd: resolvedCwd,
       env: launch.env,
@@ -5064,6 +5079,7 @@ async function executeOneShot(body, res, privateContext = null) {
       const identity = { provider: kind, accountId: dispatchAccount.account?.id || 'default',
         executionHash: ownerIdentityHash(execution), cwdIdentityHash: spawnCwdIdentity.cwdIdentityHash, cwdPolicyId: CWD_POLICY_IDENTITY };
       ownedDispatchIdentities.set(privateContext.taskId, Object.freeze(identity));
+      ownedNativeAdmissions.set(privateContext.taskId, { runId, identity: nativeLaunchIdentity, env: launch.env });
       ownedHandle = ownedExecutionBackend.prepareLaunch(privateContext, {
         binding: { requestId, invocationId, attemptId, runId, taskId: privateContext.taskId,
           reservationId: privateContext.reservationId, ...identity },
@@ -5077,13 +5093,17 @@ async function executeOneShot(body, res, privateContext = null) {
       ownedExecutionBackend.onReleased(ownedHandle.ownerId, () => {
         releasePhysicalAdmission(); liveOwnedAdmissions.delete(ownedHandle.ownerId);
         ownedDispatchIdentities.delete(privateContext.taskId);
+        ownedNativeAdmissions.delete(privateContext.taskId);
         activeRuns.delete(runId); continuityControls.delete(runId);
       });
       proc = await ownedHandle.start();
       if (!proc) throw Object.assign(new Error('Owned launch stopped before provider dispatch.'), { code: 'OWNER_START_CANCELLED' });
       ownedChildStops.set(proc, () => ownedHandle.stop());
       route.execution_owner = { ownerId: ownedHandle.ownerId, bindingHash: ownedHandle.bindingHash };
-    } else proc = trackChild(spawn(launch.file, launch.args, spawnOpts));
+    } else {
+      if (!validateClaudeLaunchAdmission(nativeLaunchIdentity, launch.env)) throw Object.assign(new Error('Native Claude launch admission changed.'), { code: 'NATIVE_LAUNCH_ADMISSION_CHANGED' });
+      proc = trackChild(spawn(launch.file, launch.args, spawnOpts));
+    }
     // ChildProcess stdin errors are emitted asynchronously and are not caught
     // by try/catch around write(). Always consume them so an early provider
     // exit (EPIPE) cannot crash the bridge process.
@@ -5107,7 +5127,7 @@ async function executeOneShot(body, res, privateContext = null) {
         cleanupPromptFile(); cleanupProviderHome();
         if (res._relayIsolationReceiptDeferred) persistCancellationReceipt();
       }).catch(() => {});
-    } else { cleanupPromptFile(); cleanupProviderHome(); }
+    } else { if (privateContext?.taskId) ownedNativeAdmissions.delete(privateContext.taskId); cleanupPromptFile(); cleanupProviderHome(); }
     releaseAdmission();
     if (err.validation) {
       return rejectBeforeAdmission(400, 'validation', {
@@ -5301,6 +5321,7 @@ async function executeOneShot(body, res, privateContext = null) {
   supervisor.progress.parser = entry.oneshot_output_parser || 'text';
   const continuityControl = { runId, kind, route, startedAt, supervisor, pid: proc.pid, cwd: resolvedCwd,
     objective: prompt, quotaFingerprint: subscriptionUsage.fingerprint(route.quota_seat), continuityId: body.continuityId || null, settled: false, reserve: null,
+    nativeLaunchIdentity,
     finalizeSupported: supportsClaudeStreamFinalization,
     finalize: requestGracefulFinalization };
   activeRuns.set(runId, continuityControl);
@@ -5314,7 +5335,11 @@ async function executeOneShot(body, res, privateContext = null) {
   const copilotDenials = createCopilotDenialObserver(kind);
   const usageObserver = createProviderUsageObserver(entry.oneshot_output_parser, supervisor, {
     onEvent: (event) => {
-      const observation = parseClaudeStreamRateLimit(event, { quotaSeat: route.quota_seat || quotaSeatForProvider(kind) });
+      if (nativeLaunchIdentity.required && !sameClaudeLaunchIdentity(nativeLaunchIdentity)) {
+        continuityControl.stop?.('account_identity_changed'); return;
+      }
+      const observation = parseClaudeStreamRateLimit(event, { quotaSeat: route.quota_seat || quotaSeatForProvider(kind),
+        accountFingerprint: nativeLaunchIdentity.identity?.accountFingerprint });
       if (observation) subscriptionUsage.observe(observation);
     },
     onTerminal: () => {
@@ -5792,6 +5817,10 @@ ownedExecutionBackend = createOwnedExecutionBackend({
   receiptStoreId: RECEIPT_STORE_IDENTITY.id,
   getTaskQueue: () => taskQueue, getPipeline: () => workflowPipeline,
   readExecutionIdentity: task => ownedDispatchIdentities.get(task.id) || null,
+  validateLaunchAdmission: binding => {
+    const captured = ownedNativeAdmissions.get(binding.taskId);
+    return !!captured && captured.runId === binding.runId && validateClaudeLaunchAdmission(captured.identity, captured.env);
+  },
 });
 const taskQueue = createTaskQueue({
   dataDir: path.join(DATA_DIR, 'tasks'),
@@ -6420,6 +6449,10 @@ const progressAssessor = createProgressAssessor({ dataDir: DATA_DIR, queue: task
 let continuityTickBusy = false;
 function observeRunContinuity(run) {
   const at = Date.now();
+  if ((run.nativeLaunchIdentity?.required || isNativeClaudeEntry(loadConfig()[run.kind]))
+    && (!run.nativeLaunchIdentity?.required || !sameClaudeLaunchIdentity(run.nativeLaunchIdentity))) {
+    run.handoffPath = continuity.saveRun(run); run.stop?.('account_identity_changed'); return;
+  }
   const usage = subscriptionUsage.verdict(run.route.quota_seat || quotaSeatForProvider(run.kind),
     { model: run.route.requested_model });
   if (run.quotaFingerprint && subscriptionUsage.fingerprint(run.route.quota_seat) !== run.quotaFingerprint) {
@@ -6455,6 +6488,86 @@ async function tickContinuity() {
 }
 setInterval(tickContinuity, 5000).unref();
 
+function isNativeClaudeEntry(entry) {
+  return entry?.npm_package === '@anthropic-ai/claude-code' || entry?.credential_env === 'CLAUDE_CONFIG_DIR';
+}
+function claudeGeneration(cfg, registry) {
+  return crypto.createHash('sha256').update(JSON.stringify({ entries: Object.fromEntries(Object.entries(cfg)
+    .filter(([, entry]) => isNativeClaudeEntry(entry))), registry })).digest('hex');
+}
+function claudeEntryGeneration(entry) {
+  return crypto.createHash('sha256').update(JSON.stringify(entry)).digest('hex');
+}
+function captureClaudeLaunchIdentity(kind, accountId, actualEnv = null, dispatchSnapshot = null) {
+  const unavailable = { required: true, identity: null };
+  try {
+    const cfg = loadConfig(), entry = cfg[kind];
+    if (!(dispatchSnapshot ? dispatchSnapshot.required : isNativeClaudeEntry(entry))) return { required: false, identity: null };
+    if (!isNativeClaudeEntry(entry) || (dispatchSnapshot
+      && claudeEntryGeneration(entry) !== dispatchSnapshot.entryGeneration)) return unavailable;
+    const registry = providerAccounts.loadRegistry(DATA_DIR, { strict: true });
+    const account = providerAccounts.accountsFor(kind, entry, registry).find((a) => a.id === accountId);
+    // Only the proven default layout is readable. No linked-account mkdir/probe.
+    if (entry.enabled === false || !account?.enabled || !account.implicit
+      || (dispatchSnapshot && account.quotaSeat !== dispatchSnapshot.quotaSeat)
+      || !providerAccounts.accountIsProvisioned({ entry, account, dataDir: DATA_DIR, kind })
+      || !providerAccounts.accountAuthAvailable({ entry, account, dataDir: DATA_DIR, kind })) return unavailable;
+    const expectedEnv = buildEnv(normalizeEnvOverrides(entry.oneshot_env), entry.strip_env || []);
+    const env = actualEnv || expectedEnv;
+    for (const key of ['HOME', 'USERPROFILE', 'CLAUDE_CONFIG_DIR']) if (env[key] !== expectedEnv[key]) return unavailable;
+    const generation = claudeGeneration(cfg, registry);
+    const sample = readClaudeNativeUsage({ env, quotaSeat: account.quotaSeat });
+    if (!sample.identity || generation !== claudeGeneration(loadConfig(), providerAccounts.loadRegistry(DATA_DIR, { strict: true }))) return unavailable;
+    return { required: true, identity: Object.freeze({ kind, accountId, quotaSeat: account.quotaSeat,
+      generation, ...sample.identity }), observation: sample.observation };
+  } catch { return unavailable; }
+}
+function sameClaudeLaunchIdentity(captured, actualEnv = null) {
+  if (!captured?.required) return true;
+  if (!captured.identity) return false;
+  const current = captureClaudeLaunchIdentity(captured.identity.kind, captured.identity.accountId, actualEnv);
+  return current.required && !!current.identity && JSON.stringify(current.identity) === JSON.stringify(captured.identity);
+}
+function observeClaudeNativeSnapshot(captured) {
+  if (!captured.identity || !sameClaudeLaunchIdentity(captured)) return false;
+  // Existing unbound active executions cannot inherit the newly learned login.
+  for (const run of continuityControls.values()) if (run.route.quota_seat === captured.identity.quotaSeat
+    && isNativeClaudeEntry(loadConfig()[run.kind]) && !run.nativeLaunchIdentity?.identity) {
+    run.handoffPath = continuity.saveRun(run); run.stop?.('account_identity_changed');
+  }
+  if (!subscriptionUsage.bindIdentity(captured.identity.quotaSeat, captured.identity.accountFingerprint)) return false;
+  return !!captured.observation && subscriptionUsage.observe(captured.observation);
+}
+function validateClaudeLaunchAdmission(captured, actualEnv = null) {
+  if (!captured?.required) return true;
+  if (!sameClaudeLaunchIdentity(captured, actualEnv)) return false;
+  const usage = subscriptionUsage.verdict(captured.identity.quotaSeat, { accountFingerprint: captured.identity.accountFingerprint });
+  return usage.freshness === 'fresh' && usage.admit;
+}
+function refreshClaudeNativeUsage() {
+  const cfg = loadConfig(), registry = providerAccounts.loadRegistry(DATA_DIR, { strict: true });
+  const snapshots = [];
+  for (const [kind, entry] of Object.entries(cfg)) {
+    if (!isNativeClaudeEntry(entry) || entry.enabled === false) continue;
+    for (const account of providerAccounts.accountsFor(kind, entry, registry).slice(0, 8)) {
+      const sample = captureClaudeLaunchIdentity(kind, account.id);
+      if (sample.identity) snapshots.push(sample);
+    }
+  }
+  const identities = new Map(), conflicting = new Set(), seen = new Set();
+  for (const { identity } of snapshots) {
+    const key = JSON.stringify([identity.profileHash, identity.accountFingerprint]);
+    if (identities.has(identity.quotaSeat) && identities.get(identity.quotaSeat) !== key) conflicting.add(identity.quotaSeat);
+    identities.set(identity.quotaSeat, key);
+  }
+  let refreshed = 0;
+  for (const sample of snapshots) {
+    const i = sample.identity, key = JSON.stringify([i.quotaSeat, i.profileHash, i.accountFingerprint]);
+    if (conflicting.has(i.quotaSeat) || seen.has(key)) continue;
+    seen.add(key); if (observeClaudeNativeSnapshot(sample)) refreshed++;
+  }
+  return refreshed;
+}
 let nativeUsageProbe = null, lastNativeUsageProbeAt = 0;
 async function refreshNativeUsage() {
   if (nativeUsageProbe) return nativeUsageProbe;
@@ -6462,11 +6575,11 @@ async function refreshNativeUsage() {
   lastNativeUsageProbeAt = Date.now();
   nativeUsageProbe = (async () => {
     const cfg = loadConfig(), entry = cfg.codex;
-    if (entry?.npm_package !== '@openai/codex') return { refreshed: false, reason: 'native_codex_unconfigured' };
+    let refreshed = refreshClaudeNativeUsage();
+    if (entry?.npm_package !== '@openai/codex') return { refreshed: refreshed > 0, accounts: refreshed };
     const generation = crypto.createHash('sha256').update(JSON.stringify({ entry,
       registry: providerAccounts.loadRegistry(DATA_DIR, { strict: true }) })).digest('hex');
     const registry = providerAccounts.loadRegistry(DATA_DIR, { strict: true });
-    let refreshed = 0;
     for (const account of providerAccounts.accountsFor('codex', entry, registry).slice(0, 8)) {
       if (!account.enabled || !providerAccounts.accountIsProvisioned({ entry, account, dataDir: DATA_DIR, kind: 'codex' })) continue;
       try {

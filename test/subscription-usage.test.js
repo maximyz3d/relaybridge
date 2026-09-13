@@ -4,6 +4,111 @@ const fs = require('node:fs'), path = require('node:path'), os = require('node:o
 const { createSubscriptionUsage } = require('../lib/subscription-usage');
 const { parseCodexRateLimits, parseClaudeStatuslineUsage, parseClaudeStreamRateLimit } = require('../lib/native-usage');
 const T = 1700000000000;
+const { parseClaudeNativeCache } = require('../lib/native-usage');
+const uuid = '11111111-2222-3333-4444-555555555555';
+function native(f, remaining = 11, resetMs = T + 86400000 - 437, accountUuid = uuid) {
+  return parseClaudeNativeCache({ oauthAccount: { accountUuid }, cachedUsageUtilization: { accountUuid, fetchedAtMs: f.at(), utilization:
+    Object.fromEntries(['five_hour', 'seven_day'].map(name => [name, { utilization: 100 - remaining, resets_at: new Date(resetMs).toISOString() }])) } },
+  { quotaSeat: 'claude', now: f.at() });
+}
+test('Claude first identity binding retains legacy denials and needs complete fresh bound windows', t => {
+  const f = fixture(t), reset = T / 1000 + 86400;
+  const old = parseClaudeStreamRateLimit({ type: 'rate_limit_event', rate_limit_info: { status: 'rejected',
+    unifiedWindows: { five_hour: { utilization: .97, resetsAt: reset }, seven_day: { utilization: .97, resetsAt: reset } } } },
+  { quotaSeat: 'claude', observedAt: f.at() });
+  f.store.observe(old); const cached = native(f, 3), fp = cached.accountFingerprint;
+  const prior = JSON.parse(fs.readFileSync(path.join(f.dir, 'native-usage.json'))).claude;
+  assert.equal(f.store.bindIdentity('claude', fp), true);
+  const bound = JSON.parse(fs.readFileSync(path.join(f.dir, 'native-usage.json'))).claude;
+  assert.deepEqual(bound.buckets, prior.buckets); assert.deepEqual(bound.history, prior.history); assert.equal(bound.observedAt, prior.observedAt);
+  assert.equal(f.store.headroom('claude', { accountFingerprint: fp }).reason, 'native_account_capacity_unbound');
+  assert.equal(f.store.headroom('claude').protected, true);
+  f.advance(1000); assert.equal(f.store.observe(native(f, 3)), true);
+  const usage = f.store.headroom('claude', { accountFingerprint: fp }); assert.equal(usage.freshness, 'fresh'); assert.equal(usage.protected, true);
+  assert.equal(usage.ordinaryUsageAllowed, false);
+  const oldSnapshot = JSON.parse(fs.readFileSync(path.join(f.dir, 'native-usage.json'))).claude;
+  const other = native(f, 90, T + 86400000 - 437, 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee');
+  assert.equal(f.store.bindIdentity('claude', other.accountFingerprint), true);
+  assert.equal(f.store.headroom('claude', { accountFingerprint: other.accountFingerprint }).percentRemaining, null);
+  const isolated = JSON.parse(fs.readFileSync(path.join(f.dir, 'native-usage.json'))).claude;
+  assert.deepEqual(isolated.previousIdentity.buckets, oldSnapshot.buckets);
+  assert.equal(f.store.observe(native(f, 3)), false, 'previous account must not overwrite current selection');
+});
+test('cache watermark persists and replay cannot renew freshness or discard newer stream evidence', t => {
+  const f = fixture(t); const value = native(f); f.store.bindIdentity('claude', value.accountFingerprint); assert.equal(f.store.observe(value), true);
+  f.advance(1000); const reopened = createSubscriptionUsage({ dataDir: f.dir, now: f.at });
+  const before = fs.readFileSync(path.join(f.dir, 'native-usage.json'), 'utf8');
+  assert.equal(reopened.observe(value), false); assert.equal(fs.readFileSync(path.join(f.dir, 'native-usage.json'), 'utf8'), before);
+  const current = native(f); assert.equal(reopened.observe(current), true);
+  const stream = parseClaudeStreamRateLimit({ type: 'rate_limit_event', rate_limit_info: { status: 'allowed',
+    unifiedWindows: { five_hour: { utilization: .89, resetsAt: (T + 86400000) / 1000 }, seven_day: { utilization: .89, resetsAt: (T + 86400000) / 1000 } } } },
+  { quotaSeat: 'claude', observedAt: f.at() + 1000, accountFingerprint: value.accountFingerprint });
+  f.advance(1000); assert.equal(reopened.observe(stream), true); assert.equal(reopened.observe(current), false);
+  f.advance(180001); assert.equal(reopened.observe(current), false); assert.equal(reopened.headroom('claude').freshness, 'stale');
+});
+test('returning to an identity restores reserve and denial protection across restart without reusing capacity', t => {
+  const f = fixture(t), a = native(f, 4), fp = a.accountFingerprint;
+  const state = () => JSON.parse(fs.readFileSync(path.join(f.dir, 'native-usage.json'))).claude;
+  f.store.bindIdentity('claude', fp); assert.equal(f.store.observe(a), true); f.advance(6000);
+  const denied = parseClaudeStreamRateLimit({ type: 'rate_limit_event', rate_limit_info: { status: 'rejected',
+    unifiedWindows: Object.fromEntries(['five_hour', 'seven_day'].map(id => [id,
+      { utilization: .97, resetsAt: (T + 86400000) / 1000 }])) } },
+  { quotaSeat: 'claude', observedAt: f.at(), accountFingerprint: fp });
+  assert.equal(f.store.observe(denied), true); const prior = state();
+  const b = native(f, 90, T + 86400000, 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee');
+  assert.equal(f.store.bindIdentity('claude', b.accountFingerprint), true);
+  const restarted = createSubscriptionUsage({ dataDir: f.dir, now: f.at });
+  assert.equal(restarted.bindIdentity('claude', fp), true);
+  assert.deepEqual(state().buckets, prior.buckets); assert.equal(state().ordinaryUsageAllowed, false);
+  assert.equal(restarted.headroom('claude', { accountFingerprint: fp }).freshness, 'stale');
+  assert.equal(restarted.headroom('claude').protected, true);
+  f.advance(1000); assert.equal(restarted.observe(native(f, 90)), false, 'new timestamp cannot replenish the same account window');
+  assert.equal(restarted.observe(native(f, 3)), true);
+  assert.equal(restarted.headroom('claude').protected, true); assert.equal(restarted.headroom('claude').ordinaryUsageAllowed, false);
+  assert.equal(state().buckets.account.windows.five_hour.rateAnchorObservedAt, prior.buckets.account.windows.five_hour.rateAnchorObservedAt);
+});
+test('identity-bound denials survive rejected capacity without renewing windows or accepting older permission', t => {
+  for (const shifted of [false, true]) {
+    const f = fixture(t), a = native(f, 80), fp = a.accountFingerprint;
+    const state = () => JSON.parse(fs.readFileSync(path.join(f.dir, 'native-usage.json'))).claude;
+    f.store.bindIdentity('claude', fp); f.store.observe(a); const prior = state(); f.advance(1000);
+    const event = (status, remaining, offset = 0, observedAt = f.at(), accountFingerprint = fp) =>
+      parseClaudeStreamRateLimit({ type: 'rate_limit_event', rate_limit_info: { status,
+        unifiedWindows: Object.fromEntries(['five_hour', 'seven_day'].map(id => [id,
+          { utilization: (100 - remaining) / 100, resetsAt: (T + 86400000) / 1000 + offset }])) } },
+      { quotaSeat: 'claude', observedAt, accountFingerprint });
+    assert.equal(f.store.observe(event('rejected', shifted ? 80 : 90, shifted ? 1 : 0)), false);
+    assert.deepEqual(state().buckets, prior.buckets); assert.equal(state().observedAt, prior.observedAt);
+    assert.equal(state().source, prior.source); assert.equal(state().evidenceHash, prior.evidenceHash);
+    assert.equal(f.store.headroom('claude').ordinaryUsageAllowed, false); assert.equal(f.store.verdict('claude').admit, false);
+    assert.equal(f.store.observe(event('allowed', 80, 0, f.at() - 1)), false);
+    const reopened = createSubscriptionUsage({ dataDir: f.dir, now: f.at });
+    assert.equal(reopened.verdict('claude').admit, false);
+    assert.equal(reopened.observe(event('allowed', 80)), true);
+    assert.equal(reopened.verdict('claude').admit, false, 'same-time permission cannot clear denial');
+    f.advance(1000); assert.equal(reopened.observe(event('allowed', 80)), true);
+    assert.equal(reopened.verdict('claude').admit, true);
+  }
+});
+test('fractional reset equivalence retains rate anchor in both orders and rejects drift and recovery', t => {
+  for (const nativeFirst of [true, false]) {
+    const f = fixture(t), fp = native(f).accountFingerprint, reset = (T + 86400000) / 1000;
+    const stream = remaining => parseClaudeStreamRateLimit({ type: 'rate_limit_event', rate_limit_info: { status: 'allowed',
+      unifiedWindows: Object.fromEntries(['five_hour', 'seven_day'].map(name => [name, { utilization: (100 - remaining) / 100, resetsAt: reset }])) } },
+    { quotaSeat: 'claude', observedAt: f.at(), accountFingerprint: fp });
+    f.store.bindIdentity('claude', fp); assert.equal(f.store.observe(nativeFirst ? native(f, 12) : stream(12)), true);
+    f.advance(6000); assert.equal(f.store.observe(nativeFirst ? stream(11) : native(f, 11)), true);
+    assert.equal(Math.round(f.store.headroom('claude').percentPerHour), 600);
+    const anchor = f.store.headroom('claude').windows[0].rateAnchorObservedAt;
+    f.advance(150000); assert.equal(f.store.observe(native(f, 11)), true);
+    const usage = f.store.headroom('claude'); assert.equal(usage.windows[0].rateAnchorObservedAt, anchor); assert.ok(usage.percentPerHour < 30); assert.equal(usage.protected, false);
+    f.advance(1000); assert.equal(f.store.observe(native(f, 12)), false, 'same window cannot restore capacity');
+    assert.equal(f.store.observe(native(f, 11, T + 86400000 - 436)), false, 'do not chain fractional tolerance');
+    assert.equal(f.store.observe(native(f, 11, T + 86400000 + 1000)), false, 'future reset drift is not rollover');
+    f.advance(86400000); assert.equal(f.store.observe(native(f, 90, f.at() + 86400000)), true);
+    assert.equal(f.store.headroom('claude').percentPerHour, null);
+  }
+});
 function fixture(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rb-native-store-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   let at = T; const store = createSubscriptionUsage({ dataDir: dir, now: () => at });
@@ -11,6 +116,43 @@ function fixture(t) {
     rateLimitsByLimitId: { codex: { primary: { usedPercent: 100 - remaining, windowDurationMins: 10080, resetsAt: T / 1000 + 86400 } } }, ...extra }, { quotaSeat: seat, observedAt: at });
   return { store, dir, codex, advance: (ms) => { at += ms; }, at: () => at };
 }
+test('invalid stream retains native protection and last valid depletion anchor', t => {
+  const f = fixture(t), fp = native(f, 12).accountFingerprint; f.store.bindIdentity('claude', fp); f.store.observe(native(f, 12));
+  f.advance(6000); f.store.observe(native(f, 11));
+  const before = f.store.headroom('claude').windows[0]; f.advance(1000);
+  const malformed = parseClaudeStreamRateLimit({ type: 'rate_limit_event', rate_limit_info: { status: 'allowed',
+    unifiedWindows: { five_hour: { utilization: 'invalid', resetsAt: (T + 86400000) / 1000 } } } },
+  { quotaSeat: 'claude', observedAt: f.at(), accountFingerprint: fp });
+  assert.equal(f.store.observe(malformed), true); assert.notEqual(f.store.headroom('claude').freshness, 'fresh');
+  const invalid = f.store.headroom('claude').windows[0];
+  assert.equal(invalid.nativeResetNs, before.nativeResetNs); assert.equal(invalid.rateAnchorObservedAt, before.rateAnchorObservedAt);
+  f.advance(1000); assert.equal(f.store.observe(native(f, 90)), false);
+  f.advance(150000); assert.equal(f.store.observe(native(f, 11)), true);
+  assert.equal(f.store.headroom('claude').windows[0].rateAnchorObservedAt, before.rateAnchorObservedAt);
+  assert.ok(f.store.headroom('claude').percentPerHour < 30);
+});
+test('selected identity and seat high-water mark cannot be replaced by stream claims or older new-account fetches', t => {
+  const f = fixture(t), first = native(f); assert.equal(f.store.observe(first), false, 'independent profile binding is required');
+  f.store.bindIdentity('claude', first.accountFingerprint); assert.equal(f.store.observe(first), true);
+  const second = native(f, 90, T + 86400000, 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee');
+  assert.equal(f.store.observe(second), false); f.store.bindIdentity('claude', second.accountFingerprint);
+  assert.equal(f.store.observe(second), false, 'account isolation retains the prior seat observation barrier');
+  f.advance(1000); assert.equal(f.store.observe(native(f, 90, T + 86400000, 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee')), true);
+});
+test('submillisecond reset precision rejects early stream boundaries and same-millisecond native drift', t => {
+  const f = fixture(t), reset = T + 86400000;
+  const exact = suffix => parseClaudeNativeCache({ oauthAccount: { accountUuid: uuid }, cachedUsageUtilization: {
+    accountUuid: uuid, fetchedAtMs: f.at(), utilization: Object.fromEntries(['five_hour', 'seven_day'].map(id =>
+      [id, { utilization: 89, resets_at: new Date(reset).toISOString().replace('.000Z', suffix) }])) } }, { quotaSeat: 'claude', now: f.at() });
+  const value = exact('.000001Z'); f.store.bindIdentity('claude', value.accountFingerprint); assert.equal(f.store.observe(value), true); f.advance(1000);
+  const stream = seconds => parseClaudeStreamRateLimit({ type: 'rate_limit_event', rate_limit_info: { status: 'allowed', unifiedWindows: {
+    five_hour: { utilization: .89, resetsAt: seconds }, seven_day: { utilization: .89, resetsAt: seconds } } } },
+  { quotaSeat: 'claude', accountFingerprint: value.accountFingerprint, observedAt: f.at() });
+  assert.equal(f.store.observe(stream(reset / 1000)), false);
+  assert.equal(f.store.observe(stream(reset / 1000 + 1)), true); f.advance(1000);
+  assert.equal(f.store.observe(exact('.000002Z')), false); assert.equal(f.store.observe(exact('.000001Z')), true);
+  assert.equal(f.store.headroom('claude').windows[0].resetsAt, reset, 'expiry uses the conservative original raw millisecond');
+});
 test('reserve settings default on, validate floor, persist, and never infer allowance from absence', (t) => {
   const { store, dir } = fixture(t);
   assert.equal(store.getSettings().reservePercent, 5); assert.equal(store.getSettings().usageProtection, true);
