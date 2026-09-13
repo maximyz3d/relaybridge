@@ -532,35 +532,133 @@ test('concurrent source preparations publish one complete deterministic manifest
 
 function manifestVerificationFixture(root, { at, injections = 1, afterPublish } = {}) {
   const target = path.join(root, 'build-info.json');
+  const temporary = path.join(root, '.build-info.fixture.tmp');
   const fsApi = Object.create(fs);
-  const state = { attempts: 0, replacements: 0, published: false };
+  const state = { attempts: 0, replacements: 0, distinctReplacements: 0, published: false,
+    operations: [], failures: [], overflow: 0, fixtureCloses: 0, consumedCloses: 0,
+    openHandles: 0, pendingCloses: 0, armed: 0 };
   const handles = new Map();
-  function replace(bytes = fs.readFileSync(target)) {
-    const temporary = path.join(root, '.build-info.fixture.tmp');
-    fs.writeFileSync(temporary, bytes, { flag: 'wx', mode: 0o600 });
-    fs.renameSync(temporary, target);
-    state.replacements += 1;
+  let pendingClose = null;
+  let armedRead = null;
+  const statKey = (stat) => [stat.dev, stat.ino, stat.mode, stat.size, stat.mtimeMs, stat.ctimeMs].join(':');
+  function record(list, value) {
+    if (list.length < 16) list.push(value);
+    else state.overflow += 1;
+  }
+  function failure(operation, error) {
+    const code = typeof error?.code === 'string' && /^[A-Z0-9_]{1,32}$/.test(error.code) ? error.code : 'UNKNOWN';
+    record(state.failures, { operation, code });
+  }
+  function track() {
+    state.openHandles = handles.size;
+    state.pendingCloses = pendingClose === null ? 0 : 1;
+    state.armed = armedRead === null ? 0 : 1;
+  }
+  function replace(bytes = fs.readFileSync(target), phase = 'after-publish', closeFd = null) {
+    let operation = `${phase}:stat-before`;
+    let staged = false;
+    try {
+      const before = fs.lstatSync(target);
+      // Stage while the manifest fd is still live, so this temporary open cannot
+      // reuse the fd whose later production close the fixture must consume.
+      operation = `${phase}:stage`;
+      fs.writeFileSync(temporary, bytes, { flag: 'wx', mode: 0o600 });
+      staged = true;
+      if (closeFd !== null) {
+        operation = `${phase}:close-manifest-fd`;
+        if (handles.get(closeFd) !== target || pendingClose !== null) {
+          throw Object.assign(new Error('fixture descriptor ownership mismatch'), { code: 'ESTALEFD' });
+        }
+        fs.closeSync(closeFd);
+        handles.delete(closeFd);
+        pendingClose = closeFd;
+        state.fixtureCloses += 1;
+        record(state.operations, operation);
+      }
+      operation = `${phase}:replace`;
+      fs.renameSync(temporary, target);
+      staged = false;
+      state.replacements += 1;
+      record(state.operations, operation);
+      operation = `${phase}:stat-after`;
+      const after = fs.lstatSync(target);
+      if (statKey(before) !== statKey(after)) state.distinctReplacements += 1;
+      return after;
+    } catch (error) {
+      failure(operation, error);
+      throw error;
+    } finally {
+      if (staged) {
+        try { fs.unlinkSync(temporary); } catch (error) { failure(`${phase}:cleanup`, error); }
+      }
+      track();
+    }
   }
   fsApi.lstatSync = (file, ...args) => {
     if (file === path.join(root, '.git')) state.attempts += 1;
+    if (file === target && armedRead !== null) {
+      const pending = armedRead;
+      armedRead = null;
+      if (!pending.postReadStat) {
+        const error = Object.assign(new Error('fixture requires the real post-read fstat'), { code: 'EFSTATORDER' });
+        failure('after-read:lstat', error);
+        track();
+        throw error;
+      }
+      // Production already captured the real live-handle stat. Close our fd
+      // now, replace atomically, and return only the real replacement path stat.
+      return replace(pending.bytes, 'after-read', pending.fd);
+    }
     return fs.lstatSync(file, ...args);
   };
   fsApi.openSync = (file, ...args) => {
-    if (file === target && at === 'before-open' && state.replacements < injections) replace();
+    if (pendingClose !== null) {
+      const error = Object.assign(new Error('fixture close must be consumed before another open'), { code: 'EFDREUSE' });
+      failure('open', error);
+      throw error;
+    }
+    if (file === target && at === 'before-open' && state.replacements < injections) replace(undefined, 'before-open');
     const fd = fs.openSync(file, ...args);
     handles.set(fd, file);
+    track();
     return fd;
   };
   fsApi.closeSync = (fd) => {
+    if (armedRead?.fd === fd) armedRead = null;
+    if (pendingClose === fd) {
+      pendingClose = null;
+      state.consumedCloses += 1;
+      track();
+      return;
+    }
+    if (!handles.has(fd)) {
+      failure('close', { code: 'EUNTRACKEDFD' });
+      track();
+      return;
+    }
+    try { fs.closeSync(fd); }
+    catch (error) { failure('close', error); throw error; }
     handles.delete(fd);
-    return fs.closeSync(fd);
+    track();
+  };
+  fsApi.fstatSync = (fd, ...args) => {
+    const stat = fs.fstatSync(fd, ...args);
+    if (armedRead?.fd === fd) {
+      armedRead.postReadStat = true;
+      record(state.operations, 'after-read:fstat');
+    }
+    return stat;
   };
   fsApi.readFileSync = (file, ...args) => {
     if (state.published && at === 'source-error' && handles.get(file) === path.join(root, 'lib', 'feature.js')) {
       throw Object.assign(new Error('injected source read failure'), { code: 'EIO' });
     }
     const bytes = fs.readFileSync(file, ...args);
-    if (handles.get(file) === target && at === 'after-read' && state.replacements < injections) replace();
+    if (handles.get(file) === target && at === 'after-read' && state.replacements < injections) {
+      armedRead = { fd: file, bytes: Buffer.from(bytes), postReadStat: false };
+      record(state.operations, 'after-read:arm');
+      track();
+    }
     return bytes;
   };
   fsApi.renameSync = (from, to) => {
@@ -573,17 +671,36 @@ function manifestVerificationFixture(root, { at, injections = 1, afterPublish } 
   return { fsApi, state };
 }
 
+function assertFixtureSettled(state, operations, fixtureCloses = 0) {
+  assert.deepEqual(state.failures, [], 'typed fixture failures must remain visible outside the loader catch');
+  assert.equal(state.overflow, 0);
+  assert.equal(state.openHandles, 0);
+  assert.equal(state.pendingCloses, 0);
+  assert.equal(state.armed, 0);
+  assert.equal(state.fixtureCloses, fixtureCloses);
+  assert.equal(state.consumedCloses, state.fixtureCloses);
+  assert.equal(state.distinctReplacements, state.replacements, 'replacement must change real metadata');
+  assert.deepEqual(state.operations, operations);
+}
+
 for (const at of ['before-open', 'after-read']) {
   test(`a concurrent same-buildId replacement ${at} is rejected once and verified on retry`, (t) => {
     const root = makeSourceRepo(t);
     const expected = prepareBuildInfo(root, { env: {} }).identity.buildId;
+    const operations = at === 'before-open' ? ['before-open:replace']
+      : ['after-read:arm', 'after-read:fstat', 'after-read:close-manifest-fd', 'after-read:replace'];
+    const fixtureCloses = at === 'after-read' ? 1 : 0;
     const strict = manifestVerificationFixture(root, { at });
-    assert.equal(loadBuildIdentity(root, { fsApi: strict.fsApi, env: {} }).reason, 'build_info_invalid');
+    const rejected = loadBuildIdentity(root, { fsApi: strict.fsApi, env: {} });
+    assertFixtureSettled(strict.state, operations, fixtureCloses);
+    assert.equal(rejected.reason, 'build_info_invalid');
     assert.equal(strict.state.attempts, 1);
     assert.equal(strict.state.replacements, 1);
 
     const retry = manifestVerificationFixture(root, { at });
-    const prepared = prepareBuildInfo(root, { fsApi: retry.fsApi, env: {} });
+    let prepared;
+    try { prepared = prepareBuildInfo(root, { fsApi: retry.fsApi, env: {} }); }
+    finally { assertFixtureSettled(retry.state, operations, fixtureCloses); }
     assert.equal(prepared.updated, true);
     assert.equal(prepared.identity.ready, true);
     assert.equal(prepared.identity.buildId, expected);
@@ -600,6 +717,7 @@ test('persistent manifest churn exhausts bounded verification and fails closed',
   const root = makeSourceRepo(t);
   const fixture = manifestVerificationFixture(root, { at: 'before-open', injections: Infinity });
   assert.throws(() => prepareBuildInfo(root, { fsApi: fixture.fsApi, env: {} }), /generated build-info\.json did not verify/);
+  assertFixtureSettled(fixture.state, Array(4).fill('before-open:replace'));
   assert.equal(fixture.state.attempts, 4);
   assert.equal(fixture.state.replacements, 4);
   assert.equal(loadBuildIdentity(root, { env: {} }).ready, true);
@@ -615,6 +733,7 @@ test('a ready identity with a different buildId fails immediately without retry'
     fsApi: fixture.fsApi,
     env: { NODE_ENV: 'test', RELAYBRIDGE_TEST_BUILD_ID: wrongId },
   }), /generated build-info\.json did not verify/);
+  assertFixtureSettled(fixture.state, []);
   assert.equal(fixture.state.attempts, 1);
 });
 
@@ -633,6 +752,7 @@ test('stale, version-mismatched and missing published manifests are not retried'
       replace(JSON.stringify(manifest));
     } });
     assert.throws(() => prepareBuildInfo(root, { fsApi: fixture.fsApi, env: {} }), /generated build-info\.json did not verify/);
+    assertFixtureSettled(fixture.state, reason === 'build_info_missing' ? [] : ['after-publish:replace']);
     assert.equal(fixture.state.attempts, 1, reason);
     assert.equal(loadBuildIdentity(root, { env: {} }).reason, reason);
   }
@@ -643,6 +763,7 @@ test('a source read failure during verification is not retried', (t) => {
   const fixture = manifestVerificationFixture(root, { at: 'source-error' });
   assert.throws(() => prepareBuildInfo(root, { fsApi: fixture.fsApi, env: {} }),
     /source checkout changed while build identity was being computed/);
+  assertFixtureSettled(fixture.state, []);
   assert.equal(fixture.state.attempts, 1);
 });
 
