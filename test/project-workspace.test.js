@@ -51,3 +51,118 @@ test('completed coding workflow status agrees in task cards project counts and c
 test('unavailable or partial delivery never becomes advisor evidence or completed work',t=>{const f=fixture(t);f.workspace.sendMessage({actionId:'message_0001',threadId:f.created.threadId,text:'Consult'});f.workspace.tick();f.complete(f.submissions[0].id,{action:'consult',question:'Review this'});f.workspace.tick();f.complete(f.submissions[1].id,'');f.queue.getResult=()=>({resultPersisted:false,metadata:null,result:null});f.workspace.tick();assert.equal(f.submissions.length,2);assert.equal(f.workspace.view().thread.state,'needs_attention');assert.equal(f.workspace.view().tasks.length,0);});
 test('explicit resume recovers absent saved task identity rather than generating another',t=>{const f=fixture(t),submit=f.queue.submitDurable;f.queue.submitDurable=()=>{throw new Error('temporarily unavailable');};f.workspace.sendMessage({actionId:'message_0001',threadId:f.created.threadId,text:'Preserve the intent'});f.workspace.tick();const blocked=f.workspace.view().thread;assert.equal(blocked.canResume,true);assert.ok(blocked.queueTaskId);f.queue.submitDurable=submit;const restarted=createProjectWorkspace(f.options);restarted.resume({actionId:'resume_00001',threadId:f.created.threadId});restarted.tick();assert.equal(f.submissions.length,1);assert.equal(f.submissions[0].id,blocked.queueTaskId);});
 test('second consultation never consumes stale first-advisor evidence after quota pause',t=>{const f=fixture(t);let blocked=false;f.options.quota.verdict=()=>({admit:!blocked});f.workspace.sendMessage({actionId:'message_0001',threadId:f.created.threadId,text:'Plan'});f.workspace.tick();f.complete(f.submissions[0].id,{action:'consult',question:'FIRST QUESTION'});f.workspace.tick();f.complete(f.submissions[1].id,'FIRST ANSWER');f.workspace.tick();f.complete(f.submissions[2].id,{action:'consult',question:'SECOND QUESTION'});blocked=true;f.workspace.tick();assert.equal(f.workspace.view().thread.state,'waiting_for_quota');blocked=false;f.workspace.resume({actionId:'resume_00001',threadId:f.created.threadId});f.workspace.tick();assert.equal(f.submissions[3].intent.kind,'claude');assert.match(f.submissions[3].intent.prompt,/SECOND QUESTION/);assert.doesNotMatch(f.submissions[3].intent.prompt,/FIRST ANSWER/);});
+// Attached existing calls. Every ID and text below is synthetic fixture data.
+const crypto=require('node:crypto'),{isDeepStrictEqual}=require('node:util');const sha=text=>crypto.createHash('sha256').update(text,'utf8').digest('hex');
+function attachFixture(t,{runs=[],receipts=[],receiptsDir}={}){const f=fixture(t),dir=receiptsDir===undefined?path.join(f.dataDir,'receipts'):receiptsDir;
+ if(dir&&receipts.length){fs.mkdirSync(dir,{recursive:true});fs.writeFileSync(path.join(dir,'2026-09-13.jsonl'),receipts.map(r=>JSON.stringify(r)).join('\n')+'\n');}
+ const results=new Map();f.queue.getResult=id=>{const r=results.get(id);if(r instanceof Error)throw r;return r||{taskId:id,resultState:'unavailable',resultPersisted:false,result:null,metadata:null,unavailableReason:'result_not_persisted'};};
+ const workspace=createProjectWorkspace({...f.options,receiptsDir:dir,activeRuns:()=>runs});
+ const settle=(id,{status='done',result='Synthetic fixture result',partial=false,persisted=true,...extra}={})=>{f.tasks.set(id,{id,status,body:{requestId:'queued:'+id,prompt:'Synthetic fixture prompt for '+id,kind:'codex'},execution:{state:'settled'},result,receiptId:'rcpt_fx_'+id.slice(2),route:{run_id:'run_fx_'+id.slice(2)},...extra});
+  if(persisted)results.set(id,{taskId:id,resultState:'persisted',resultPersisted:true,result,metadata:{sha256:sha(result),bytes:Buffer.byteLength(result),complete:!partial,partial,requestId:'queued:'+id,providerReceiptId:'rcpt_fx_'+id.slice(2),providerRunId:'run_fx_'+id.slice(2)}});};
+ let n=0;const attach=(input)=>workspace.attachCall({actionId:`attach_${String(++n).padStart(4,'0')}`,projectId:f.created.projectId,...input});
+ return{...f,workspace,results,settle,attach,runs,receiptsDir:dir};}
+const storeFile=f=>path.join(f.dataDir,'project-workspace','workspace.json');
+test('attaching an existing call is idempotent, project scoped and never dispatches or adds messages',t=>{
+ const f=attachFixture(t);f.settle('t_fx_done');f.workspace.sendMessage({actionId:'message_0001',threadId:f.created.threadId,text:'Pending coordinator work'});
+ const input={actionId:'attach_0001',projectId:f.created.projectId,taskId:'t_fx_done',label:'Synthetic queued call'};
+ const first=f.workspace.attachCall(input);assert.match(first.attachmentId,/^pc_[a-f0-9]{24}$/);assert.deepEqual(f.workspace.attachCall(input),{...first,idempotent:true});
+ assert.throws(()=>f.workspace.attachCall({...input,label:'Changed'}),e=>e.status===409);
+ assert.throws(()=>f.workspace.attachCall({...input,actionId:'attach_0002'}),e=>e.status===409&&/already attached/.test(e.message));
+ const other=f.workspace.createProject({actionId:'project_0002',name:'Project B',cwd:f.dataDir});
+ const second=f.workspace.attachCall({...input,actionId:'attach_0003',projectId:other.projectId});assert.notEqual(second.attachmentId,first.attachmentId);
+ const a=f.workspace.view({projectId:f.created.projectId}),b=f.workspace.view({projectId:other.projectId});
+ assert.deepEqual(a.attachedCalls.map(c=>c.id),[first.attachmentId]);assert.deepEqual(b.attachedCalls.map(c=>c.id),[second.attachmentId]);
+ assert.equal(f.workspace.getAttachedCall({projectId:f.created.projectId,attachmentId:first.attachmentId}).verified.state,'completed');
+ assert.throws(()=>f.workspace.getAttachedCall({projectId:other.projectId,attachmentId:first.attachmentId}),e=>e.status===404);
+ assert.equal(a.thread.messages.length,1);assert.equal(b.thread.messages.length,0);assert.equal(a.tasks.length,0);
+ assert.equal(f.submissions.length,0,'attach and reads do not dispatch pending work');
+ f.workspace.tick();assert.equal(f.submissions.length,1,'the pending message was dispatchable, so zero above is meaningful');
+});
+test('attach validation rejects malformed IDs, oversized, binary and credential text before storage',t=>{
+ const f=attachFixture(t),before=fs.readFileSync(storeFile(f),'utf8'),art=(text,extra={})=>({taskId:'t_fx_any',artifacts:[{role:'result',text,...extra}]});
+ const rejects=[[{},400,/at least one/],[{taskId:'not-a-task'},400,/ZodError|Invalid/],[{taskId:'t_fx_any',extra:true},400,/ZodError|Unrecognized/],
+  [art('x'.repeat(200001)),413,/200001 bytes/],[art('é'.repeat(100001)),413,/bytes/],[art('binary'+String.fromCharCode(1)+'data'),400,/binary or control/],[art('lone \uD800 surrogate'),400,/binary or control/],
+  [art('Synthetic note with sk-'+'fixtureFIXTUREfixture0000 inside'),400,/credential or token/],[art('x',{origin:'bridge_verified'}),400,/Unrecognized|ZodError/],
+  [{taskId:'t_fx_any',artifacts:[{role:'result',text:'a'},{role:'result',text:'b'}]},400,/at most one/],[art('x',{sha256:'abc'}),400,/ZodError|Invalid/]];
+ for(const [input,status,pattern] of rejects)assert.throws(()=>f.attach(input),e=>(e.status||400)===status&&(pattern.test(e.message)||pattern.test(e.name)),JSON.stringify(input).slice(0,80));
+ assert.throws(()=>f.workspace.attachCall({actionId:'attach_9999',projectId:'p_'+'0'.repeat(24),taskId:'t_fx_any'}),e=>e.status===404);
+ assert.equal(fs.readFileSync(storeFile(f),'utf8'),before,'nothing was stored');
+ const large='Synthetic large artifact line.\n'.repeat(7000).slice(0,200000);assert.equal(Buffer.byteLength(large),200000);
+ const {attachmentId}=f.attach(art(large));const detail=f.workspace.getAttachedCall({projectId:f.created.projectId,attachmentId});
+ assert.equal(detail.callerArtifacts[0].text,large);assert.equal(detail.callerArtifacts[0].callerDeclaredTruncated,false);assert.equal(f.submissions.length,0);
+});
+test('attached calls resolve task, live run, receipt and unavailable sources in priority order',t=>{
+ const receipts=[{receiptId:'rcpt_fx_direct',event:'bridge_provider_call',status:'completed',timestamp:'2026-09-13T10:00:00Z',provider:'fixture',requestId:'fx-direct-0001',runId:'run_fx_direct',inputHash:sha('Synthetic direct prompt'),outputHash:sha('Synthetic direct output\n'),outputChars:24,prompt:'must not be surfaced',route:{requested_model:'fixture-standard',applied_effort:'medium',secret:'x'}},
+  {receiptId:'rcpt_fx_partial',event:'bridge_provider_call',status:'timed_out',timestamp:'2026-09-13T10:01:00Z',requestId:'fx-partial-0001',runId:'run_fx_partial',partialResult:true,failureClass:'provider_timeout'}];
+ const runs=[{runId:'run_fx_live',kind:'fixture',route:{request_id:'fx-live-0001',requested_model:'fixture-heavy',applied_effort:'high'},phase:'provider_running',ageMs:4200,bytes:512,lines:3},
+  {runId:'run_fx_running',kind:'codex',route:{request_id:'queued:t_fx_running'},phase:'provider_running',ageMs:10,bytes:1}];
+ const f=attachFixture(t,{runs,receipts});
+ f.settle('t_fx_done');f.settle('t_fx_partial',{status:'failed',partial:true,partialCheckpoint:'Synthetic checkpoint'});f.settle('t_fx_lost',{persisted:false});
+ f.tasks.set('t_fx_queued',{id:'t_fx_queued',status:'queued',body:{requestId:'queued:t_fx_queued',prompt:'p'},execution:{state:'reserved'}});
+ f.tasks.set('t_fx_running',{id:'t_fx_running',status:'running',body:{requestId:'queued:t_fx_running',prompt:'p'},execution:{state:'dispatched'}});
+ f.tasks.set('t_fx_stale',{id:'t_fx_stale',status:'running',body:{requestId:'queued:t_fx_stale',prompt:'p'},execution:{state:'dispatched'}});
+ f.tasks.set('t_fx_nocontract',{id:'t_fx_nocontract',status:'done',body:{requestId:'queued:t_fx_nocontract',prompt:'p'},execution:{state:'settled'}});
+ f.results.set('t_fx_nocontract',Object.assign(new Error('no delivery'),{code:'DELIVERY_UNAVAILABLE'}));
+ const cases=[[{taskId:'t_fx_done'},'task','completed'],[{requestId:'queued:t_fx_queued'},'task','queued'],[{taskId:'t_fx_running'},'task','running'],[{taskId:'t_fx_partial'},'task','partial'],
+  [{taskId:'t_fx_lost'},'task','result_unavailable'],[{taskId:'t_fx_nocontract'},'task','result_unavailable'],[{taskId:'t_fx_stale'},'task','running'],[{requestId:'fx-live-0001'},'active_run','running'],
+  [{requestId:'fx-direct-0001'},'receipt','completed'],[{runId:'run_fx_partial'},'receipt','partial'],[{taskId:'t_fx_missing'},null,'unavailable'],[{requestId:'fx-unknown-0001'},null,'unavailable']];
+ const ids=cases.map(([refs])=>f.attach(refs).attachmentId),view=f.workspace.view().attachedCalls;
+ cases.forEach(([refs,source,state],i)=>{const call=view.find(c=>c.id===ids[i]);assert.equal(call.verified.source,source,JSON.stringify(refs));assert.equal(call.verified.state,state,JSON.stringify(refs));assert.deepEqual(call.callerArtifacts,[]);assert.equal(call.verified.mismatches.length,0,JSON.stringify(refs));});
+ const byRefs=refs=>view.find(c=>c.id===ids[cases.findIndex(c=>isDeepStrictEqual(c[0],refs))]);
+ assert.equal(byRefs({taskId:'t_fx_running'}).verified.live.runId,'run_fx_running');
+ assert.deepEqual(byRefs({taskId:'t_fx_stale'}).verified.observations,['queue_reports_running_without_live_progress']);
+ assert.equal(byRefs({taskId:'t_fx_nocontract'}).verified.result.unavailableReason,'no_result_delivery_contract');
+ const live=byRefs({requestId:'fx-live-0001'}).verified.live;assert.deepEqual([live.runId,live.model,live.effort,live.bytes],['run_fx_live','fixture-heavy','high',512]);
+ const direct=byRefs({requestId:'fx-direct-0001'}).verified;assert.equal(direct.result.state,'not_retained_by_bridge');assert.equal(direct.receipt.model,'fixture-standard');
+ assert.doesNotMatch(JSON.stringify(direct),/must not be surfaced|"secret"/);
+ assert.deepEqual(byRefs({taskId:'t_fx_missing'}).verified.unavailableReasons,['task_not_found','no_matching_receipt_in_scanned_window']);
+ assert.deepEqual(byRefs({requestId:'fx-unknown-0001'}).verified.unavailableReasons,['no_active_run','no_matching_receipt_in_scanned_window']);
+ const partial=f.workspace.getAttachedCall({projectId:f.created.projectId,attachmentId:ids[3]}).verified;assert.equal(partial.partialCheckpoint,'Synthetic checkpoint');assert.equal(partial.resultText,'Synthetic fixture result');
+ const unconfigured=createProjectWorkspace({...f.options,activeRuns:()=>[]});assert.deepEqual(unconfigured.view().attachedCalls.at(-1).verified.unavailableReasons,['no_active_run','receipts_not_configured']);
+ assert.equal(f.submissions.length,0);
+});
+test('disagreeing IDs surface both values without reconciling bridge identity or state',t=>{
+ const receipts=[{receiptId:'rcpt_fx_foreign',event:'bridge_provider_call',status:'completed',timestamp:'2026-09-13T11:00:00Z',requestId:'fx-foreign-0001',runId:'run_fx_foreign',outputHash:sha('other')}];
+ const f=attachFixture(t,{receipts});f.settle('t_fx_done');
+ const wrongRequest=f.attach({taskId:'t_fx_done',requestId:'fx-wrong-request-01'}).attachmentId,wrongReceipt=f.attach({taskId:'t_fx_done',receiptId:'rcpt_fx_foreign'}).attachmentId;
+ const consistent=f.attach({taskId:'t_fx_done',requestId:'queued:t_fx_done',runId:'run_fx_fx_done'}).attachmentId;
+ const view=Object.fromEntries(f.workspace.view().attachedCalls.map(c=>[c.id,c.verified]));
+ assert.equal(view[wrongRequest].displayState,'id_mismatch');assert.equal(view[wrongRequest].state,'completed');assert.equal(view[wrongRequest].refStatus.taskId,'confirmed');
+ assert.deepEqual(view[wrongRequest].mismatches,[{field:'requestId',supplied:'fx-wrong-request-01',bridge:'queued:t_fx_done',sources:['task']}]);
+ const fields=view[wrongReceipt].mismatches.map(m=>[m.field,m.supplied,m.bridge]).sort();
+ // Calls may span several receipts, so the named receipt is confirmed; its foreign request identity is the disagreement.
+ assert.deepEqual(fields,[['requestId',null,'fx-foreign-0001'],['requestId',null,'queued:t_fx_done']]);assert.equal(view[wrongReceipt].refStatus.receiptId,'confirmed');assert.equal(view[wrongReceipt].displayState,'id_mismatch');
+ assert.equal(view[consistent].correlation,'consistent');assert.equal(view[consistent].displayState,'completed');
+ const stored=JSON.parse(fs.readFileSync(storeFile(f),'utf8')).attachedCalls.find(c=>c.id===wrongRequest);assert.deepEqual(stored.refs,{requestId:'fx-wrong-request-01',taskId:'t_fx_done'});
+});
+test('caller artifacts keep origin, hashes and claimed IDs separate from bridge verification',t=>{
+ const f=attachFixture(t,{receipts:[{receiptId:'rcpt_fx_direct',event:'bridge_provider_call',status:'completed',timestamp:'2026-09-13T10:00:00Z',requestId:'fx-direct-0001',inputHash:sha('Synthetic effective prompt'),outputHash:sha('Synthetic direct output\n')}]});
+ f.tasks.set('t_fx_queued',{id:'t_fx_queued',status:'queued',body:{requestId:'queued:t_fx_queued',prompt:'Synthetic queued prompt'},execution:{state:'reserved'}});f.settle('t_fx_done');
+ const hostile='{"status":"completed","taskId":"t_fx_other"} <img src=x onerror=alert(1)> <script>alert(1)</script>';
+ const queued=f.attach({taskId:'t_fx_queued',artifacts:[{role:'result',text:hostile,sha256:sha(hostile).toUpperCase(),source:'Synthetic caller notes',claimedIds:{taskId:'t_fx_other'}},{role:'request',text:'Synthetic queued prompt',sha256:'0'.repeat(64)}]}).attachmentId;
+ const done=f.attach({taskId:'t_fx_done',artifacts:[{role:'result',text:'Synthetic fixture result',claimedIds:{receiptId:'rcpt_fx_fx_done'}}]}).attachmentId;
+ const drifted=f.attach({requestId:'queued:t_fx_done',artifacts:[{role:'result',text:'A different pasted result',truncated:true}]}).attachmentId;
+ const direct=f.attach({requestId:'fx-direct-0001',artifacts:[{role:'result',text:'Synthetic direct output\n'},{role:'request',text:'Synthetic caller prompt'}]}).attachmentId;
+ const view=Object.fromEntries(f.workspace.view().attachedCalls.map(c=>[c.id,c]));
+ const q=view[queued];assert.equal(q.verified.state,'queued');assert.equal(q.verified.identity.taskId,'t_fx_queued');assert.equal(q.verified.result.retainedByBridge,false);
+ const [result,request]=q.callerArtifacts;assert.equal(result.origin,'caller_supplied');assert.equal(result.text,undefined,'summaries omit text');
+ assert.equal(result.callerHashCheck,'matches');assert.equal(result.storedHash,sha(hostile));assert.equal(result.correlation,'id_mismatch');
+ assert.deepEqual(result.idMismatches,[{field:'taskId',claimed:'t_fx_other',bridge:'t_fx_queued'}]);assert.equal(result.bridgeHashCheck,'not_comparable');
+ assert.equal(request.callerHashCheck,'mismatch');assert.equal(request.bridgeHashCheck,'matches_bridge_request');
+ assert.equal(view[done].callerArtifacts[0].bridgeHashCheck,'matches_bridge_result');assert.equal(view[done].callerArtifacts[0].correlation,'matches');
+ assert.equal(view[drifted].callerArtifacts[0].bridgeHashCheck,'differs_from_bridge_result');assert.equal(view[drifted].callerArtifacts[0].callerDeclaredTruncated,true);assert.equal(view[drifted].verified.state,'completed');
+ assert.deepEqual(view[direct].callerArtifacts.map(a=>a.bridgeHashCheck),['matches_receipt_output','differs_from_receipt_input']);assert.equal(view[direct].verified.source,'receipt');
+ const detail=f.workspace.getAttachedCall({projectId:f.created.projectId,attachmentId:queued});assert.equal(detail.callerArtifacts[0].text,hostile);assert.equal(detail.callerArtifacts[0].storedTextCheck,'matches_stored_hash');
+ assert.equal(detail.verified.resultText,null);assert.equal(detail.verified.state,'queued');
+ const stored=JSON.parse(fs.readFileSync(storeFile(f),'utf8')).attachedCalls;assert.ok(stored.every(c=>c.artifacts.every(a=>a.origin==='caller_supplied'&&a.storedHash===sha(a.text))));
+ f.workspace.sendMessage({actionId:'message_0001',threadId:f.created.threadId,text:'What next?'});f.workspace.tick();assert.doesNotMatch(f.submissions[0].intent.prompt,/onerror|Synthetic caller notes/);
+});
+test('existing project storage without attached calls stays readable and malformed attachments are refused',t=>{
+ const f=attachFixture(t),file=storeFile(f),legacy=JSON.parse(fs.readFileSync(file,'utf8'));assert.equal(legacy.attachedCalls,undefined);
+ const view=f.workspace.view();assert.equal(view.storageError,undefined);assert.deepEqual(view.attachedCalls,[]);
+ f.attach({taskId:'t_fx_any'});const saved=JSON.parse(fs.readFileSync(file,'utf8'));assert.deepEqual(saved.projects,legacy.projects);assert.deepEqual(saved.threads,legacy.threads);assert.equal(saved.attachedCalls.length,1);
+ fs.writeFileSync(file,JSON.stringify({...saved,attachedCalls:[{...saved.attachedCalls[0],projectId:'p_'+'f'.repeat(24)}]}));assert.ok(f.workspace.view().storageError);
+ fs.writeFileSync(file,JSON.stringify({...saved,attachedCalls:'not a list'}));assert.throws(()=>f.attach({taskId:'t_fx_other'}),e=>e.status===503);
+});
+test('attached call count is bounded per project',t=>{const f=attachFixture(t,{receiptsDir:null});for(let i=0;i<50;i++)f.attach({taskId:`t_fx_${i}`});assert.throws(()=>f.attach({taskId:'t_fx_50'}),e=>e.status===413);
+ const other=f.workspace.createProject({actionId:'project_0002',name:'Project B',cwd:f.dataDir});assert.ok(f.workspace.attachCall({actionId:'attach_other1',projectId:other.projectId,taskId:'t_fx_50'}).attachmentId);});

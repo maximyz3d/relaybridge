@@ -6386,7 +6386,7 @@ const continuity = createContinuity({ dataDir: DATA_DIR, quota: subscriptionUsag
   resolveCandidate: continuityCandidate, activeControls: () => [...continuityControls.values()] });
 const { createProjectWorkspace } = require('./lib/project-workspace');
 const projectWorkspace = createProjectWorkspace({ dataDir: DATA_DIR, queue: taskQueue, quota: subscriptionUsage,
-  workflows: workflowController,
+  workflows: workflowController, receiptsDir: RECEIPTS_DIR,
   validateCwd: (cwd) => ({ ...captureAllowedCwdIdentity(cwd), cwdPolicyId: CWD_POLICY_IDENTITY }),
   resolveIntent: (body, snapshot) => {
     const cfg = loadConfig();
@@ -6415,7 +6415,8 @@ const projectWorkspace = createProjectWorkspace({ dataDir: DATA_DIR, queue: task
       expectedCwdIdentityHash: snapshot.cwdIdentityHash, expectedCwdPolicyId: CWD_POLICY_IDENTITY,
       expectedPromptHash: controls.promptEvidence.effectiveHash };
   },
-  activeRuns: () => [...activeRuns.values()].map((run) => ({ route: { request_id: run.route.request_id },
+  activeRuns: () => [...activeRuns.values()].map((run) => ({ runId: run.runId, kind: run.kind,
+    route: { request_id: run.route.request_id, requested_model: run.route.requested_model, applied_effort: run.route.applied_effort },
     ...run.supervisor.snapshot(Date.now()),
     nativeUsage: subscriptionUsage.headroom(run.route.quota_seat || quotaSeatForProvider(run.kind), { model: run.route.requested_model }) })),
   log: (message) => console.log(`[RelayBridge] project workspace: ${message}`),
@@ -6437,6 +6438,20 @@ for (const [route, operation] of Object.entries({ projects: 'createProject', thr
     } catch (error) { res.status(error.status || 400).json({ error: error.name === 'ZodError' ? 'Check the request fields and their length limits.' : error.message }); }
   });
 }
+// Attaching an existing call only records references and caller-supplied text;
+// unlike the routes above it never schedules a coordinator tick or dispatch.
+app.post('/api/project-workspace/attach-call', (req, res) => {
+  try {
+    const result = projectWorkspace.attachCall(req.body || {});
+    res.status(result.idempotent ? 200 : 201).json(result);
+  } catch (error) { res.status(error.status || 400).json({ error: error.name === 'ZodError' ? 'Check the request fields and their length limits.' : error.message }); }
+});
+app.get('/api/project-workspace/attached-calls/:id', (req, res) => {
+  try {
+    res.setHeader('Cache-Control', 'no-store');
+    res.json(projectWorkspace.getAttachedCall({ projectId: String(req.query.projectId || ''), attachmentId: req.params.id }));
+  } catch (error) { res.status(error.status || 400).json({ error: error.message }); }
+});
 const progressAssessor = createProgressAssessor({ dataDir: DATA_DIR, queue: taskQueue, controls: continuityControls,
   getSettings: () => subscriptionUsage.getSettings(),
   hasCapacity: () => taskQueue.stats().active < taskQueue.stats().maxConcurrent && activeOneShotCount < MAX_ACTIVE_ONESHOTS,
