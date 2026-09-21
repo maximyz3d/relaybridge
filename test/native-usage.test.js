@@ -32,6 +32,19 @@ test('native Claude cache preserves original fetch, raw fractional reset and per
     const p = cachePayload(); mutate(p); assert.equal(parseClaudeNativeCache(p, { quotaSeat: 'claude', now: T }), null);
   }
 });
+test('native Claude accepts only a zero-use inactive five-hour window without a reset', () => {
+  const payload = cachePayload();
+  payload.cachedUsageUtilization.utilization.five_hour = { utilization: 0, resets_at: null };
+  const value = parseClaudeNativeCache(payload, { quotaSeat: 'claude', now: T });
+  assert.deepEqual(value.buckets[0].windows[0], { id: 'five_hour', percentRemaining: 100,
+    resetsAt: null, nativeUsedPercent: 0, nativeNoActiveWindow: true, windowDurationMs: 18000000 });
+  for (const mutate of [w => w.utilization = 1, w => delete w.resets_at,
+    w => w.resets_at = 'invalid', w => w.utilization = null]) {
+    const bad = cachePayload(); bad.cachedUsageUtilization.utilization.five_hour = { utilization: 0, resets_at: null };
+    mutate(bad.cachedUsageUtilization.utilization.five_hour);
+    assert.equal(parseClaudeNativeCache(bad, { quotaSeat: 'claude', now: T }), null);
+  }
+});
 test('native default profile reader separates identity from stale or mismatched cache and rejects path races', t => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'rb-native-profile-'));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));

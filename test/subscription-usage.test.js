@@ -11,6 +11,58 @@ function native(f, remaining = 11, resetMs = T + 86400000 - 437, accountUuid = u
     Object.fromEntries(['five_hour', 'seven_day'].map(name => [name, { utilization: 100 - remaining, resets_at: new Date(resetMs).toISOString() }])) } },
   { quotaSeat: 'claude', now: f.at() });
 }
+function inactiveFiveHour(f, weeklyRemaining = 100, weeklyReset = f.at() + 604800000) {
+  return parseClaudeNativeCache({ oauthAccount: { accountUuid: uuid }, cachedUsageUtilization: {
+    accountUuid: uuid, fetchedAtMs: f.at(), utilization: {
+      five_hour: { utilization: 0, resets_at: null },
+      seven_day: { utilization: 100 - weeklyRemaining, resets_at: new Date(weeklyReset).toISOString() },
+    },
+  } }, { quotaSeat: 'claude', now: f.at() });
+}
+test('inactive native five-hour window admits fresh zero usage, expires, and cannot erase an active window before reset', t => {
+  const f = fixture(t), weeklyReset = T + 604800000, zero = inactiveFiveHour(f, 100, weeklyReset);
+  assert.equal(f.store.bindIdentity('claude', zero.accountFingerprint), true);
+  assert.equal(f.store.observeNativeCache(zero), true);
+  assert.equal(f.store.verdict('claude').admit, true);
+  f.advance(180001);
+  assert.equal(f.store.headroom('claude').freshness, 'stale');
+  const activeReset = f.at() + 86400000;
+  const active = parseClaudeNativeCache({ oauthAccount: { accountUuid: uuid }, cachedUsageUtilization: {
+    accountUuid: uuid, fetchedAtMs: f.at(), utilization: {
+      five_hour: { utilization: 10, resets_at: new Date(activeReset).toISOString() },
+      seven_day: { utilization: 0, resets_at: new Date(weeklyReset).toISOString() },
+    },
+  } }, { quotaSeat: 'claude', now: f.at() });
+  assert.equal(f.store.observeNativeCache(active), true, 'first active reset follows an unused window');
+  const before = storeBytes(f);
+  f.advance(1000);
+  assert.equal(f.store.observeNativeCache(inactiveFiveHour(f, 100, weeklyReset)), false, 'zero usage cannot replenish an active window early');
+  assert.equal(storeBytes(f), before);
+  f.advance(86400000);
+  assert.equal(f.store.observeNativeCache(inactiveFiveHour(f, 100, weeklyReset)), true, 'zero usage is valid after the anchored reset');
+  assert.equal(f.store.verdict('claude').admit, true);
+});
+test('inactive native marker cannot stand in for a missing weekly window', t => {
+  const f = fixture(t), zero = inactiveFiveHour(f);
+  f.store.bindIdentity('claude', zero.accountFingerprint);
+  zero.buckets[0].windows[1] = { ...zero.buckets[0].windows[0] };
+  assert.equal(f.store.observeNativeCache(zero), false);
+  assert.equal(f.store.headroom('claude').freshness, 'stale');
+});
+test('invalid stream keeps inactive-window identity until fresh native evidence recovers it', t => {
+  const f = fixture(t), weeklyReset = T + 604800000, zero = inactiveFiveHour(f, 100, weeklyReset);
+  f.store.bindIdentity('claude', zero.accountFingerprint);
+  assert.equal(f.store.observeNativeCache(zero), true);
+  f.advance(1000);
+  const invalid = parseClaudeStreamRateLimit({ type: 'rate_limit_event', rate_limit_info: {
+    status: 'allowed', unifiedWindows: { five_hour: { utilization: 'invalid', resetsAt: (T + 86400000) / 1000 } },
+  } }, { quotaSeat: 'claude', observedAt: f.at(), accountFingerprint: zero.accountFingerprint });
+  assert.equal(f.store.observe(invalid), true);
+  assert.equal(f.store.headroom('claude').reason, 'native_evidence_invalid');
+  f.advance(1000);
+  assert.equal(f.store.observeNativeCache(inactiveFiveHour(f, 100, weeklyReset)), true);
+  assert.equal(f.store.headroom('claude').reason, 'headroom_available');
+});
 test('Claude first identity binding retains legacy denials and needs complete fresh bound windows', t => {
   const f = fixture(t), reset = T / 1000 + 86400;
   const old = parseClaudeStreamRateLimit({ type: 'rate_limit_event', rate_limit_info: { status: 'rejected',

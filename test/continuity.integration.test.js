@@ -96,6 +96,19 @@ test('default native Claude cache refresh is non-generating, independent of Code
   const rejected = await bridge.request('/api/usage/native', { kind: 'claude', rate_limits: { five_hour: { used_percentage: 0, resets_at: Math.floor(Date.now() / 1000) + 86400 } } });
   assert.equal(rejected.body.observed, false, 'unbound statusline cannot relabel the selected login');
 });
+test('zero-use native Claude cache with no five-hour reset admits the selected profile', async t => {
+  const bridge = await nativeClaudeFixture(t, { mutate(profile) {
+    profile.cachedUsageUtilization.utilization.five_hour = { utilization: 0, resets_at: null };
+    profile.cachedUsageUtilization.utilization.seven_day.utilization = 0;
+  } });
+  await waitFor(() => fs.existsSync(bridge.usageFile));
+  const before = JSON.parse(fs.readFileSync(bridge.usageFile)).claude;
+  assert.equal(before.buckets.account.windows.five_hour.nativeNoActiveWindow, true);
+  assert.equal(completeJsonLines(bridge.events).length, 0);
+  const reply = await bridge.ask();
+  assert.equal(reply.status, 200, JSON.stringify(reply.body));
+  assert.equal(reply.body.model_invocation, true);
+});
 
 test('verified native adapter refreshes stale counters while preserving unadmitted reset authority', async t => {
   const { createSubscriptionUsage } = require('../lib/subscription-usage');
