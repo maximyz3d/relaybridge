@@ -19,6 +19,7 @@ async function waitFor(check, timeoutMs = 10000) {
 
 async function startTestBridge(t, configure, { env: extraEnv = {}, nodeArgs = [] } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rb-security-bridge-'));
+  const nativeHome = path.join(root, 'native-home'); fs.mkdirSync(nativeHome);
   const configPath = path.join(root, 'config.json');
   fs.writeFileSync(configPath, JSON.stringify(configure(root)));
   const port = await new Promise((resolve, reject) => {
@@ -28,7 +29,8 @@ async function startTestBridge(t, configure, { env: extraEnv = {}, nodeArgs = []
   const base = `http://127.0.0.1:${port}`;
   const proc = spawn(process.execPath, [...nodeArgs, path.join(ROOT, 'server.js')], {
     cwd: ROOT, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, NODE_ENV: 'test', RELAYBRIDGE_TEST_BUILD_ID: 'security-integration-fixture',
+    env: { ...process.env, HOME: nativeHome, USERPROFILE: nativeHome, CLAUDE_CONFIG_DIR: undefined, CODEX_HOME: undefined,
+      NODE_ENV: 'test', RELAYBRIDGE_TEST_BUILD_ID: 'security-integration-fixture',
       PORT: String(port), PTY_MODE: 'none', RELAYBRIDGE_CONFIG_FILE: configPath,
       RELAYBRIDGE_TOKEN_FILE: path.join(root, 'token'), RELAYBRIDGE_DATA_DIR: path.join(root, 'data'),
       RELAYBRIDGE_ALLOWED_ROOTS: root, ...extraEnv },

@@ -12,17 +12,105 @@ active runs, without changing their existing timer mode.
 
 Codex allowance comes from the installed CLI's native `account/rateLimits/read`
 RPC, once per minute, with no thread or model generation. Claude allowance comes
-from passive CLI rate-limit events and, optionally, its status line. Windows,
+from passive CLI rate-limit events and a bounded read of the default CLI's
+`.claude.json` native utilization cache. This read never launches a CLI or an
+authentication request. The optional status line remains an unbound observation.
+Windows,
 reset times, model buckets and configured linked accounts remain separate.
 Shared provider aliases share one quota seat. Only backend-provided account IDs
 are hashed as account identity; a configured profile alone cannot prove that a
 login has not changed outside RelayBridge.
 
+For recognized native Anthropic CLI entries, only the default profile layout is
+currently qualified. A relocated `HOME`, any effective `CLAUDE_CONFIG_DIR`,
+or alternate authentication/backend selector from the shipped identity-isolation
+list (including inherited or explicit OAuth/API tokens) is unavailable. A
+missing/unsafe metadata file, disabled account or removed account is unavailable;
+there is no default-profile fallback. The reader checks a bounded regular file
+through one nonblocking descriptor and rejects replacement or mutation during the read. It
+returns only hashed OAuth account/profile identity and selected utilization
+fields, never credentials or raw account identifiers.
+
+Profile identity and allowance are separate. A stale or mismatched native cache
+can identify the selected profile but cannot establish current capacity. Both
+five-hour and weekly windows must be valid, tied to that account, and fetched
+within three minutes, with no future timestamp. The original `fetchedAtMs` is
+persisted; rereading identical bytes cannot renew freshness. A new fetch must
+exceed both that account's persisted fetch watermark and the seat's latest
+accepted observation, including across identity changes and bridge restarts.
+Initial identity binding preserves legacy windows, depletion anchors and denials
+as unattributed protection. A changed identity isolates the previous account's
+evidence, and new work requires fresh evidence for the selected account. Returning
+to a previously selected identity restores its windows, anchors and denials but
+still requires a new complete fetch. Up to 32 inactive identity snapshots are
+retained per seat; further unknown identities are refused rather than evicting
+protection. A correctly bound stream's explicit denial is retained even when its
+capacity update is rejected, without refreshing capacity timestamps. An older or
+same-time affirmative event cannot clear that denial.
+
+Native fractional reset instants retain their original ISO/nanosecond precision.
+Native reset estimates may cross a whole-second boundary on successive fetches.
+A versioned immutable reset anchor admits fresh native estimates within one
+second in either direction, inclusive. This radius is a conservative local
+reconciliation policy covering observed jitter, not a vendor-guaranteed window
+identifier. Repeated updates and restarts cannot move the anchor or accumulate
+more tolerance. Older native records bootstrap once from validated retained
+provenance; millisecond precision and retained origin are labeled explicitly.
+Caller-supplied anchor metadata and inconsistent persisted anchors are refused.
+Retained native provenance is recognized even when its raw millisecond field is
+missing. Malformed native state cannot become fresh headroom on reads or be
+replaced through stream migration; existing low-capacity and denial protection
+remains in force while its allowance is unavailable.
+
+Streams still match only the anchor's original next-second ceiling. Unequal
+stream reset values whose nearest-second rounding cell overlaps the anchored
+band cannot establish a new window. Both ingestion orders and restarts retain
+the earliest conservative expiry and depletion anchor. Same-window increases,
+refreshes at or after that earliest expiry, and out-of-band resets before the
+original rollover boundary are rejected by ordinary observation. A genuine later window requires the
+original boundary to have elapsed and independent unambiguous reset evidence.
+Invalid intervening samples retain prior protection and cannot restore capacity.
+
+The verified default native-profile adapter has a separate counter-refresh path
+for an out-of-band reset estimate. It requires a complete fresh authenticated
+two-window fetch and complete valid prior native authority bound to that same
+account. Both counters must stay equal or decrease; both original effective
+deadlines must remain future at fetch and processing time. Any decrease within
+one second of its prior observation rejects the complete counter refresh so
+the rate estimator cannot clear existing depletion protection. An incoming reset
+earlier than either retained expiry disqualifies this path. Reset ISO/ms/ns,
+immutable anchor, boundary and effective expiry remain unchanged. A separate
+`nativeCounterRefresh` record labels the incoming reset claim as unadmitted and
+binds its fetch/evidence to the retained record. Counter freshness and depletion
+rates advance normally; this never proves reset equivalence or replenishment.
+Replay, expiry, identity, denial and reserve protections still apply. Generic
+observations, streams and statusline ingress cannot select this path or supply
+its marker. Repeated drift cannot slide an anchor or extend its deadline.
+
+In CLI2.1.270, `/usage` displays freshly fetched utilization even when its
+five-minute cache-write throttle suppresses a disk update. The bridge still
+requires a persisted fetch within three minutes. A fresh display alone cannot
+renew that evidence, and this repair does not extend its freshness lifetime.
+
+The configuration snapshot that supplies the launch command fixes whether native
+identity is required. A changed selected entry or quota seat refuses admission;
+removing native markers cannot downgrade a pending launch to generic dispatch.
+Each native launch binds the selected provider/account, quota seat, profile,
+configuration/registry generation and independently read account fingerprint.
+The bridge checks this binding at admission, immediately before spawn, and at
+owned start/readiness/permit boundaries. Stream observations and continuity
+ticks recheck the live profile; a change checkpoints and stops the old run.
+These checks are launch-only and do not change physical settlement or recovery.
+Eligible aliases share cache observations only when seat/profile/account agree;
+disabled or removed aliases cannot be revived by deduplication. Custom transports
+are not classified as native Anthropic merely because their kind is `claude`.
+
 Observations expire after three minutes. Repeated cached Claude status-line
 payloads do not make an old observation fresh. Explicit denial and stale low
 capacity remain protected until affirmative native evidence clears them.
-Unknown capacity allows ordinary calls, but cannot qualify an automatic
-successor or assessor. Local token counts and operator estimates do not become
+Unknown capacity allows ordinary calls on generic transports, but native
+Anthropic CLI launches require fresh capacity bound to the selected profile.
+Unknown capacity cannot qualify an automatic successor or assessor. Local token counts and operator estimates do not become
 subscription percentages.
 
 A window's `usedPercent`/`utilization` outside its valid 0-100/0-1 range is

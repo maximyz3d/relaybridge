@@ -162,10 +162,10 @@ test('Markdown targets, file URIs and canonical containment never reparse labels
   }
   const outside = path.join(parent, 'outside'); fs.mkdirSync(outside); fs.writeFileSync(path.join(outside, 'real.js'), 'outside');
   fs.symlinkSync(outside, path.join(root, 'escape'), process.platform === 'win32' ? 'junction' : 'dir');
-  const escaped = verifyReferencedPaths('escape/real.js and escape/absent.js', root);
+  const escaped = verifyReferencedPaths('escape/real.js:1-2 and escape/absent.js:1-2', root);
   assert.equal(escaped.citations.every((row) => row.status === 'outside_workspace'), true);
   assert.deepEqual(escaped.present, []); assert.deepEqual(escaped.missing, []);
-  const ambiguous = verifyReferencedPaths('escape/../outside/real.js and escape/../outside/absent.js', root);
+  const ambiguous = verifyReferencedPaths('escape/../outside/real.js:1-2 and escape/../outside/absent.js:1-2', root);
   assert.equal(ambiguous.citations.every((row) => row.status === 'unverifiable'), true);
   assert.deepEqual(ambiguous.missing, []); assert.deepEqual(ambiguous.present, []);
   fs.writeFileSync(path.join(root, 'a(b).ts'), 'real');
@@ -198,6 +198,25 @@ test('path extraction finds real file references and ignores prose', () => {
   assert.ok(paths.includes('src/app/main.js'));
   assert.ok(paths.includes('lib/util.ts'));
   assert.equal(paths.length, 2, 'prose must not be mistaken for a path');
+});
+
+test('bold repository citations accept line ranges without weakening missing-path checks', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rb-citation-range-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const relative = 'tests/test_fable_prod_p0_build_ps1.py';
+  fs.mkdirSync(path.join(root, 'tests')); fs.writeFileSync(path.join(root, relative), '# real');
+  const actualAnswer = `**${relative}:134-147**. ${relative}:134-147 ${relative}:134 ${relative}:134:7 ${relative}#L134-L147`;
+  const verified = verifyReferencedPaths(actualAnswer, root);
+  assert.equal(verified.confidence, 'ok'); assert.equal(verified.present.length, 1);
+  assert.equal(verified.citations.length, 4); assert.equal(verified.citations.filter(c => c.duplicate).length, 3);
+  assert.deepEqual(extractReferencedPaths(`**${relative}:134-147**`), [`${relative}:134-147`]);
+  assert.deepEqual(extractReferencedPaths(`*${relative}:134-147*`), [`${relative}:134-147`]);
+  assert.deepEqual(extractReferencedPaths(`**${relative}:134-147*`), [], 'mismatched emphasis is not a citation wrapper');
+  assert.deepEqual(extractReferencedPaths(`\`**${relative}:134-147**\``), [], 'code literals keep emphasis bytes');
+  assert.deepEqual(extractReferencedPaths(`[citation](*${relative}:134-147*)`), [], 'link targets keep emphasis bytes');
+  assert.deepEqual(extractReferencedPaths(`${relative}:12- ${relative}:abc-7`), [], 'malformed ranges are not citations');
+  const fictional = verifyReferencedPaths('**tests/template_fixture.py:1-3**', root);
+  assert.equal(fictional.confidence, 'likely-fabricated'); assert.deepEqual(fictional.missing, ['tests/template_fixture.py:1-3']);
 });
 
 test('URLs and node_modules are not treated as workspace paths', () => {

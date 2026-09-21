@@ -6,9 +6,19 @@ const path = require('node:path');
 const { startTestBridge, waitFor, completeJsonLines } = require('./helpers/temporary-bridge');
 
 test('REST workflow carries Astra/ultra through the real queue and argv without a provider writer', async (t) => {
-  let capture;
+  let capture, allowanceCapture;
   const bridge = await startTestBridge(t, (root) => {
     capture = path.join(root, 'calls.jsonl');
+    allowanceCapture = path.join(root, 'allowance.jsonl');
+    const allowance = path.join(root, 'allowance.cjs');
+    fs.writeFileSync(allowance, `const fs=require('node:fs');let input='';
+      process.stdin.on('data',chunk=>{input+=chunk;let index;while((index=input.indexOf('\\n'))>=0){
+        const q=JSON.parse(input.slice(0,index));input=input.slice(index+1);
+        fs.appendFileSync(${JSON.stringify(allowanceCapture)},JSON.stringify({method:q.method})+'\\n');
+        if(q.id===1)console.log(JSON.stringify({id:1,result:{}}));
+        if(q.id===2)console.log(JSON.stringify({id:2,result:{ordinaryUsageAllowed:true,rateLimits:{limitId:'codex',
+          primary:{usedPercent:20,resetsAt:Math.floor(Date.now()/1000)+3600,windowDurationMins:300}}}}));
+      }});process.stdin.on('end',()=>process.exit(0));`);
     const script = path.join(root, 'advisor.cjs');
     fs.writeFileSync(script, `const fs = require('node:fs'); let input = ''; process.stdin.on('data', c => input += c);
       process.stdin.on('end', () => {
@@ -21,9 +31,13 @@ test('REST workflow carries Astra/ultra through the real queue and argv without 
     codex.oneshot_safe = [process.execPath, script, '-'];
     codex.oneshot_dangerous = [];
     codex.oneshot_output_parser = 'text';
+    codex.native_usage_command = [process.execPath, allowance];
     delete codex.probe; delete codex.version_probe;
     return { _models: { discoverOnBoot: false }, codex };
   }, { env: { RELAYBRIDGE_WARM_DIAG: '0', RELAYBRIDGE_REMOTE_MCP: '0' } });
+  await waitFor(async () => (await bridge.request('/api/usage/native')).body.observations
+    .some(o => o.quotaSeat === 'codex' && o.freshness === 'fresh'));
+  assert.ok(completeJsonLines(allowanceCapture).some(call => call.method === 'account/rateLimits/read'));
   const created = await bridge.request('/api/workflows', { cwd: bridge.root, objective: 'Verify the bounded provider contract.',
     acceptance: 'Exact Astra ultra, external revision, fresh closing review.', profile: 'codex-astra-ultra',
     permissionMode: 'full', acknowledgeFilesystemWrites: true });

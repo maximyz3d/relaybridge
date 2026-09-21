@@ -39,6 +39,34 @@ test('prepared and pinned permit are durable before exactly one proceed',async t
  assert.equal(f.owners[0].allowed,1);await assert.rejects(store.permit(record.ownerId),{code:'OWNER_PERMIT_UNAVAILABLE'});assert.equal(f.owners[0].allowed,1);
 });
 
+test('launch admission rejects before start and rechecks after readiness before permission',async t=>{
+ let allowed=false;const f=fixture(t,{validateLaunchAdmission:()=>allowed}),store=f.open(),record=store.prepare(binding);
+ await assert.rejects(store.start(record.ownerId),{code:'OWNER_LAUNCH_ADMISSION_CHANGED'});
+ assert.equal(f.owners[0].started,false);assert.equal(f.owners[0].allowed,0);
+ allowed=true;await store.start(record.ownerId);
+ let ready;f.owners[0].ready=new Promise(resolve=>{ready=resolve;});const pending=store.permit(record.ownerId);
+ allowed=false;ready();await assert.rejects(pending,{code:'OWNER_LAUNCH_ADMISSION_CHANGED'});
+ assert.equal(f.owners[0].allowed,0);assert.equal(f.owners[0].stopped,1);assert.equal(store.inspect(record.ownerId).permitted,undefined);
+});
+
+test('launch admission cannot be a truthy promise and is checked immediately before proceed',async t=>{
+ const f=fixture(t,{validateLaunchAdmission:()=>Promise.resolve(true)}),store=f.open(),record=store.prepare(binding);
+ await assert.rejects(store.start(record.ownerId),{code:'OWNER_LAUNCH_ADMISSION_CHANGED'});assert.equal(f.owners[0].started,false);
+ let checks=0;f.options.validateLaunchAdmission=()=>++checks<3;store.close();
+ const second=fixture(t,{validateLaunchAdmission:f.options.validateLaunchAdmission}),journal=second.open(),next=journal.prepare(binding);
+ await journal.start(next.ownerId);await assert.rejects(journal.permit(next.ownerId),{code:'OWNER_LAUNCH_ADMISSION_CHANGED'});
+ assert.equal(checks,3);assert.equal(second.owners[0].allowed,0);assert.equal(second.owners[0].stopped,1);
+});
+
+test('changed live launch admission cannot block physical settlement or immutable recovery',async t=>{
+ let allowed=true;const f=fixture(t,{validateLaunchAdmission:()=>{if(!allowed)throw new Error('launch identity changed');return true;}});
+ const {store,id}=await gated(f);allowed=false;f.owners[0].finish();await store.confirmPhysical(id);
+ const request=input(store,id),decision=store.recover(id,request);await store.applyRelease(id,decision.decisionId);
+ assert.equal(f.applied(),1);assert.equal(store.heldCount(),0);store.close();const restored=f.open();
+ assert.deepEqual(restored.recover(id,request),decision);await restored.applyRelease(id,decision.decisionId);
+ assert.equal(f.applied(),1);assert.equal(f.owners[0].allowed,1);
+});
+
 test('real Linux PID1 owner integrates with journal before a disposable local helper runs',{skip:!fs.existsSync('/usr/bin/bwrap'),timeout:10000},async t=>{
  const {createLinuxPhysicalOwner}=require('../lib/linux-physical-owner');
  const {probeLinuxNamespace}=require('../lib/linux-owner-identity');

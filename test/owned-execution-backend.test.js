@@ -10,7 +10,7 @@ const native = (name, fn) => test(name, { skip: process.platform !== 'linux' || 
 const RUN = 'wf_backend_111111111111';
 async function waitFor(fn, timeout = 6000) { const end = Date.now() + timeout; while (Date.now() < end) { const value = fn(); if (value) return value; await new Promise((resolve) => setTimeout(resolve, 15)); } throw new Error('condition timed out'); }
 function assertCode(fn, code) { assert.throws(fn, (error) => error.code === code); }
-async function fixture(t, { autoFinalize = true, beforeStart = null, abort = false } = {}) {
+async function fixture(t, { autoFinalize = true, beforeStart = null, abort = false, validateLaunchAdmission = () => true } = {}) {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'rb-owned-backend-'));
   const dataDir = path.join(temp, 'data'), cwd = path.join(temp, 'project'), program = path.join(temp, 'fixture.cjs');
   fs.mkdirSync(dataDir, { mode: 0o700 }); fs.mkdirSync(cwd, { mode: 0o700 });
@@ -23,7 +23,7 @@ async function fixture(t, { autoFinalize = true, beforeStart = null, abort = fal
   activeIdentity = identity;
   function construct(enabled) {
     backend = createOwnedExecutionBackend({ enabled, dataDir, receiptStoreId: hash('receipt-store'),
-      getTaskQueue: () => queue, getPipeline: () => pipeline, readExecutionIdentity: () => structuredClone(activeIdentity), now: () => clock.value });
+      getTaskQueue: () => queue, getPipeline: () => pipeline, readExecutionIdentity: () => structuredClone(activeIdentity), validateLaunchAdmission, now: () => clock.value });
     queue = createTaskQueue({ dataDir: path.join(dataDir, 'tasks'), maxConcurrent: 2, autoStart: false,
       executionOwners: backend.taskAuthority, requiresExecutionOwner: (task) => backend.requiresOwnedTask(task),
       executeOneShot: async (body, res, context) => {
@@ -150,9 +150,12 @@ native('owned lease before task enrollment fences ordinary writes across disable
 });
 
 native('restored physical hold and explicit expired recovery retain original account after default changes', async (t) => {
-  const f = await fixture(t, { autoFinalize: false }); const task = f.submit();
+  let launchAllowed = true;
+  const f = await fixture(t, { autoFinalize: false, validateLaunchAdmission: () => {
+    if (!launchAllowed) throw new Error('current native launch identity unavailable'); return true;
+  } }); const task = f.submit();
   await waitFor(() => f.queue.get(task.id).status === 'done'); await waitFor(() => f.backend.inspectWriter(RUN).state === 'ready_for_recovery');
-  const before = f.backend.reservationSnapshot()[0]; assert.equal(before.held, true); f.identityChange();
+  const before = f.backend.reservationSnapshot()[0]; assert.equal(before.held, true); f.identityChange(); launchAllowed = false;
   await f.restart(false); assert.equal(f.backend.reservationSnapshot()[0].accountId, 'fixture_account');
   assert.equal(f.queue.get(task.id).execution.state, 'owned_held');
   const view = f.backend.inspectWriter(RUN), workflow = f.pipeline.get(RUN); f.clock.value += 101;
@@ -171,6 +174,13 @@ native('pre-permit abort never starts a provider and keeps physical capacity sep
   assert.equal(f.backend.reservationSnapshot()[0].writerHeld, false);
   assert.equal(f.backend.reservationSnapshot()[0].held, true); assert.equal(f.released(), 0);
   assert.equal(f.queue.get(task.id).execution.state, 'owned_held');
+});
+
+native('backend forwards launch-only identity rejection before a local fixture can execute', async (t) => {
+  let checks = 0;
+  const f = await fixture(t, { validateLaunchAdmission: binding => { checks++; assert.ok(binding.taskId); return false; } });
+  f.submit(); await waitFor(() => f.error()); assert.equal(f.error().code, 'OWNER_LAUNCH_ADMISSION_CHANGED');
+  assert.equal(checks, 1); assert.equal(f.dispatched(), 0); assert.equal(fs.existsSync(path.join(f.cwd, 'executions.txt')), false);
 });
 
 native('exact fixture qualification cannot authorize native providers or a changed helper', async (t) => {
