@@ -25,6 +25,7 @@ const { createSubscriptionUsage } = require('./lib/subscription-usage');
 const { createContinuity } = require('./lib/continuity');
 const { createProgressAssessor } = require('./lib/progress-assessor');
 const { parseCodexRateLimits, parseClaudeStreamRateLimit, parseClaudeStatuslineUsage, readCodexRateLimits, readClaudeNativeUsage } = require('./lib/native-usage');
+const { refreshClaudeUsageViaPty } = require('./lib/claude-usage-probe');
 const { parseCodexOutput } = require('./lib/codex-output');
 const { validateProviderBudget } = require('./lib/provider-budget');
 const { promptTransportLimits, preparePrompt, renderPromptSlot } = require('./lib/prompt-transport');
@@ -539,6 +540,7 @@ let state = loadState();
 
 // ---- Persistent collabs (group chats) + projects -----------------------
 const DATA_DIR = path.resolve(envFirst('RELAYBRIDGE_DATA_DIR', 'PS_BRIDGE_DATA_DIR') || path.join(ROOT, 'data'));
+const CLAUDE_USAGE_PROBE_DIR = path.join(DATA_DIR, 'claude-usage-probe');
 const GITHUB_REGISTRY_FILE = path.resolve(envFirst('RELAYBRIDGE_GITHUB_REPOS') || path.join(DATA_DIR, 'github-repos.json'));
 const WSL_NATIVE_RUNTIME = platform.wslNativeRuntimeStatus({
   checkout: ROOT,
@@ -4734,14 +4736,32 @@ async function executeOneShot(body, res, privateContext = null) {
     });
   }
   const selectedQuotaSeat = dispatchAccount.quotaSeat || quotaSeatForProvider(kind);
-  const nativeLaunchIdentity = captureClaudeLaunchIdentity(kind, dispatchAccount.account?.id || 'default', null,
-    Object.freeze({ ...nativeDispatchConfig, quotaSeat: selectedQuotaSeat }));
+  const nativeDispatchSnapshot = Object.freeze({ ...nativeDispatchConfig, quotaSeat: selectedQuotaSeat });
+  let nativeLaunchIdentity = captureClaudeLaunchIdentity(kind, dispatchAccount.account?.id || 'default', null,
+    nativeDispatchSnapshot);
   if (nativeLaunchIdentity.required) {
     if (!nativeLaunchIdentity.identity) return rejectBeforeAdmission(409, 'account_identity_unavailable', {
       error: 'The selected native Claude profile identity is unavailable.', model_invocation: false, physical_attempt_count: 0 });
     observeClaudeNativeSnapshot(nativeLaunchIdentity);
-    if (!validateClaudeLaunchAdmission(nativeLaunchIdentity)) return rejectBeforeAdmission(409, 'quota_unknown', {
-      error: 'Native Claude requires fresh capacity bound to the selected profile and protected reserve.', model_invocation: false, physical_attempt_count: 0 });
+    const nativeUsage = subscriptionUsage.verdict(nativeLaunchIdentity.identity.quotaSeat,
+      { accountFingerprint: nativeLaunchIdentity.identity.accountFingerprint });
+    if (nativeUsage.freshness !== 'fresh') {
+      const refreshed = await probeClaudeNativeAdmission(nativeLaunchIdentity, nativeDispatchSnapshot);
+      if (res.destroyed) return;
+      if (refreshed) {
+        nativeLaunchIdentity = refreshed;
+        observeClaudeNativeSnapshot(nativeLaunchIdentity);
+      }
+      try { progressAssessor.assertDispatch(body); }
+      catch (error) { return rejectBeforeAdmission(409, 'assessment_revoked', { error: error.message }); }
+    }
+    if (!validateClaudeLaunchAdmission(nativeLaunchIdentity)) {
+      if (nativeUsage.freshness !== 'fresh') {
+        claudeUsageProbeFailures.set(claudeUsageProbeKey(nativeLaunchIdentity.identity), Date.now());
+      }
+      return rejectBeforeAdmission(409, 'quota_unknown', {
+        error: 'Native Claude requires fresh capacity bound to the selected profile and protected reserve.', model_invocation: false, physical_attempt_count: 0 });
+    }
   }
   const providerCooldown = cooldowns.status(kind);
   const quotaCooldown = [cooldowns.status(selectedQuotaSeat),
@@ -6534,7 +6554,7 @@ function captureClaudeLaunchIdentity(kind, accountId, actualEnv = null, dispatch
     const sample = readClaudeNativeUsage({ env, quotaSeat: account.quotaSeat });
     if (!sample.identity || generation !== claudeGeneration(loadConfig(), providerAccounts.loadRegistry(DATA_DIR, { strict: true }))) return unavailable;
     return { required: true, identity: Object.freeze({ kind, accountId, quotaSeat: account.quotaSeat,
-      generation, ...sample.identity }), observation: sample.observation };
+      generation, ...sample.identity }), observation: sample.observation, cacheFetchedAt: sample.cacheFetchedAt };
   } catch { return unavailable; }
 }
 function sameClaudeLaunchIdentity(captured, actualEnv = null) {
@@ -6558,6 +6578,55 @@ function validateClaudeLaunchAdmission(captured, actualEnv = null) {
   if (!sameClaudeLaunchIdentity(captured, actualEnv)) return false;
   const usage = subscriptionUsage.verdict(captured.identity.quotaSeat, { accountFingerprint: captured.identity.accountFingerprint });
   return usage.freshness === 'fresh' && usage.admit;
+}
+const claudeUsageProbes = new Map(), claudeUsageProbeFailures = new Map();
+const CLAUDE_USAGE_PROBE_FAILURE_COOLDOWN_MS = 60000;
+const claudeUsageProbeKey = identity => JSON.stringify([identity.quotaSeat, identity.profileHash,
+  identity.accountFingerprint]);
+async function probeClaudeNativeAdmission(captured, dispatchSnapshot = null) {
+  if (!captured?.identity || !pty) return null;
+  const key = claudeUsageProbeKey(captured.identity);
+  if (Date.now() - (claudeUsageProbeFailures.get(key) || 0) < CLAUDE_USAGE_PROBE_FAILURE_COOLDOWN_MS) return null;
+  let task = claudeUsageProbes.get(key);
+  if (!task) {
+    task = (async () => {
+      try {
+        const cfg = loadConfig(), entry = cfg[captured.identity.kind], settings = entry?.native_usage_probe;
+        if (!settings || settings.enabled !== true || !Array.isArray(settings.command)
+          || typeof settings.command[0] !== 'string' || !settings.command[0]) return false;
+        const probeStat = fs.lstatSync(CLAUDE_USAGE_PROBE_DIR);
+        if (!probeStat.isDirectory() || probeStat.isSymbolicLink()
+          || path.resolve(fs.realpathSync(CLAUDE_USAGE_PROBE_DIR)) !== path.resolve(CLAUDE_USAGE_PROBE_DIR)) return false;
+        const env = buildEnv(normalizeEnvOverrides(entry.oneshot_env), entry.strip_env || []);
+        const trusted = readClaudeNativeUsage({ env, quotaSeat: captured.identity.quotaSeat,
+          projectCwd: CLAUDE_USAGE_PROBE_DIR });
+        if (!trusted.identity || trusted.identity.accountFingerprint !== captured.identity.accountFingerprint
+          || trusted.identity.profileHash !== captured.identity.profileHash || !trusted.projectTrustAccepted) return false;
+        const command = resolveExecutable(settings.command[0], env), args = settings.command.slice(1).map(String);
+        const timeoutMs = Number.isSafeInteger(settings.timeout_ms)
+          ? Math.min(30000, Math.max(1000, settings.timeout_ms)) : 15000;
+        const readSample = () => readClaudeNativeUsage({ env, quotaSeat: captured.identity.quotaSeat,
+          projectCwd: CLAUDE_USAGE_PROBE_DIR });
+        const result = await refreshClaudeUsageViaPty({ ptyImpl: pty, command, args, env, cwd: CLAUDE_USAGE_PROBE_DIR,
+          readSample, expectedIdentity: captured.identity, baselineFetchedAt: captured.cacheFetchedAt, timeoutMs });
+        if (!result.refreshed) { claudeUsageProbeFailures.set(key, Date.now()); return false; }
+        return true;
+      } catch {
+        claudeUsageProbeFailures.set(key, Date.now()); return false;
+      }
+    })().finally(() => claudeUsageProbes.delete(key));
+    claudeUsageProbes.set(key, task);
+  }
+  if (!await task) {
+    claudeUsageProbeFailures.set(key, Date.now());
+    return null;
+  }
+  const current = captureClaudeLaunchIdentity(captured.identity.kind, captured.identity.accountId, null, dispatchSnapshot);
+  if (!current.identity || JSON.stringify(current.identity) !== JSON.stringify(captured.identity)
+    || !current.observation || current.observation.observedAt <= (captured.cacheFetchedAt || 0)) {
+    claudeUsageProbeFailures.set(key, Date.now()); return null;
+  }
+  return current;
 }
 function refreshClaudeNativeUsage() {
   const cfg = loadConfig(), registry = providerAccounts.loadRegistry(DATA_DIR, { strict: true });

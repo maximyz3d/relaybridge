@@ -147,6 +147,7 @@
     ]
   },
   "claude": {
+    "native_usage_probe": { "enabled": true, "command": ["claude", "--safe-mode", "--restricted", "--strict-mcp-config", "--mcp-config", "{\"mcpServers\":{}}", "--tools", "Read", "--permission-mode", "plan"], "timeout_ms": 15000 },
     "oneshot_capabilities": {
       "safe": [
         "model_invocation",
@@ -340,6 +341,7 @@
     "npm_package": "@anthropic-ai/claude-code"
   },
   "claude_fable": {
+    "native_usage_probe": { "enabled": true, "command": ["claude", "--safe-mode", "--restricted", "--strict-mcp-config", "--mcp-config", "{\"mcpServers\":{}}", "--tools", "Read", "--permission-mode", "plan"], "timeout_ms": 15000 },
     "oneshot_capabilities": {
       "safe": [
         "model_invocation",

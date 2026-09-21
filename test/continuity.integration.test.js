@@ -39,7 +39,8 @@ async function fixture(t) {
 }
 // Explicitly declared native protocol with a disposable metadata profile and
 // an inert Node transport. No installed Claude binary/account is used here.
-async function nativeClaudeFixture(t, { mutate = () => {}, registry = null, changeConfig = () => {}, env = {}, interleaveConfig = null } = {}) {
+async function nativeClaudeFixture(t, { mutate = () => {}, registry = null, changeConfig = () => {}, env = {}, interleaveConfig = null,
+  probeMode = null } = {}) {
   let profile, events, initial;
   const nodeArgs = [];
   const bridge = await startTestBridge(t, root => {
@@ -56,11 +57,13 @@ async function nativeClaudeFixture(t, { mutate = () => {}, registry = null, chan
       nodeArgs.push('--require', preload);
     }
     profile = path.join(root, 'native-home', '.claude.json'); events = path.join(root, 'native-events.jsonl');
+    const probeCwd = path.join(root, 'data', 'claude-usage-probe'); fs.mkdirSync(probeCwd, { recursive: true });
     const accountUuid = '11111111-2222-3333-4444-555555555555', at = Date.now(), reset = Math.floor(at / 1000) * 1000 + 86400000;
     initial = { oauthAccount: { accountUuid }, cachedUsageUtilization: { accountUuid, fetchedAtMs: at, utilization:
       Object.fromEntries(['five_hour', 'seven_day'].map(name => [name, { utilization: 20, resets_at: new Date(reset - 437).toISOString() }])) } };
+    initial.projects = { [probeCwd]: { hasTrustDialogAccepted: true } };
     mutate(initial); fs.writeFileSync(profile, JSON.stringify(initial));
-    if (registry) { fs.mkdirSync(path.join(root, 'data')); fs.writeFileSync(path.join(root, 'data', 'accounts.json'), JSON.stringify({ providers: registry })); }
+    if (registry) { fs.mkdirSync(path.join(root, 'data'), { recursive: true }); fs.writeFileSync(path.join(root, 'data', 'accounts.json'), JSON.stringify({ providers: registry })); }
     const script = path.join(root, 'native-fixture.cjs');
     fs.writeFileSync(script, `const fs=require('node:fs');let input='';const event=type=>fs.appendFileSync(${JSON.stringify(events)},JSON.stringify({type,at:Date.now()})+'\\n');
       const usage=()=>console.log(JSON.stringify({type:'rate_limit_event',rate_limit_info:{status:'allowed',unifiedWindows:{five_hour:{utilization:.2,resetsAt:${reset / 1000}},seven_day:{utilization:.2,resetsAt:${reset / 1000}}}}}));
@@ -68,17 +71,75 @@ async function nativeClaudeFixture(t, { mutate = () => {}, registry = null, chan
         if(input.includes('HOLD')){if(!input.includes('TICK'))usage();const timer=setInterval(()=>{if(!input.includes('TICK'))usage();},100);
           process.on('SIGTERM',()=>{clearInterval(timer);event('stopped');process.exit(0);});}
         else {usage();console.log(JSON.stringify({type:'result',subtype:'success',result:'Synthetic native protocol completed.'}));event('finished');}});`);
+    const probeScript = path.join(root, 'native-usage-probe.cjs');
+    if (probeMode) fs.writeFileSync(probeScript, `const fs=require('node:fs');let input='';
+      const event=type=>fs.appendFileSync(${JSON.stringify(events)},JSON.stringify({type,at:Date.now()})+'\\n');
+      console.log('Claude Code v1.0\\n? for shortcuts\\n❯ ');
+      process.stdin.on('data',chunk=>{input+=chunk;if(!input.includes('/usage'))return;input='';event('usage_probe');
+        if(${JSON.stringify(probeMode)}==='recover'){const value=JSON.parse(fs.readFileSync(${JSON.stringify(profile)},'utf8'));
+          value.cachedUsageUtilization.fetchedAtMs=Date.now();fs.writeFileSync(${JSON.stringify(profile)},JSON.stringify(value));}
+        if(input.includes('/exit'))process.exit(0);});setInterval(()=>{},1000);`);
     const entry = { label: 'Synthetic native Claude', npm_package: '@anthropic-ai/claude-code', credential_env: 'CLAUDE_CONFIG_DIR', quota_seat: 'claude',
       safe: [process.execPath], probe: [process.execPath, '--version'], version_probe: [process.execPath, '--version'],
       model: 'fixture-model', model_tiers: { standard: { model: 'fixture-model', args: ['--model', 'fixture-model'] } },
       oneshot_safe: [process.execPath, script, '--model', 'fixture-model'], oneshot_output_parser: 'claude_json',
       oneshot_safe_filesystem_policy: 'read_only_enforced', oneshot_capabilities: { safe: ['model_invocation', 'workspace_read', 'tool_use'] } };
+    if (probeMode) entry.native_usage_probe = { enabled: true, command: [process.execPath, probeScript], timeout_ms: 2500 };
     const cfg = { _models: { discoverOnBoot: false }, claude: entry, claude_fable: { ...entry } }; changeConfig(cfg, root); return cfg;
   }, { nodeArgs, env: { ...unsetBridgeEnv, RELAYBRIDGE_WARM_DIAG: '0', RELAYBRIDGE_REMOTE_MCP: '0', ...env } });
   return { ...bridge, profile, events, initial, usageFile: path.join(bridge.root, 'data', 'usage', 'native-usage.json'),
     ask: (prompt = 'Complete synthetic protocol.', kind = 'claude') => bridge.request('/api/oneshot',
       { kind, cwd: bridge.root, prompt, dangerous: false, modelTier: 'standard', effort: 'medium', useCache: false }) };
 }
+
+test('stale native Claude admission refreshes through a non-generating PTY probe', async t => {
+  const bridge = await nativeClaudeFixture(t, {
+    probeMode: 'recover', env: { PTY_MODE: 'auto' },
+    mutate: profile => { profile.cachedUsageUtilization.fetchedAtMs -= 180001; },
+  });
+  const replies = await Promise.all([bridge.ask('First synthetic protocol.', 'claude'),
+    bridge.ask('Second synthetic protocol.', 'claude_fable')]);
+  for (const reply of replies) {
+    assert.equal(reply.status, 200, JSON.stringify(reply.body)); assert.equal(reply.body.model_invocation, true);
+  }
+  const events = completeJsonLines(bridge.events);
+  assert.equal(events.filter(event => event.type === 'usage_probe').length, 1);
+  assert.equal(events.filter(event => event.type === 'started').length, 2);
+});
+
+test('failed native Claude PTY refresh stays fail-closed and fresh capacity skips the probe', async t => {
+  await t.test('failed refresh', async sub => {
+    const bridge = await nativeClaudeFixture(sub, {
+      probeMode: 'fail', env: { PTY_MODE: 'auto' },
+      mutate: profile => { profile.cachedUsageUtilization.fetchedAtMs -= 180001; },
+    });
+    const replies = [await bridge.ask(), await bridge.ask('Retry during probe cooldown.')];
+    for (const reply of replies) {
+      assert.equal(reply.body.failureClass, 'quota_unknown', JSON.stringify(reply.body));
+      assert.equal(reply.body.model_invocation, false);
+    }
+    const events = completeJsonLines(bridge.events);
+    assert.equal(events.filter(event => event.type === 'usage_probe').length, 1);
+    assert.equal(events.filter(event => event.type === 'started').length, 0);
+  });
+  await t.test('fresh cache', async sub => {
+    const bridge = await nativeClaudeFixture(sub, { probeMode: 'recover', env: { PTY_MODE: 'auto' } });
+    const reply = await bridge.ask(); assert.equal(reply.status, 200, JSON.stringify(reply.body));
+    assert.equal(completeJsonLines(bridge.events).filter(event => event.type === 'usage_probe').length, 0);
+  });
+  await t.test('fresh protected reserve', async sub => {
+    const bridge = await nativeClaudeFixture(sub, {
+      probeMode: 'recover', env: { PTY_MODE: 'auto' },
+      mutate: profile => {
+        for (const window of Object.values(profile.cachedUsageUtilization.utilization)) window.utilization = 98;
+      },
+    });
+    const reply = await bridge.ask();
+    assert.equal(reply.body.failureClass, 'quota_reserve', JSON.stringify(reply.body));
+    assert.equal(reply.body.model_invocation, false);
+    assert.equal(completeJsonLines(bridge.events).filter(event => event.type === 'usage_probe').length, 0);
+  });
+});
 
 test('default native Claude cache refresh is non-generating, independent of Codex and deduplicates eligible aliases', async t => {
   const bridge = await nativeClaudeFixture(t);
