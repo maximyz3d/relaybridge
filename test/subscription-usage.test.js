@@ -987,6 +987,38 @@ test('denial and spend-control nulls cannot fabricate recovery', (t) => {
   f.advance(1000); f.store.observe(f.codex(100, { ordinaryUsageAllowed: null })); assert.equal(f.store.verdict('codex').admit, false);
   f.advance(1000); f.store.observe(f.codex(90)); assert.equal(f.store.verdict('codex').admit, true);
 });
+// B1: verdict()'s window-reset re-admit must gate on ALL vendor-block kinds carried by
+// headroom(), not just ordinaryUsageAllowed:false -- spendControlReached and reachedType
+// (rate_limit_reached / *_credits_depleted) independently mean the vendor itself refuses
+// the account, and a rolled-over local window must not paper over that.
+test('B1: ordinaryUsageAllowed:false vendor block survives an anchored window rollover', (t) => {
+  const f = fixture(t);
+  f.store.observe(f.codex(4, { ordinaryUsageAllowed: false }));
+  assert.equal(f.store.verdict('codex').admit, false);
+  f.advance(86400001);
+  assert.equal(f.store.verdict('codex').admit, false, 'ordinaryUsageAllowed:false must survive window rollover');
+});
+test('B1: bucket spendControlReached vendor block survives an anchored window rollover', (t) => {
+  const f = fixture(t);
+  f.store.observe(parseCodexRateLimits({ ordinaryUsageAllowed: true, rateLimits: { limitId: 'codex' },
+    rateLimitsByLimitId: { codex: { primary: { usedPercent: 96, windowDurationMins: 10080, resetsAt: T / 1000 + 86400 },
+      spendControlReached: true } } }, { quotaSeat: 'codex', observedAt: f.at() }));
+  assert.equal(f.store.headroom('codex').vendorBlocked, true);
+  assert.equal(f.store.verdict('codex').admit, false);
+  f.advance(86400001);
+  assert.equal(f.store.verdict('codex').admit, false, 'spendControlReached must survive window rollover');
+});
+test('B1: bucket reachedType vendor block survives an anchored window rollover', (t) => {
+  for (const reachedType of ['rate_limit_reached', 'workspace_owner_credits_depleted']) {
+    const f = fixture(t);
+    f.store.observe(parseCodexRateLimits({ ordinaryUsageAllowed: true, rateLimits: { limitId: 'codex' },
+      rateLimitsByLimitId: { codex: { primary: { usedPercent: 96, windowDurationMins: 10080, resetsAt: T / 1000 + 86400 },
+        rateLimitReachedType: reachedType } } }, { quotaSeat: 'codex', observedAt: f.at() }));
+    assert.equal(f.store.verdict('codex').admit, false);
+    f.advance(86400001);
+    assert.equal(f.store.verdict('codex').admit, false, `${reachedType} must survive window rollover`);
+  }
+});
 test('a full healthy Codex refresh retires expired removed windows', (t) => {
   const f = fixture(t); f.store.observe(f.codex(90, { rateLimitsByLimitId: { codex: {
     primary: { usedPercent: 10, windowDurationMins: 10080, resetsAt: T / 1000 + 86400 },

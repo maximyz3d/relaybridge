@@ -140,6 +140,33 @@ test('a binding window whose anchored rollover has occurred stale-admits through
   assert.equal(reply.body.route.stale_reason, 'window_reset', JSON.stringify(reply.body));
 });
 
+// B1: a genuinely rolled-over binding window must NOT stale-admit when the prior seat is
+// itself vendor-blocked (spend control reached). The window's own reset says nothing about
+// whether the vendor still refuses the account, so the fallback must reject as before.
+test('a vendor spend-control block is not released by an anchored window rollover', async t => {
+  const bridge = await staleNativeFixture(t, {
+    initialUtilization: 99, probeMode: 'fail',
+    patchStoreSeat: seat => {
+      const pastMs = Date.now() - 5000;
+      const pastNs = BigInt(pastMs) * 1000000n;
+      const boundary = Number((pastNs + 999999999n) / 1000000000n) * 1000;
+      for (const w of Object.values(seat.buckets.account.windows)) {
+        w.resetsAt = pastMs;
+        w.nativeResetMs = pastMs;
+        w.nativeResetNs = String(pastNs);
+        w.nativeResetIso = new Date(pastMs).toISOString();
+        w.resetBoundaryMs = boundary;
+        w.nativeResetAnchor = { version: 1, ns: String(pastNs), precision: 'nanosecond', origin: 'observed' };
+      }
+      seat.buckets.account.spendControlReached = true;
+    },
+  });
+  const reply = await bridge.ask();
+  assert.equal(reply.status, 409, JSON.stringify(reply.body));
+  assert.ok(['quota_reserve', 'quota_unknown'].includes(reply.body.failureClass), JSON.stringify(reply.body));
+  assert.equal(reply.body.model_invocation, false);
+});
+
 // Contrast: a forged/moved resetsAt alone, with the underlying native reset identity
 // (nativeResetMs/anchor) left untouched, must NOT be trusted as a rollover -- the seat stays
 // protected and the request is rejected as quota_reserve, same as before any window "reset".

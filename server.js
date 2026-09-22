@@ -4829,7 +4829,11 @@ async function executeOneShot(body, res, privateContext = null) {
         ? priorSeat.windows.reduce((a, b) => (a.percentRemaining ?? 100) <= (b.percentRemaining ?? 100) ? a : b) : null;
       // S5: trust the store's own anchored rollover boundary, not a raw resetsAt --
       // a forged or moved resetsAt must not release protection early.
-      const windowReset = !!bindingWindow && subscriptionUsage.anchoredRolloverOccurred(bindingWindow);
+      // B1: a stale window-reset admit is not enough when the prior seat is itself
+      // vendor-blocked (spend control / rate-limit / credits-depleted); the vendor
+      // block must independently clear before we trust a fallback admission.
+      const windowReset = !!bindingWindow && !priorSeat.vendorBlocked
+        && subscriptionUsage.anchoredRolloverOccurred(bindingWindow);
       const headroomAboveReserve = hasPriorObservation && priorSeat.admit === true;
       if (identityStillMatches && hasPriorObservation && (windowReset || headroomAboveReserve)) {
         staleAdmittedNativeUsage = true;
