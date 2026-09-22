@@ -24,9 +24,8 @@ test('a notify-only supervisor stall never kills the run and is filed as a super
         // resolves, and no stall detector fires (Refs #133, Round 7 G8).
         // Staying silent across two ticks (10s) plus census-latency margin
         // guarantees at least one fully-silent check-in regardless of census
-        // speed. Dedup (server.js:5510-5522, stallIncidentReported) ensures
-        // this still files exactly one supervision_stall incident even if
-        // more than one silent check-in occurs before output arrives.
+        // speed. Dedup (server.js:5510-5527) files each stall kind at most
+        // once per run, however many silent check-ins occur (see below).
         oneshot_safe: [process.execPath, helper, '--prompt-file', '{prompt_file}', '--delay', '14000'],
         oneshot_dangerous: [process.execPath, helper, '--prompt-file', '{prompt_file}', '--delay', '14000'],
         supervisor: {
