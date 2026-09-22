@@ -7776,8 +7776,13 @@ app.post('/api/broadcast', trackedHandler(async (req, res) => {
   } catch (err) { return rejectInvalidIntent(res, req.body || {}, err); }
   const startedAt = Date.now();
   const budgetTaskTier = classifyTask(prompt).tier;
-  const deadlineAt = startedAt + effectiveTimeoutMs;
-  const queueDeadline = Math.min(deadlineAt, startedAt + TIMEOUT_POLICY.broadcastQueueWaitMs);
+  // effectiveTimeoutMs is null when the caller gave no timeoutMs and
+  // oneShotDefaultMs is unset: that means no deadline, not an immediate one.
+  // The queue-wait ceiling (broadcastQueueWaitMs) is likewise no longer
+  // enforced, so admission-limited members retry until deadlineAt (or
+  // forever, if there is none) rather than being cut off by a separate,
+  // shorter queue deadline.
+  const deadlineAt = effectiveTimeoutMs === null ? null : startedAt + effectiveTimeoutMs;
   const activeCaptured = new Set();
   let clientGone = false;
   res.once('close', () => {
@@ -7793,15 +7798,15 @@ app.post('/api/broadcast', trackedHandler(async (req, res) => {
     selection: { tag: typeof tag === 'string' ? tag : null, all: all === true, explicitProviders: Array.isArray(providers) ? providers : [] },
     targets,
     members: [],
-    deadlineAt: new Date(deadlineAt).toISOString(),
+    deadlineAt: deadlineAt === null ? null : new Date(deadlineAt).toISOString(),
     timeoutMs: effectiveTimeoutMs,
   });
   const callOnce = async (kind) => {
     if (clientGone || res.destroyed) {
       return { statusCode: 499, body: { error: 'broadcast client disconnected', dropped_out: true, cancelled: true } };
     }
-    const remainingMs = deadlineAt - Date.now();
-    if (remainingMs < TIMEOUT_POLICY.minimumMs) {
+    const remainingMs = deadlineAt === null ? null : deadlineAt - Date.now();
+    if (remainingMs !== null && remainingMs < TIMEOUT_POLICY.minimumMs) {
       return { statusCode: 408, body: { error: 'broadcast deadline exceeded', dropped_out: true, timed_out: true } };
     }
     const captured = new CapturedOneShotResponse();
@@ -7823,8 +7828,7 @@ app.post('/api/broadcast', trackedHandler(async (req, res) => {
     while (
       response.statusCode === 429 &&
       response.body?.failureClass === 'admission_limit' &&
-      Date.now() < queueDeadline &&
-      Date.now() < deadlineAt &&
+      (deadlineAt === null || Date.now() < deadlineAt) &&
       !clientGone &&
       !res.destroyed
     ) {
@@ -7861,7 +7865,7 @@ app.post('/api/broadcast', trackedHandler(async (req, res) => {
     runId: run.runId,
     status: run.status,
     timeoutMs: effectiveTimeoutMs,
-    deadlineAt: new Date(deadlineAt).toISOString(),
+    deadlineAt: deadlineAt === null ? null : new Date(deadlineAt).toISOString(),
   });
 }));
 

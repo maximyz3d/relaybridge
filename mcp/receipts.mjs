@@ -276,10 +276,12 @@ export function readRun(runId) {
 function staleRunHorizon(run) {
   const deadline = Date.parse(run.deadlineAt || '');
   if (Number.isFinite(deadline)) return deadline + TIMEOUT_POLICY.mcpHostGraceMs;
-  // Legacy records have only an estimated progress horizon, never death proof.
-  const lastProgress = Date.parse(run.updatedAt || run.createdAt || '');
-  if (!Number.isFinite(lastProgress)) return null;
-  return lastProgress + TIMEOUT_POLICY.oneShotMaxMs + TIMEOUT_POLICY.mcpHostGraceMs;
+  // No caller deadline (deadlineAt null/absent) means no time-based horizon:
+  // oneShotMaxMs no longer exists to estimate one from, and a run with no
+  // deadline is not overdue just because time passed — only actual liveness
+  // (the bridge still reporting the run active) can say a run has stalled,
+  // and that check happens where run status is read, not here.
+  return null;
 }
 
 function allRunSummaries() {

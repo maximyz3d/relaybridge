@@ -36,7 +36,6 @@ export const localAdapterIdentity = Object.freeze({
 const START_LOCK = path.join(BRIDGE_ROOT, '.mcp-start.lock');
 const OUT_LOG = path.join(BRIDGE_ROOT, 'bridge.mcp.out.log');
 const ERR_LOG = path.join(BRIDGE_ROOT, 'bridge.mcp.err.log');
-const MAX_BRIDGE_REQUEST_TIMEOUT_MS = TIMEOUT_POLICY.oneShotMaxMs + TIMEOUT_POLICY.transportGraceMs;
 // Accommodates the provider output ceiling even after JSON escaping, while
 // refusing an unbounded response from a broken local server.
 const MAX_BRIDGE_RESPONSE_BYTES = 128 * 1024 * 1024;
@@ -105,10 +104,12 @@ function requestBridgeText(url, { method, headers, body, signal }) {
   });
 }
 
+// No enforced ceiling: a caller's timeoutMs (or the 30s default for routine
+// bridge calls) is only ever floored, never clamped down to a policy max.
 function boundedBridgeRequestTimeoutMs(value) {
   const parsed = Number(value);
   const selected = Number.isFinite(parsed) && parsed > 0 ? Math.trunc(parsed) : 30000;
-  return Math.max(TIMEOUT_POLICY.minimumMs, Math.min(selected, MAX_BRIDGE_REQUEST_TIMEOUT_MS));
+  return Math.max(TIMEOUT_POLICY.minimumMs, selected);
 }
 
 function validatedBaseUrl(value) {
