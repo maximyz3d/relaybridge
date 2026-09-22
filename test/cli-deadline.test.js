@@ -7,22 +7,27 @@ const config = require('../cli-config.json');
 const { buildTaskPlan } = require('../lib/task-plan');
 const { resolveProviderControls } = require('../lib/execution-contract');
 
-test('Gemini safe/writer print wait is derived from the effective cap plus bounded margin', () => {
+const UNCAPPED_PRINT_TIMEOUT = '2147483s';
+
+test('Gemini safe/writer print wait is rendered at the uncapped ceiling regardless of configured caps', () => {
+  // No count- or time-based kill exists any more: whatever hardCapMs/idleMs
+  // combination a caller supplies, the rendered --print-timeout is identical
+  // and does not track it.
   for (const options of [{}, { timeoutMs: 1000 }, { globals: { idleMs: 5000, hardCapMs: 3000 } },
     { entry: { supervisor: { hardCapMs: 3600000 } } }, { timeoutMs: 1999.9 }]) {
     const supervisorOptions = resolveAttemptTiming(options);
-    assert.equal(supervisorOptions.hardCapMs, Number(new RunSupervisor(supervisorOptions).opts.hardCapMs));
     let prior;
     for (const slot of [config.gemini.oneshot_safe, config.gemini.oneshot_dangerous]) {
       const value = renderCliDeadline({ entry: config.gemini, slot, supervisorOptions });
-      assert.ok(value.deadline.marginMs >= 30000 && value.deadline.marginMs < 31000);
-      assert.equal(value.deadline.hardCapMs, supervisorOptions.hardDeadline === false ? 86400000 : supervisorOptions.hardCapMs);
+      assert.equal(value.deadline.finite, false);
+      assert.equal(value.deadline.hardCapMs, null);
+      assert.equal(value.deadline.printTimeout, UNCAPPED_PRINT_TIMEOUT);
       assert.ok(value.slot.includes(value.deadline.printTimeout)); assert.equal(value.slot.includes(PRINT_TIMEOUT_TOKEN), false);
       if (prior) assert.deepEqual(value.deadline, prior); prior = value.deadline;
     }
   }
   const normal = renderCliDeadline({ entry: config.gemini, slot: config.gemini.oneshot_safe, supervisorOptions: resolveAttemptTiming() });
-  assert.equal(normal.deadline.printTimeout, '86430s'); // Adaptive transport ceiling plus bounded drain margin
+  assert.equal(normal.deadline.printTimeout, UNCAPPED_PRINT_TIMEOUT);
   const late = new RunSupervisor({ ...resolveAttemptTiming(), startedAt: 0 });
   late.recordOutput('continued semantic progress', 16 * 60000);
   assert.notEqual(late.evaluate(16 * 60000).action, 'kill');
@@ -37,13 +42,17 @@ test('progress completes beyond the former 15min boundary; silence alone does no
   }
   assert.equal(active.recordOutput('Final complete answer.\n', 16 * 60000 + 1), true);
   assert.notEqual(active.evaluate(16 * 60000 + 1).action, 'kill');
+  // Silence alone, with CPU sampled and confirmed idle, is never enough by
+  // itself either: a single check-in's `silent`/`cpu_idle` detectors only
+  // start a streak, they do not kill on the first check-in.
   const silent = new RunSupervisor(options);
   silent.recordCpuSample(0, 0);
   silent.recordCpuSample(0, options.idleMs);
   const verdict = silent.evaluate(options.idleMs);
   assert.equal(verdict.action, 'continue');
+  // Non-adaptive runs are also never clock-killed any more.
   const legacy = new RunSupervisor(resolveAttemptTiming({ startedAt: 0, globals: { adaptive: false } }));
-  assert.equal(legacy.evaluate(options.idleMs).action, 'kill');
+  assert.notEqual(legacy.evaluate(options.idleMs).action, 'kill');
   const rendered = renderCliDeadline({ entry: config.gemini, slot: config.gemini.oneshot_safe, supervisorOptions: options });
   assert.ok(options.idleMs < rendered.deadline.printTimeoutMs);
 });
@@ -58,10 +67,12 @@ test('malformed/duplicate/literal/unlimited print flags and overflow fail before
     assert.throws(() => renderCliDeadline({ entry, slot, supervisorOptions }), { code: 'invalid_print_timeout' });
   }
   const slot = ['agy', '--print-timeout=' + PRINT_TIMEOUT_TOKEN];
-  assert.equal(renderCliDeadline({ entry, slot, supervisorOptions }).slot[1], '--print-timeout=86430s');
+  assert.equal(renderCliDeadline({ entry, slot, supervisorOptions }).slot[1], `--print-timeout=${UNCAPPED_PRINT_TIMEOUT}`);
   assert.throws(() => renderCliDeadline({ entry: {}, slot, supervisorOptions }), { code: 'invalid_print_timeout' });
+  // The rendered ceiling no longer derives from supervisorOptions.hardCapMs at
+  // all, so a malformed/missing hardCapMs on that object cannot break render.
   for (const hardCapMs of [Infinity, NaN, -1, 0, Number.MAX_SAFE_INTEGER]) {
-    assert.throws(() => renderCliDeadline({ entry, slot, supervisorOptions: { hardCapMs } }), { code: 'invalid_print_timeout' });
+    assert.equal(renderCliDeadline({ entry, slot, supervisorOptions: { hardCapMs } }).deadline.printTimeout, UNCAPPED_PRINT_TIMEOUT);
   }
   assert.deepEqual(renderCliDeadline({ entry: {}, slot: ['node', '--', '--print-timeout', 'literal'], supervisorOptions }).slot,
     ['node', '--', '--print-timeout', 'literal']);
@@ -76,8 +87,10 @@ test('planned deadline args match execution while runtime timeout leaves exact m
       slot: dangerous ? config.gemini.oneshot_dangerous : config.gemini.oneshot_safe, execution: plan.execution, dangerous });
     const render = renderCliDeadline({ entry: config.gemini, slot: controls.slot, supervisorOptions: resolveAttemptTiming({ timeoutMs: 4000 }) });
     assert.deepEqual(plan.args, render.slot.slice(1)); assert.deepEqual(plan.cliDeadline, render.deadline);
+    // The rendered ceiling is now fixed, so a different requestedTimeoutMs no
+    // longer changes cliDeadline.printTimeout.
     const changed = buildTaskPlan({ route, config, requestedKind: 'gemini', requestedTimeoutMs: 9000, dangerous }).primary;
-    assert.deepEqual(changed.execution, plan.execution); assert.notEqual(changed.cliDeadline.printTimeout, plan.cliDeadline.printTimeout);
+    assert.deepEqual(changed.execution, plan.execution); assert.equal(changed.cliDeadline.printTimeout, plan.cliDeadline.printTimeout);
   }
 });
 

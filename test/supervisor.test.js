@@ -11,10 +11,13 @@ function make(overrides = {}) {
   return new RunSupervisor({ startedAt: T0, ...overrides });
 }
 
-test('a run that keeps producing new content is never stopped mid-task', () => {
-  const s = make({ idleMs: 60000, hardCapMs: 3600000 });
+// ---- no run is stopped by elapsed time, token count or output bytes -------
+
+test('a run that keeps producing new content is never stopped mid-task, even past every former cap', () => {
+  const s = make({ idleMs: 60000, hardCapMs: 3600000, checkInIntervalMs: 300000 });
   let now = T0;
-  // Twenty minutes of steady, varied output â€” well past the old 3 min cap.
+  // Twenty minutes of steady, varied output, spanning several check-in
+  // boundaries -- well past every retired clock-based cap.
   for (let i = 0; i < 240; i++) {
     now += 5000;
     s.recordOutput(`step ${i}: editing module number ${i} and running its checks\n`, now);
@@ -22,148 +25,341 @@ test('a run that keeps producing new content is never stopped mid-task', () => {
     assert.equal(verdict.action, 'continue', `killed at minute ${(now - T0) / 60000}: ${verdict.reason}`);
   }
   assert.equal(s.phase(now), 'streaming');
+  assert.equal(s.stopped, null);
 });
 
-test('silence past the idle window with no CPU advance is called a stall', () => {
-  const s = make({ idleMs: 60000 });
-  s.recordOutput('starting work\n', T0 + 1000);
-  assert.equal(s.evaluate(T0 + 30000).action, 'continue');
-  const verdict = s.evaluate(T0 + 90000);
-  assert.equal(verdict.action, 'kill');
-  assert.equal(verdict.reason, 'idle_stall');
-  assert.match(verdict.detail, /no output for \d+s/);
-});
-
-test('buffered providers survive the retired six-minute idle cutoff by default', () => {
-  const s = make();
-  const verdict = s.evaluate(T0 + 361000);
-  assert.equal(verdict.action, 'continue');
-  assert.equal(verdict.reason, 'starting');
-  assert.equal(s.snapshot(T0 + 361000).idleBudgetMs, DEFAULTS.idleMs - 361000);
-});
-
-test('CPU advance while silent buys grace, so a quietly thinking CLI survives', () => {
-  const s = make({ idleMs: 60000, cpuActiveMs: 500, graceExtensions: 3 });
-  s.recordOutput('thinking\n', T0 + 1000);
-  s.recordCpuSample(1000, T0 + 30000);
-  // 40s of CPU burned while producing nothing: that is work, not a wedge.
-  s.recordCpuSample(41000, T0 + 55000);
-  assert.equal(s.evaluate(T0 + 80000).action, 'continue');
-  assert.equal(s.extensionsUsed, 1);
-});
-
-test('grace is bounded so a busy-spinning process cannot extend forever', () => {
-  const s = make({ idleMs: 60000, cpuActiveMs: 500, graceExtensions: 2 });
-  s.recordOutput('go\n', T0 + 1000);
-  let cpu = 0;
-  let now = T0 + 30000;
-  for (let i = 0; i < 3; i++) {
-    cpu += 30000;
-    now += 30000;
-    s.recordCpuSample(cpu, now);
+test('output past spillAfterBytes keeps recording and never kills; caller spills to disk instead', () => {
+  const s = make({ spillAfterBytes: 100, checkInIntervalMs: 999999999 });
+  let now = T0;
+  let lastAccepted = true;
+  for (let i = 0; i < 20; i++) {
+    now += 10;
+    lastAccepted = s.recordOutput(`unique padding line number ${i} ` + 'x'.repeat(20) + '\n', now);
   }
-  // The first sample only establishes a baseline, so three samples grant two.
-  assert.equal(s.extensionsUsed, 2);
-  const verdict = s.evaluate(now + 70000);
-  assert.equal(verdict.action, 'kill');
-  assert.equal(verdict.reason, 'idle_stall');
-  assert.match(verdict.detail, /grace extensions/);
+  assert.equal(lastAccepted, false, 'caller is told to start spilling once past the threshold');
+  assert.equal(s.spilling, true);
+  assert.equal(s.evaluate(now).action, 'continue');
+  s.recordOutputSpillPath('/tmp/run-1/output.spill');
+  assert.equal(s.snapshot(now).outputSpillPath, '/tmp/run-1/output.spill');
+  assert.equal(s.snapshot(now).spilling, true);
 });
 
-test('a repeating line is caught as a loop even though output keeps flowing', () => {
-  const s = make({ loopRepeatThreshold: 8, idleMs: 600000 });
+test('the old maxOutputBytes key is accepted as an alias for spillAfterBytes', () => {
+  const s = make({ maxOutputBytes: 50 });
+  assert.equal(s.opts.spillAfterBytes, 50);
+});
+
+// ---- ignoredCaps: configured budgets/hardCap/timeout are recorded, never enforced ----
+
+test('configured providerBudget, hardCapMs and timeoutMs are exposed via ignoredCaps and never enforced', () => {
+  const s = make({
+    hardCapMs: 5000,
+    timeoutMs: 3000,
+    checkInIntervalMs: 60000,
+    providerBudget: { maxTotalTokens: 10, maxOutputTokens: 5, maxCacheReadTokens: null, maxCacheCreationTokens: null, maxTurns: null },
+  });
+  assert.equal(s.ignoredCaps.hardCapMs, 5000);
+  assert.equal(s.ignoredCaps.timeoutMs, 3000);
+  assert.equal(s.ignoredCaps.providerBudget.maxTotalTokens, 10);
+  s.recordProviderUsage({ total_tokens: 999999 }, { phase: 'incremental' });
+  s.recordOutput('healthy progress line one\n', T0 + 1000);
+  const verdict = s.evaluate(T0 + 3600000); // far past both hardCapMs and timeoutMs
+  assert.equal(verdict.action, 'continue');
+  const snap = s.snapshot(T0 + 3600000);
+  assert.deepEqual(snap.ignoredCaps.providerBudget.maxTotalTokens, 10);
+  assert.equal(snap.ignoredCaps.hardCapMs, 5000);
+});
+
+test('unconfigured hardCapMs/timeoutMs/providerBudget report as null in ignoredCaps', () => {
+  const s = make();
+  assert.equal(s.ignoredCaps.hardCapMs, null);
+  assert.equal(s.ignoredCaps.timeoutMs, null);
+  for (const field of Object.keys(DEFAULTS.providerBudget)) assert.equal(s.ignoredCaps.providerBudget[field], null);
+});
+
+test('DEFAULTS.providerBudget ships with no enforced ceiling on any field, including maxTurns', () => {
+  for (const field of Object.keys(DEFAULTS.providerBudget)) {
+    assert.equal(DEFAULTS.providerBudget[field], null, `${field} must not carry a default ceiling`);
+  }
+  assert.equal(DEFAULTS.hardCapMs, null, 'no default hard cap is enforced');
+});
+
+test('a hard cap configured well below the idle window is preserved as-is, not clamped', () => {
+  // There is nothing left to trap a run under any more, so the old
+  // idle-window correction no longer applies -- the informational value is
+  // simply recorded verbatim.
+  const s = make({ idleMs: 300000, hardCapMs: 1000 });
+  assert.equal(s.opts.hardCapMs, 1000);
+  assert.equal(s.ignoredCaps.hardCapMs, 1000);
+});
+
+// ---- check-in cadence -------------------------------------------------
+
+test('check-ins fire at the fixed interval and also early on a large token jump', () => {
+  const s = make({ checkInIntervalMs: 60000, checkInTokens: 500000 });
+  s.recordOutput('start\n', T0 + 1000);
+  // Not yet due: neither interval nor token growth threshold reached.
+  s.evaluate(T0 + 1000);
+  assert.equal(s.checkins.length, 0);
+  // A big token jump forces an early check-in even though the interval has
+  // not elapsed.
+  s.recordProviderUsage({ total_tokens: 600000 }, { phase: 'incremental' });
+  s.evaluate(T0 + 5000);
+  assert.equal(s.checkins.length, 1);
+});
+
+// ---- rule (a): wedged ---------------------------------------------------
+
+test('wedged fires after wedgedCheckins consecutive check-ins with no bytes, CPU, progress or tokens', () => {
+  const s = make({ checkInIntervalMs: 60000, wedgedCheckins: 3 });
+  let now = T0;
+  let verdict;
+  for (let i = 0; i < 3; i++) {
+    now += 60000;
+    s.recordCpuSample(0, now); // confirmed idle each check-in window
+    verdict = s.evaluate(now);
+    if (i < 2) assert.equal(verdict.action, 'continue', `stopped early at check-in ${i + 1}`);
+  }
+  assert.equal(verdict.action, 'kill');
+  assert.equal(verdict.reason, 'wedged');
+  assert.ok(Array.isArray(verdict.evidence) && verdict.evidence.length > 0, 'kill carries check-in evidence');
+});
+
+test('CPU activity while silent prevents the wedged streak from accumulating', () => {
+  const s = make({ checkInIntervalMs: 60000, wedgedCheckins: 2, cpuActiveMs: 500 });
+  let now = T0;
+  let cpu = 0;
+  for (let i = 0; i < 4; i++) {
+    now += 60000;
+    cpu += 1000; // well above cpuActiveMs each interval: genuine work while silent
+    s.recordCpuSample(cpu, now);
+    assert.equal(s.evaluate(now).action, 'continue', `wrongly stopped at check-in ${i + 1}`);
+  }
+});
+
+test('when CPU cannot be sampled at all, the wider unsampledWedgedCheckins threshold applies', () => {
+  const s = make({ checkInIntervalMs: 60000, wedgedCheckins: 2, unsampledWedgedCheckins: 4 });
+  let now = T0;
+  let verdict;
+  for (let i = 0; i < 4; i++) {
+    now += 60000;
+    s.recordCpuSample(null, now); // unverifiable
+    verdict = s.evaluate(now);
+    if (i < 3) assert.equal(verdict.action, 'continue', `stopped before the widened threshold at check-in ${i + 1}`);
+  }
+  assert.equal(verdict.action, 'kill');
+  assert.equal(verdict.reason, 'wedged');
+});
+
+// ---- rule (b): loop_confirmed -------------------------------------------
+
+test('loop_confirmed fires after loopCheckins consecutive repeating/no-new-content check-ins with no progress', () => {
+  // The line's very first occurrence is genuine new content (progress), so
+  // it takes one extra cycle beyond loopCheckins before the repeat-with-no-
+  // progress streak can reach the threshold.
+  const s = make({ checkInIntervalMs: 60000, loopCheckins: 2, loopRepeatThreshold: 3 });
+  let now = T0;
+  let verdict;
+  for (let cycle = 0; cycle < 3; cycle++) {
+    for (let i = 0; i < 4; i++) {
+      now += 1000;
+      s.recordOutput('Retrying the same tool call after the previous attempt failed\n', now);
+    }
+    now = T0 + (cycle + 1) * 60000;
+    verdict = s.evaluate(now);
+    if (cycle < 2) assert.equal(verdict.action, 'continue', `stopped early at cycle ${cycle}`);
+  }
+  assert.equal(verdict.action, 'kill');
+  assert.equal(verdict.reason, 'loop_confirmed');
+});
+
+test('output that keeps growing without ever saying anything new is caught by no_new_content, not by progress', () => {
+  const known = ['alpha line of content here', 'beta line of content here', 'gamma line of content here'];
+  const s = make({ checkInIntervalMs: 60000, loopCheckins: 2, noNewContentMs: 30000, loopRepeatThreshold: 500 });
+  let now = T0;
+  let verdict;
+  for (let cycle = 0; cycle < 3; cycle++) {
+    for (let i = 0; i < 3; i++) {
+      now += 1000;
+      s.recordOutput(known[i % known.length] + '\n', now);
+    }
+    now = T0 + (cycle + 1) * 60000;
+    verdict = s.evaluate(now);
+    if (cycle < 2) assert.equal(verdict.action, 'continue', `stopped early at cycle ${cycle}`);
+  }
+  assert.equal(verdict.action, 'kill');
+  assert.equal(verdict.reason, 'loop_confirmed');
+});
+
+test('progress lines that differ only by a counter are not mistaken for a loop', () => {
+  const s = make({ checkInIntervalMs: 60000, loopRepeatThreshold: 8 });
+  let now = T0;
+  for (let i = 0; i < 60; i++) {
+    now += 500;
+    s.recordOutput(`processed ${i} of 60 files in the workspace\n`, now);
+  }
+  now = T0 + 60000;
+  assert.equal(s.evaluate(now).action, 'continue');
+});
+
+// ---- loop-detection primitives (unchanged by the check-in redesign) -------
+
+test('a repeating line is tracked by maxRepeat even though output keeps flowing', () => {
+  const s = make();
   let now = T0;
   for (let i = 0; i < 8; i++) {
     now += 1000;
     s.recordOutput('Retrying tool call because the previous attempt failed\n', now);
   }
-  const verdict = s.evaluate(now);
-  assert.equal(verdict.action, 'kill');
-  assert.equal(verdict.reason, 'loop_detected');
-  assert.match(verdict.detail, /repeated 8 times/);
-});
-
-test('progress lines that differ only by a counter are not mistaken for a loop', () => {
-  const s = make({ loopRepeatThreshold: 8, idleMs: 600000 });
-  let now = T0;
-  for (let i = 0; i < 60; i++) {
-    now += 1000;
-    s.recordOutput(`processed ${i} of 60 files in the workspace\n`, now);
-  }
-  assert.equal(s.evaluate(now).action, 'continue');
-});
-
-test('output that grows without ever saying anything new is treated as churn', () => {
-  const s = make({ noNewContentMs: 60000, loopRepeatThreshold: 500, idleMs: 600000 });
-  let now = T0;
-  const known = ['alpha line of content here', 'beta line of content here', 'gamma line of content here'];
-  for (let i = 0; i < 90; i++) {
-    now += 1000;
-    s.recordOutput(known[i % known.length] + '\n', now);
-  }
-  const verdict = s.evaluate(now);
-  assert.equal(verdict.action, 'kill');
-  assert.equal(verdict.reason, 'loop_detected');
-  assert.match(verdict.detail, /nothing new/);
+  assert.equal(s.maxRepeat().count, 8);
 });
 
 test('spinner and ANSI noise does not count as repeated content', () => {
-  const s = make({ loopRepeatThreshold: 4, idleMs: 600000 });
+  const s = make();
   let now = T0;
   for (const frame of ['|', '/', '-', '\\', '|', '/', '-', '\\']) {
     now += 500;
     s.recordOutput(`\u001b[2K\r${frame}\n`, now);
   }
-  assert.equal(s.evaluate(now).action, 'continue');
+  assert.equal(s.maxRepeat().count, 0);
 });
 
-test('lines split across chunk boundaries are reassembled before analysis', () => {
-  const s = make({ loopRepeatThreshold: 3, idleMs: 600000 });
+test('lines split across chunk boundaries are reassembled before repeat analysis', () => {
+  const s = make();
   let now = T0;
   for (let i = 0; i < 3; i++) {
     now += 100;
     s.recordOutput('the identical repeated ', now);
     s.recordOutput('sentence appears again\n', now);
   }
+  assert.equal(s.maxRepeat().count, 3);
+});
+
+// ---- rule (c): burn_without_progress ------------------------------------
+
+test('burn_without_progress fires after burnCheckins consecutive no-progress check-ins burn burnTokens total', () => {
+  const s = make({ checkInIntervalMs: 60000, burnCheckins: 2, burnTokens: 1000000 });
+  let now = T0;
+  now += 60000;
+  s.recordProviderUsage({ total_tokens: 600000 }, { phase: 'incremental' });
+  assert.equal(s.evaluate(now).action, 'continue');
+  now += 60000;
+  s.recordProviderUsage({ total_tokens: 1300000 }, { phase: 'incremental' });
   const verdict = s.evaluate(now);
   assert.equal(verdict.action, 'kill');
-  assert.equal(verdict.reason, 'loop_detected');
+  assert.equal(verdict.reason, 'burn_without_progress');
+  assert.match(verdict.detail, /1300000 tokens|tokens/);
 });
 
-test('runaway output is capped so the bridge cannot be grown out of memory', () => {
-  const s = make({ maxOutputBytes: 4096, idleMs: 600000, loopRepeatThreshold: 10000 });
+test('burn without progress never fires when the total stays under burnTokens', () => {
+  const s = make({ checkInIntervalMs: 60000, burnCheckins: 2, burnTokens: 1000000 });
   let now = T0;
-  let accepted = true;
-  for (let i = 0; i < 200; i++) {
-    now += 10;
-    accepted = s.recordOutput(`unique padding line number ${i} ` + 'x'.repeat(60) + '\n', now);
+  for (let i = 0; i < 4; i++) {
+    now += 60000;
+    s.recordProviderUsage({ total_tokens: (i + 1) * 100000 }, { phase: 'incremental' });
+    assert.equal(s.evaluate(now).action, 'continue');
   }
-  assert.equal(accepted, false, 'caller should be told to stop accumulating');
+});
+
+// ---- progress resets every streak ---------------------------------------
+
+test('new content or a productive assessment resets the wedged/loop/burn streaks', () => {
+  const s = make({ checkInIntervalMs: 60000, wedgedCheckins: 2 });
+  let now = T0;
+  now += 60000;
+  s.recordCpuSample(0, now);
+  assert.equal(s.evaluate(now).action, 'continue');
+  assert.equal(s.wedgedStreak, 1);
+  now += 60000;
+  s.recordOutput('fresh, real progress just happened\n', now);
+  assert.equal(s.evaluate(now).action, 'continue');
+  assert.equal(s.wedgedStreak, 0, 'progress must reset the streak, not just avoid killing');
+  // Two more silent, CPU-idle check-ins from here must NOT kill on the first
+  // of them -- the streak restarted from zero.
+  now += 60000;
+  s.recordCpuSample(0, now);
+  assert.equal(s.evaluate(now).action, 'continue');
+  now += 60000;
+  s.recordCpuSample(0, now);
+  assert.equal(s.evaluate(now).action, 'kill');
+});
+
+test('a current-generation productive assessment verdict resets streaks even without new bytes', () => {
+  const s = make({ checkInIntervalMs: 60000, wedgedCheckins: 2, adaptive: true });
+  let now = T0;
+  now += 60000;
+  s.recordCpuSample(0, now);
+  assert.equal(s.evaluate(now).action, 'continue');
+  assert.equal(s.wedgedStreak, 1);
+  s.progress.assessment = { verdict: 'productive', materialGeneration: s.progress.materialGeneration };
+  now += 60000;
+  s.recordCpuSample(0, now);
+  assert.equal(s.evaluate(now).action, 'continue');
+  assert.equal(s.wedgedStreak, 0);
+});
+
+// ---- stallAction: notify vs checkpoint_and_kill --------------------------
+
+test('stallAction "notify" never kills; it records a stall once and continues', () => {
+  const s = make({ checkInIntervalMs: 60000, wedgedCheckins: 2, stallAction: 'notify' });
+  let now = T0;
+  now += 60000;
+  s.recordCpuSample(0, now);
+  assert.equal(s.evaluate(now).action, 'continue');
+  now += 60000;
+  s.recordCpuSample(0, now);
+  const verdict = s.evaluate(now);
+  assert.equal(verdict.action, 'continue');
+  assert.equal(verdict.reason, 'stall_notified');
+  assert.equal(s.stopped, null);
+  assert.equal(s.stall.reason, 'wedged');
+  const firstStallAt = s.stall.at;
+  // A further triggering check-in must not overwrite the first recorded stall.
+  now += 60000;
+  s.recordCpuSample(0, now);
+  s.evaluate(now);
+  assert.equal(s.stall.at, firstStallAt);
+  assert.equal(s.snapshot(now).stall.reason, 'wedged');
+});
+
+test('stallAction defaults to checkpoint_and_kill and rejects unknown values', () => {
+  const s = make();
+  assert.equal(s.opts.stallAction, 'checkpoint_and_kill');
+  const bogus = make({ stallAction: 'ignore_everything' });
+  assert.equal(bogus.opts.stallAction, 'checkpoint_and_kill');
+});
+
+// ---- rule (d): assessor_stuck, checked at any time -----------------------
+
+test('assessor disabled/unavailable does not block deterministic check-in rules (a)-(c)', () => {
+  const s = make({ adaptive: false, checkInIntervalMs: 60000, wedgedCheckins: 2 });
+  assert.equal(s.opts.adaptive, false);
+  assert.equal(s.assessmentEnabled, false);
+  let now = T0;
+  now += 60000;
+  s.recordCpuSample(0, now);
+  assert.equal(s.evaluate(now).action, 'continue');
+  now += 60000;
+  s.recordCpuSample(0, now);
   const verdict = s.evaluate(now);
   assert.equal(verdict.action, 'kill');
-  assert.equal(verdict.reason, 'output_cap');
+  assert.equal(verdict.reason, 'wedged', 'rule (a) fires the same whether adaptive is on or off');
 });
 
-test('the hard cap stops even a perfectly healthy run', () => {
-  const s = make({ idleMs: 60000, hardCapMs: 120000 });
+test('healthy varied output survives 120 simulated minutes with the assessor disabled', () => {
+  const s = make({ adaptive: false, checkInIntervalMs: 300000 });
   let now = T0;
-  for (let i = 0; i < 12; i++) {
-    now += 10000;
-    s.recordOutput(`still working on distinct item ${i} right now\n`, now);
+  for (let minute = 1; minute <= 120; minute++) {
+    now = T0 + minute * 60000;
+    s.recordOutput(`distinct work item completed at minute ${minute}\n`, now);
+    const verdict = s.evaluate(now);
+    assert.equal(verdict.action, 'continue', `unexpectedly stopped at minute ${minute}: ${verdict.reason}`);
   }
-  const verdict = s.evaluate(now + 1000);
-  assert.equal(verdict.action, 'kill');
-  assert.equal(verdict.reason, 'hard_cap');
+  assert.equal(s.stopped, null);
+  assert.equal(s.progress.assessment, null, 'no assessment was ever accepted, matching a disabled assessor');
 });
 
-test('a verdict is sticky so a killed run keeps its original reason', () => {
-  const s = make({ idleMs: 60000, hardCapMs: 90000 });
-  s.recordOutput('one line of output\n', T0 + 1000);
-  const first = s.evaluate(T0 + 70000);
-  assert.equal(first.reason, 'idle_stall');
-  const second = s.evaluate(T0 + 5000000);
-  assert.equal(second.reason, 'idle_stall', 'hard cap must not overwrite the real cause');
-});
+// ---- CPU sampling scheduling (unchanged) ---------------------------------
 
 test('CPU sampling is only requested once a run has gone quiet', () => {
   const s = make({ idleMs: 60000 });
@@ -174,202 +370,71 @@ test('CPU sampling is only requested once a run has gone quiet', () => {
   assert.equal(s.needsCpuSample(T0 + 45000), false, 'sampling is rate limited');
 });
 
-test('unverifiable idle follows the configured policy', () => {
-  const kill = make({ idleMs: 60000, onUnverifiableIdle: 'kill' });
-  kill.recordOutput('x'.repeat(40) + '\n', T0 + 1000);
-  kill.recordCpuSample(null, T0 + 40000);
-  assert.equal(kill.evaluate(T0 + 90000).action, 'continue', 'still inside the widened unverified-idle window');
-  assert.equal(kill.evaluate(T0 + 260000).action, 'kill', 'past the widened window it stops');
+// ---- a kill verdict is sticky ---------------------------------------------
 
-  const wait = make({ idleMs: 60000, onUnverifiableIdle: 'continue' });
-  wait.recordOutput('y'.repeat(40) + '\n', T0 + 1000);
-  wait.recordCpuSample(null, T0 + 40000);
-  assert.equal(wait.evaluate(T0 + 90000).action, 'continue');
+test('a kill verdict is sticky so a stopped run keeps its original reason', () => {
+  const s = make({ checkInIntervalMs: 60000, wedgedCheckins: 2 });
+  let now = T0;
+  now += 60000;
+  s.recordCpuSample(0, now);
+  s.evaluate(now);
+  now += 60000;
+  s.recordCpuSample(0, now);
+  const first = s.evaluate(now);
+  assert.equal(first.reason, 'wedged');
+  now += 5000000;
+  const second = s.evaluate(now);
+  assert.equal(second.reason, 'wedged');
+  assert.equal(second, s.stopped);
 });
 
-test('snapshot reports which limit will fire first', () => {
-  const s = make({ idleMs: 60000, hardCapMs: 600000 });
+// ---- snapshot -------------------------------------------------------------
+
+test('snapshot exposes checkins, stall, ignoredCaps, outputSpillPath and spilling', () => {
+  const s = make({ idleMs: 60000, checkInIntervalMs: 60000 });
   s.recordOutput('working on it\n', T0 + 1000);
   const snap = s.snapshot(T0 + 31000);
   assert.equal(snap.phase, 'quiet');
-  assert.equal(snap.idleBudgetMs, 30000);
-  assert.equal(snap.hardCapRemainingMs, 569000);
-  assert.equal(snap.bytes, 14);
+  assert.equal(snap.bytes, Buffer.byteLength('working on it\n'));
   assert.equal(snap.stopped, null);
+  assert.deepEqual(snap.checkins, []);
+  assert.equal(snap.stall, null);
+  assert.equal(snap.outputSpillPath, null);
+  assert.equal(snap.spilling, false);
+  assert.ok('providerBudget' in snap.ignoredCaps && 'hardCapMs' in snap.ignoredCaps && 'timeoutMs' in snap.ignoredCaps);
 });
 
-test('a request timeout is honored as the hard cap, not as a kill clock', () => {
+test('snapshot.checkins carries the bounded fingerprint history, most recent last, capped at 20', () => {
+  const s = make({ checkInIntervalMs: 1000 });
+  let now = T0;
+  for (let i = 0; i < 25; i++) {
+    now += 1000;
+    s.recordOutput(`unique item ${i}\n`, now);
+    s.evaluate(now);
+  }
+  const snap = s.snapshot(now);
+  assert.equal(snap.checkins.length, 20);
+  const last = snap.checkins.at(-1);
+  assert.ok('at' in last && 'bytes' in last && 'lastNewContentAt' in last && 'progress' in last
+    && 'cpuActiveSinceLast' in last && 'totalTokens' in last && 'repeatCount' in last
+    && 'verdict' in last && Array.isArray(last.detectors));
+});
+
+// ---- resolveSupervisorOptions ---------------------------------------------
+
+test('an explicit request timeout is recorded as the informational hard cap, not a kill clock', () => {
   const opts = resolveSupervisorOptions({
     entry: { supervisor: { idleMs: 90000 } },
     globals: { idleMs: 120000, hardCapMs: 1800000 },
     hardCapMs: 600000,
   });
-  assert.equal(opts.hardCapMs, 600000, 'explicit request cap wins');
+  assert.equal(opts.hardCapMs, 600000, 'explicit request cap wins as the recorded value');
   assert.equal(opts.idleMs, 90000, 'provider override beats globals');
+  const s = new RunSupervisor({ startedAt: T0, ...opts });
+  assert.equal(s.ignoredCaps.hardCapMs, 600000);
 });
 
-test('a hard cap below the idle window is corrected instead of trapping the run', () => {
-  const s = make({ idleMs: 300000, hardCapMs: 1000 });
-  assert.equal(s.opts.hardCapMs, 300000);
-});
-
-test('defaults leave real headroom for long agentic tasks', () => {
-  assert.ok(DEFAULTS.hardCapMs >= 1800000, 'ceiling should allow a long task');
-  assert.ok(DEFAULTS.idleMs >= 180000, 'buffered print-mode CLIs need a wide idle window');
-});
-
-test('adaptive supervision with the assessor disabled never silently restores a hard timeout or idle-only kill, and keeps budgets/explicit deadlines enforced', () => {
-  // The server-side assessor loop gates on settings.dynamicSupervision/assessorEnabled and simply
-  // never calls acceptAssessment() when either is off. corroboratedStall() can then never fire,
-  // so evaluate()'s adaptive branch must keep returning 'continue' through repeated and quiet
-  // output for a full 120-minute virtual clock rather than falling back to an idle/loop kill or
-  // a fabricated hard cap โ€” exactly the accepted design, not a defect to patch around.
-  const s = new RunSupervisor(resolveSupervisorOptions({ startedAt: T0 }));
-  assert.equal(s.opts.adaptive, true);
-  assert.equal(s.opts.hardDeadline, false, 'no explicit deadline means no hard cap fabricated for a disabled assessor');
-  let now = T0;
-  for (let minute = 1; minute <= 120; minute++) {
-    now = T0 + minute * 60000;
-    // Alternate between an exact repeat (would trip loop_detected in the legacy branch)
-    // and total silence (would trip idle_stall in the legacy branch) every other minute.
-    if (minute % 2 === 0) s.recordOutput('same status line again\n', now);
-    const verdict = s.evaluate(now);
-    assert.equal(verdict.action, 'continue', `unexpectedly stopped at minute ${minute}: ${verdict.reason}`);
-  }
-  assert.equal(s.stopped, null);
-  assert.equal(s.progress.assessment, null, 'no assessment was ever accepted, matching a disabled assessor');
-
-  // Token/output budgets remain authoritative with the assessor disabled.
-  const budgeted = new RunSupervisor(resolveSupervisorOptions({ startedAt: T0,
-    providerBudget: { maxOutputTokens: null, maxTotalTokens: 1000, maxCacheReadTokens: null, maxCacheCreationTokens: null, maxTurns: null } }));
-  budgeted.recordProviderUsage({ total_tokens: 1500 }, { phase: 'incremental' });
-  assert.equal(budgeted.evaluate(T0 + 60000).reason, 'token_budget');
-
-  // An explicit deadline (queued timeoutMs / per-provider hardCapMs) remains an absolute ceiling.
-  const deadlined = new RunSupervisor(resolveSupervisorOptions({ startedAt: T0, hardCapMs: 1800000 }));
-  assert.equal(deadlined.opts.hardDeadline, true);
-  deadlined.recordOutput('still going\n', T0 + 1800000);
-  assert.equal(deadlined.evaluate(T0 + 1800000).reason, 'hard_cap');
-});
-
-test('provider-reported multi-turn usage stops at a distinct token budget without estimates', () => {
-  const s = make({ providerBudget: {
-    maxOutputTokens: 1000, maxTotalTokens: 5000, maxCacheReadTokens: null,
-    maxCacheCreationTokens: null, maxTurns: 2,
-  } });
-  s.recordProviderUsage({ output_tokens: 200, total_tokens: 2100, turns: 1 }, { phase: 'incremental' });
-  assert.equal(s.evaluate(T0 + 1000).action, 'continue');
-  s.recordProviderUsage({ output_tokens: 450, total_tokens: 4300, turns: 2 }, { phase: 'incremental' });
-  assert.equal(s.evaluate(T0 + 2000).action, 'continue');
-  s.recordProviderUsage({ output_tokens: 700, total_tokens: 6200, turns: 3 }, { phase: 'incremental' });
-  const verdict = s.evaluate(T0 + 3000);
-  assert.equal(verdict.reason, 'token_budget');
-  assert.match(verdict.detail, /provider-reported/);
-  assert.equal(s.snapshot(T0 + 3000).providerUsagePhase, 'incremental');
-});
-
-test('provider token reserve requests finalization once without weakening the hard ceiling', () => {
-  const s = make({
-    finalizationSupported: true,
-    providerBudget: {
-      maxOutputTokens: null, maxTotalTokens: 10000, maxCacheReadTokens: null,
-      maxCacheCreationTokens: null, maxTurns: null,
-    },
-    providerBudgetFinalizationReserve: {
-      maxOutputTokens: 0, maxTotalTokens: 2000,
-      maxCacheReadTokens: 0, maxCacheCreationTokens: 0,
-    },
-  });
-  s.recordProviderUsage({ total_tokens: 8999 }, { phase: 'incremental' });
-  assert.equal(s.evaluate(T0 + 1000).action, 'continue');
-  s.recordProviderUsage({ total_tokens: 9000 }, { phase: 'incremental' });
-  const reserve = s.evaluate(T0 + 2000);
-  assert.equal(reserve.action, 'finalize');
-  assert.equal(reserve.reason, 'token_budget_reserve');
-  assert.equal(reserve.reserve.reserve, 1000, 'reserve is capped at 10% of a small caller budget');
-  assert.equal(s.evaluate(T0 + 2500).action, 'finalize', 'inspection cannot consume a pending advisory');
-  assert.equal(s.snapshot(T0 + 2500).finalizationRequested, null);
-  assert.equal(s.acknowledgeFinalization(reserve.reserve), true);
-  assert.equal(s.acknowledgeFinalization(reserve.reserve), false);
-  assert.equal(s.evaluate(T0 + 3000).action, 'continue', 'acknowledged finalization is requested only once');
-  s.recordProviderUsage({ total_tokens: 10001 }, { phase: 'incremental' });
-  const killed = s.evaluate(T0 + 4000);
-  assert.equal(killed.action, 'kill');
-  assert.equal(killed.reason, 'token_budget');
-  assert.equal(s.snapshot(T0 + 4000).finalizationRequested.threshold, 9000);
-});
-
-test('hard stop guards take precedence over a finalization reserve on the same tick', async (t) => {
-  const reserveOptions = {
-    finalizationSupported: true,
-    providerBudget: {
-      maxOutputTokens: null, maxTotalTokens: 10000, maxCacheReadTokens: null,
-      maxCacheCreationTokens: null, maxTurns: null,
-    },
-    providerBudgetFinalizationReserve: {
-      maxOutputTokens: 0, maxTotalTokens: 2000,
-      maxCacheReadTokens: 0, maxCacheCreationTokens: 0,
-    },
-  };
-  const atReserve = (supervisor) => {
-    supervisor.recordProviderUsage({ total_tokens: 9000 }, { phase: 'incremental' });
-    return supervisor;
-  };
-
-  await t.test('output cap', () => {
-    const s = atReserve(make({ ...reserveOptions, maxOutputBytes: 32 }));
-    s.recordOutput('unique output beyond the configured byte ceiling', T0 + 1000);
-    assert.equal(s.evaluate(T0 + 1000).reason, 'output_cap');
-  });
-
-  await t.test('hard cap', () => {
-    const s = atReserve(make({ ...reserveOptions, idleMs: 1000, hardCapMs: 1000 }));
-    assert.equal(s.evaluate(T0 + 1000).reason, 'hard_cap');
-  });
-
-  await t.test('repeat loop', () => {
-    const s = atReserve(make({ ...reserveOptions, loopRepeatThreshold: 2 }));
-    s.recordOutput('same synthetic repeated line\nsame synthetic repeated line\n', T0 + 1000);
-    assert.equal(s.evaluate(T0 + 1000).reason, 'loop_detected');
-  });
-
-  await t.test('idle stall', () => {
-    const s = atReserve(make({ ...reserveOptions, idleMs: 1000 }));
-    assert.equal(s.evaluate(T0 + 1000).reason, 'idle_stall');
-  });
-});
-
-test('terminal usage never requests a pointless finalization turn', () => {
-  const s = make({ finalizationSupported: true, providerBudget: {
-    maxOutputTokens: null, maxTotalTokens: 10000, maxCacheReadTokens: null,
-    maxCacheCreationTokens: null, maxTurns: null,
-  } });
-  s.recordProviderUsage({ total_tokens: 9500 }, { phase: 'terminal' });
-  assert.equal(s.evaluate(T0 + 1000).action, 'continue');
-  assert.equal(s.snapshot(T0 + 1000).finalizationRequested, null);
-});
-
-test('unsupported live input never receives a finalization advisory', () => {
-  const s = make({ providerBudget: { maxTotalTokens: 1000 } });
-  s.recordProviderUsage({ total_tokens: 950 }, { phase: 'incremental' });
-  assert.equal(s.evaluate(T0 + 1000).action, 'continue');
-  assert.equal(s.acknowledgeFinalization({ threshold: 900 }), false);
-  s.recordProviderUsage({ total_tokens: 1001 }, { phase: 'incremental' });
-  assert.equal(s.evaluate(T0 + 2000).reason, 'token_budget');
-});
-
-test('missing or malformed provider usage never falls back to output-size enforcement', () => {
-  const s = make({ providerBudget: {
-    maxOutputTokens: 1, maxTotalTokens: 1, maxCacheReadTokens: 1,
-    maxCacheCreationTokens: 1, maxTurns: 1,
-  }, maxOutputBytes: 1000000 });
-  s.recordOutput('a long but unique answer is only a transport estimate\n', T0 + 1000);
-  assert.equal(s.recordProviderUsage({ output_tokens: -1 }), false);
-  assert.equal(s.evaluate(T0 + 2000).action, 'continue');
-  assert.equal(s.snapshot(T0 + 2000).providerUsagePhase, 'unavailable');
-});
-
-test('per-run provider budget overrides provider and global defaults', () => {
+test('per-run provider budget overrides provider and global defaults (resolution only, never enforced)', () => {
   const opts = resolveSupervisorOptions({
     globals: { providerBudget: { maxTurns: 20 } },
     entry: { supervisor: { providerBudget: { maxTurns: 10 } } },
@@ -389,94 +454,84 @@ test('a sparse per-run override retains provider-specific ceilings', () => {
   assert.equal(opts.providerBudget.maxOutputTokens, 4000);
 });
 
-// ---- issue #82: a turn count is not a budget ------------------------------
-// The shipped providerBudget.maxTurns of 24 stopped healthy agentic runs. An
-// agentic CLI spends one turn per tool call, so num_turns tracks how many
-// files a model read, not what the run cost. Turns therefore ship disabled,
-// while every token ceiling and every liveness check stays exactly as it was.
+// ---- provider usage tracking never triggers a kill/finalize --------------
 
-test('the shipped default no longer imposes a turn ceiling on normal runs', () => {
-  assert.equal(DEFAULTS.providerBudget.maxTurns, null,
-    'a fixed turn cap killed complete, successful terminal results');
-  for (const field of ['maxOutputTokens', 'maxTotalTokens', 'maxCacheReadTokens', 'maxCacheCreationTokens']) {
-    assert.ok(Number.isSafeInteger(DEFAULTS.providerBudget[field]) && DEFAULTS.providerBudget[field] > 0,
-      `${field} must still bound cost`);
-  }
+test('provider-reported usage, including past any configured budget, is tracked but never stops or auto-finalizes a run', () => {
+  const s = make({ providerBudget: {
+    maxOutputTokens: 1000, maxTotalTokens: 5000, maxCacheReadTokens: null,
+    maxCacheCreationTokens: null, maxTurns: 2,
+  } });
+  s.recordProviderUsage({ output_tokens: 200, total_tokens: 2100, turns: 1 }, { phase: 'incremental' });
+  assert.equal(s.evaluate(T0 + 1000).action, 'continue');
+  s.recordProviderUsage({ output_tokens: 700, total_tokens: 6200, turns: 3 }, { phase: 'incremental' });
+  const verdict = s.evaluate(T0 + 2000);
+  assert.equal(verdict.action, 'continue');
+  assert.equal(s.snapshot(T0 + 2000).providerUsagePhase, 'incremental');
+  assert.equal(s.snapshot(T0 + 2000).finalizationRequested, null);
 });
 
-test('a healthy run reporting far more than 24 turns runs to completion by default', () => {
+test('requestGracefulFinalization is a manual, directly-callable advisory, no longer auto-triggered by budget proximity', () => {
+  const s = make({ finalizationSupported: true, providerBudget: { maxTotalTokens: 10000 } });
+  s.recordProviderUsage({ total_tokens: 9999 }, { phase: 'incremental' });
+  assert.equal(s.evaluate(T0 + 1000).action, 'continue', 'no automatic finalize even one token under the old reserve line');
+  assert.equal(s.snapshot(T0 + 1000).finalizationRequested, null);
+  const reserve = s.requestGracefulFinalization({ threshold: 9000 });
+  assert.deepEqual(reserve, { threshold: 9000 });
+  assert.deepEqual(s.finalizationRequested, { threshold: 9000 });
+  s.recordProviderUsage({ total_tokens: 50000 }, { phase: 'incremental' });
+  assert.equal(s.evaluate(T0 + 2000).action, 'continue', 'a graceful advisory is not itself a kill');
+});
+
+test('acknowledgeFinalization remains directly callable and is single-shot', () => {
+  const s = make({ finalizationSupported: true });
+  assert.equal(s.acknowledgeFinalization({ threshold: 900 }), true);
+  assert.equal(s.acknowledgeFinalization({ threshold: 900 }), false, 'already requested');
+});
+
+test('acknowledgeFinalization refuses when the provider does not support finalization', () => {
+  const s = make();
+  assert.equal(s.acknowledgeFinalization({ threshold: 900 }), false);
+});
+
+test('missing or malformed provider usage never falls back to output-size enforcement', () => {
+  const s = make({ providerBudget: {
+    maxOutputTokens: 1, maxTotalTokens: 1, maxCacheReadTokens: 1,
+    maxCacheCreationTokens: 1, maxTurns: 1,
+  }, spillAfterBytes: 1000000 });
+  s.recordOutput('a long but unique answer is only a transport estimate\n', T0 + 1000);
+  assert.equal(s.recordProviderUsage({ output_tokens: -1 }), false);
+  assert.equal(s.evaluate(T0 + 2000).action, 'continue');
+  assert.equal(s.snapshot(T0 + 2000).providerUsagePhase, 'unavailable');
+});
+
+// ---- issue #82: a turn count is not a budget, generalized to the full uncap policy ----
+
+test('providerBudget.maxTurns (and every other budget field) resolves and is recorded, but is never enforced by RunSupervisor', () => {
+  assert.equal(DEFAULTS.providerBudget.maxTurns, null);
+  const opts = resolveSupervisorOptions({ globals: { providerBudget: { maxTurns: 24 } } });
+  assert.equal(opts.providerBudget.maxTurns, 24, 'layered resolution still works');
+  const s = new RunSupervisor({ startedAt: T0, ...opts });
+  assert.equal(s.ignoredCaps.providerBudget.maxTurns, 24);
+  s.recordProviderUsage({ turns: 4000 }, { phase: 'incremental' });
+  s.recordOutput('turn after turn of real, distinct work\n', T0 + 1000);
+  assert.equal(s.evaluate(T0 + 2000).action, 'continue', 'a huge turn count alone never stops a healthy run');
+});
+
+test('a healthy run reporting far more than the old 24-turn default runs to completion', () => {
   const s = make();
   let now = T0;
-  // One turn per tool call: 36 file reads is an ordinary review, not a runaway.
   for (let turn = 1; turn <= 36; turn++) {
     now += 5000;
     s.recordOutput(`turn ${turn}: read module ${turn} and summarised its exports\n`, now);
     assert.equal(s.recordProviderUsage({
-      output_tokens: turn * 400,
-      total_tokens: turn * 9000,
-      cache_read_input_tokens: turn * 20000,
-      cache_creation_input_tokens: turn * 2000,
-      turns: turn,
+      output_tokens: turn * 400, total_tokens: turn * 9000,
+      cache_read_input_tokens: turn * 20000, cache_creation_input_tokens: turn * 2000, turns: turn,
     }, { phase: 'incremental' }), true);
     const verdict = s.evaluate(now);
     assert.equal(verdict.action, 'continue', `stopped at turn ${turn}: ${verdict.reason} ${verdict.detail}`);
   }
-  s.recordProviderUsage({
-    output_tokens: 14400, total_tokens: 324000,
-    cache_read_input_tokens: 720000, cache_creation_input_tokens: 72000, turns: 36,
-  }, { phase: 'terminal' });
+  s.recordProviderUsage({ output_tokens: 14400, total_tokens: 324000,
+    cache_read_input_tokens: 720000, cache_creation_input_tokens: 72000, turns: 36 }, { phase: 'terminal' });
   assert.equal(s.evaluate(now).action, 'continue', 'the terminal report of a finished run must survive');
   assert.equal(s.snapshot(now).providerBudget.maxTurns, null);
-});
-
-test('disabling turns does not disable the token ceilings that bound real cost', () => {
-  const cacheStop = make();
-  cacheStop.recordProviderUsage({
-    turns: 400, cache_read_input_tokens: DEFAULTS.providerBudget.maxCacheReadTokens + 1,
-  }, { phase: 'incremental' });
-  const cacheVerdict = cacheStop.evaluate(T0 + 1000);
-  assert.equal(cacheVerdict.reason, 'token_budget');
-  assert.match(cacheVerdict.detail, /cache_read_input_tokens/,
-    'the dimension that actually measures spend must be the one named');
-
-  for (const [budgetField, usageField] of Object.entries({
-    maxOutputTokens: 'output_tokens',
-    maxTotalTokens: 'total_tokens',
-    maxCacheCreationTokens: 'cache_creation_input_tokens',
-  })) {
-    const s = make();
-    s.recordProviderUsage({ [usageField]: DEFAULTS.providerBudget[budgetField] + 1 }, { phase: 'incremental' });
-    assert.equal(s.evaluate(T0 + 1000).reason, 'token_budget', budgetField);
-  }
-});
-
-test('an explicit turn ceiling is still enforced, from any of the three layers', () => {
-  const layers = [
-    { label: 'globals', options: { globals: { providerBudget: { maxTurns: 24 } } } },
-    { label: 'provider entry', options: { entry: { supervisor: { providerBudget: { maxTurns: 24 } } } } },
-    { label: 'request', options: { providerBudget: { maxTurns: 24 } } },
-  ];
-  for (const layer of layers) {
-    const opts = resolveSupervisorOptions({ globals: { providerBudget: { maxTurns: null } }, ...layer.options });
-    assert.equal(opts.providerBudget.maxTurns, 24, layer.label);
-    const s = new RunSupervisor({ startedAt: T0, ...opts });
-    s.recordProviderUsage({ turns: 24 }, { phase: 'incremental' });
-    assert.equal(s.evaluate(T0 + 1000).action, 'continue', `${layer.label}: the limit itself is allowed`);
-    s.recordProviderUsage({ turns: 25 }, { phase: 'incremental' });
-    const verdict = s.evaluate(T0 + 2000);
-    assert.equal(verdict.reason, 'token_budget', layer.label);
-    assert.match(verdict.detail, /provider-reported turns 25 exceeded maxTurns 24/);
-  }
-});
-
-test('a global turn ceiling can still be lifted per provider or per request', () => {
-  const globals = { providerBudget: { maxTurns: 24 } };
-  assert.equal(resolveSupervisorOptions({
-    globals, entry: { supervisor: { providerBudget: { maxTurns: null } } },
-  }).providerBudget.maxTurns, null, 'a provider entry may opt out');
-  assert.equal(resolveSupervisorOptions({
-    globals, providerBudget: { maxTurns: null },
-  }).providerBudget.maxTurns, null, 'one request may opt out');
-  assert.equal(resolveSupervisorOptions({ globals }).providerBudget.maxTurns, 24,
-    'and an operator ceiling still applies when nobody overrides it');
 });

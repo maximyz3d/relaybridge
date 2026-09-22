@@ -19,13 +19,15 @@ test('project chat performs durable Codex → stronger advisor → Codex → wor
  const rejected=await b.request('/api/project-workspace/messages',{actionId:'message_0001',threadId,text:'Different request'});assert.equal(rejected.status,409);
  const raw=await fetch(b.base+'/api/project-workspace/state');assert.equal(raw.status,401);
 });
-test('project advisor pins configured complex budget and the resulting ceiling still stops usage',{timeout:45000},async t=>{const budget={maxOutputTokens:20000,maxTotalTokens:900000,maxCacheReadTokens:700000,maxCacheCreationTokens:150000,maxTurns:null};const b=await fixture(t,{claude:{supervisor:{providerBudgetByTaskTier:{complex:budget}}}});const created=(await b.request('/api/project-workspace/projects',{actionId:'project_0001',name:'Budget project',cwd:b.root})).body;
+test('project advisor pins configured complex budget, which is resolved and exposed but never stops usage (Refs #133)',{timeout:45000},async t=>{const budget={maxOutputTokens:20000,maxTotalTokens:900000,maxCacheReadTokens:700000,maxCacheCreationTokens:150000,maxTurns:null};const b=await fixture(t,{claude:{supervisor:{providerBudgetByTaskTier:{complex:budget}}}});const created=(await b.request('/api/project-workspace/projects',{actionId:'project_0001',name:'Budget project',cwd:b.root})).body;
  await b.request('/api/project-workspace/messages',{actionId:'message_0001',threadId:created.threadId,text:'Design a complex migration.'});
  const state=await waitFor(async()=>{const v=(await b.request('/api/project-workspace/state')).body;return v.tasks?.[0]?.state==='completed'&&v;},35000);
  const advisor=state.thread.messages.find(m=>m.role==='advisor');assert.ok(advisor?.taskId,'advisor task identity is retained');
  const persisted=JSON.parse(fs.readFileSync(path.join(b.root,'data','tasks',advisor.taskId+'.json'),'utf8'));assert.deepEqual(persisted.body.providerBudget,budget);
  const {RunSupervisor}=require('../lib/run-supervisor');const supervisor=new RunSupervisor({providerBudget:persisted.body.providerBudget});
- supervisor.recordProviderUsage({output_tokens:budget.maxOutputTokens+1},{phase:'incremental'});assert.equal(supervisor.evaluate().reason,'token_budget');
+ supervisor.recordProviderUsage({output_tokens:budget.maxOutputTokens+1},{phase:'incremental'});
+ const verdict=supervisor.evaluate();assert.equal(verdict.action,'continue','exceeding the resolved output-token ceiling never stops the run any more');
+ assert.equal(supervisor.snapshot().ignoredCaps.providerBudget.maxOutputTokens,budget.maxOutputTokens,'the resolved-but-unenforced ceiling is still visible via ignoredCaps');
 });
 test('workspace routes retain CSP and coding tasks use valid real workflow IDs',{timeout:25000},async t=>{const b=await fixture(t);for(const route of ['/','/control-center.html']){const response=await fetch(b.base+route);assert.equal(response.status,200);assert.match(response.headers.get('content-security-policy'),/script-src-attr 'none'/);assert.equal(response.headers.get('x-frame-options'),'DENY');assert.match(await response.text(),/What are we building/);}
  const legacy=await fetch(b.base+'/terminal');assert.match(await legacy.text(),/<script nonce="[A-Za-z0-9+/=]+">\s*const API/);
