@@ -4827,7 +4827,9 @@ async function executeOneShot(body, res, privateContext = null) {
         && priorSeat.reason !== 'no_native_observation' && priorSeat.reason !== 'native_account_capacity_unbound';
       const bindingWindow = hasPriorObservation
         ? priorSeat.windows.reduce((a, b) => (a.percentRemaining ?? 100) <= (b.percentRemaining ?? 100) ? a : b) : null;
-      const windowReset = !!bindingWindow && Number.isSafeInteger(bindingWindow.resetsAt) && Date.now() > bindingWindow.resetsAt;
+      // S5: trust the store's own anchored rollover boundary, not a raw resetsAt --
+      // a forged or moved resetsAt must not release protection early.
+      const windowReset = !!bindingWindow && subscriptionUsage.anchoredRolloverOccurred(bindingWindow);
       const headroomAboveReserve = hasPriorObservation && priorSeat.admit === true;
       if (identityStillMatches && hasPriorObservation && (windowReset || headroomAboveReserve)) {
         staleAdmittedNativeUsage = true;

@@ -105,26 +105,53 @@ test('a prior same-identity observation above reserve admits through a failed pr
   assert.equal(completeJsonLines(bridge.events).filter(e => e.type === 'usage_probe').length, 1);
 });
 
-// S5: an at/below-reserve prior observation whose binding window has already reset counts
-// as renewed (headroom unknown-but-renewed), so it must not be filtered out as
-// 'quota_reserve' at account-selection time (resolveDispatchAccount's admit filter,
-// server.js:6912, reading subscriptionUsage.verdict(...).admit) NOR at the native-launch
-// stale-admit fallback (server.js:4740-4786). The fix lives in headroom()'s `low` /
-// `protectedState` computation (lib/subscription-usage.js): a window whose own resetsAt has
-// already passed no longer counts toward "still low", so verdict().admit becomes true and
-// resolveDispatchAccount lets the seat through; the probe then fails (fixture: probeMode
-// 'fail'), and the stale-admit fallback's own windowReset check admits it with
-// native_usage_freshness:'stale_admitted' and stale_reason:'window_reset'.
-test('a binding window reset since the prior observation renews headroom and stale-admits', async t => {
+// S5: an at/below-reserve prior observation whose binding window has genuinely rolled over
+// (the store's own anchored reset boundary, not just a raw resetsAt field, has passed) must
+// stale-admit through the native-launch fallback (server.js's stale-admit branch) with
+// stale_reason:'window_reset'. headroom()'s `low`/`protectedState` computation is unchanged
+// from main (a window's raw resetsAt no longer factors into it at all) -- the reserve stays
+// protected at account-selection time until the probe runs; only the stale-admit fallback,
+// via subscriptionUsage.anchoredRolloverOccurred(), may release admission, and only when the
+// anchor itself (not merely resetsAt) has genuinely moved into the past. This fixture ages
+// the whole native reset identity (nativeResetMs/nativeResetNs/nativeResetIso/
+// resetBoundaryMs/nativeResetAnchor.ns) together with resetsAt, simulating a real rollover
+// rather than a forged/moved resetsAt alone.
+test('a binding window whose anchored rollover has occurred stale-admits through the fallback', async t => {
   const bridge = await staleNativeFixture(t, {
     initialUtilization: 99, probeMode: 'fail',
-    patchStoreSeat: seat => { for (const w of Object.values(seat.buckets.account.windows)) w.resetsAt = Date.now() - 5000; },
+    patchStoreSeat: seat => {
+      const pastMs = Date.now() - 5000;
+      const pastNs = BigInt(pastMs) * 1000000n;
+      const boundary = Number((pastNs + 999999999n) / 1000000000n) * 1000;
+      for (const w of Object.values(seat.buckets.account.windows)) {
+        w.resetsAt = pastMs;
+        w.nativeResetMs = pastMs;
+        w.nativeResetNs = String(pastNs);
+        w.nativeResetIso = new Date(pastMs).toISOString();
+        w.resetBoundaryMs = boundary;
+        w.nativeResetAnchor = { version: 1, ns: String(pastNs), precision: 'nanosecond', origin: 'observed' };
+      }
+    },
   });
   const reply = await bridge.ask();
   assert.equal(reply.status, 200, JSON.stringify(reply.body));
   assert.equal(reply.body.model_invocation, true);
   assert.equal(reply.body.route.native_usage_freshness, 'stale_admitted', JSON.stringify(reply.body));
   assert.equal(reply.body.route.stale_reason, 'window_reset', JSON.stringify(reply.body));
+});
+
+// Contrast: a forged/moved resetsAt alone, with the underlying native reset identity
+// (nativeResetMs/anchor) left untouched, must NOT be trusted as a rollover -- the seat stays
+// protected and the request is rejected as quota_reserve, same as before any window "reset".
+test('a raw resetsAt moved into the past without an anchor change is not trusted as a rollover', async t => {
+  const bridge = await staleNativeFixture(t, {
+    initialUtilization: 99, probeMode: 'fail',
+    patchStoreSeat: seat => { for (const w of Object.values(seat.buckets.account.windows)) w.resetsAt = Date.now() - 5000; },
+  });
+  const reply = await bridge.ask();
+  assert.equal(reply.status, 409, JSON.stringify(reply.body));
+  assert.equal(reply.body.failureClass, 'quota_reserve', JSON.stringify(reply.body));
+  assert.equal(reply.body.model_invocation, false);
 });
 
 // Contrast case required by the lane spec: at/below reserve, but the binding window has
