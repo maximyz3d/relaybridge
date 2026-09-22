@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { McpServer } from '@modelcontextprotocol/server';
+import { McpServer, SdkError, SdkErrorCode } from '@modelcontextprotocol/server';
 import { serveStdio } from '@modelcontextprotocol/server/stdio';
 import { z } from 'zod';
 import TIMEOUT_POLICY from '../timeout-policy.cjs';
@@ -1654,6 +1654,7 @@ async function callProvider({
   // no longer indistinguishable at the HTTP layer (B2, Refs #133).
   let bridgeSignal = signal;
   let hostDeadlineDetached = false;
+  let detachedBy = null;
   const durableTaskId = timeoutMs === undefined ? `t_mcp_${crypto.randomBytes(12).toString('hex')}` : null;
   const collectionOverride = Number(process.env.RELAYBRIDGE_COLLECTION_MS);
   const collectionBudget = Number.isSafeInteger(collectionOverride) && collectionOverride >= 100 && collectionOverride <= 30000
@@ -1666,7 +1667,30 @@ async function callProvider({
   if (signal) {
     const bridgeController = new AbortController();
     const forwardOrDetach = () => {
-      if (signal.reason?.name === 'TimeoutError') { hostDeadlineDetached = true; return; }
+      const reason = signal.reason;
+      // Every notifications/cancelled reason the SDK surfaces here is either
+      // the Error we set below or the raw string from CancelledNotification
+      // params.reason (see server.mjs's notification wiring in
+      // @modelcontextprotocol/server: controller.abort(notification.params.reason)).
+      const reasonText = typeof reason === 'string' ? reason : (reason?.message || '');
+      // (a) host/transport deadline (explicit TimeoutError from our own code).
+      const isHostTimeout = reason?.name === 'TimeoutError';
+      // (b) BLOCKER fix: Protocol._onclose() aborts every in-flight handler
+      // with SdkError(SdkErrorCode.ConnectionClosed, ...) on ANY transport
+      // close (host restart, disconnect, session teardown) -- not just a
+      // real user cancel. Match by code, not message text (Refs #133 review).
+      const isConnectionClosed = reason instanceof SdkError && reason.code === SdkErrorCode.ConnectionClosed;
+      // (c) a notifications/cancelled reason that is itself a client-side
+      // request timeout (e.g. "McpError: MCP error -32001: Request timed
+      // out"), which is a deadline, not a user-initiated cancel.
+      const isClientTimeoutCancel = !isHostTimeout && !isConnectionClosed
+        && (reason?.code === SdkErrorCode.RequestTimeout || /-32001|RequestTimeout|timed out/i.test(reasonText));
+      if (isHostTimeout || isConnectionClosed || isClientTimeoutCancel) {
+        hostDeadlineDetached = true;
+        detachedBy = isHostTimeout ? 'host_timeout' : isConnectionClosed ? 'transport_closed' : 'client_timeout_cancel';
+        return;
+      }
+      // Every other notifications/cancelled reason is a genuine user cancel.
       bridgeController.abort(signal.reason);
       explicitlyCancelActiveRun({ requestId, invocationId, attemptId }).catch(() => {});
     };
@@ -2056,6 +2080,11 @@ async function callProvider({
     // true when a host/transport deadline fired but the run was NOT cancelled:
     // it continued in the background and this result reflects its completion.
     hostDeadlineDetached,
+    // Which of the three detach causes applied (null when not detached):
+    // 'transport_closed' (SDK ConnectionClosed on any transport close),
+    // 'host_timeout' (our own TimeoutError), or 'client_timeout_cancel' (a
+    // notifications/cancelled reason that is itself a request timeout).
+    detachedBy,
     // A caller timeoutMs is a check-in hint, never an enforced ceiling (B2,
     // Refs #133): record it here so callers can see it was received and
     // ignored, rather than silently dropping it.

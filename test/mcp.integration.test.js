@@ -1142,28 +1142,39 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   assert.equal(providerTimeout.structuredContent.supervisorStopReason, null);
   assert.equal(providerTimeout.structuredContent.providerTimeoutSource, 'provider_cli_diagnostic');
 
-  const claudeBudgetPartial = await client.callTool({
+  // F4 check-in semantics (Refs #133): crossing a provider budget is a
+  // check-in, not a stop -- the run always reaches its real terminal instead
+  // of being cut off mid-stream. See test/quota-budget-truth.test.js's
+  // "budget check-in and accepted quota boundary" cases for the model this
+  // rewrite follows.
+  const claudeBudgetCheckIn = await client.callTool({
     name: 'ask_provider',
     arguments: {
-      kind: 'usage_json_multiturn', prompt: 'MCP_CLAUDE_BUDGET_PARTIAL', useCache: false,
+      kind: 'usage_json_multiturn', prompt: 'MCP_CLAUDE_BUDGET_CHECKIN', useCache: false,
       providerBudget: {
         maxOutputTokens: null, maxTotalTokens: null, maxCacheReadTokens: null,
         maxCacheCreationTokens: null, maxTurns: 2,
       },
     },
   });
-  assert.equal(claudeBudgetPartial.structuredContent.stdout, '');
-  assert.equal(claudeBudgetPartial.structuredContent.droppedOut, true);
-  assert.equal(claudeBudgetPartial.structuredContent.partialResult, true);
-  assert.equal(claudeBudgetPartial.structuredContent.failureClass, 'token_budget');
-  assert.equal(claudeBudgetPartial.structuredContent.rateLimited, false,
-    'late provider text cannot override the sticky MCP budget verdict');
-  assert.equal(claudeBudgetPartial.structuredContent.stopReason, 'token_budget');
-  assert.equal(claudeBudgetPartial.structuredContent.supervisorStopReason, 'token_budget');
-  assert.equal(claudeBudgetPartial.structuredContent.partialDiagnostic, 'turn 2\n\nturn 3');
-  assert.equal(claudeBudgetPartial.structuredContent.partialDiagnosticTruncated, false);
-  assert.equal(claudeBudgetPartial.structuredContent.cleanedOutputUnavailable, true);
-  assert.doesNotMatch(claudeBudgetPartial.structuredContent.partialDiagnostic,
+  assert.equal(claudeBudgetCheckIn.structuredContent.stdout,
+    'LATE RATE LIMIT 429 MUST NOT CHANGE THE VERDICT');
+  assert.equal(claudeBudgetCheckIn.structuredContent.droppedOut, false);
+  assert.equal(claudeBudgetCheckIn.structuredContent.modelInvocation, true);
+  assert.equal(claudeBudgetCheckIn.structuredContent.failureClass, null);
+  assert.equal(claudeBudgetCheckIn.structuredContent.rateLimited, false,
+    'late provider text cannot override the sticky MCP verdict; a check-in never stops the run');
+  assert.equal(claudeBudgetCheckIn.structuredContent.budgetExceeded, false);
+  assert.equal(claudeBudgetCheckIn.structuredContent.stopReason, null);
+  assert.equal(claudeBudgetCheckIn.structuredContent.supervisorStopReason, null);
+  // The task-tier budget resolution (the exact providerBudget the caller
+  // asked for, including the maxTurns check-in trigger) stays visible on the
+  // receipt even though it no longer stops the run.
+  assert.deepEqual(claudeBudgetCheckIn.structuredContent.providerBudget, {
+    maxOutputTokens: null, maxTotalTokens: null, maxCacheReadTokens: null,
+    maxCacheCreationTokens: null, maxTurns: 2,
+  });
+  assert.doesNotMatch(claudeBudgetCheckIn.structuredContent.stdout,
     /THINKING_MUST_NOT_ESCAPE|TOOL_INPUT_MUST_NOT_ESCAPE|DUPLICATE_ID_MUST_NOT_ESCAPE/);
   const lateFinalPid = Number(fs.readFileSync(lateFinalPidMarker, 'utf8').trim());
   assert.ok(Number.isSafeInteger(lateFinalPid) && lateFinalPid > 0);
@@ -1664,25 +1675,25 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   });
   assert.equal(usageTransport.structuredContent.receipt.actualTotalTokens, usageOuterReceipt.actualTotalTokens);
   assert.equal(usageTransport.structuredContent.receipt.requestId, usageOuterReceipt.requestId);
+  // F4 check-in semantics (Refs #133): a budget check-in is not a stop, so
+  // the outer/transport receipts record a real completed terminal, not a
+  // dropped one -- see the rewritten claudeBudgetCheckIn assertions above.
   const budgetOuterReceipt = receipts.structuredContent.receipts.find((receipt) =>
-    receipt.receiptId === claudeBudgetPartial.structuredContent.receiptId);
-  assert.equal(budgetOuterReceipt.status, 'dropped');
-  assert.equal(budgetOuterReceipt.failureClass, 'token_budget');
-  assert.equal(budgetOuterReceipt.stopReason, 'token_budget');
-  assert.equal(budgetOuterReceipt.supervisorStopReason, 'token_budget');
-  assert.equal(budgetOuterReceipt.resultSubtype, null);
-  assert.equal(budgetOuterReceipt.actualTotalTokens, 1695);
+    receipt.receiptId === claudeBudgetCheckIn.structuredContent.receiptId);
+  assert.equal(budgetOuterReceipt.status, 'completed');
+  assert.equal(budgetOuterReceipt.failureClass, null);
+  assert.equal(budgetOuterReceipt.stopReason, null);
+  assert.equal(budgetOuterReceipt.supervisorStopReason, null);
+  assert.equal(budgetOuterReceipt.resultSubtype, 'success');
   assert.match(budgetOuterReceipt.transportReceiptId, /^rcpt_/);
   const budgetTransport = await client.callTool({
     name: 'get_receipt', arguments: { receiptId: budgetOuterReceipt.transportReceiptId },
   });
-  assert.equal(budgetTransport.structuredContent.receipt.status, 'dropped');
-  assert.equal(budgetTransport.structuredContent.receipt.failureClass, 'token_budget');
-  assert.equal(budgetTransport.structuredContent.receipt.resultSubtype, null);
-  assert.equal(budgetTransport.structuredContent.receipt.outputChars, 0);
-  assert.equal(budgetTransport.structuredContent.receipt.actualTotalTokens, 1695);
+  assert.equal(budgetTransport.structuredContent.receipt.status, 'completed');
+  assert.equal(budgetTransport.structuredContent.receipt.failureClass, null);
+  assert.equal(budgetTransport.structuredContent.receipt.resultSubtype, 'success');
+  assert.ok(budgetTransport.structuredContent.receipt.outputChars > 0);
   assert.equal(budgetTransport.structuredContent.receipt.providerNumTurns, 3);
-  assert.equal(budgetTransport.structuredContent.receipt.providerBudgetEnforcement, 'incremental');
   assert.ok(budgetTransport.structuredContent.receipt.transportOutputChars > 0);
   const grokQuotaOuterReceipt = receipts.structuredContent.receipts.find((receipt) =>
     receipt.receiptId === grokQuota.structuredContent.receiptId);
@@ -1870,4 +1881,79 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   assert.equal(detachOuter.structuredContent.receipt.receiptId, detachTransportReceipt.outerReceiptId);
   assert.notEqual(detachOuter.structuredContent.receipt.cancelled, true,
     'the reconciled outer receipt must not be recorded as a cancellation either');
+
+  // Finding 1, cases (c) vs. explicit cancel (root review, Refs #133): both
+  // arrive over the wire as the identical notifications/cancelled message;
+  // only the reason text tells them apart. Each uses the same already-
+  // connected primary client + a per-call AbortController, so this is
+  // in-process and deterministic (no killed child process involved).
+  const waitForNewPid = async (previousPid) => {
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      if (fs.existsSync(detachPidMarker)) {
+        const pid = Number(fs.readFileSync(detachPidMarker, 'utf8').trim());
+        if (pid && pid !== previousPid && isLiveProcess(pid)) return pid;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    throw new Error('slow_detach provider did not start a new process in time');
+  };
+
+  // (c) a client-timeout-shaped notifications/cancelled reason detaches: the
+  // provider runs to natural completion and a real terminal receipt is
+  // persisted, exactly like a host TimeoutError.
+  const timeoutCancelController = new AbortController();
+  const timeoutCancelPending = client.callTool({
+    name: 'ask_provider', arguments: { kind: 'slow_detach', prompt: 'MCP_CLIENT_TIMEOUT_MARKER', useCache: false },
+  }, { signal: timeoutCancelController.signal }).catch(() => {});
+  const timeoutCancelPid = await waitForNewPid(detachPid);
+  timeoutCancelController.abort(new Error('McpError: MCP error -32001: Request timed out'));
+  await timeoutCancelPending;
+  const timeoutCancelExitDeadline = Date.now() + 5000;
+  while (Date.now() < timeoutCancelExitDeadline && isLiveProcess(timeoutCancelPid)) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.equal(isLiveProcess(timeoutCancelPid), false,
+    'a client-timeout-shaped cancel must detach: the provider finishes on its own, not killed early');
+  const timeoutCancelExpectedHash = crypto.createHash('sha256').update('MCP_CLIENT_TIMEOUT_MARKER').digest('hex');
+  const timeoutCancelLookupDeadline = Date.now() + 5000;
+  let timeoutCancelReceipt = null;
+  while (Date.now() < timeoutCancelLookupDeadline && !timeoutCancelReceipt) {
+    const timeoutCancelReceipts = await client.callTool({ name: 'list_receipts', arguments: { limit: 500 } });
+    timeoutCancelReceipt = timeoutCancelReceipts.structuredContent.receipts.find((receipt) =>
+      receipt.event === 'bridge_provider_call' && receipt.provider === 'slow_detach'
+      && receipt.outputHash === timeoutCancelExpectedHash);
+    if (!timeoutCancelReceipt) await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  assert.ok(timeoutCancelReceipt, 'a client-timeout-shaped notifications/cancelled must still persist exactly one terminal receipt');
+  assert.equal(timeoutCancelReceipt.status, 'completed',
+    'a request-timeout-shaped cancel reason detaches; it must not record a cancellation');
+
+  // A genuine user cancel (reason "user cancelled") still explicitly
+  // cancels, so its receipt has no completed output to match by hash (the
+  // run is dropped, not run to completion) -- identify it instead as a new
+  // slow_detach receipt that was not already present before this call.
+  const priorSlowDetachReceiptsSnapshot = await client.callTool({ name: 'list_receipts', arguments: { limit: 500 } });
+  const priorSlowDetachReceiptIds = new Set(
+    priorSlowDetachReceiptsSnapshot.structuredContent.receipts
+      .filter((receipt) => receipt.event === 'bridge_provider_call' && receipt.provider === 'slow_detach')
+      .map((receipt) => receipt.receiptId));
+  const userCancelController = new AbortController();
+  const userCancelPending = client.callTool({
+    name: 'ask_provider', arguments: { kind: 'slow_detach', prompt: 'MCP_USER_CANCEL_MARKER', useCache: false },
+  }, { signal: userCancelController.signal }).catch(() => {});
+  await waitForNewPid(timeoutCancelPid);
+  userCancelController.abort(new Error('user cancelled'));
+  await userCancelPending;
+  const userCancelDeadline = Date.now() + 5000;
+  let userCancelReceipt = null;
+  while (Date.now() < userCancelDeadline && !userCancelReceipt) {
+    const userCancelReceipts = await client.callTool({ name: 'list_receipts', arguments: { limit: 500 } });
+    userCancelReceipt = userCancelReceipts.structuredContent.receipts.find((receipt) =>
+      receipt.event === 'bridge_provider_call' && receipt.provider === 'slow_detach'
+      && !priorSlowDetachReceiptIds.has(receipt.receiptId));
+    if (!userCancelReceipt) await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  assert.ok(userCancelReceipt, 'reason "user cancelled" must still persist exactly one terminal receipt');
+  assert.equal(userCancelReceipt.status, 'cancelled', 'reason "user cancelled" must still explicitly cancel the run');
 });

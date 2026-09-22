@@ -5247,6 +5247,11 @@ async function executeOneShot(body, res, privateContext = null) {
     return sendOneShotResult(res, { kind, route, exitCode: -1, stdout: '', stderr: err.message, error: 'spawn failed', dropped_out: true, model_invocation: false }, {
       kind, prompt, route, startedAt, cwd: resolvedCwd,
       accountId: dispatchAccount.account?.id || null,
+      // Finding 2 (Refs #133): the non-owned launch-throw path must still
+      // persist exactly one terminal receipt even when the client already
+      // disconnected before spawn failed here -- sendOneShotResult otherwise
+      // silently no-ops on a dead socket (line ~1112), leaving zero receipts.
+      persistAfterDisconnect: true,
     });
   }
   let stdout = '';
