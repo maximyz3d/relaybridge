@@ -112,18 +112,22 @@ test('CLI can register before spawn and bind its resulting PID without replacing
 });
 
 test('timer-driven check-in kill stops once and late timer callback cannot resurrect settlement', async () => {
-  // No clock-based hard_cap kill exists any more; the periodic tick now only
-  // ever kills via a check-in rule (here: wedged, unsampled since http has no CPU sample).
+  // No clock-based hard_cap kill exists any more, and an unsampled-CPU stall
+  // (http has no CPU sample) only ever raises an incident and never kills
+  // (S4, Refs #133). The periodic tick still kills through a remaining
+  // check-in rule that does not depend on CPU sampling -- here
+  // burn_without_progress, fired by consecutive no-progress check-ins that
+  // together burned at least burnTokens.
   let tick, clears = 0, stops = 0, releases = 0, now = 0;
   const registry = new Map();
   const life = createAttemptLifecycle({ runId: 'timed', kind: 'fixture', route: {}, registry,
-    supervisor: new RunSupervisor({ startedAt: 0, checkInIntervalMs: 500, unsampledWedgedCheckins: 2 }),
+    supervisor: new RunSupervisor({ startedAt: 0, checkInIntervalMs: 500, burnCheckins: 2, burnTokens: 5 }),
     now: () => now, releaseAdmission: () => { releases++; },
     schedule: (fn) => { tick = fn; return 1; }, clearSchedule: () => { clears++; } });
   life.bindTransport({ type: 'http', requestStop: () => { stops++; } }); life.markDispatched();
-  now = 500; tick();
+  now = 500; life.observeUsage({ total_tokens: 5 }, 'terminal');
   now = 1000; tick();
-  assert.equal(stops, 1); assert.equal(life.snapshot().stop.reason, 'wedged');
+  assert.equal(stops, 1); assert.equal(life.snapshot().stop.reason, 'burn_without_progress');
   await life.settlePhysical({ evidence: 'http_transport_settled' });
   tick(); assert.equal(clears, 1); assert.equal(releases, 1); assert.equal(registry.size, 0);
 });
