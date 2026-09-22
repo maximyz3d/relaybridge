@@ -14,7 +14,7 @@ async function fixture(t) {
     fs.writeFileSync(script, [
       "let mode='';process.stdin.on('data',c=>mode+=c);process.stdin.on('end',()=>{mode=mode.trim();",
       "const assistant={type:'assistant',message:{id:'before-stop',usage:{input_tokens:1,output_tokens:1,cache_read_input_tokens:1,cache_creation_input_tokens:0},content:[{type:'text',text:'Analysis of rate limit 429. Retry-After: 14400'}]}};",
-      "const terminal={type:'result',subtype:'success',is_error:false,result:'TERMINAL_ANSWER_MUST_NOT_ESCAPE: 429 retry-after: 14400',num_turns:1,usage:{input_tokens:1,output_tokens:1,cache_read_input_tokens:651048,cache_creation_input_tokens:0}};",
+      "const terminal={type:'result',subtype:'success',is_error:false,result:'TERMINAL_ANSWER: 429 retry-after: 14400',num_turns:1,usage:{input_tokens:1,output_tokens:1,cache_read_input_tokens:651048,cache_creation_input_tokens:0}};",
       "if(mode.startsWith('accepted')){terminal.subtype='error_during_execution';terminal.is_error=true;terminal.api_error_status=429;terminal.terminal_reason='api_error';terminal.errors=mode.includes('no-reset')?['Too many requests']:['Retry-After: 120'];}",
       "if(mode.startsWith('string-status'))terminal.api_error_status='429';",
       "if(mode.startsWith('invalid-document')){terminal.api_error_status=429;terminal.subtype='invalid';}",
@@ -41,41 +41,70 @@ for (const mode of ['pure-budget', 'accepted-newline', 'accepted-no-newline', 'a
     // Crossing the budget is a check-in, not a stop: no budget failureClass/stop_reason, and the run
     // always runs to its real terminal instead of being cut off mid-stream.
     assert.equal(value.stop_reason, null); assert.equal(value.supervisor_stop_reason, null);
-    assert.equal(value.budget_exceeded, false); assert.equal(value.dropped_out, true);
+    assert.equal(value.budget_exceeded, false);
     assert.equal(value.model_invocation, true);
     assert.equal(value.usage.cache_read_input_tokens, mode === 'late-same-chunk' ? 9000000 : 651048);
-    // Vendor quota evidence is still the accepted primary terminal reason, formal (accepted / late-retry)
-    // or heuristic (stderr-derived), and it still sets a cooldown either way.
-    assert.equal(value.failureClass, 'rate_limit');
-    assert.equal(value.rate_limited, true);
     const accepted = mode.startsWith('accepted') || mode === 'late-same-chunk';
-    assert.equal(value.provider_api_error_status, accepted ? 429 : null);
-    // A real (non-error) terminal now escapes to stdout since nothing truncates the run early;
-    // any terminal that carries an api_error_status field (formal or malformed) still suppresses it.
-    const stdoutEscapes = mode === 'pure-budget' || mode === 'late-same-chunk';
-    assert.equal(value.stdout, stdoutEscapes ? 'TERMINAL_ANSWER_MUST_NOT_ESCAPE: 429 retry-after: 14400' : '');
+    const malformedTerminal = mode.startsWith('string-status') || mode.startsWith('invalid-document');
+    if (mode === 'pure-budget') {
+      // A genuinely clean success: nothing typed anywhere flags a rate limit, so
+      // the fixture's decoy stderr/text must not recolor it, and the real
+      // terminal answer escapes to stdout untouched.
+      assert.equal(value.failureClass, null);
+      assert.equal(value.rate_limited, false);
+      assert.equal(value.dropped_out, false);
+      assert.equal(value.stdout, 'TERMINAL_ANSWER: 429 retry-after: 14400');
+      assert.equal(value.quota_evidence, null);
+      assert.equal(value.provider_api_error_status, null);
+    } else if (malformedTerminal) {
+      // A result document was present but had an invalid field (a string
+      // api_error_status, or an unsupported subtype). That is still a typed
+      // terminal artifact, just a broken one: dropped_out is genuinely true
+      // (no usable output came back), but the decoy prose must not promote it
+      // to a fabricated rate limit.
+      assert.equal(value.failureClass, 'provider_error');
+      assert.equal(value.rate_limited, false);
+      assert.equal(value.dropped_out, true);
+      assert.equal(value.stdout, '');
+      assert.equal(value.quota_evidence, null);
+      assert.equal(value.provider_api_error_status, null);
+    } else {
+      // Accepted formal evidence only: a numeric api_error_status field or a
+      // typed api_retry event, never stderr. Still classifies rate_limit with
+      // a cooldown, exactly as before the check-in change.
+      assert.equal(value.failureClass, 'rate_limit');
+      assert.equal(value.rate_limited, true);
+      assert.equal(value.dropped_out, true);
+      assert.equal(value.provider_api_error_status, 429);
+      const stdoutEscapes = mode === 'late-same-chunk';
+      assert.equal(value.stdout, stdoutEscapes ? 'TERMINAL_ANSWER: 429 retry-after: 14400' : '');
+      assert.equal(value.quota_evidence.source, 'claude_terminal_api_status');
+      assert.equal(value.quota_evidence.status, 429);
+    }
     if (mode === 'late-same-chunk') {
       // With no budget stop, the late-arriving retry chunk in the same read is now actually processed.
       assert.equal(value.provider_retries.count, 1);
       assert.equal(value.provider_num_turns, 42);
     }
     const rows = (await bridge.request('/api/cooldowns')).body.cooling;
-    assert.equal(rows.length, 1);
-    assert.equal(rows[0].seat, 'subscription:anthropic:default');
-    assert.equal(value.cooldown.scope, 'account');
     if (accepted) {
-      assert.equal(value.quota_evidence.source, 'claude_terminal_api_status');
-      assert.equal(value.quota_evidence.status, 429);
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0].seat, 'subscription:anthropic:default');
+      assert.equal(value.cooldown.scope, 'account');
+      const expected = mode.includes('no-reset') ? 300 : 120;
+      assert.equal(value.cooldown.source, mode.includes('no-reset') ? 'backoff' : 'retry-after');
+      assert.ok(value.retry_after > expected - 5 && value.retry_after <= expected, JSON.stringify(value.cooldown));
+      assert.equal(rows.some((row) => row.seat === 'subscription:anthropic:other'), false);
     } else {
-      assert.equal(value.quota_evidence, null, 'stderr-derived detection is not accepted, typed vendor evidence');
+      // Non-accepted modes never set a cooldown: no formal vendor-accepted
+      // evidence exists, so the fixture's decoy text must not fabricate the
+      // old 14400s account block.
+      assert.equal(rows.length, 0);
+      assert.equal(value.cooldown, undefined);
     }
-    const expected = mode.includes('no-reset') ? 300 : (accepted ? 120 : 14400);
-    assert.equal(value.cooldown.source, mode.includes('no-reset') ? 'backoff' : 'retry-after');
-    assert.ok(value.retry_after > expected - 5 && value.retry_after <= expected, JSON.stringify(value.cooldown));
-    assert.equal(rows.some((row) => row.seat === 'subscription:anthropic:other'), false);
     const receipt = completeJsonLines(path.join(bridge.root, 'data', 'receipts', new Date().toISOString().slice(0, 10) + '.jsonl'))
       .find((row) => row.receiptId === value.receiptId);
-    assert.equal(receipt.failureClass, 'rate_limit');
+    assert.equal(receipt.failureClass, value.failureClass);
     assert.equal(receipt.providerApiErrorStatus, accepted ? 429 : null);
     assert.deepEqual(receipt.quotaEvidence, value.quota_evidence);
     assert.deepEqual(receipt.cooldown, value.cooldown || null);
@@ -83,7 +112,12 @@ for (const mode of ['pure-budget', 'accepted-newline', 'accepted-no-newline', 'a
     const usageRows = fs.existsSync(ledgerDir) ? fs.readdirSync(ledgerDir).filter((name) => name.endsWith('.jsonl'))
       .flatMap((name) => completeJsonLines(path.join(ledgerDir, name))) : [];
     assert.ok(usageRows.length, 'usage ledger must retain the physical attempt');
-    assert.equal(usageRows.at(-1).failureKind, 'rate_limited', 'independent 429 must not rewrite ledger primary failure');
+    // The ledger's primary failure mirrors the terminal classification: an
+    // accepted 429 still marks the seat rate_limited; a clean check-in success
+    // records no failure; a malformed-but-typed terminal is provider_error,
+    // never a fabricated rate limit.
+    const expectedFailureKind = accepted ? 'rate_limited' : (mode === 'pure-budget' ? null : 'provider_error');
+    assert.equal(usageRows.at(-1).failureKind, expectedFailureKind, 'independent 429 must not rewrite ledger primary failure');
   });
 }
 
@@ -94,7 +128,7 @@ test('a replayed execution tuple retains its task-tier budget when flat tier fie
   const execution = resolveProviderControls({ kind: 'claude', entry, slot: entry.oneshot_safe,
     taskTier: 'critical', phase: 'plan' }).execution;
   const response = await bridge.request('/api/oneshot', { kind: 'claude', prompt: 'pure-budget', dangerous: false, execution });
-  assert.equal(response.body.failureClass, 'rate_limit', JSON.stringify(response.body));
+  assert.equal(response.body.failureClass, null, JSON.stringify(response.body));
   assert.equal(response.body.budget_exceeded, false);
   assert.equal(response.body.provider_budget.maxCacheReadTokens, 650000);
 });
