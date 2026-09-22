@@ -20,7 +20,7 @@ const unsetBridgeEnv = Object.fromEntries(inheritedBridgeKeys.map((key) => [key,
 // overwrites the seed (matches continuity.integration.test.js's confirmed behavior that a
 // stale-at-boot profile never produces a store observation on its own).
 async function staleNativeFixture(t, { initialUtilization = 20, initialResetOffsetMs = 86400000,
-  probeMode = null, patchStoreSeat = null, primeStore = true } = {}) {
+  probeMode = null, patchStoreSeat = null, primeStore = true, trustProbeDir = true } = {}) {
   let profile, events, usageFile;
   const bridge = await startTestBridge(t, root => {
     profile = path.join(root, 'native-home', '.claude.json'); events = path.join(root, 'native-events.jsonl');
@@ -29,7 +29,12 @@ async function staleNativeFixture(t, { initialUtilization = 20, initialResetOffs
     const accountUuid = '11111111-2222-3333-4444-555555555555', at = Date.now(), reset = at + initialResetOffsetMs;
     const initial = { oauthAccount: { accountUuid }, cachedUsageUtilization: { accountUuid, fetchedAtMs: at, utilization:
       Object.fromEntries(['five_hour', 'seven_day'].map(name => [name, { utilization: initialUtilization, resets_at: new Date(reset).toISOString() }])) } };
-    initial.projects = { [probeCwd]: { hasTrustDialogAccepted: true } };
+    // B1 fixture knob: when false, the probe's own project-trust read (a distinct
+    // readClaudeNativeUsage call bound to CLAUDE_USAGE_PROBE_DIR) never establishes trust, so
+    // probeClaudeNativeAdmission's pre-refresh identity comparison fails with
+    // reason 'identity_mismatch_pre' -- the same reason code an actual account/profile
+    // mismatch at that comparison would produce.
+    if (trustProbeDir) initial.projects = { [probeCwd]: { hasTrustDialogAccepted: true } };
     fs.writeFileSync(profile, JSON.stringify(initial));
     if (primeStore) {
       const nativeHome = path.join(root, 'native-home');
@@ -68,6 +73,15 @@ async function staleNativeFixture(t, { initialUtilization = 20, initialResetOffs
       process.stdin.on('data',chunk=>{input+=chunk;if(!input.includes('/usage'))return;input='';event('usage_probe');
         if(${JSON.stringify(probeMode)}==='recover'){const value=JSON.parse(fs.readFileSync(${JSON.stringify(profile)},'utf8'));
           value.cachedUsageUtilization.fetchedAtMs=Date.now();fs.writeFileSync(${JSON.stringify(profile)},JSON.stringify(value));}
+        if(${JSON.stringify(probeMode)}==='drift'){
+          // B1 fixture: the logged-in account changes DURING the probe round-trip (refreshed,
+          // not merely stale), so the post-refresh identity comparison inside
+          // probeClaudeNativeAdmission sees a different account than the one captured at
+          // admission time and fails closed with reason identity_mismatch_post.
+          const value=JSON.parse(fs.readFileSync(${JSON.stringify(profile)},'utf8'));
+          const driftedUuid='99999999-8888-7777-6666-555555555555';
+          value.oauthAccount.accountUuid=driftedUuid; value.cachedUsageUtilization.accountUuid=driftedUuid;
+          value.cachedUsageUtilization.fetchedAtMs=Date.now();fs.writeFileSync(${JSON.stringify(profile)},JSON.stringify(value));}
         if(input.includes('/exit'))process.exit(0);});setInterval(()=>{},1000);`);
     const entry = { label: 'Synthetic native Claude', npm_package: '@anthropic-ai/claude-code', credential_env: 'CLAUDE_CONFIG_DIR', quota_seat: 'claude',
       safe: [process.execPath], probe: [process.execPath, '--version'], version_probe: [process.execPath, '--version'],
@@ -91,39 +105,32 @@ test('a prior same-identity observation above reserve admits through a failed pr
   assert.equal(completeJsonLines(bridge.events).filter(e => e.type === 'usage_probe').length, 1);
 });
 
-// NOTE on the two cases below (windowReset-near-reserve admits as stale, and
-// at/below-reserve stays fail-closed with a probe reason): both are
-// UNREACHABLE through this fixture (or any request through /api/oneshot) as
-// originally specified, and are documented rather than faked per the lane
-// contract. resolveDispatchAccount (server.js:6823) filters candidate
-// accounts by `subscriptionUsage.verdict(seat, ...).admit` BEFORE the
-// native-launch-identity stale-admit fallback (server.js:4740-4786) is ever
-// reached; the oneshot dispatch call site (server.js:4677) does not pass
-// `ignoreNativeReserve: true` (unlike the two other call sites at
-// server.js:6426 and 6460, which do use that seam for native-launch
-// pre-checks). So any seat whose last-known usage is at/below reserve -
-// which is exactly what both of these cases need to seed - gets rejected
-// earlier, at account-selection time, with failureClass 'quota_reserve' and
-// no `probe_reason` (server.js:4696), regardless of whether a binding window
-// has since reset or what the probe would have returned. Reaching the
-// fallback's own reserve-aware branches would require threading
-// `ignoreNativeReserve: true` into the server.js:4677 dispatch call
-// conditionally for native-launch identities - a broader change than this
-// lane's minimal-edit scope (server.js untouched outside 4918-4920,
-// 5111, 5153 for this task). Both cases are asserted against the system's
-// actual, correct behavior instead.
-test('a binding window reset since the prior observation still protects reserve at account-selection time (documented unreachable case)', async t => {
+// S5: an at/below-reserve prior observation whose binding window has already reset counts
+// as renewed (headroom unknown-but-renewed), so it must not be filtered out as
+// 'quota_reserve' at account-selection time (resolveDispatchAccount's admit filter,
+// server.js:6912, reading subscriptionUsage.verdict(...).admit) NOR at the native-launch
+// stale-admit fallback (server.js:4740-4786). The fix lives in headroom()'s `low` /
+// `protectedState` computation (lib/subscription-usage.js): a window whose own resetsAt has
+// already passed no longer counts toward "still low", so verdict().admit becomes true and
+// resolveDispatchAccount lets the seat through; the probe then fails (fixture: probeMode
+// 'fail'), and the stale-admit fallback's own windowReset check admits it with
+// native_usage_freshness:'stale_admitted' and stale_reason:'window_reset'.
+test('a binding window reset since the prior observation renews headroom and stale-admits', async t => {
   const bridge = await staleNativeFixture(t, {
     initialUtilization: 99, probeMode: 'fail',
     patchStoreSeat: seat => { for (const w of Object.values(seat.buckets.account.windows)) w.resetsAt = Date.now() - 5000; },
   });
   const reply = await bridge.ask();
-  assert.equal(reply.status, 409, JSON.stringify(reply.body));
-  assert.equal(reply.body.failureClass, 'quota_reserve', JSON.stringify(reply.body));
-  assert.equal(reply.body.model_invocation, false);
+  assert.equal(reply.status, 200, JSON.stringify(reply.body));
+  assert.equal(reply.body.model_invocation, true);
+  assert.equal(reply.body.route.native_usage_freshness, 'stale_admitted', JSON.stringify(reply.body));
+  assert.equal(reply.body.route.stale_reason, 'window_reset', JSON.stringify(reply.body));
 });
 
-test('a prior observation at or below reserve is filtered at account-selection time, not the native fallback (documented unreachable case)', async t => {
+// Contrast case required by the lane spec: at/below reserve, but the binding window has
+// NOT reset (initialResetOffsetMs stays in the future, the fixture default). This must still
+// be filtered out at account-selection time as 'quota_reserve', with no probe ever run.
+test('a prior observation at or below reserve whose window has not reset still rejects as quota_reserve', async t => {
   const bridge = await staleNativeFixture(t, { initialUtilization: 99, probeMode: 'fail' });
   const reply = await bridge.ask();
   assert.equal(reply.status, 409, JSON.stringify(reply.body));
@@ -167,4 +174,40 @@ test('requireFreshUsage stays fail-closed even when the stale-admit fallback wou
   assert.equal(refused.status, 409, JSON.stringify(refused.body));
   assert.equal(refused.body.failureClass, 'quota_unknown', JSON.stringify(refused.body));
   assert.equal(refused.body.model_invocation, false);
+});
+
+// B1: the stale-admit fallback previously judged only headroom/windowReset from the prior
+// observation, with no identity check at all -- so a wrong-account probe result, or an
+// account that changed while the probe was mid-flight, could still stale-admit and launch
+// under the wrong login. Both tests below force an identity mismatch and assert the request
+// is refused with no provider ever started.
+
+test('an identity mismatch during the probe rejects and never stale-admits', async t => {
+  // trustProbeDir:false means probeClaudeNativeAdmission's own pre-refresh identity read
+  // (bound to CLAUDE_USAGE_PROBE_DIR) never establishes project trust, so the probe fails
+  // closed with reason identity_mismatch_pre before it ever runs the refresh command.
+  const bridge = await staleNativeFixture(t, { probeMode: 'fail', trustProbeDir: false });
+  const reply = await bridge.ask();
+  assert.equal(reply.status, 409, JSON.stringify(reply.body));
+  assert.equal(reply.body.failureClass, 'quota_unknown', JSON.stringify(reply.body));
+  assert.equal(reply.body.probe_reason, 'identity_mismatch_pre', JSON.stringify(reply.body));
+  assert.equal(reply.body.model_invocation, false);
+  assert.equal(completeJsonLines(bridge.events).filter(e => e.type === 'started').length, 0);
+});
+
+test('an account that drifts during the probe round-trip rejects with no spawn', async t => {
+  // probeMode:'drift' swaps the logged-in account mid-probe (a genuine refresh happens, not
+  // merely staleness). refreshClaudeUsageViaPty's own sameIdentity gate then never reports
+  // refreshed:true for the new account, so the probe times out unrefreshed; and the
+  // post-probe sameClaudeLaunchIdentity() re-check this lane added to the stale-admit
+  // fallback sees the now-drifted profile and refuses to fall back, so the request rejects
+  // before the pre-spawn identity re-checks (server.js ~5119/5161) are ever reached, and no
+  // provider process is started under the wrong account.
+  const bridge = await staleNativeFixture(t, { probeMode: 'drift' });
+  const reply = await bridge.ask();
+  assert.equal(reply.status, 409, JSON.stringify(reply.body));
+  assert.equal(reply.body.failureClass, 'quota_unknown', JSON.stringify(reply.body));
+  assert.ok(reply.body.probe_reason, JSON.stringify(reply.body));
+  assert.equal(reply.body.model_invocation, false);
+  assert.equal(completeJsonLines(bridge.events).filter(e => e.type === 'started').length, 0);
 });

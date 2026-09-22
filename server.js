@@ -4743,6 +4743,10 @@ async function executeOneShot(body, res, privateContext = null) {
   // probe result (see the quota_unknown gate below). Not yet threaded into the eventual
   // success receipt/response: that assembly lives outside this lane's owned server.js regions.
   let staleAdmittedNativeUsage = false;
+  // S5: which fallback condition justified the stale admit, threaded onto the receipt
+  // alongside native_usage_freshness so a window-reset admit is distinguishable from a
+  // headroom-above-reserve admit after the fact.
+  let staleAdmitReason = null;
   if (nativeLaunchIdentity.required) {
     if (!nativeLaunchIdentity.identity) return rejectBeforeAdmission(409, 'account_identity_unavailable', {
       error: 'The selected native Claude profile identity is unavailable.', model_invocation: false, physical_attempt_count: 0 });
@@ -4767,6 +4771,14 @@ async function executeOneShot(body, res, privateContext = null) {
       // Fall back to the last same-identity observation rather than rejecting outright: admit
       // as stale when its binding window has already reset, or its last known headroom is
       // still above the protected-reserve trigger that validateClaudeLaunchAdmission enforces.
+      // B1: never stale-admit on an identity mismatch. A probe that itself detected a mismatch
+      // (identity_mismatch_pre/post) means the captured identity cannot be trusted for a
+      // fallback decision, even if a cheap re-capture still looks identical; and
+      // validateClaudeLaunchAdmission's own sameClaudeLaunchIdentity() check must independently
+      // hold, since a validation failure can also mean the identity itself drifted, not just
+      // freshness/headroom.
+      const probeIdentityMismatch = typeof nativeProbeReason === 'string' && nativeProbeReason.startsWith('identity_mismatch');
+      const identityStillMatches = !probeIdentityMismatch && sameClaudeLaunchIdentity(nativeLaunchIdentity);
       const priorSeat = subscriptionUsage.verdict(nativeLaunchIdentity.identity.quotaSeat,
         { accountFingerprint: nativeLaunchIdentity.identity.accountFingerprint });
       const hasPriorObservation = Array.isArray(priorSeat.windows) && priorSeat.windows.length > 0
@@ -4775,8 +4787,9 @@ async function executeOneShot(body, res, privateContext = null) {
         ? priorSeat.windows.reduce((a, b) => (a.percentRemaining ?? 100) <= (b.percentRemaining ?? 100) ? a : b) : null;
       const windowReset = !!bindingWindow && Number.isSafeInteger(bindingWindow.resetsAt) && Date.now() > bindingWindow.resetsAt;
       const headroomAboveReserve = hasPriorObservation && priorSeat.admit === true;
-      if (hasPriorObservation && (windowReset || headroomAboveReserve)) {
+      if (identityStillMatches && hasPriorObservation && (windowReset || headroomAboveReserve)) {
         staleAdmittedNativeUsage = true;
+        staleAdmitReason = windowReset ? 'window_reset' : 'headroom_above_reserve';
       } else {
         claudeUsageProbeFailures.set(claudeUsageProbeKey(nativeLaunchIdentity.identity), Date.now());
         return rejectBeforeAdmission(409, 'quota_unknown', {
@@ -4918,6 +4931,7 @@ async function executeOneShot(body, res, privateContext = null) {
     native_usage_freshness: nativeLaunchIdentity?.required
       ? (staleAdmittedNativeUsage ? 'stale_admitted' : 'fresh')
       : null,
+    stale_reason: staleAdmittedNativeUsage ? staleAdmitReason : null,
     transport: entry.transport || 'cli',
     configured_binary: bin,
     resolved_binary: resolvedBin,
@@ -5108,7 +5122,10 @@ async function executeOneShot(body, res, privateContext = null) {
     resolvedCwd = spawnCwdIdentity.resolved;
     ownedExecutionBackend?.assertWorkspaceLaunchAllowed({ cwd: resolvedCwd, privateContext, dangerous: useDanger });
     if (useDanger) writerWorkspaceBaseline = captureWriterWorkspaceSnapshot(resolvedCwd);
-    if (!staleAdmittedNativeUsage && !validateClaudeLaunchAdmission(nativeLaunchIdentity, launch.env)) throw Object.assign(new Error('Native Claude launch identity or capacity changed.'), { code: 'NATIVE_LAUNCH_ADMISSION_CHANGED' });
+    // B1: a stale admit still must verify account/identity against the actual spawn env;
+    // only the freshness/headroom comparison is skipped for a stale admit.
+    if (staleAdmittedNativeUsage ? !sameClaudeLaunchIdentity(nativeLaunchIdentity, launch.env)
+      : !validateClaudeLaunchAdmission(nativeLaunchIdentity, launch.env)) throw Object.assign(new Error('Native Claude launch identity or capacity changed.'), { code: 'NATIVE_LAUNCH_ADMISSION_CHANGED' });
     const spawnOpts = {
       cwd: resolvedCwd,
       env: launch.env,
@@ -5150,7 +5167,8 @@ async function executeOneShot(body, res, privateContext = null) {
       ownedChildStops.set(proc, () => ownedHandle.stop());
       route.execution_owner = { ownerId: ownedHandle.ownerId, bindingHash: ownedHandle.bindingHash };
     } else {
-      if (!staleAdmittedNativeUsage && !validateClaudeLaunchAdmission(nativeLaunchIdentity, launch.env)) throw Object.assign(new Error('Native Claude launch admission changed.'), { code: 'NATIVE_LAUNCH_ADMISSION_CHANGED' });
+      if (staleAdmittedNativeUsage ? !sameClaudeLaunchIdentity(nativeLaunchIdentity, launch.env)
+        : !validateClaudeLaunchAdmission(nativeLaunchIdentity, launch.env)) throw Object.assign(new Error('Native Claude launch admission changed.'), { code: 'NATIVE_LAUNCH_ADMISSION_CHANGED' });
       proc = trackChild(spawn(launch.file, launch.args, spawnOpts));
     }
     // ChildProcess stdin errors are emitted asynchronously and are not caught
