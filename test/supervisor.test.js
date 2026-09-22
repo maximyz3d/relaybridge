@@ -137,7 +137,15 @@ test('CPU activity while silent prevents the wedged streak from accumulating', (
   }
 });
 
-test('when CPU cannot be sampled at all, the wider unsampledWedgedCheckins threshold applies', () => {
+// S4 (Refs #133): unverifiable CPU silence is never sufficient evidence for a
+// wedged kill. It still checks in and raises an incident marker
+// (unsampledStall) once the wider unsampledWedgedCheckins threshold is
+// reached, but evaluate() must keep returning 'continue' throughout -- a
+// silent run with unsampled CPU is never killed via the wedged path.
+test('when CPU cannot be sampled at all, silence never kills as wedged -- it raises an incident marker instead', () => {
+  // loopCheckins/noNewContentMs stay at their generous defaults so the only
+  // corroborated rule in reach across these 4 check-ins is the unsampled
+  // wedged path itself -- isolating that it alone never kills.
   const s = make({ checkInIntervalMs: 60000, wedgedCheckins: 2, unsampledWedgedCheckins: 4 });
   let now = T0;
   let verdict;
@@ -145,10 +153,13 @@ test('when CPU cannot be sampled at all, the wider unsampledWedgedCheckins thres
     now += 60000;
     s.recordCpuSample(null, now); // unverifiable
     verdict = s.evaluate(now);
-    if (i < 3) assert.equal(verdict.action, 'continue', `stopped before the widened threshold at check-in ${i + 1}`);
+    assert.equal(verdict.action, 'continue', `unsampled CPU silence must never kill (check-in ${i + 1})`);
+    assert.notEqual(verdict.reason, 'wedged');
   }
-  assert.equal(verdict.action, 'kill');
-  assert.equal(verdict.reason, 'wedged');
+  const snapshot = s.snapshot(now);
+  assert.ok(snapshot.unsampledStall, 'incident marker set after unsampledWedgedCheckins');
+  assert.equal(snapshot.unsampledStall.reason, 'unsampled_wedged');
+  assert.equal(snapshot.stall, null, 'stallAction default never sets the notify-kill stall field');
 });
 
 // ---- rule (b): loop_confirmed -------------------------------------------
@@ -357,6 +368,41 @@ test('healthy varied output survives 120 simulated minutes with the assessor dis
   }
   assert.equal(s.stopped, null);
   assert.equal(s.progress.assessment, null, 'no assessment was ever accepted, matching a disabled assessor');
+});
+
+// S6 (Refs #133): a failing progress assessor -- one that throws, refuses
+// (malformed/stale verdict rejected by acceptAssessment), or never has
+// capacity to respond -- must never itself kill or block the watched run.
+// With adaptive enabled but no assessment ever accepted, assessor_stuck can
+// never fire, and the deterministic rules (a)-(c) still run the show.
+test('a failing progress assessor never kills or blocks; deterministic rules still fire', () => {
+  const s = make({ adaptive: true, checkInIntervalMs: 60000, wedgedCheckins: 2, noNewContentMs: 1000 });
+  s.setAssessmentEnabled(true);
+  assert.equal(s.assessmentEnabled, true);
+
+  // The assessor "refuses": it submits a stale/malformed verdict that
+  // acceptAssessment must reject rather than apply.
+  const snap = s.progress.snapshot(T0);
+  const refused = s.progress.acceptAssessment(
+    { runId: 'wrong-run', attemptId: null, evidenceHash: snap.hash, materialGeneration: snap.materialGeneration,
+      verdict: 'stuck', evidenceIds: [] },
+    snap, T0);
+  assert.equal(refused, false, 'a malformed/stale assessor verdict is rejected, not applied');
+  assert.equal(s.progress.assessment, null);
+
+  // The assessor also simply throws/never responds for the rest of the run --
+  // acceptAssessment is never called again. evaluate() must never return
+  // assessor_stuck, and the deterministic wedged rule still corroborates and
+  // kills on its own evidence.
+  let now = T0, verdict;
+  for (let i = 0; i < 2; i++) {
+    now += 60000;
+    s.recordCpuSample(0, now); // confirmed idle
+    verdict = s.evaluate(now);
+    assert.notEqual(verdict.reason, 'assessor_stuck', 'a silent/failing assessor never produces assessor_stuck');
+  }
+  assert.equal(verdict.action, 'kill');
+  assert.equal(verdict.reason, 'wedged', 'deterministic rule (a) still fires despite the failed assessor');
 });
 
 // ---- CPU sampling scheduling (unchanged) ---------------------------------
