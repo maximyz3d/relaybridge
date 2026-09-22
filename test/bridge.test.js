@@ -845,7 +845,9 @@ test('prompt-file transport preserves long special-character prompts and cleans 
       oneshot_safe: [...baseSlot, '--claude-json-retry-hang'],
       oneshot_dangerous: [...baseSlot, '--claude-json-retry-hang'],
       oneshot_output_parser: 'claude_json',
-      supervisor: { idleMs: 1000, hardCapMs: 1000, graceExtensions: 0 },
+      // No wall-clock cap: a silent, CPU-idle helper is killed as wedged at
+      // the second check-in (the first sees its startup output).
+      supervisor: { checkInIntervalMs: 500, wedgedCheckins: 1, unsampledWedgedCheckins: 1 },
     },
     fail: {
       label: 'Fail',
