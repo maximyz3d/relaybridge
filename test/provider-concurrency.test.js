@@ -107,28 +107,53 @@ test('configured limits retain a cancelled process slot until physical exit with
   skip: process.platform === 'win32', timeout: 30000,
 }, async (t) => {
   const bridge = await fixture(t, { RELAYBRIDGE_MAX_ACTIVE_ONESHOTS: '3', RELAYBRIDGE_MAX_ACTIVE_PER_PROVIDER: '2' });
-  const controller = new AbortController();
-  const cancelled = bridge.call('claude', 'RB_CASE_cancel', { signal: controller.signal });
-  const rejected = assert.rejects(cancelled, { name: 'AbortError' });
+  const cancelId = 'RB_CASE_cancel';
+  const cancelled = bridge.call('claude', cancelId);
   const sibling = bridge.call('claude', 'RB_CASE_sibling');
-  const codex = bridge.call('codex', 'RB_CASE_codex');
+  const codexController = new AbortController();
+  const codex = bridge.call('codex', 'RB_CASE_codex', { signal: codexController.signal });
+  const codexRejected = assert.rejects(codex, { name: 'AbortError' });
   await waitFor(() => bridge.started().length === 3);
-  controller.abort(); await rejected;
-  await waitFor(() => bridge.events().some((event) => event.id === 'RB_CASE_cancel' && event.event === 'termination_requested'));
+
+  // A plain client disconnect (HTTP abort) now detaches under F2/F5: the run
+  // keeps going and its slot is NOT freed early. Only an explicit cancel does.
+  codexController.abort(); await codexRejected;
+  const afterAbort = await bridge.call('copilot', 'RB_CASE_afterAbort');
+  assert.equal(afterAbort.status, 429);
+  assert.equal(afterAbort.body.activeOneShotCount, 3);
+  assert.equal(bridge.events().filter((event) => event.event === 'termination_requested').length, 0);
+
+  // Explicit cancel via POST /api/runs/:runId/cancel -> cancelActiveRun.
+  const cancelStartedEvent = bridge.started().find((event) => event.id === cancelId);
+  const activeRuns = (await bridge.request('/api/runs/active')).body.runs;
+  const cancelRun = activeRuns.find((run) => run.pid === cancelStartedEvent.pid);
+  assert.ok(cancelRun, 'active run for RB_CASE_cancel not found');
+  const cancelResponse = await bridge.request(`/api/runs/${cancelRun.runId}/cancel`, {
+    requestId: `parallel:${cancelId}`, invocationId: `parallel:${cancelId}`, attemptId: `parallel:${cancelId}:attempt:1`,
+  });
+  assert.equal(cancelResponse.status, 202);
+  assert.equal(cancelResponse.body.stopRequested, true);
+  await waitFor(() => bridge.events().some((event) => event.id === cancelId && event.event === 'termination_requested'));
   const held = await bridge.call('claude', 'RB_CASE_stillHeld');
   assert.equal(held.status, 429);
   assert.equal(held.body.activeForKind, 2);
   assert.equal(held.body.activeOneShotCount, 3);
-  bridge.release('RB_CASE_cancel');
+  bridge.release(cancelId);
   await waitFor(async () => (await bridge.health()).activeOneShotCount === 2);
   const replacement = bridge.call('claude', 'RB_CASE_replacement');
   await waitFor(() => bridge.started().length === 4);
   assert.equal(bridge.events().filter((event) => event.event === 'termination_requested').length, 1);
   bridge.releaseEverything();
-  for (const response of await Promise.all([sibling, codex, replacement])) assert.equal(response.status, 200);
+  for (const response of await Promise.all([sibling, replacement])) assert.equal(response.status, 200);
   await waitFor(async () => (await bridge.health()).activeOneShotCount === 0);
-  const rows = bridge.receipts().filter((row) => row.requestId === 'parallel:RB_CASE_cancel');
-  assert.equal(rows.length, 1); assert.equal(rows[0].status, 'cancelled');
+  // Two receipt rows are expected: the operator-cancel intent binding
+  // (event: 'active_run_cancel_requested') and the final delivery receipt
+  // once the process physically exits (status: 'cancelled').
+  const rows = bridge.receipts().filter((row) => row.requestId === `parallel:${cancelId}`);
+  assert.equal(rows.length, 2);
+  assert.equal(rows.filter((row) => row.event === 'active_run_cancel_requested').length, 1);
+  const delivered = rows.filter((row) => row.status === 'cancelled');
+  assert.equal(delivered.length, 1);
 });
 
 test('background tasks use all eight default slots and queued overflow completes', { timeout: 30000 }, async (t) => {
