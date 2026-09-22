@@ -230,6 +230,9 @@ test('two independent MCP clients overlap same-provider calls and preserve each 
       assert.equal(row.requestId, outer.requestId);
       assert.equal(row.invocationId, outer.invocationId);
       assert.equal(result.route.request_id, outer.requestId);
+    } else {
+      assert.equal(result.requestId, outer.requestId);
+      assert.equal(result.invocationId, outer.invocationId);
     }
   }
   assert.equal(requests.size, 4); assert.equal(invocations.size, 4); assert.equal(receipts.size, 4);
