@@ -26,6 +26,10 @@ function nullableNonNegativeInteger(name) {
 const minimumMs = positiveInteger('minimumMs');
 const oneShotDefaultMs = nullableNonNegativeInteger('oneShotDefaultMs');
 const oneShotMaxMs = nullableNonNegativeInteger('oneShotMaxMs');
+// mcpInlineWaitMs bounds only how long a caller's MCP tool call may block
+// inline; it is not a run cap. The run detaches when the host times out and
+// keeps going in the background.
+const mcpInlineWaitMs = positiveInteger('mcpInlineWaitMs');
 const transportGraceMs = positiveInteger('transportGraceMs');
 const mcpHostGraceMs = positiveInteger('mcpHostGraceMs');
 const broadcastQueueWaitMs = nullableNonNegativeInteger('broadcastQueueWaitMs');
@@ -55,6 +59,7 @@ module.exports = Object.freeze({
   minimumMs,
   oneShotDefaultMs,
   oneShotMaxMs,
+  mcpInlineWaitMs,
   transportGraceMs,
   mcpHostGraceMs,
   broadcastQueueWaitMs,

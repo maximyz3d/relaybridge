@@ -104,7 +104,7 @@ mcp_tool_timeout_sec=$(
   "$node_path" -e '
     const fs = require("fs");
     const p = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-    const values = [p.oneShotMaxMs, p.transportGraceMs, p.mcpHostGraceMs];
+    const values = [p.mcpInlineWaitMs, p.transportGraceMs, p.mcpHostGraceMs];
     if (!values.every(Number.isFinite)) process.exit(2);
     const seconds = Math.ceil(values.reduce((a, b) => a + b, 0) / 1000);
     if (!Number.isInteger(seconds) || seconds < 1) process.exit(3);

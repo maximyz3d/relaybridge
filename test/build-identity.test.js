@@ -775,7 +775,7 @@ posixOnly('POSIX MCP registration cannot strand a new token on snapshot or build
   write(path.join(root, 'mcp', 'server.mjs'), '// fixture\n');
   write(path.join(root, 'mcp', 'launcher.mjs'), '// fixture\n');
   write(path.join(root, 'config', 'timeout-policy.json'), JSON.stringify({
-    oneShotMaxMs: 1000, transportGraceMs: 1000, mcpHostGraceMs: 1000,
+    oneShotMaxMs: 1000, mcpInlineWaitMs: 1000, transportGraceMs: 1000, mcpHostGraceMs: 1000,
   }));
   const generatedManifest = '{"version":"2.0.1","buildId":"2.0.1+cccccccccccccccc"}\n';
   write(path.join(root, 'tools', 'prepare-build-info.cjs'), `
@@ -877,7 +877,7 @@ posixOnly('POSIX MCP registrations from distinct worktrees serialize global conf
     write(path.join(root, 'mcp', 'server.mjs'), '// concurrent fixture\n');
     write(path.join(root, 'mcp', 'launcher.mjs'), '// concurrent fixture\n');
     write(path.join(root, 'config', 'timeout-policy.json'), JSON.stringify({
-      oneShotMaxMs: 1000, transportGraceMs: 1000, mcpHostGraceMs: 1000,
+      oneShotMaxMs: 1000, mcpInlineWaitMs: 1000, transportGraceMs: 1000, mcpHostGraceMs: 1000,
     }));
     write(path.join(root, 'tools', 'prepare-build-info.cjs'), `
       const fs = require('node:fs');
