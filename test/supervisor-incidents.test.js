@@ -15,12 +15,20 @@ test('a notify-only supervisor stall never kills the run and is filed as a super
         label: 'Stall Notify Fixture',
         safe: [process.execPath, helper, '--version'],
         dangerous: [process.execPath, helper, '--version'],
-        // The supervisor polls on a fixed 5s tick (server.js executeOneShot),
-        // so the fixture must stay silent across at least one tick before it
-        // produces output, or the only check-in coincides with fresh bytes
-        // arriving and no stall detector fires.
-        oneshot_safe: [process.execPath, helper, '--prompt-file', '{prompt_file}', '--delay', '5500'],
-        oneshot_dangerous: [process.execPath, helper, '--prompt-file', '{prompt_file}', '--delay', '5500'],
+        // The supervisor polls on a fixed 5s tick (server.js ~5555-5576), but
+        // each tick's verdict is only applied in applyVerdict(), which runs
+        // in sampleProcessCensus().finally() -- so the tick's effective time
+        // is "5s plus however long the process census takes". On Windows
+        // that census can take 1-3s, so a fixture silent for only one tick
+        // (5500ms) can have its output already parsed by the time the census
+        // resolves, and no stall detector fires (Refs #133, Round 7 G8).
+        // Staying silent across two ticks (10s) plus census-latency margin
+        // guarantees at least one fully-silent check-in regardless of census
+        // speed. Dedup (server.js:5510-5522, stallIncidentReported) ensures
+        // this still files exactly one supervision_stall incident even if
+        // more than one silent check-in occurs before output arrives.
+        oneshot_safe: [process.execPath, helper, '--prompt-file', '{prompt_file}', '--delay', '14000'],
+        oneshot_dangerous: [process.execPath, helper, '--prompt-file', '{prompt_file}', '--delay', '14000'],
         supervisor: {
           stallAction: 'notify',
           checkInIntervalMs: 1000,
