@@ -847,7 +847,13 @@ test('prompt-file transport preserves long special-character prompts and cleans 
       oneshot_output_parser: 'claude_json',
       // No wall-clock cap: a silent, CPU-idle helper is killed as wedged at
       // the second check-in (the first sees its startup output).
-      supervisor: { checkInIntervalMs: 500, wedgedCheckins: 1, unsampledWedgedCheckins: 1 },
+      // S4 (Refs #133): unsampled CPU silence alone can no longer kill via
+      // 'wedged' -- only a CPU-confirmed-idle streak can. If this sandbox
+      // cannot sample the helper's CPU (cpuUnavailable), noNewContentMs is
+      // kept just as small so loop_confirmed fires instead as the remaining
+      // signal, so this fixture never hangs waiting on a kill that will not
+      // come through the wedged path alone.
+      supervisor: { checkInIntervalMs: 500, wedgedCheckins: 1, unsampledWedgedCheckins: 1, noNewContentMs: 500 },
     },
     fail: {
       label: 'Fail',
@@ -2786,6 +2792,11 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(retryTimeout.provider_retries.count, 1);
   assert.equal(retryTimeout.provider_retries.total_delay_ms, 250);
   assert.equal(retryTimeout.stdout, '');
+  // S3 (Refs #133): a supervisor kill must carry the checkpoint saved just
+  // before the process died, sourced from continuity.saveRun.
+  assert.ok(retryTimeout.stop_checkpoint_id, 'kill receipt carries stop_checkpoint_id');
+  assert.ok(retryTimeout.stop_checkpoint_path, 'kill receipt carries stop_checkpoint_path');
+  assert.ok(fs.existsSync(retryTimeout.stop_checkpoint_path), 'stop_checkpoint_path points at a real checkpoint file');
   const retryTimeoutReceipt = fs.readFileSync(path.join(tempRoot, 'data', 'receipts', new Date().toISOString().slice(0, 10) + '.jsonl'), 'utf8')
     .trim().split(/\r?\n/).map((line) => JSON.parse(line))
     .find((row) => row.receiptId === retryTimeout.receiptId);
@@ -2794,6 +2805,8 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(retryTimeoutReceipt.providerTimeoutSource, 'relay_supervisor');
   assert.equal(retryTimeoutReceipt.providerRetryCount, 1);
   assert.equal(retryTimeoutReceipt.estimatedOutputTokens, 0);
+  assert.equal(retryTimeoutReceipt.stopCheckpointId, retryTimeout.stop_checkpoint_id);
+  assert.equal(retryTimeoutReceipt.stopCheckpointPath, retryTimeout.stop_checkpoint_path);
 
   const diag = await (await fetch(baseUrl + '/api/diag', { headers: auth })).json();
   assert.equal(diag.results.echo.found, true);

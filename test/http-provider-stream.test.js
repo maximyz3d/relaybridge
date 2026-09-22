@@ -30,16 +30,31 @@ test('malformed frames, usage, missing and conflicting terminals fail closed', (
   }
 });
 
-test('wire, frame and semantic byte caps reject before excessive retention', () => {
+test('wire and frame byte caps reject before excessive retention', () => {
   for (const [options, wire, code] of [
     [{ maxWireBytes: 8 }, '123456789', 'http_wire_limit'],
     [{ maxFrameBytes: 8 }, '123456789', 'http_frame_limit'],
-    [{ maxOutputBytes: 2 }, '{"done":true,"response":"雪"}', 'http_output_limit'],
     [{ maxFrames: 1 }, '{"done":false}\n{"done":true}', 'http_frame_limit'],
   ]) {
     const parser = createOllamaStreamParser(options);
     assert.throws(() => { parser.push(Buffer.from(wire)); parser.finish(); }, { code });
   }
+});
+
+// S1 (Refs #133): output past maxOutputBytes no longer throws output_cap. It
+// spills to the caller via onOutputSpill and the in-memory response keeps
+// only a bounded tail (outputTailBytes), never an unbounded buffer.
+test('semantic output past maxOutputBytes spills instead of throwing output_cap', () => {
+  const spilled = [];
+  const parser = createOllamaStreamParser({ maxOutputBytes: 2, outputTailBytes: 4,
+    onOutputSpill: (chunk) => spilled.push(chunk) });
+  parser.push(Buffer.from('{"done":false,"response":"abcdef"}\n'));
+  parser.push(Buffer.from('{"done":true,"response":"ghij"}\n'));
+  const result = parser.finish();
+  assert.equal(spilled.join(''), 'abcdefghij');
+  assert.equal(result.transport.spilling, true);
+  assert.ok(Buffer.byteLength(result.response, 'utf8') <= 4, 'tail stays bounded');
+  assert.equal(result.response, 'ghij');
 });
 
 test('malformed UTF-8 is rejected, including incomplete final multibyte characters', () => {

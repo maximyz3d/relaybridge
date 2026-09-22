@@ -840,6 +840,10 @@ function appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt, 
       ? payload.writer_diff_summary : null,
     stopReason: normalizeClaudeResultString(payload.stop_reason),
     supervisorStopReason: normalizeClaudeResultString(payload.supervisor_stop_reason),
+    // S3 (Refs #133): a supervisor kill must carry the checkpoint saved just
+    // before the process died, sourced from continuity.saveRun.
+    stopCheckpointId: payload.stop_checkpoint_id || null,
+    stopCheckpointPath: payload.stop_checkpoint_path || null,
     providerTimeoutSource: normalizeClaudeResultString(payload.provider_timeout_source),
     providerBudget: payload.provider_budget || null,
     providerBudgetEnforcement: normalizeClaudeResultString(payload.provider_budget_enforcement),
@@ -2254,6 +2258,22 @@ async function runHttpProviderOneShot({ entry, prompt, effectivePrompt, res, rou
   let requestStarted = false, responseStatus = null, semanticOutput = '', terminal = null, payload;
   let acceptedUsage = null, sealedPayload = null, transportDiagnostic = null;
   const wireProgress = (bytes) => { route.transport_wire_bytes += bytes; };
+  // Ollama stream output past supervisor.opts.spillAfterBytes no longer
+  // throws output_cap (Refs #133): it spills to the same
+  // <runId>.output-spill.log convention as the CLI path, and only a bounded
+  // tail is kept in memory so semanticOutput cannot grow unbounded.
+  let outputSpillFd = null, outputSpillPath = null;
+  const OUTPUT_SPILL_TAIL_BYTES = 8 * 1024 * 1024;
+  const spillOverflow = (chunk) => {
+    if (!chunk) return;
+    if (!outputSpillPath) {
+      outputSpillPath = path.join(DATA_DIR, 'runs', `${runId}.output-spill.log`);
+      try { fs.mkdirSync(path.dirname(outputSpillPath), { recursive: true }); } catch {}
+      try { outputSpillFd = fs.openSync(outputSpillPath, 'a'); } catch { outputSpillFd = null; }
+      supervisor.recordOutputSpillPath(outputSpillPath);
+    }
+    if (outputSpillFd !== null) { try { fs.writeSync(outputSpillFd, chunk); } catch {} }
+  };
   const meta = { kind: route.provider, prompt, route, startedAt, accountId, cwd, persistAfterDisconnect: true };
   const usageFromTerminal = (value) => {
     const input = nonnegativeUsageNumber(value.prompt_eval_count);
@@ -2342,10 +2362,17 @@ async function runHttpProviderOneShot({ entry, prompt, effectivePrompt, res, rou
       } else {
         await readOllamaStream(response, { signal: controller.signal,
           maxOutputBytes: Math.min(supervisor.opts.spillAfterBytes, HTTP_PROVIDER_LIMITS.maxOutputBytes),
+          outputTailBytes: OUTPUT_SPILL_TAIL_BYTES,
           onWireBytes: wireProgress,
+          onOutputSpill: spillOverflow,
           onTerminal: (value) => acceptTerminal(value, usageFromTerminal(value)),
           onDelta: (delta) => {
-            lifecycle.observeOutput(delta, (accepted) => { semanticOutput += accepted; });
+            lifecycle.observeOutput(delta, (accepted) => {
+              semanticOutput += accepted;
+              if (Buffer.byteLength(semanticOutput, 'utf8') > OUTPUT_SPILL_TAIL_BYTES) {
+                semanticOutput = semanticOutput.slice(-OUTPUT_SPILL_TAIL_BYTES);
+              }
+            });
             return !lifecycle.snapshot().stop;
           }, onTerminalAccepted: sealTerminal });
       }
@@ -2360,6 +2387,7 @@ async function runHttpProviderOneShot({ entry, prompt, effectivePrompt, res, rou
       errorCode: error.code || null, auth_failed: isHostedApiKeyMissingError(error),
       dropped_out: true, model_invocation: requestStarted ? (responseStatus && responseStatus >= 200 && responseStatus < 300 ? true : null) : false };
   } finally {
+    if (outputSpillFd !== null) { try { fs.closeSync(outputSpillFd); } catch {} outputSpillFd = null; }
     res.removeListener('close', detach);
     lifecycle.sealOutcome(payload);
     const state = lifecycle.snapshot();
@@ -5419,6 +5447,27 @@ async function executeOneShot(body, res, privateContext = null) {
     continuityControl.stopCheckpointPath = stopCheckpointPath;
     return true;
   };
+  // S2/S4 (Refs #133): stallAction:"notify" (this.stall) and unverifiable
+  // CPU silence (this.unsampledStall) never kill, but they must still be
+  // visible as incidents, once each per run, with the check-in evidence
+  // that triggered them.
+  let stallIncidentReported = false;
+  let unsampledStallIncidentReported = false;
+  const reportSupervisorIncidents = () => {
+    const snap = supervisor.snapshot();
+    if (snap.stall && !stallIncidentReported) {
+      stallIncidentReported = true;
+      incidentLog.report({ classification: 'capacity_unknown', runId, phase: 'supervision',
+        provider: kind, summary: `stallAction notify: ${snap.stall.reason} -- ${snap.stall.detail}`,
+        nextAction: 'Inspect the run; stallAction:"notify" never kills, evidence is in the check-in log.' });
+    }
+    if (snap.unsampledStall && !unsampledStallIncidentReported) {
+      unsampledStallIncidentReported = true;
+      incidentLog.report({ classification: 'capacity_unknown', runId, phase: 'supervision',
+        provider: kind, summary: `unsampled CPU silence (never killed): ${snap.unsampledStall.detail}`,
+        nextAction: 'CPU could not be sampled to confirm idleness; inspect the run manually.' });
+    }
+  };
 
   continuityControl.stop = (reason = 'quota_reserve') => {
     continuityControl.handoffPath = continuity.saveRun(continuityControl);
@@ -5447,6 +5496,7 @@ async function executeOneShot(body, res, privateContext = null) {
       // directly callable by other code paths.
       const verdict = supervisor.evaluate();
       if (latchSupervisorVerdict(verdict)) killProcessTree(proc);
+      else reportSupervisorIncidents();
     };
     // Sample descendants even while model output is buffered. This is
     // observational evidence, never termination or filesystem authority.
@@ -5522,6 +5572,8 @@ async function executeOneShot(body, res, privateContext = null) {
     if (latchSupervisorVerdict(verdict)) {
       retainLateStdout(lateChunk);
       killProcessTree(proc);
+    } else {
+      reportSupervisorIncidents();
     }
   });
   proc.stderr.on('data', (d) => {
@@ -5729,6 +5781,12 @@ async function executeOneShot(body, res, privateContext = null) {
       partial_checkpoint: parsedOutput.partialCheckpoint?.text, writer_diff_summary: collectWriterDiffSummary(), stop_reason: stopReason });
     const sentPayload = sendOneShotResult(res, {
       continuity: { handoffPath: continuityControl.handoffPath, continuityId: continuityControl.continuityId },
+      // S3 (Refs #133): the checkpoint saved by latchSupervisorVerdict just
+      // before a supervisor kill (wedged/loop_confirmed/burn_without_progress/
+      // assessor_stuck) must survive onto the receipt, not just live on
+      // continuityControl -- the terminal continuity.saveRun() above
+      // reassigns handoffPath to a later, non-stop checkpoint.
+      ...(stopCheckpointPath ? { stop_checkpoint_id: runId, stop_checkpoint_path: stopCheckpointPath } : {}),
       kind,
       route,
       exitCode: code,
