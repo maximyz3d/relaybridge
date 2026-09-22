@@ -978,7 +978,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.match(dashboard.headers.get('content-security-policy') || '', /script-src-attr 'none'/);
   const dashboardHtml = await dashboard.text();
   assert.match(dashboardHtml, /<script nonce="[A-Za-z0-9+/=]+">\s*const API/);
-  assert.match(dashboardHtml, /const ONE_SHOT_DEFAULT_TIMEOUT_MS = 1200000;/);
+  assert.match(dashboardHtml, /const ONE_SHOT_DEFAULT_TIMEOUT_MS = null;/);
   assert.doesNotMatch(dashboardHtml, /__ONE_SHOT_DEFAULT_TIMEOUT_MS__/);
   assert.match(dashboardHtml, /provider budgets are unenforceable and character estimates are disabled/);
   const runningHealth = await (await fetch(baseUrl + '/api/health')).json();
@@ -992,7 +992,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(typeof runningHealth.runtime.platform, 'string');
   assert.equal(runningHealth.runtime.wslNative.ok, true);
   assert.equal(runningHealth.runtime.nativeProviderBinariesOnly, true);
-  assert.deepEqual(runningHealth.oneShotTimeoutPolicy, { minimumMs: 1000, defaultMs: 1200000, maxMs: 2700000 });
+  assert.deepEqual(runningHealth.oneShotTimeoutPolicy, { minimumMs: 1000, defaultMs: null, maxMs: null });
   assert.ok(Object.prototype.hasOwnProperty.call(runningHealth, 'tokenAcl'));
   if (process.platform === 'win32') {
     assert.equal(runningHealth.tokenAcl.applicable, true);
@@ -2443,12 +2443,12 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(cappedTimeoutResponse.status, 200);
   const cappedTimeoutResult = await cappedTimeoutResponse.json();
   assert.equal(cappedTimeoutResult.route.requested_timeout_ms, 1500000);
-  // 1.5M ms sits under the raised ceiling (2.7M), so it passes through unclamped.
+  // 1.5M ms passes through unclamped.
   assert.equal(cappedTimeoutResult.route.effective_timeout_ms, 1500000);
   assert.equal(cappedTimeoutResult.route.timeout_clamped, false);
 
-  // Above the ceiling the policy clamps; an OMITTED timeout arms no clock at
-  // all (effective is null) — supervision governs instead.
+  // There is no ceiling any more: a large timeoutMs passes through unclamped
+  // as a hint, and an OMITTED timeout arms no clock (effective is null).
   const overCapResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST',
     headers: jsonAuth,
@@ -2456,8 +2456,8 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   });
   assert.equal(overCapResponse.status, 200);
   const overCapResult = await overCapResponse.json();
-  assert.equal(overCapResult.route.effective_timeout_ms, 2700000);
-  assert.equal(overCapResult.route.timeout_clamped, true);
+  assert.equal(overCapResult.route.effective_timeout_ms, 9000000);
+  assert.equal(overCapResult.route.timeout_clamped, false);
 
   const noTimeoutResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST',
