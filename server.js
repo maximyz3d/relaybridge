@@ -5350,7 +5350,11 @@ async function executeOneShot(body, res, privateContext = null) {
   let stopReason = null;
   let stopDetail = '';
   let stopBudgetEnforcement = null;
+  let stopCheckpointPath = null;
   let sampling = false;
+  let outputSpillFd = null;
+  let outputSpillPath = null;
+  const OUTPUT_SPILL_TAIL_BYTES = 8 * 1024 * 1024;
   const censusCpu = createCensusCpuTracker();
   const copilotDenials = createCopilotDenialObserver(kind);
   const usageObserver = createProviderUsageObserver(entry.oneshot_output_parser, supervisor, {
@@ -5366,15 +5370,24 @@ async function executeOneShot(body, res, privateContext = null) {
       if (supportsClaudeStreamFinalization) closeProviderInput();
     },
   });
+  // Kills are the only supervisor-driven stops now (wedged, loop_confirmed,
+  // burn_without_progress, assessor_stuck; Refs #133). Every kill path must
+  // save a continuity checkpoint before the process actually dies, so a
+  // resumed run has the latest public state; the checkpoint path is attached
+  // to the stop detail as evidence.
   const latchSupervisorVerdict = (verdict) => {
     if (verdict.action !== 'kill' || stopReason) return false;
     stopReason = verdict.reason;
     stopDetail = verdict.detail;
     supervisorStdout = stdout;
-    if (verdict.reason === 'token_budget') {
-      stopBudgetEnforcement = supervisor.snapshot().providerUsagePhase;
-    }
-    timedOut = ['hard_cap', 'idle_stall', 'loop_detected'].includes(verdict.reason);
+    timedOut = ['wedged', 'loop_confirmed', 'burn_without_progress'].includes(verdict.reason);
+    // Evidence: the check-in fingerprints that justified the kill (verdict.evidence,
+    // populated by lib/run-supervisor.js #stopOrNotify) plus the checkpoint saved
+    // just before the process actually dies.
+    continuityControl.stopEvidence = verdict.evidence || null;
+    continuityControl.handoffPath = continuity.saveRun(continuityControl);
+    stopCheckpointPath = continuityControl.handoffPath;
+    continuityControl.stopCheckpointPath = stopCheckpointPath;
     return true;
   };
 
@@ -5385,6 +5398,7 @@ async function executeOneShot(body, res, privateContext = null) {
   };
   const finishSupervision = () => {
     clearInterval(tick);
+    if (outputSpillFd !== null) { try { fs.closeSync(outputSpillFd); } catch {} outputSpillFd = null; }
     if (!ownedHandle) activeRuns.delete(runId);
   };
   const tick = setInterval(() => {
@@ -5398,11 +5412,11 @@ async function executeOneShot(body, res, privateContext = null) {
     }
     if (nativeState?.stopNeeded) continuityControl.stop('native_transport_limit');
     const applyVerdict = () => {
+      // Auto-finalization on budget proximity was removed with the provider
+      // budget kill (Refs #133); evaluate() never returns 'finalize' any
+      // more, only 'continue' or 'kill'. requestGracefulFinalization remains
+      // directly callable by other code paths.
       const verdict = supervisor.evaluate();
-      if (verdict.action === 'finalize') {
-        requestGracefulFinalization(verdict);
-        return;
-      }
       if (latchSupervisorVerdict(verdict)) killProcessTree(proc);
     };
     // Sample descendants even while model output is buffered. This is
@@ -5436,8 +5450,28 @@ async function executeOneShot(body, res, privateContext = null) {
   });
   proc.stdout.setEncoding('utf8');
   proc.stderr.setEncoding('utf8');
-  // recordOutput returns false once the output cap is reached, which stops the
-  // buffer growing before the kill lands â€” a runaway CLI cannot OOM the bridge.
+  // Output bytes are never a kill trigger (Refs #133): recordOutput keeps
+  // accepting and parsing every chunk for progress/loop detection regardless
+  // of size, and returns false once total bytes pass spillAfterBytes. Past
+  // that point we stop growing the in-memory buffer without bound — instead
+  // the overflow is appended to a spill file under the run's data directory
+  // and only the most recent OUTPUT_SPILL_TAIL_BYTES are kept in memory, so
+  // stream-json result parsing still sees the final events.
+  const spillOverflow = (chunk) => {
+    if (!chunk) return;
+    if (!outputSpillPath) {
+      outputSpillPath = path.join(DATA_DIR, 'runs', `${runId}.output-spill.log`);
+      try { fs.mkdirSync(path.dirname(outputSpillPath), { recursive: true }); } catch {}
+      try { outputSpillFd = fs.openSync(outputSpillPath, 'a'); } catch { outputSpillFd = null; }
+      supervisor.recordOutputSpillPath(outputSpillPath);
+      continuityControl.outputSpillPath = outputSpillPath;
+    }
+    if (outputSpillFd !== null) { try { fs.writeSync(outputSpillFd, chunk); } catch {} }
+    stdout += chunk;
+    if (Buffer.byteLength(stdout, 'utf8') > OUTPUT_SPILL_TAIL_BYTES) {
+      stdout = stdout.slice(-OUTPUT_SPILL_TAIL_BYTES);
+    }
+  };
   proc.stdout.on('data', (d) => {
     if (stopReason) {
       // Retain a bounded tail solely for transport byte/hash evidence. It is
@@ -5449,10 +5483,14 @@ async function executeOneShot(body, res, privateContext = null) {
     const semanticChars = usageObserver.record(chunk);
     const semanticChunk = chunk.slice(0, semanticChars);
     const lateChunk = chunk.slice(semanticChars);
-    if (semanticChunk && supervisor.recordOutput(semanticChunk)) stdout += semanticChunk;
+    if (semanticChunk) {
+      if (supervisor.recordOutput(semanticChunk)) stdout += semanticChunk;
+      else spillOverflow(semanticChunk);
+    }
+    // Auto-finalization on budget proximity was removed (Refs #133);
+    // evaluate() only ever returns 'continue' or 'kill' here.
     const verdict = supervisor.evaluate();
-    if (verdict.action === 'finalize') requestGracefulFinalization(verdict);
-    else if (latchSupervisorVerdict(verdict)) {
+    if (latchSupervisorVerdict(verdict)) {
       retainLateStdout(lateChunk);
       killProcessTree(proc);
     }
