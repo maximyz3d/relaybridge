@@ -4739,28 +4739,50 @@ async function executeOneShot(body, res, privateContext = null) {
   const nativeDispatchSnapshot = Object.freeze({ ...nativeDispatchConfig, quotaSeat: selectedQuotaSeat });
   let nativeLaunchIdentity = captureClaudeLaunchIdentity(kind, dispatchAccount.account?.id || 'default', null,
     nativeDispatchSnapshot);
+  // Set when admission falls back to a prior same-identity observation instead of a fresh
+  // probe result (see the quota_unknown gate below). Not yet threaded into the eventual
+  // success receipt/response: that assembly lives outside this lane's owned server.js regions.
+  let staleAdmittedNativeUsage = false;
   if (nativeLaunchIdentity.required) {
     if (!nativeLaunchIdentity.identity) return rejectBeforeAdmission(409, 'account_identity_unavailable', {
       error: 'The selected native Claude profile identity is unavailable.', model_invocation: false, physical_attempt_count: 0 });
     observeClaudeNativeSnapshot(nativeLaunchIdentity);
     const nativeUsage = subscriptionUsage.verdict(nativeLaunchIdentity.identity.quotaSeat,
       { accountFingerprint: nativeLaunchIdentity.identity.accountFingerprint });
+    let nativeProbeReason = null;
     if (nativeUsage.freshness !== 'fresh') {
-      const refreshed = await probeClaudeNativeAdmission(nativeLaunchIdentity, nativeDispatchSnapshot);
+      const probe = await probeClaudeNativeAdmission(nativeLaunchIdentity, nativeDispatchSnapshot);
       if (res.destroyed) return;
-      if (refreshed) {
-        nativeLaunchIdentity = refreshed;
+      nativeProbeReason = probe?.reason || null;
+      if (probe?.ok && probe.identity) {
+        nativeLaunchIdentity = probe.identity;
         observeClaudeNativeSnapshot(nativeLaunchIdentity);
       }
       try { progressAssessor.assertDispatch(body); }
       catch (error) { return rejectBeforeAdmission(409, 'assessment_revoked', { error: error.message }); }
     }
     if (!validateClaudeLaunchAdmission(nativeLaunchIdentity)) {
-      if (nativeUsage.freshness !== 'fresh') {
+      // The probe itself did not establish fresh admission (or was never attempted because
+      // nativeUsage was already fresh at capture but drifted stale between here and now).
+      // Fall back to the last same-identity observation rather than rejecting outright: admit
+      // as stale when its binding window has already reset, or its last known headroom is
+      // still above the protected-reserve trigger that validateClaudeLaunchAdmission enforces.
+      const priorSeat = subscriptionUsage.verdict(nativeLaunchIdentity.identity.quotaSeat,
+        { accountFingerprint: nativeLaunchIdentity.identity.accountFingerprint });
+      const hasPriorObservation = Array.isArray(priorSeat.windows) && priorSeat.windows.length > 0
+        && priorSeat.reason !== 'no_native_observation' && priorSeat.reason !== 'native_account_capacity_unbound';
+      const bindingWindow = hasPriorObservation
+        ? priorSeat.windows.reduce((a, b) => (a.percentRemaining ?? 100) <= (b.percentRemaining ?? 100) ? a : b) : null;
+      const windowReset = !!bindingWindow && Number.isSafeInteger(bindingWindow.resetsAt) && Date.now() > bindingWindow.resetsAt;
+      const headroomAboveReserve = hasPriorObservation && priorSeat.admit === true;
+      if (hasPriorObservation && (windowReset || headroomAboveReserve)) {
+        staleAdmittedNativeUsage = true;
+      } else {
         claudeUsageProbeFailures.set(claudeUsageProbeKey(nativeLaunchIdentity.identity), Date.now());
+        return rejectBeforeAdmission(409, 'quota_unknown', {
+          error: 'Native Claude requires fresh capacity bound to the selected profile and protected reserve.',
+          probe_reason: nativeProbeReason, model_invocation: false, physical_attempt_count: 0 });
       }
-      return rejectBeforeAdmission(409, 'quota_unknown', {
-        error: 'Native Claude requires fresh capacity bound to the selected profile and protected reserve.', model_invocation: false, physical_attempt_count: 0 });
     }
   }
   const providerCooldown = cooldowns.status(kind);
@@ -6583,25 +6605,33 @@ const claudeUsageProbes = new Map(), claudeUsageProbeFailures = new Map();
 const CLAUDE_USAGE_PROBE_FAILURE_COOLDOWN_MS = 60000;
 const claudeUsageProbeKey = identity => JSON.stringify([identity.quotaSeat, identity.profileHash,
   identity.accountFingerprint]);
+// One stderr line per probe failure, reason code only: no config values, tokens, prompts or
+// filesystem contents. quotaSeat/accountFingerprint are already-opaque identifiers used
+// throughout the bridge's own logs and receipts.
+function logClaudeNativeProbeFailure(identity, reason) {
+  try { console.error(`[claude-native-probe] reason=${reason} quotaSeat=${identity?.quotaSeat || 'unknown'}`); } catch {}
+}
 async function probeClaudeNativeAdmission(captured, dispatchSnapshot = null) {
-  if (!captured?.identity || !pty) return null;
+  const fail = (reason) => ({ ok: false, reason, identity: null });
+  if (!captured?.identity) return fail('probe_identity_missing');
+  if (!pty) return fail('probe_pty_unavailable');
   const key = claudeUsageProbeKey(captured.identity);
-  if (Date.now() - (claudeUsageProbeFailures.get(key) || 0) < CLAUDE_USAGE_PROBE_FAILURE_COOLDOWN_MS) return null;
+  if (Date.now() - (claudeUsageProbeFailures.get(key) || 0) < CLAUDE_USAGE_PROBE_FAILURE_COOLDOWN_MS) return fail('probe_cooldown');
   let task = claudeUsageProbes.get(key);
   if (!task) {
     task = (async () => {
       try {
         const cfg = loadConfig(), entry = cfg[captured.identity.kind], settings = entry?.native_usage_probe;
         if (!settings || settings.enabled !== true || !Array.isArray(settings.command)
-          || typeof settings.command[0] !== 'string' || !settings.command[0]) return false;
+          || typeof settings.command[0] !== 'string' || !settings.command[0]) return fail('probe_config_missing');
         const probeStat = fs.lstatSync(CLAUDE_USAGE_PROBE_DIR);
         if (!probeStat.isDirectory() || probeStat.isSymbolicLink()
-          || path.resolve(fs.realpathSync(CLAUDE_USAGE_PROBE_DIR)) !== path.resolve(CLAUDE_USAGE_PROBE_DIR)) return false;
+          || path.resolve(fs.realpathSync(CLAUDE_USAGE_PROBE_DIR)) !== path.resolve(CLAUDE_USAGE_PROBE_DIR)) return fail('probe_dir_invalid');
         const env = buildEnv(normalizeEnvOverrides(entry.oneshot_env), entry.strip_env || []);
         const trusted = readClaudeNativeUsage({ env, quotaSeat: captured.identity.quotaSeat,
           projectCwd: CLAUDE_USAGE_PROBE_DIR });
         if (!trusted.identity || trusted.identity.accountFingerprint !== captured.identity.accountFingerprint
-          || trusted.identity.profileHash !== captured.identity.profileHash || !trusted.projectTrustAccepted) return false;
+          || trusted.identity.profileHash !== captured.identity.profileHash || !trusted.projectTrustAccepted) return fail('identity_mismatch_pre');
         const command = resolveExecutable(settings.command[0], env), args = settings.command.slice(1).map(String);
         const timeoutMs = Number.isSafeInteger(settings.timeout_ms)
           ? Math.min(30000, Math.max(1000, settings.timeout_ms)) : 15000;
@@ -6609,24 +6639,42 @@ async function probeClaudeNativeAdmission(captured, dispatchSnapshot = null) {
           projectCwd: CLAUDE_USAGE_PROBE_DIR });
         const result = await refreshClaudeUsageViaPty({ ptyImpl: pty, command, args, env, cwd: CLAUDE_USAGE_PROBE_DIR,
           readSample, expectedIdentity: captured.identity, baselineFetchedAt: captured.cacheFetchedAt, timeoutMs });
-        if (!result.refreshed) { claudeUsageProbeFailures.set(key, Date.now()); return false; }
-        return true;
+        if (!result.refreshed) return fail(`probe_not_refreshed:${result.reason || 'unknown'}`);
+        return { ok: true, reason: null };
       } catch {
-        claudeUsageProbeFailures.set(key, Date.now()); return false;
+        return fail('probe_threw');
       }
     })().finally(() => claudeUsageProbes.delete(key));
     claudeUsageProbes.set(key, task);
   }
-  if (!await task) {
+  const taskResult = await task;
+  if (!taskResult.ok) {
     claudeUsageProbeFailures.set(key, Date.now());
-    return null;
+    logClaudeNativeProbeFailure(captured.identity, taskResult.reason);
+    return taskResult;
   }
   const current = captureClaudeLaunchIdentity(captured.identity.kind, captured.identity.accountId, null, dispatchSnapshot);
-  if (!current.identity || JSON.stringify(current.identity) !== JSON.stringify(captured.identity)
-    || !current.observation || current.observation.observedAt <= (captured.cacheFetchedAt || 0)) {
-    claudeUsageProbeFailures.set(key, Date.now()); return null;
+  // Compare only account + profile identity here, not `generation`: `generation` hashes the
+  // whole native-Claude config plus registry, so an unrelated config edit racing the probe
+  // (e.g. another provider's entry changing) must not turn a successful, correctly-attributed
+  // usage refresh into a false quota_unknown. `generation` still gates admission through
+  // sameClaudeLaunchIdentity()/validateClaudeLaunchAdmission() immediately after this returns,
+  // so a config change that actually matters to this account is still caught there.
+  const sameAccountProfile = !!current.identity
+    && current.identity.accountFingerprint === captured.identity.accountFingerprint
+    && current.identity.profileHash === captured.identity.profileHash
+    && current.identity.quotaSeat === captured.identity.quotaSeat;
+  if (!sameAccountProfile) {
+    claudeUsageProbeFailures.set(key, Date.now());
+    logClaudeNativeProbeFailure(captured.identity, 'identity_mismatch_post');
+    return fail('identity_mismatch_post');
   }
-  return current;
+  if (!current.observation || current.observation.observedAt <= (captured.cacheFetchedAt || 0)) {
+    claudeUsageProbeFailures.set(key, Date.now());
+    logClaudeNativeProbeFailure(captured.identity, 'observation_not_newer');
+    return fail('observation_not_newer');
+  }
+  return { ok: true, reason: null, identity: current };
 }
 function refreshClaudeNativeUsage() {
   const cfg = loadConfig(), registry = providerAccounts.loadRegistry(DATA_DIR, { strict: true });
