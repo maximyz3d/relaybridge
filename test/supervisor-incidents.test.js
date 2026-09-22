@@ -62,7 +62,29 @@ test('a notify-only supervisor stall never kills the run and is filed as a super
   const stallIncidents = incidentsResponse.body.incidents.filter(
     (incident) => incident.classification === 'supervision_stall',
   );
-  assert.equal(stallIncidents.length, 1, JSON.stringify(incidentsResponse.body.incidents));
-  assert.ok(stallIncidents[0].runId, 'incident carries the correlated runId');
-  assert.ok(stallIncidents[0].summary.length < 300, 'summary must stay bounded under 300 chars');
+  // server.js:5510-5527 tracks two independent dedupe flags: stallIncidentReported
+  // (snap.stall, summary prefix "stallAction notify:") and
+  // unsampledStallIncidentReported (snap.unsampledStall, summary prefix
+  // "unsampled CPU silence"). Each fires at most once per run, but both can
+  // legitimately fire in the same run -- e.g. when a 14s-silent fixture hits
+  // a tick whose census is still in flight or fails (recordCpuSample(null)),
+  // producing an unsampledStall on top of a stall. So the correct assertion
+  // is "at least one incident, and every incident is one of the two known
+  // kinds, each appearing at most once" -- not an exact count of 1.
+  assert.ok(stallIncidents.length >= 1, JSON.stringify(incidentsResponse.body.incidents));
+  const notifyStalls = stallIncidents.filter((i) => i.summary.startsWith('stallAction notify:'));
+  const unsampledStalls = stallIncidents.filter((i) => i.summary.startsWith('unsampled CPU silence'));
+  assert.ok(notifyStalls.length <= 1, 'at most one stallAction notify incident per run');
+  assert.ok(unsampledStalls.length <= 1, 'at most one unsampled CPU silence incident per run');
+  assert.equal(
+    notifyStalls.length + unsampledStalls.length,
+    stallIncidents.length,
+    'every supervision_stall incident must be one of the two known kinds',
+  );
+  const runIds = new Set(stallIncidents.map((incident) => incident.runId));
+  assert.equal(runIds.size, 1, 'all stall incidents must correlate to the same run');
+  for (const incident of stallIncidents) {
+    assert.ok(incident.runId, 'incident carries the correlated runId');
+    assert.ok(incident.summary.length < 300, 'summary must stay bounded under 300 chars');
+  }
 });
