@@ -1,3 +1,6 @@
+## v2.5.1 - 2026-09-22
+- #134 fix(supervisor): remove time/token caps; progress check-ins decide kills
+
 ## v2.5.0 - 2026-09-13
 - #132 Build a project chat workspace with Codex delegation
 
