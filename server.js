@@ -5770,9 +5770,18 @@ async function executeOneShot(body, res, privateContext = null) {
     // or a malformed-field parse failure) is never reclassified from
     // stderr/text prose either: only a genuine crash with no result document
     // at all may fall back to the prose heuristic.
-    const hadTypedTerminal = !nativeStructuredOutput && parsedOutput.terminalDocumentFound !== undefined
+    // Only a genuinely typed terminal document exempts prose from the
+    // rate-limit heuristic. claude_json reports terminalDocumentFound
+    // directly; native JSON parsers (grok_json/gemini_cli_json/codex_json)
+    // fall back to the exit/output/error shape since they don't set that
+    // field. Plain-text output (the codex default parser, and any other
+    // unstructured provider) is never a typed document -- a clean-looking
+    // exit-zero/stdout text run must still be reclassifiable from stderr
+    // prose (Refs #181), since text parsing carries no real success/failure
+    // typing at all.
+    const hadTypedTerminal = parsedOutput.terminalDocumentFound !== undefined
       ? parsedOutput.terminalDocumentFound
-      : (code === 0 && !!cleanedStdout && !parsedOutput.isError && !parsedOutput.parseError && !parsedOutput.failureClass);
+      : (nativeStructuredOutput && code === 0 && !!cleanedStdout && !parsedOutput.isError && !parsedOutput.parseError && !parsedOutput.failureClass);
     const rate_limited = !!terminalQuotaEvidence || (parsedOutput.resultSubtype !== 'error_max_budget_usd'
       && !cursorUsageQuotaExhausted
       && (authoritativeApiFailure === 'rate_limit'
