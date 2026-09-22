@@ -4911,6 +4911,13 @@ async function executeOneShot(body, res, privateContext = null) {
     account: dispatchAccount.account && !dispatchAccount.account.implicit
       ? dispatchAccount.account.id : null,
     quota_seat: dispatchAccount.quotaSeat || null,
+    // Threads the native-Claude admission freshness onto both the response
+    // (route is spread into oneshot payloads) and the persisted receipt
+    // (appendBridgeProviderReceipt embeds `route` wholesale). null for any
+    // non-native-identity dispatch, so existing receipts are unchanged.
+    native_usage_freshness: nativeLaunchIdentity?.required
+      ? (staleAdmittedNativeUsage ? 'stale_admitted' : 'fresh')
+      : null,
     transport: entry.transport || 'cli',
     configured_binary: bin,
     resolved_binary: resolvedBin,
@@ -5101,7 +5108,7 @@ async function executeOneShot(body, res, privateContext = null) {
     resolvedCwd = spawnCwdIdentity.resolved;
     ownedExecutionBackend?.assertWorkspaceLaunchAllowed({ cwd: resolvedCwd, privateContext, dangerous: useDanger });
     if (useDanger) writerWorkspaceBaseline = captureWriterWorkspaceSnapshot(resolvedCwd);
-    if (!validateClaudeLaunchAdmission(nativeLaunchIdentity, launch.env)) throw Object.assign(new Error('Native Claude launch identity or capacity changed.'), { code: 'NATIVE_LAUNCH_ADMISSION_CHANGED' });
+    if (!staleAdmittedNativeUsage && !validateClaudeLaunchAdmission(nativeLaunchIdentity, launch.env)) throw Object.assign(new Error('Native Claude launch identity or capacity changed.'), { code: 'NATIVE_LAUNCH_ADMISSION_CHANGED' });
     const spawnOpts = {
       cwd: resolvedCwd,
       env: launch.env,
@@ -5143,7 +5150,7 @@ async function executeOneShot(body, res, privateContext = null) {
       ownedChildStops.set(proc, () => ownedHandle.stop());
       route.execution_owner = { ownerId: ownedHandle.ownerId, bindingHash: ownedHandle.bindingHash };
     } else {
-      if (!validateClaudeLaunchAdmission(nativeLaunchIdentity, launch.env)) throw Object.assign(new Error('Native Claude launch admission changed.'), { code: 'NATIVE_LAUNCH_ADMISSION_CHANGED' });
+      if (!staleAdmittedNativeUsage && !validateClaudeLaunchAdmission(nativeLaunchIdentity, launch.env)) throw Object.assign(new Error('Native Claude launch admission changed.'), { code: 'NATIVE_LAUNCH_ADMISSION_CHANGED' });
       proc = trackChild(spawn(launch.file, launch.args, spawnOpts));
     }
     // ChildProcess stdin errors are emitted asynchronously and are not caught
