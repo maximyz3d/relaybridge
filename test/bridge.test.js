@@ -30,25 +30,33 @@ function readCompleteReceiptRows(tempRoot) {
   return bytes.slice(0, bytes.lastIndexOf('\n') + 1).split(/\r?\n/).filter(Boolean).map(JSON.parse);
 }
 
-test('one-shot timeout policy is centralized: 20 min default, ceiling equals the supervisor hard cap', () => {
-  assert.equal(TIMEOUT_POLICY.oneShotDefaultMs, 1200000);
-  // The explicit-timeout ceiling matches _supervisor.hardCapMs (45 min) so the
-  // MCP transport bound (max + grace) covers everything supervision permits —
-  // otherwise the client aborts the HTTP request under a still-healthy run.
-  assert.equal(TIMEOUT_POLICY.oneShotMaxMs, 2700000);
-  assert.equal(TIMEOUT_POLICY.broadcastQueueWaitMs, 2700000);
+test('one-shot timeout policy is uncapped: no default, no ceiling, timeoutMs is a check-in hint only', () => {
+  // A run or queued task is never stopped or refused purely for elapsed time
+  // (that is a separate supervisor-kill/progress-check-in lane); null here
+  // means "no caller deadline / no enforced maximum", not zero and not
+  // Infinity.
+  assert.equal(TIMEOUT_POLICY.oneShotDefaultMs, null);
+  assert.equal(TIMEOUT_POLICY.oneShotMaxMs, null);
+  assert.equal(TIMEOUT_POLICY.broadcastQueueWaitMs, null);
+  // An explicit caller hint is floored at minimumMs but never clamped down to
+  // a maximum, since there no longer is one.
   assert.equal(TIMEOUT_POLICY.normalizeOneShotTimeoutMs(600001), 600001);
-  assert.equal(TIMEOUT_POLICY.normalizeOneShotTimeoutMs(3000000), 2700000);
+  assert.equal(TIMEOUT_POLICY.normalizeOneShotTimeoutMs(3000000), 3000000);
+  assert.equal(TIMEOUT_POLICY.normalizeOneShotTimeoutMs(1), TIMEOUT_POLICY.minimumMs);
+  // No hint at all (default missing) stays null, not coerced to a number.
+  assert.equal(TIMEOUT_POLICY.normalizeOneShotTimeoutMs(undefined), null);
   assert.equal(TIMEOUT_POLICY.transportTimeoutMs(2700000), 2715000);
+  assert.equal(TIMEOUT_POLICY.transportTimeoutMs(undefined), null, 'no hint means no transport timeout either');
   const supervisorCfg = readConfig()._supervisor;
-  assert.equal(TIMEOUT_POLICY.oneShotMaxMs, supervisorCfg.hardCapMs, 'transport ceiling must cover the supervisor hard cap');
-  assert.equal(supervisorCfg.idleMs, 1200000, 'buffered providers get the full default window before idle-stall');
-  assert.ok(supervisorCfg.idleMs >= TIMEOUT_POLICY.oneShotDefaultMs);
+  assert.equal(supervisorCfg.hardCapMs, undefined, 'the supervisor hard wall-clock cap is gone from the template');
+  assert.equal(supervisorCfg.idleMs, 1200000, 'buffered providers still get an idle-stall check-in window');
   const routing = JSON.parse(fs.readFileSync(path.join(ROOT, 'config', 'routing-policy.json'), 'utf8'));
-  assert.deepEqual(
-    Object.fromEntries(Object.entries(routing.tiers).map(([tier, policy]) => [tier, policy.defaultTimeoutMs])),
-    { utility: 1200000, standard: 1200000, complex: 1200000, critical: 1200000 },
-  );
+  // defaultTimeoutMs was removed from the schema entirely (not nulled): a
+  // tier has no per-tier timeout concept any more, not even an explicit "no
+  // timeout" value.
+  for (const [tier, policy] of Object.entries(routing.tiers)) {
+    assert.ok(!('defaultTimeoutMs' in policy), `${tier} tier must not carry a defaultTimeoutMs key`);
+  }
 });
 
 test('shutdown stops queue dispatch and workflow timers before owned children', () => {
@@ -205,8 +213,11 @@ test('provider config uses the installed subscription CLIs and safe headless mod
   assert.ok(config.grok.oneshot_safe.includes('{prompt_file}'));
   assert.equal(config.grok.oneshot_safe[config.grok.oneshot_safe.indexOf('--permission-mode') + 1], 'dontAsk');
   assert.equal(config.grok.oneshot_safe[config.grok.oneshot_safe.indexOf('--sandbox') + 1], 'read-only');
-  assert.equal(config.grok.oneshot_safe[config.grok.oneshot_safe.indexOf('--max-turns') + 1], '32');
-  assert.equal(config.grok.oneshot_dangerous[config.grok.oneshot_dangerous.indexOf('--max-turns') + 1], '32');
+  // A run is never stopped or refused for hitting a fixed turn count any
+  // more than for elapsed time: grok's --max-turns cap was removed from both
+  // arg slots.
+  assert.ok(!config.grok.oneshot_safe.includes('--max-turns'));
+  assert.ok(!config.grok.oneshot_dangerous.includes('--max-turns'));
   assert.ok(config.grok.oneshot_safe.includes('--no-leader'));
   assert.ok(config.grok.oneshot_dangerous.includes('--no-leader'));
   assert.ok(config.grok.oneshot_safe.includes('--no-plan'));

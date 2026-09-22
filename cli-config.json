@@ -87,19 +87,18 @@
     }
   },
   "_supervisor": {
-    "_note": "Liveness policy for provider runs. Runs are judged by progress, not by the clock: while new content keeps arriving a run is left alone to finish, and it is stopped early with a reason when it goes silent or starts repeating. idleMs is generous because print-mode CLIs buffer their whole answer and emit nothing until the end. providerBudget gates on authoritative provider-reported usage only; null disables one dimension. maxTurns ships as null because an agentic CLI spends a turn per tool call, so a turn count measures neither cost nor liveness. Set a positive number here, on a provider entry, or per request when you do want a turn ceiling. Any provider entry may override these with its own \"supervisor\" object. Default elapsed time is an assessment point when dynamic supervision is enabled. Explicit timeoutMs and custom hardCapMs remain deadlines.",
+    "_note": "Liveness policy for provider runs. Runs are judged by progress, not by the clock: while new content keeps arriving a run is left alone to finish, and it is stopped early with a reason when it goes silent or starts repeating. idleMs is generous because print-mode CLIs buffer their whole answer and emit nothing until the end. providerBudget gates on authoritative provider-reported usage only; null disables one dimension. maxTurns ships as null because an agentic CLI spends a turn per tool call, so a turn count measures neither cost nor liveness. Set a positive number here, on a provider entry, or per request when you do want a turn ceiling. Any provider entry may override these with its own \"supervisor\" object. Default elapsed time is an assessment point when dynamic supervision is enabled. There is no hard wall-clock cap: a run or queued task is never stopped or refused for elapsed time alone, only for lost liveness (idle/repeat) or an explicit budget.",
     "idleMs": 1200000,
-    "hardCapMs": 2700000,
     "graceExtensions": 3,
     "loopRepeatThreshold": 12,
     "noNewContentMs": 240000,
     "maxOutputBytes": 12582912,
     "onUnverifiableIdle": "kill",
     "providerBudget": {
-      "maxOutputTokens": 100000,
-      "maxTotalTokens": 3000000,
-      "maxCacheReadTokens": 2500000,
-      "maxCacheCreationTokens": 500000,
+      "maxOutputTokens": null,
+      "maxTotalTokens": null,
+      "maxCacheReadTokens": null,
+      "maxCacheCreationTokens": null,
       "maxTurns": null
     }
   },
@@ -1122,8 +1121,6 @@
       "read-only",
       "--no-subagents",
       "--no-plan",
-      "--max-turns",
-      "32",
       "--verbatim",
       "--no-auto-update",
       "--no-leader"
@@ -1141,8 +1138,6 @@
       "off",
       "--no-subagents",
       "--no-plan",
-      "--max-turns",
-      "32",
       "--verbatim",
       "--no-auto-update",
       "--no-leader"

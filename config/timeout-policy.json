@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
   "minimumMs": 1000,
-  "oneShotDefaultMs": 1200000,
-  "oneShotMaxMs": 2700000,
+  "oneShotDefaultMs": null,
+  "oneShotMaxMs": null,
   "transportGraceMs": 15000,
   "mcpHostGraceMs": 30000,
-  "broadcastQueueWaitMs": 2700000
+  "broadcastQueueWaitMs": null
 }

@@ -1607,6 +1607,22 @@ async function callProvider({
   effort,
   maxEffortOverride = false,
 }) {
+  // A host/transport deadline (SDK TimeoutError) must not abort the bridge
+  // request: the provider process keeps running and the bridge still stores
+  // the receipt, retrievable later by requestId via get_receipt/get_run. An
+  // explicit client cancel (any other abort reason) still cancels normally.
+  let bridgeSignal = signal;
+  let hostDeadlineDetached = false;
+  if (signal) {
+    const bridgeController = new AbortController();
+    const forwardOrDetach = () => {
+      if (signal.reason?.name === 'TimeoutError') hostDeadlineDetached = true;
+      else bridgeController.abort(signal.reason);
+    };
+    if (signal.aborted) forwardOrDetach();
+    else signal.addEventListener('abort', forwardOrDetach, { once: true });
+    bridgeSignal = bridgeController.signal;
+  }
   const durableTaskId = timeoutMs === undefined ? `t_mcp_${crypto.randomBytes(12).toString('hex')}` : null;
   const collectionOverride = Number(process.env.RELAYBRIDGE_COLLECTION_MS);
   const collectionBudget = Number.isSafeInteger(collectionOverride) && collectionOverride >= 100 && collectionOverride <= 30000
@@ -1630,7 +1646,7 @@ async function callProvider({
   let status = 'failed';
   let workspaceAdmission = null;
   let admittedProfile = null, admittedPromptHash = null;
-  if (signal?.aborted) throw signal.reason || new Error('provider call cancelled before admission');
+  if (bridgeSignal?.aborted) throw bridgeSignal.reason || new Error('provider call cancelled before admission');
   try {
     // Validate the complete semantic input before workspace admission or cache
     // lookup. The server independently repeats this against its current config.
@@ -1649,7 +1665,7 @@ async function callProvider({
         taskTier: effectiveTaskTier, modelTier: effectiveModelTier,
         effort, maxEffortOverride, providerBudget, childProcessPolicy, allowedWritePaths, dangerous: false },
       timeoutMs: durableTaskId ? collectionRemaining() : TIMEOUT_POLICY.transportTimeoutMs(timeoutMs),
-      signal,
+      signal: bridgeSignal,
       actionIdentity: true,
     });
     workspaceAdmission = normalizeWorkspaceAdmission(response);
@@ -1663,7 +1679,7 @@ async function callProvider({
       cwdIdentityHash: workspaceAdmission.cwdIdentityHash, semanticMaxChars });
     if (admittedPromptHash && prepared.evidence.effectiveHash !== admittedPromptHash) throw profileAdmissionError('Local and live prompt policies disagree; provider execution is blocked.');
   } catch (error) {
-    ({ sanitized, status } = bridgeFailureResult(error, { kind, signal }));
+    ({ sanitized, status } = bridgeFailureResult(error, { kind, signal: bridgeSignal }));
   }
   const cacheKey = {
     kind,
@@ -1769,13 +1785,13 @@ async function callProvider({
         parentReceiptId, provider: kind, status: 'pending', taskId: durableTaskId,
         requestId, invocationId, attemptId });
       return { ...handle, kind, pending: true, terminal: false, collectionExpired: Date.now() >= collectionDeadlineAt,
-        collectionStopReason: signal?.aborted ? 'collection_cancelled' : Date.now() >= collectionDeadlineAt ? 'collection_deadline' : 'collection_unavailable',
+        collectionStopReason: bridgeSignal?.aborted ? 'collection_cancelled' : Date.now() >= collectionDeadlineAt ? 'collection_deadline' : 'collection_unavailable',
         submissionConfirmed: !!submission,
         cancelled: false, deadlineExceeded: false, requestId, invocationId, attemptId,
         receiptId: receipt.receiptId, nextAction: 'Collect get_task_result with this taskId. Collection ending does not stop or resubmit the worker.' };
     };
     try {
-      handle = await bridgeRequest('/api/tasks', { method: 'POST', actionIdentity: true, signal, timeoutMs: collectionRemaining(),
+      handle = await bridgeRequest('/api/tasks', { method: 'POST', actionIdentity: true, signal: bridgeSignal, timeoutMs: collectionRemaining(),
         body: { deliveryMode: 'queued', taskId: durableTaskId, kind, prompt, cwd, requiresWorkspaceAccess, inlineEvidence,
           requestId, outerReceiptId, continuityId, continuityEpoch, expectedCwdIdentityHash: workspaceAdmission.cwdIdentityHash,
           expectedCwdPolicyId: workspaceAdmission.cwdPolicyId,
@@ -1788,16 +1804,16 @@ async function callProvider({
       // An uncertain POST is reconciled by its original durable ID, never replayed
       // under a new identity. A definite pre-admission rejection remains an error.
       if (error.status >= 400 && error.status < 500 && error.status !== 408) {
-        ({ sanitized, status } = bridgeFailureResult(error, { kind, signal }));
+        ({ sanitized, status } = bridgeFailureResult(error, { kind, signal: bridgeSignal }));
       } else { try { handle = await bridgeRequest(handle.resultEndpoint, { timeoutMs: Math.min(3000, collectionRemaining()) }); } catch { return pending(); } }
     }
     if (!sanitized) {
       const until = collectionDeadlineAt;
-      while (handle.resultState === 'pending' && Date.now() < until && !signal?.aborted) {
+      while (handle.resultState === 'pending' && Date.now() < until && !bridgeSignal?.aborted) {
         await new Promise((resolve) => setTimeout(resolve, Math.min(250, Math.max(1, until - Date.now()))));
-        try { handle = await bridgeRequest(handle.resultEndpoint, { timeoutMs: Math.min(3000, collectionRemaining()), signal }); } catch { return pending(); }
+        try { handle = await bridgeRequest(handle.resultEndpoint, { timeoutMs: Math.min(3000, collectionRemaining()), signal: bridgeSignal }); } catch { return pending(); }
       }
-      if (handle.resultState === 'pending' || signal?.aborted) return pending();
+      if (handle.resultState === 'pending' || bridgeSignal?.aborted) return pending();
       // Only the verified, redacted delivery projection supplies result text.
       let task;
       try { task = await bridgeRequest(`/api/tasks/${durableTaskId}`, { timeoutMs: Math.min(3000, collectionRemaining()) }); } catch { return pending(); }
@@ -1843,7 +1859,7 @@ async function callProvider({
         dangerous: false,
       },
       timeoutMs: durableTaskId ? collectionRemaining() : TIMEOUT_POLICY.transportTimeoutMs(timeoutMs),
-      signal,
+      signal: bridgeSignal,
       actionIdentity: true,
     });
     sanitized = sanitizeProviderResponse(response);
@@ -1855,7 +1871,7 @@ async function callProvider({
       : sanitized.cancelled ? 'cancelled'
         : sanitized.timedOut ? 'timed_out' : 'dropped';
   } catch (error) {
-    ({ sanitized, status } = bridgeFailureResult(error, { kind, signal }));
+    ({ sanitized, status } = bridgeFailureResult(error, { kind, signal: bridgeSignal }));
     sanitized = await reconcileCancelledTransportAttempt({
       requestId, outerReceiptId, kind, sanitized,
     });
@@ -1995,6 +2011,9 @@ async function callProvider({
     cacheKeyHash,
     receiptId: receipt.receiptId,
     receiptPersistenceError: receipt.receiptPersistenceError || null,
+    // true when a host/transport deadline fired but the run was NOT cancelled:
+    // it continued in the background and this result reflects its completion.
+    hostDeadlineDetached,
   };
   const { policy } = loadRoutingData();
   let cachePersistenceError = null;
@@ -2106,7 +2125,10 @@ function parseChairAssessment(text) {
   }
 }
 
+// deadlineAt === null means "no caller deadline"; callers must treat a null
+// result as uncapped, never coerce it to Infinity for JSON output.
 function remainingTime(deadlineAt, floorMs = 1000) {
+  if (deadlineAt === null || deadlineAt === undefined) return null;
   return Math.max(floorMs, deadlineAt - Date.now());
 }
 
@@ -2223,7 +2245,7 @@ export function buildServer() {
       localOnly: z.boolean().default(false),
       maxProviders: z.number().int().min(1).max(4).optional(),
       committeeMode: z.enum(['advisory', 'consensus']).default('advisory'),
-      timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).max(TIMEOUT_POLICY.oneShotMaxMs).optional(),
+      timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).optional().describe('check-in hint; never enforced'),
       dangerous: z.boolean().default(false).describe('preview the explicit writer route instead of normal safe routing'),
       acknowledgeFilesystemWrites: z.boolean().default(false).describe('required with dangerous=true; confirms persistent writes are authorized'),
     }),
@@ -2271,7 +2293,7 @@ export function buildServer() {
       model: z.string().min(1).max(160).optional().describe('exact configured or available model; never silently substituted'),
       modelTier: z.enum(MODEL_TIERS).optional(),
       providerBudget: PROVIDER_BUDGET_SCHEMA.nullish(),
-      timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).max(TIMEOUT_POLICY.oneShotMaxMs).optional().describe('runtime deadline to use when previewing the provider invocation'),
+      timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).optional().describe('check-in hint; never enforced (runtime deadline preview)'),
       dangerous: z.boolean().default(false).describe('plan an explicit writer-capable provider invocation'),
       acknowledgeFilesystemWrites: z.boolean().default(false).describe('required with dangerous=true; confirms persistent writes are authorized'),
     }),
@@ -2607,7 +2629,7 @@ export function buildServer() {
       kind: z.string().min(1).max(64),
       prompt: z.string().min(1).max(100000),
       cwd: z.string().max(1000).optional(),
-      timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).max(TIMEOUT_POLICY.oneShotMaxMs).optional(),
+      timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).optional().describe('check-in hint; never enforced'),
       useCache: z.boolean().default(true),
       cacheTtlMs: z.number().int().min(0).max(86400000).optional(),
       providerBudget: PROVIDER_BUDGET_SCHEMA.nullish(),
@@ -2652,7 +2674,7 @@ export function buildServer() {
       excludedProviders: z.array(z.string()).max(8).default([]),
       localOnly: z.boolean().default(false),
       maxEscalations: z.number().int().min(0).max(3).default(2),
-      timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).max(TIMEOUT_POLICY.oneShotMaxMs).optional(),
+      timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).optional().describe('check-in hint; never enforced'),
       useCache: z.boolean().default(true),
       acknowledgeHumanGate: z.boolean().default(false),
       allowModelForDeterministic: z.boolean().default(false),
@@ -2733,7 +2755,9 @@ export function buildServer() {
         errorCode: validation.code, failureClass: 'validation', validation, route, winner: null, attempts: [],
         ...accounting, receiptId: receipt.receiptId, receiptPersistenceError: receipt.receiptPersistenceError || null }, { isError: true });
     }
-    const deadlineAt = Math.min(requestedDeadlineAt, Date.now() + tierPolicy.defaultTimeoutMs);
+    // No caller timeoutMs means no deadline: the run continues until it
+    // finishes or is explicitly cancelled, never clamped to a tier default.
+    const deadlineAt = args.timeoutMs === undefined ? null : requestedDeadlineAt;
     const rootReceipt = appendReceipt({ event: 'route_execute', routeId: route.routeId, taskHash: route.classification.taskHash, candidates: candidates.map((item) => item.kind), status: 'started' });
     let run = writeRun({
       mode: 'route_and_ask',
@@ -2742,11 +2766,11 @@ export function buildServer() {
       route,
       members: [],
       parentReceiptId: rootReceipt.receiptId,
-      deadlineAt: new Date(deadlineAt).toISOString(),
+      deadlineAt: deadlineAt === null ? null : new Date(deadlineAt).toISOString(),
     });
     const attempts = [];
     for (const candidate of candidates) {
-      if (signal?.aborted || Date.now() >= deadlineAt) break;
+      if (signal?.aborted || (deadlineAt !== null && Date.now() >= deadlineAt)) break;
       const response = await callProvider({
         kind: candidate.kind,
         prompt: args.task,
@@ -2789,7 +2813,7 @@ export function buildServer() {
     }
     const winner = attempts.find(providerSucceeded) || null;
     const cancelled = !!signal?.aborted;
-    const deadlineExceeded = !cancelled && !winner && Date.now() >= deadlineAt;
+    const deadlineExceeded = !cancelled && !winner && deadlineAt !== null && Date.now() >= deadlineAt;
     const status = cancelled ? 'cancelled' : deadlineExceeded ? 'timed_out' : winner ? 'completed' : 'failed';
     run = writeRun({
       ...run,
@@ -2829,7 +2853,7 @@ export function buildServer() {
       mode: z.enum(['advisory', 'consensus']).default(loadRoutingData().policy.committee.defaultMode),
       maxProviders: z.number().int().min(1).max(4).default(3),
       localOnly: z.boolean().default(false),
-      timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).max(TIMEOUT_POLICY.oneShotMaxMs).optional(),
+      timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).optional().describe('check-in hint; never enforced'),
       useCache: z.boolean().default(true),
       synthesisProvider: z.string().max(64).optional(),
       acknowledgeHumanGate: z.boolean().default(false),
@@ -2929,7 +2953,9 @@ export function buildServer() {
         error: error.message, validation, inputTruncated: false, modelInvocation: false,
         physicalAttemptCount: 0, tokenUsageSource: 'not_invoked' }, { isError: true });
     }
-    const deadlineAt = Math.min(requestedDeadlineAt, Date.now() + tierPolicy.defaultTimeoutMs);
+    // No caller timeoutMs means no deadline: the run continues until it
+    // finishes or is explicitly cancelled, never clamped to a tier default.
+    const deadlineAt = args.timeoutMs === undefined ? null : requestedDeadlineAt;
     const rootReceipt = appendReceipt({
       event: 'committee',
       routeId: route.routeId,
@@ -2946,7 +2972,7 @@ export function buildServer() {
       members: [],
       synthesis: null,
       parentReceiptId: rootReceipt.receiptId,
-      deadlineAt: new Date(deadlineAt).toISOString(),
+      deadlineAt: deadlineAt === null ? null : new Date(deadlineAt).toISOString(),
     });
     const membersByIndex = new Array(eligible.length);
     const settledMembers = await Promise.allSettled(eligible.map(async (candidate, index) => {
@@ -2954,7 +2980,7 @@ export function buildServer() {
       let member;
       try {
         if (signal?.aborted) throw signal.reason || new Error('committee cancelled before provider admission');
-        if (Date.now() >= deadlineAt) throw new Error('committee deadline exceeded before provider admission');
+        if (deadlineAt !== null && Date.now() >= deadlineAt) throw new Error('committee deadline exceeded before provider admission');
         const seatPrompt = seatPrompts[index];
         const response = await callProvider({
           kind: candidate.kind,
@@ -3008,7 +3034,7 @@ export function buildServer() {
     const memberEvidenceIncomplete = successes.some((member) =>
       member.inputTruncated || member.outputTruncated || member.route?.prompt_truncated);
     let synthesisInputRejected = false;
-    if (args.mode === 'consensus' && successes.length >= 2 && !signal?.aborted && Date.now() < deadlineAt) {
+    if (args.mode === 'consensus' && successes.length >= 2 && !signal?.aborted && (deadlineAt === null || Date.now() < deadlineAt)) {
       const chairKind = args.synthesisProvider || successes[0].kind;
       if (!successes.some((member) => member.kind === chairKind)) {
         synthesis = { kind: chairKind, exitCode: -1, droppedOut: true, stdout: '', stderr: 'synthesisProvider must be one of the successful, policy-eligible committee members', failureClass: 'policy' };
@@ -3067,7 +3093,7 @@ export function buildServer() {
       }
     }
     const cancelled = !!signal?.aborted;
-    const deadlineExceeded = !cancelled && Date.now() >= deadlineAt &&
+    const deadlineExceeded = !cancelled && deadlineAt !== null && Date.now() >= deadlineAt &&
       (successes.length < eligible.length || (args.mode === 'consensus' && !providerSucceeded(synthesis)));
     const synthesisCompleted = args.mode === 'consensus' && providerSucceeded(synthesis);
     // Any truncation on the way in or out — seat prompt clipping, the chair
@@ -3182,7 +3208,7 @@ export function buildServer() {
       providers: z.array(z.string()).max(16).default([]),
       all: z.boolean().default(false),
       cwd: z.string().max(1000).optional(),
-      timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).max(TIMEOUT_POLICY.oneShotMaxMs).optional(),
+      timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).optional().describe('check-in hint; never enforced'),
       providerBudget: PROVIDER_BUDGET_SCHEMA.nullish(),
       taskTier: z.enum(TASK_TIERS).optional(),
       modelTier: z.enum(MODEL_TIERS).optional(),
@@ -3654,7 +3680,7 @@ export function buildServer() {
       kind: z.string().min(1).max(64), prompt: z.string().min(1).max(100000),
       collab: z.string().max(64).optional(), title: z.string().max(120).optional(),
       cwd: z.string().max(1024).optional(), user: z.string().max(64).optional(),
-      timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).max(TIMEOUT_POLICY.oneShotMaxMs).optional(),
+      timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).optional().describe('check-in hint; never enforced'),
       providerBudget: PROVIDER_BUDGET_SCHEMA.nullish(),
       notBefore: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
       dependsOn: z.array(z.string().regex(/^t_[A-Za-z0-9_]+$/)).max(64).optional(),
@@ -3789,7 +3815,7 @@ export function buildServer() {
         modelTier: z.enum(MODEL_TIERS).optional(),
         execution: EXECUTION_SCHEMA.optional(),
         maxEffortOverride: z.boolean().optional(),
-        timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).max(TIMEOUT_POLICY.oneShotMaxMs).optional(),
+        timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).optional().describe('check-in hint; never enforced'),
         baseSha: z.string().min(1).max(80),
         ownedFiles: z.array(z.string().min(1).max(400)).min(1).max(200),
         doneWhen: z.array(z.string().min(1).max(2000)).min(1).max(40),
