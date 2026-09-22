@@ -13,8 +13,13 @@
 #   - <provider>.supervisor.providerBudgetByTaskTier -> deleted, for every
 #     provider that has one (not just claude/claude_fable)
 #   - every provider's safe/dangerous/oneshot_safe/oneshot_dangerous args
-#     array: "--max-turns" and its following value are removed, wherever
-#     they appear
+#     array: "--max-turns" and its following value, and "--max-turns=N",
+#     are removed, wherever they appear (every provider, not only Grok: no
+#     run is ever capped by turn count; the bridge's own bounded helper
+#     probes set their limits in code, not in this file)
+#
+# After the transform the script asserts that no cap survives and refuses to
+# write the file otherwise.
 #
 # Never run this against the real config directly without a backup: pass
 # --backup-dir (required) and use --dry-run first to review the diff.
@@ -109,6 +114,7 @@ JQ_FILTER='
               | [range(0; length) as $i
                   | select(
                       ($arr[$i] != "--max-turns")
+                      and ((($arr[$i] | type) == "string" and ($arr[$i] | startswith("--max-turns="))) | not)
                       and ($i == 0 or $arr[$i-1] != "--max-turns")
                     )
                   | $arr[$i]
@@ -121,7 +127,8 @@ JQ_FILTER='
 '
 
 TMP_OUT="$(mktemp "${TMPDIR:-/tmp}/migrate-uncap-config.XXXXXX.json")"
-trap 'rm -f "$TMP_OUT"' EXIT
+FINAL_TMP=""
+trap 'rm -f "$TMP_OUT" ${FINAL_TMP:+"$FINAL_TMP"}' EXIT
 
 if ! jq "$JQ_FILTER" "$CONFIG_PATH" > "$TMP_OUT"; then
   echo "error: jq transform failed" >&2
@@ -130,6 +137,19 @@ fi
 
 if ! jq -e '.' "$TMP_OUT" >/dev/null 2>&1; then
   echo "error: migrated output is not valid JSON; aborting, original left untouched" >&2
+  exit 1
+fi
+
+# Prove the caps are gone, not merely that the output parses.
+NO_CAPS_LEFT='
+  ([._supervisor.providerBudget // {} | .[] | select(. != null)] | length == 0)
+  and ((._supervisor // {}) | has("hardCapMs") | not)
+  and ([.[] | objects | .supervisor? | objects | select(has("providerBudgetByTaskTier"))] | length == 0)
+  and ([.[] | objects | (.safe, .dangerous, .oneshot_safe, .oneshot_dangerous) | arrays | .[]
+        | strings | select(. == "--max-turns" or startswith("--max-turns="))] | length == 0)
+'
+if ! jq -e "$NO_CAPS_LEFT" "$TMP_OUT" >/dev/null 2>&1; then
+  echo "error: migrated output still contains a cap; aborting, original left untouched" >&2
   exit 1
 fi
 
@@ -150,5 +170,7 @@ fi
 # Atomic replace: same filesystem as CONFIG_PATH, then rename.
 FINAL_TMP="$(mktemp "$(dirname "$CONFIG_PATH")/.cli-config.json.XXXXXX")"
 cp "$TMP_OUT" "$FINAL_TMP"
+chmod --reference="$CONFIG_PATH" "$FINAL_TMP"
 mv -f "$FINAL_TMP" "$CONFIG_PATH"
+FINAL_TMP=""
 echo "migrated $CONFIG_PATH (backup at $BACKUP_PATH)"
