@@ -2260,13 +2260,15 @@ async function runHttpProviderOneShot({ entry, prompt, effectivePrompt, res, rou
   lifecycle.physicalDone.then(() => { runControl.settled = true; continuity.saveRun(runControl); continuityControls.delete(runId); }).catch(() => {});
   res._relayLifecycle = lifecycle;
   lifecycle.bindTransport({ type: 'http', requestStop: () => controller.abort() });
-  const detach = () => {
-    if (!res.writableEnded) lifecycle.clientDetached({ reason: disconnectFailureClass({
-      client: route.client_surface, deadlineAt: route.client_deadline_at,
-    }) });
-  };
+  // A client disconnect detaches rather than cancels (Refs #133): the
+  // upstream fetch keeps running to natural completion and the real
+  // terminal receipt persists via meta.persistAfterDisconnect below. Only an
+  // explicit cancel (POST /api/runs/:runId/cancel -> cancelActiveRun ->
+  // runControl.stop -> lifecycle.requestStop) aborts the controller. This
+  // mirrors the CLI provider path (executeOneShot), which never calls
+  // lifecycle on res 'close' either.
+  const detach = () => {};
   res.once('close', detach);
-  if (res.destroyed) detach();
   let requestStarted = false, responseStatus = null, semanticOutput = '', terminal = null, payload;
   let acceptedUsage = null, sealedPayload = null, transportDiagnostic = null;
   const wireProgress = (bytes) => { route.transport_wire_bytes += bytes; };
@@ -7982,10 +7984,16 @@ app.post('/api/broadcast', trackedHandler(async (req, res) => {
   const deadlineAt = effectiveTimeoutMs === null ? null : startedAt + effectiveTimeoutMs;
   const activeCaptured = new Set();
   let clientGone = false;
+  // A caller disconnect detaches rather than cancels (Refs #133): member
+  // runs keep going to natural completion (each persists its own terminal
+  // receipt via executeOneShot's persistAfterDisconnect path) instead of
+  // being force-cancelled here. clientGone only stops this handler's own
+  // admission-retry loop and HTTP write; it no longer reaches into
+  // activeCaptured to cancel members. An explicit cancel of a member run
+  // goes through POST /api/runs/:runId/cancel like any other run.
   res.once('close', () => {
     if (res.writableEnded) return;
     clientGone = true;
-    for (const captured of activeCaptured) captured.cancel();
   });
   let run = writeBroadcastRun({
     mode: 'broadcast',

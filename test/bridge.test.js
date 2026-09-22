@@ -4264,14 +4264,26 @@ test('agents listing, tag updates, and broadcast fan-out respect auth, autoRoute
   assert.deepEqual(explicit.targets, ['optin', 'beta_only']);
   assert.ok(explicit.results.find((member) => member.provider === 'optin').ok);
 
+  // A caller disconnect detaches rather than cancels (Refs #133): the
+  // member run stays active after the caller goes away, and only an
+  // explicit cancel through the real cancel route stops it.
   const broadcastController = new AbortController();
-  const cancelledBroadcast = broadcast({
-    prompt: 'cancel this broadcast',
+  const detachedBroadcast = broadcast({
+    prompt: 'detach this broadcast',
     providers: ['slow_cancel'],
     timeoutMs: 600001,
   }, { signal: broadcastController.signal });
-  setTimeout(() => broadcastController.abort(new Error('broadcast cancellation test')), 150);
-  await assert.rejects(cancelledBroadcast);
+  setTimeout(() => broadcastController.abort(new Error('broadcast disconnect test')), 150);
+  await assert.rejects(detachedBroadcast);
+  const activeAfterDisconnect = await (await fetch(baseUrl + '/api/runs/active', { headers: jsonAuth })).json();
+  const detachedRun = activeAfterDisconnect.runs.find((run) => run.kind === 'slow_cancel');
+  assert.ok(detachedRun, 'detached broadcast member run must still be active after its caller disconnected');
+  const cancelRes = await fetch(baseUrl + `/api/runs/${detachedRun.runId}/cancel`, {
+    method: 'POST', headers: jsonAuth, body: JSON.stringify({
+      requestId: detachedRun.route.request_id, invocationId: detachedRun.route.invocation_id, attemptId: detachedRun.route.attempt_id,
+    }),
+  });
+  assert.equal(cancelRes.status, 202, 'explicit cancel of the detached broadcast member run must be accepted');
   const cancellationDeadline = Date.now() + 5000;
   let cancellationHealth;
   while (Date.now() < cancellationDeadline) {
@@ -4279,8 +4291,8 @@ test('agents listing, tag updates, and broadcast fan-out respect auth, autoRoute
     if (cancellationHealth.activeTaskCount === 0 && cancellationHealth.activeOneShotCount === 0) break;
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  assert.equal(cancellationHealth.activeTaskCount, 0, 'cancelled broadcast provider must not outlive its caller');
-  assert.equal(cancellationHealth.activeOneShotCount, 0, 'cancelled broadcast must release its admission slot');
+  assert.equal(cancellationHealth.activeTaskCount, 0, 'explicitly cancelled broadcast member run must not outlive the cancel');
+  assert.equal(cancellationHealth.activeOneShotCount, 0, 'explicitly cancelled broadcast member run must release its admission slot');
 
   // all:true fans out to every AI provider except opt-in seats, queues past the
   // global cap of 2, and reports per-member failures without failing the run.
