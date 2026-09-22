@@ -1231,10 +1231,15 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(fs.existsSync(path.join(realProviderHome, 'provider-artifact.txt')), false);
   assert.deepEqual(fs.readdirSync(promptTemp), []);
 
-  const abortController = new AbortController();
+  // Under detach semantics (F2/F5), a plain client disconnect no longer kills
+  // the process; only an explicit cancel does. Drive this race with the
+  // explicit cancel route (POST /api/runs/:runId/cancel -> cancelActiveRun)
+  // instead of an HTTP abort, so the physical-exit-before-cleanup property is
+  // still exercised without waiting out the fixture's 10s delayed child.
+  const raceRequestId = 'race:isolated-disconnect-cleanup';
   const racedRequest = fetch(baseUrl + '/api/oneshot', {
-    method: 'POST', headers: jsonAuth, signal: abortController.signal,
-    body: JSON.stringify({ kind: 'isolated_race', prompt: 'disconnect cleanup race', dangerous: false }),
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ kind: 'isolated_race', prompt: 'disconnect cleanup race', dangerous: false, requestId: raceRequestId }),
   }).catch(() => null);
   const raceStartDeadline = Date.now() + 5000;
   while (Date.now() < raceStartDeadline
@@ -1242,7 +1247,14 @@ test('prompt-file transport preserves long special-character prompts and cleans 
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   assert.ok(fs.readdirSync(promptTemp).some((name) => name.startsWith('RelayBridge-provider-home-')));
-  abortController.abort();
+  const raceActive = await (await fetch(baseUrl + '/api/runs/active', { headers: jsonAuth })).json();
+  const raceRun = raceActive.runs.find((run) => run.route?.request_id === raceRequestId);
+  assert.ok(raceRun, 'active run for the disconnect-cleanup race not found');
+  const raceCancelResponse = await fetch(`${baseUrl}/api/runs/${raceRun.runId}/cancel`, {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ requestId: raceRequestId, invocationId: raceRequestId, attemptId: `${raceRequestId}:attempt:1` }),
+  });
+  assert.equal(raceCancelResponse.status, 202);
   await racedRequest;
   const raceCleanupDeadline = Date.now() + 5000;
   while (Date.now() < raceCleanupDeadline && fs.readdirSync(promptTemp).length) {
@@ -2638,8 +2650,23 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(busyShutdownResult.code, 'BRIDGE_BUSY');
   assert.ok(busyShutdownResult.busy.oneShots > 0);
   assert.equal((await fetch(baseUrl + '/api/health')).status, 200, 'busy shutdown refusal must leave the bridge running');
+  // Under detach semantics (F2/F5), a plain HTTP abort no longer kills the
+  // run: it just drops the client. The slot stays held until an explicit
+  // cancel (POST /api/runs/:runId/cancel -> cancelActiveRun).
   firstController.abort();
   await firstSlow.catch(() => {});
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  assert.equal((await (await fetch(baseUrl + '/api/health')).json()).activeOneShotCount, 1,
+    'a plain client disconnect detaches; it must not free the slot');
+  const firstActive = await (await fetch(baseUrl + '/api/runs/active', { headers: jsonAuth })).json();
+  const firstRun = firstActive.runs.find((run) => run.route?.request_id === 'test:client-cancel:one');
+  assert.ok(firstRun, 'detached run for test:client-cancel:one must still be tracked active');
+  const firstCancelResponse = await fetch(`${baseUrl}/api/runs/${firstRun.runId}/cancel`, {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ requestId: 'test:client-cancel:one', invocationId: 'test:client-cancel:one',
+      attemptId: 'test:client-cancel:one:attempt:1' }),
+  });
+  assert.equal(firstCancelResponse.status, 202);
   const admissionDeadline = Date.now() + 5000;
   let activeOneShotCount = -1;
   while (Date.now() < admissionDeadline) {
@@ -2656,11 +2683,11 @@ test('prompt-file transport preserves long special-character prompts and cleans 
     if (cancelledReceipts.length) break;
     await new Promise((resolve) => setTimeout(resolve, 50));
   } while (Date.now() < cancellationReceiptDeadline);
-  assert.equal(cancelledReceipts.length, 1, 'client disconnect writes exactly one terminal receipt');
+  assert.equal(cancelledReceipts.length, 1, 'explicit cancel writes exactly one terminal receipt');
   const cancelledReceipt = cancelledReceipts[0];
-  assert.ok(cancelledReceipt, 'client disconnect must persist a terminal provider receipt');
-  assert.equal(cancelledReceipt.failureClass, 'client_cancelled');
-  assert.equal(cancelledReceipt.stopReason, 'client_cancelled');
+  assert.ok(cancelledReceipt, 'explicit cancel must persist a terminal provider receipt');
+  assert.equal(cancelledReceipt.failureClass, 'operator_cancelled');
+  assert.equal(cancelledReceipt.stopReason, 'operator_cancelled');
   assert.equal(cancelledReceipt.modelInvocation, true);
   assert.equal(cancelledReceipt.tokenUsageSource, 'unknown');
   assert.equal(cancelledReceipt.invocationId, 'test:client-cancel:one');
@@ -2670,6 +2697,14 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(cancelledReceipt.cleanedOutputUnavailable, true);
   assert.ok(cancelledReceipt.progressAtCancellation);
 
+  // Under detach semantics (F2/F5, Refs #133) an MCP client's past-due
+  // deadline header no longer kills the run on disconnect -- finalFailureClass
+  // (server.js) has no 'mcp_deadline_cancelled'/'client_cancelled' branch any
+  // more, and disconnectFailureClass/resolveCancellationTerminalState in
+  // lib/cancellation-state.js are now unreachable from an ordinary admitted
+  // disconnect (they only cover the pre-spawn isolation-cleanup-deferred
+  // fallback). Only an explicit cancel (POST /api/runs/:runId/cancel) stops
+  // the run, and it always reports failureClass/stopReason 'operator_cancelled'.
   const deadlineController = new AbortController();
   const deadlineRequest = fetch(baseUrl + '/api/oneshot', {
     method: 'POST',
@@ -2696,16 +2731,28 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(deadlineAdmitted, true, 'deadline fixture must reach provider admission before disconnect');
   deadlineController.abort();
   await deadlineRequest.catch(() => {});
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  assert.equal((await (await fetch(baseUrl + '/api/health')).json()).activeOneShotCount, 1,
+    'a past-due MCP deadline header on a plain disconnect must not free the slot; only explicit cancel does');
+  const deadlineActive = await (await fetch(baseUrl + '/api/runs/active', { headers: jsonAuth })).json();
+  const deadlineRun = deadlineActive.runs.find((run) => run.route?.request_id === 'test:mcp-deadline:one');
+  assert.ok(deadlineRun, 'detached run for test:mcp-deadline:one must still be tracked active');
+  const deadlineCancelResponse = await fetch(`${baseUrl}/api/runs/${deadlineRun.runId}/cancel`, {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ requestId: 'test:mcp-deadline:one', invocationId: 'test:mcp-deadline:one',
+      attemptId: 'test:mcp-deadline:one:attempt:1' }),
+  });
+  assert.equal(deadlineCancelResponse.status, 202);
   let deadlineReceipt = null;
   const deadlineReceiptWait = Date.now() + 5000;
   while (Date.now() < deadlineReceiptWait && !deadlineReceipt) {
     const rows = readCompleteReceiptRows(tempRoot);
-    deadlineReceipt = rows.find((row) => row.requestId === 'test:mcp-deadline:one') || null;
+    deadlineReceipt = rows.find((row) => row.requestId === 'test:mcp-deadline:one' && row.status === 'cancelled') || null;
     if (!deadlineReceipt) await new Promise((resolve) => setTimeout(resolve, 50));
   }
   assert.ok(deadlineReceipt);
-  assert.equal(deadlineReceipt.failureClass, 'mcp_deadline_cancelled');
-  assert.equal(deadlineReceipt.stopReason, 'mcp_deadline_cancelled');
+  assert.equal(deadlineReceipt.failureClass, 'operator_cancelled');
+  assert.equal(deadlineReceipt.stopReason, 'operator_cancelled');
   assert.equal(deadlineReceipt.modelInvocation, true);
   assert.equal(deadlineReceipt.tokenUsageSource, 'unknown');
   assert.equal(deadlineReceipt.physicalAttemptCount, 1);
@@ -2748,10 +2795,15 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   }
   assert.equal(raceActiveCount, 0, 'completion/cancellation race leaves no provider survivor');
 
+  // retry_hang never exits on its own (setInterval after the retry event), so
+  // under detach semantics a plain disconnect leaves it running forever; only
+  // an explicit cancel (POST /api/runs/:runId/cancel) terminates it.
   const retryHangController = new AbortController();
+  const retryHangRequestId = 'test:retry-hang:one';
   const retryHang = fetch(baseUrl + '/api/oneshot', {
     method: 'POST', headers: jsonAuth,
-    body: JSON.stringify({ kind: 'retry_hang', prompt: 'preserve retry metrics on cancellation', dangerous: false }),
+    body: JSON.stringify({ kind: 'retry_hang', prompt: 'preserve retry metrics on cancellation', dangerous: false,
+      requestId: retryHangRequestId }),
     signal: retryHangController.signal,
   });
   // Windows process startup can exceed 250 ms after the expanded structured
@@ -2761,6 +2813,15 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   await new Promise((resolve) => setTimeout(resolve, 1000));
   retryHangController.abort();
   await retryHang.catch(() => {});
+  const retryHangActive = await (await fetch(baseUrl + '/api/runs/active', { headers: jsonAuth })).json();
+  const retryHangRun = retryHangActive.runs.find((run) => run.route?.request_id === retryHangRequestId);
+  assert.ok(retryHangRun, 'detached retry_hang run must still be tracked active after a plain disconnect');
+  const retryHangCancelResponse = await fetch(`${baseUrl}/api/runs/${retryHangRun.runId}/cancel`, {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ requestId: retryHangRequestId, invocationId: retryHangRequestId,
+      attemptId: `${retryHangRequestId}:attempt:1` }),
+  });
+  assert.equal(retryHangCancelResponse.status, 202);
   const retryHangDeadline = Date.now() + 5000;
   let retryHangReceipt = null;
   while (Date.now() < retryHangDeadline) {
