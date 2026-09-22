@@ -1617,6 +1617,18 @@ async function explicitlyCancelActiveRun({ requestId, invocationId, attemptId },
   } catch { /* best-effort; the request's own abort still applies */ }
 }
 
+// A null/undefined collectionMs means "no caller deadline" (the default now
+// that a caller's timeoutMs is only a hint -- see remainingTime), which must
+// mean the full default collection window, not Math.max(100, null) === 100.
+// RELAYBRIDGE_COLLECTION_MS still overrides, capped to a caller deadline
+// when one exists (Refs #133).
+export function collectionBudgetMs(collectionMs, collectionOverride) {
+  const hasCallerDeadline = collectionMs !== null && collectionMs !== undefined;
+  const validOverride = Number.isSafeInteger(collectionOverride) && collectionOverride >= 100 && collectionOverride <= 30000;
+  if (validOverride) return hasCallerDeadline ? Math.min(collectionOverride, collectionMs) : collectionOverride;
+  return hasCallerDeadline ? Math.min(30000, Math.max(100, collectionMs)) : 30000;
+}
+
 async function callProvider({
   kind,
   prompt,
@@ -1657,8 +1669,7 @@ async function callProvider({
   let detachedBy = null;
   const durableTaskId = timeoutMs === undefined ? `t_mcp_${crypto.randomBytes(12).toString('hex')}` : null;
   const collectionOverride = Number(process.env.RELAYBRIDGE_COLLECTION_MS);
-  const collectionBudget = Number.isSafeInteger(collectionOverride) && collectionOverride >= 100 && collectionOverride <= 30000
-    ? Math.min(collectionOverride, collectionMs) : Math.min(30000, Math.max(100, collectionMs));
+  const collectionBudget = collectionBudgetMs(collectionMs, collectionOverride);
   const collectionDeadlineAt = durableTaskId ? Date.now() + collectionBudget : null;
   const collectionRemaining = () => Math.max(1, collectionDeadlineAt - Date.now());
   const requestId = durableTaskId ? `queued:${durableTaskId}` : `mcp:${crypto.randomUUID()}`;
