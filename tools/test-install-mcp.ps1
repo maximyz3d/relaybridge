@@ -346,7 +346,7 @@ require('./fake-mcp-client.js');
     $codexAfter = [IO.File]::ReadAllText($codexConfig, [Text.UTF8Encoding]::new($false))
     $claudeAfter = [IO.File]::ReadAllText($claudeConfig, [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
     Assert-True ($codexAfter -match '\[mcp_servers\.relaybridge\]') 'Codex canonical registration must be created'
-    Assert-True ($codexAfter -match 'tool_timeout_sec = 2745') 'Codex MCP timeout must cover the 45-minute provider cap plus transport and host grace'
+    Assert-True ($codexAfter -match 'tool_timeout_sec = 2745') 'Codex MCP timeout must cover the 45-minute inline MCP wait plus transport and host grace'
     foreach ($newTool in @(
       'plan_task', 'list_models', 'list_active_runs', 'bridge_activity',
       'submit_task', 'get_task', 'list_tasks', 'cancel_task',
