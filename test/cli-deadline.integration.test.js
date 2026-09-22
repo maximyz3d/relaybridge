@@ -39,7 +39,9 @@ test('Gemini deadline is identical in REST/CLI/MCP plans, dispatched argv, and r
       assert.equal(planned.status, 200, JSON.stringify(planned.body));
       const primary = planned.body.primary;
       assert.equal(primary.validation, null, JSON.stringify(primary));
-      assert.equal(primary.effectiveTimeoutMs, timeoutMs === undefined ? null : timeoutMs === 4000 ? 4000 : 2700000);
+      // Issue #133: oneShotMaxMs is null, so a caller timeout is a check-in
+      // hint recorded as-is, never clamped down to a lower ceiling.
+      assert.equal(primary.effectiveTimeoutMs, timeoutMs === undefined ? null : timeoutMs);
       const body = buildAskBody(planned.body, task, bridge.root);
       assert.equal(body.timeoutMs, timeoutMs);
       const result = await bridge.request('/api/oneshot', { ...body, dangerous });

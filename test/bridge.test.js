@@ -1641,6 +1641,9 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(longRunResult.provider_num_turns, 36);
   assert.equal(longRunResult.usage.total_tokens, 39960);
 
+  // Issue #133: providerBudget (including an explicit maxTurns ceiling) is
+  // recorded for callers but never enforced as a kill — only corroborated
+  // stall/loop/burn evidence at check-in boundaries may stop a run.
   const longRunCappedResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST',
     headers: jsonAuth,
@@ -1651,12 +1654,13 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   });
   assert.equal(longRunCappedResponse.status, 200);
   const longRunCappedResult = await longRunCappedResponse.json();
-  assert.equal(longRunCappedResult.stop_reason, 'token_budget',
-    'an operator who asks for a turn ceiling still gets one');
-  assert.equal(longRunCappedResult.failureClass, 'token_budget');
-  assert.equal(longRunCappedResult.dropped_out, true);
-  assert.equal(longRunCappedResult.provider_budget_enforcement, 'incremental');
-  assert.notEqual(longRunCappedResult.stdout, 'LONGRUN_OK');
+  assert.equal(longRunCappedResult.stop_reason, null,
+    'an explicit provider budget is informational only and never kills a run');
+  assert.equal(longRunCappedResult.failureClass, null);
+  assert.equal(longRunCappedResult.dropped_out, false);
+  assert.equal(longRunCappedResult.provider_budget.maxTurns, 24,
+    'the requested ceiling is still recorded even though it is not enforced');
+  assert.equal(longRunCappedResult.stdout, 'LONGRUN_OK');
 
   const multiTurnBudgetResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST',
@@ -1671,14 +1675,14 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   });
   assert.equal(multiTurnBudgetResponse.status, 200);
   const multiTurnBudgetResult = await multiTurnBudgetResponse.json();
-  assert.equal(multiTurnBudgetResult.stop_reason, 'token_budget');
-  assert.equal(multiTurnBudgetResult.failureClass, 'token_budget');
+  assert.equal(multiTurnBudgetResult.stop_reason, null,
+    'a maxTurns:2 request must not cut off a 3-turn run that finishes on its own');
+  assert.equal(multiTurnBudgetResult.failureClass, null);
   assert.equal(multiTurnBudgetResult.rate_limited, false,
-    'a late rate-limit phrase cannot override the sticky local budget verdict');
-  assert.equal(multiTurnBudgetResult.rate_limited, false, 'partial tool prose is not vendor quota evidence');
-  assert.ok(!multiTurnBudgetResult.cooldown, 'local budget stop must not cool the shared seat');
+    'a rate-limit phrase riding along in a successful final answer is not vendor quota evidence');
+  assert.ok(!multiTurnBudgetResult.cooldown, 'a completed run must not cool the shared seat');
   assert.equal(multiTurnBudgetResult.timed_out, false);
-  assert.equal(multiTurnBudgetResult.dropped_out, true);
+  assert.equal(multiTurnBudgetResult.dropped_out, false);
   assert.equal(multiTurnBudgetResult.provider_num_turns, 3);
   assert.equal(multiTurnBudgetResult.usage.total_tokens, 1995);
   assert.deepEqual({
@@ -1687,36 +1691,23 @@ test('prompt-file transport preserves long special-character prompts and cleans 
     cache_read_input_tokens: multiTurnBudgetResult.usage.cache_read_input_tokens,
     cache_creation_input_tokens: multiTurnBudgetResult.usage.cache_creation_input_tokens,
   }, {
-    input_tokens: 0,
+    input_tokens: 300,
     output_tokens: 120,
     cache_read_input_tokens: 1500,
     cache_creation_input_tokens: 75,
   });
-  assert.equal(multiTurnBudgetResult.provider_budget_enforcement, 'incremental');
-  assert.equal(multiTurnBudgetResult.stdout, '');
-  assert.equal(multiTurnBudgetResult.partial_result, true);
-  assert.equal(multiTurnBudgetResult.partial_diagnostic, 'turn 2\n\nturn 3');
-  assert.equal(multiTurnBudgetResult.partial_diagnostic_truncated, false);
-  assert.equal(multiTurnBudgetResult.partial_checkpoint, 'turn 3');
-  assert.equal(multiTurnBudgetResult.partial_checkpoint_bytes, Buffer.byteLength('turn 3'));
-  assert.equal(multiTurnBudgetResult.partial_checkpoint_original_bytes, Buffer.byteLength('turn 3'));
-  assert.equal(multiTurnBudgetResult.partial_checkpoint_truncated, false);
-  assert.equal(multiTurnBudgetResult.partial_checkpoint_event_type, 'assistant');
-  assert.match(multiTurnBudgetResult.partial_checkpoint_hash, /^[0-9a-f]{64}$/);
-  assert.match(multiTurnBudgetResult.partial_checkpoint_message_id_hash, /^[0-9a-f]{64}$/);
-  assert.equal(multiTurnBudgetResult.partial_checkpoint_unavailable_reason, null);
-  assert.equal(multiTurnBudgetResult.cleaned_output_unavailable, true);
-  assert.equal(multiTurnBudgetResult.cleaned_output_unavailable_reason, 'incomplete_or_malformed_terminal_result');
-  assert.doesNotMatch(multiTurnBudgetResult.partial_diagnostic,
+  assert.equal(multiTurnBudgetResult.stdout, 'LATE RATE LIMIT 429 MUST NOT CHANGE THE VERDICT');
+  assert.ok(!multiTurnBudgetResult.partial_result);
+  assert.doesNotMatch(multiTurnBudgetResult.stdout,
     /THINKING_MUST_NOT_ESCAPE|TOOL_INPUT_MUST_NOT_ESCAPE|DUPLICATE_ID_MUST_NOT_ESCAPE/);
   const lateFinalPid = Number(fs.readFileSync(lateFinalPidMarker, 'utf8').trim());
   assert.ok(Number.isSafeInteger(lateFinalPid) && lateFinalPid > 0);
   assert.equal(isLiveProcess(lateFinalPid), false,
-    'the late-final provider must be gone before its terminal response is returned');
+    'the provider process must be gone before its terminal response is returned');
   const postBudgetCooldowns = await (await fetch(baseUrl + '/api/cooldowns', { headers: auth })).json();
   assert.equal(postBudgetCooldowns.cooling.some((item) =>
     item.seat === 'subscription:anthropic:default'), false,
-  'a late success after a local budget stop must neither clear nor create account cooldown state');
+  'a completed run must neither clear nor create account cooldown state');
 
   // Issue #97: the budget overage is only discoverable from the terminal
   // `result` line itself, written last with no trailing newline, so the kill
@@ -1736,15 +1727,14 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   });
   assert.equal(terminalOnlyBudgetResponse.status, 200);
   const terminalOnlyBudgetResult = await terminalOnlyBudgetResponse.json();
-  assert.equal(terminalOnlyBudgetResult.stop_reason, 'token_budget');
-  assert.equal(terminalOnlyBudgetResult.failureClass, 'token_budget');
+  // Issue #133: an exceeded providerBudget observed only in the terminal
+  // document is informational only and never kills or recolors the run.
+  assert.equal(terminalOnlyBudgetResult.stdout, 'you are near your rate limit, but here is the answer');
+  assert.equal(terminalOnlyBudgetResult.failureClass, null);
+  assert.equal(terminalOnlyBudgetResult.stop_reason, null);
+  assert.equal(terminalOnlyBudgetResult.dropped_out, false);
   assert.equal(terminalOnlyBudgetResult.provider_budget_enforcement, 'terminal');
-  assert.equal(terminalOnlyBudgetResult.rate_limited, false,
-    'a rate-limit phrase inside the suppressed terminal result must not override the budget verdict');
-  assert.equal(terminalOnlyBudgetResult.dropped_out, true);
-  assert.equal(terminalOnlyBudgetResult.stdout, '');
-  assert.equal(terminalOnlyBudgetResult.usage.total_tokens, 10000,
-    'suppressing terminal answer content must retain authoritative provider usage');
+  assert.equal(terminalOnlyBudgetResult.usage.total_tokens, 10000);
   const postTerminalBudgetCooldowns = await (await fetch(baseUrl + '/api/cooldowns', { headers: auth })).json();
   assert.equal(postTerminalBudgetCooldowns.cooling.some((item) =>
     item.seat === 'subscription:anthropic:default'), false,
@@ -1758,28 +1748,18 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   });
   assert.equal(olderTerminalResponse.status, 200);
   const olderTerminal = await olderTerminalResponse.json();
-  assert.equal(olderTerminal.stop_reason, 'token_budget');
-  assert.equal(olderTerminal.failureClass, 'token_budget');
-  assert.equal(olderTerminal.budget_exceeded, true);
+  // Issue #133: this fixture's stall-recovery scenario is unrelated to budget
+  // enforcement; with the setInterval hang removed (nothing kills a run for
+  // budget any more), it surfaces a pre-existing, independent claude_json
+  // parser protocol violation (a terminal result arriving before a newer
+  // assistant event) rather than a recovered "newer accepted checkpoint".
+  assert.equal(olderTerminal.stdout, '');
+  assert.match(olderTerminal.stderr, /claude_json parse failed: result precedes newer assistant output/);
+  assert.equal(olderTerminal.failureClass, 'provider_error');
+  assert.equal(olderTerminal.stop_reason, null);
   assert.equal(olderTerminal.dropped_out, true);
   assert.equal(olderTerminal.provider_budget_enforcement, 'incremental');
-  assert.equal(olderTerminal.stdout, '');
-  assert.equal(olderTerminal.partial_result, true);
-  assert.equal(olderTerminal.partial_checkpoint, 'NEWER_ACCEPTED_CHECKPOINT');
-  assert.equal(olderTerminal.partial_checkpoint_event_type, 'assistant');
-  assert.equal(olderTerminal.partial_checkpoint_unavailable_reason, null);
-  assert.equal(olderTerminal.partial_checkpoint_hash,
-    crypto.createHash('sha256').update('NEWER_ACCEPTED_CHECKPOINT').digest('hex'));
-  assert.equal(olderTerminal.usage.total_tokens, 1202, 'an older terminal must not overwrite the budget-tripping cumulative');
-  assert.equal(olderTerminal.progress.providerUsage.total_tokens, 1202);
-  assert.equal(olderTerminal.progress.providerUsagePhase, 'incremental');
-  assert.equal(olderTerminal.provider_num_turns, 2);
-  assert.equal(olderTerminal.provider_terminal_reason, null);
-  assert.equal(olderTerminal.provider_stop_reason, null);
-  assert.equal(olderTerminal.provider_duration_ms, null);
-  assert.equal(olderTerminal.provider_api_duration_ms, null);
-  assert.equal(olderTerminal.provider_api_error_status, null);
-  assert.match(olderTerminal.stderr, /result precedes newer assistant output/);
+  assert.equal(olderTerminal.usage.total_tokens, 1202);
 
   const boundedBudgetResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST',
@@ -1794,20 +1774,16 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   });
   assert.equal(boundedBudgetResponse.status, 200);
   const boundedBudgetResult = await boundedBudgetResponse.json();
-  assert.equal(boundedBudgetResult.stop_reason, 'token_budget');
-  assert.equal(boundedBudgetResult.supervisor_stop_reason, 'token_budget');
-  assert.equal(boundedBudgetResult.failureClass, 'token_budget');
-  assert.equal(boundedBudgetResult.dropped_out, true);
-  assert.equal(boundedBudgetResult.stdout, '');
-  assert.equal(boundedBudgetResult.partial_result, true);
-  assert.equal(boundedBudgetResult.partial_diagnostic.length, 12000);
-  assert.equal(boundedBudgetResult.partial_diagnostic_truncated, true);
-  assert.match(boundedBudgetResult.partial_diagnostic, /TAIL_KEPT\n\nfinal bounded turn$/);
-  assert.doesNotMatch(boundedBudgetResult.partial_diagnostic,
-    /HEAD_SHOULD_TRUNCATE|BOUNDED_THINKING_MUST_NOT_ESCAPE|BOUNDED_TOOL_INPUT_MUST_NOT_ESCAPE/);
-  assert.equal(boundedBudgetResult.cleaned_output_unavailable, true);
-  assert.equal(boundedBudgetResult.partial_checkpoint, 'final bounded turn');
-  assert.equal(boundedBudgetResult.partial_checkpoint_truncated, false);
+  // Issue #133: a maxTurns budget exceeded mid-run (provider_num_turns 2 >
+  // maxTurns 1) is informational only ("MUST_BE_KILLED" must survive).
+  assert.equal(boundedBudgetResult.stdout, 'MUST_BE_KILLED');
+  assert.equal(boundedBudgetResult.failureClass, null);
+  assert.equal(boundedBudgetResult.stop_reason, null);
+  assert.equal(boundedBudgetResult.dropped_out, false);
+  assert.equal(boundedBudgetResult.budget_exceeded, false);
+  assert.equal(boundedBudgetResult.provider_budget_enforcement, 'terminal');
+  assert.equal(boundedBudgetResult.provider_budget.maxTurns, 1);
+  assert.equal(boundedBudgetResult.provider_num_turns, 2);
 
   const healthyStreamPrompt = 'finish one healthy stream turn\n' + 'unicode 😀 quotes " and backslash \\ newline\n'.repeat(1000);
   const healthyStreamResponse = await fetch(baseUrl + '/api/oneshot', {
@@ -1841,19 +1817,17 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   });
   assert.equal(gracefulFinalizeResponse.status, 200);
   const gracefulFinalize = await gracefulFinalizeResponse.json();
+  // Issue #133: graceful finalization is no longer auto-requested on budget
+  // proximity (only quota_reserve still triggers it directly, elsewhere in
+  // server.js), so the fixture completes its single turn normally and no
+  // finalization is requested or sent.
   assert.equal(gracefulFinalize.stdout, 'FINALIZED_OK');
   assert.equal(gracefulFinalize.dropped_out, false);
   assert.equal(gracefulFinalize.stop_reason, null);
   assert.equal(gracefulFinalize.route.prompt_transport, 'stdin_stream_json');
-  assert.equal(gracefulFinalize.graceful_finalization.supported, true);
-  assert.equal(gracefulFinalize.graceful_finalization.requested, true);
-  assert.equal(gracefulFinalize.graceful_finalization.sent, true);
-  assert.equal(gracefulFinalize.graceful_finalization.method, 'claude_stream_json_user_message');
-  assert.equal(gracefulFinalize.graceful_finalization.reserve.budgetField, 'maxTotalTokens');
-  assert.equal(gracefulFinalize.graceful_finalization.reserve.usageField, 'total_tokens');
-  assert.equal(gracefulFinalize.graceful_finalization.reserve.threshold, 900);
-  assert.equal(gracefulFinalize.graceful_finalization.reserve.limit, 1000);
-  assert.equal(gracefulFinalize.usage.total_tokens, 910);
+  assert.equal(gracefulFinalize.graceful_finalization, null);
+  assert.equal(gracefulFinalize.provider_budget_enforcement, 'terminal');
+  assert.equal(gracefulFinalize.usage.total_tokens, 900);
 
   const epipeResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST',
@@ -1868,11 +1842,14 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   });
   assert.equal(epipeResponse.status, 200, 'an asynchronous stdin EPIPE must not crash the bridge');
   const epipe = await epipeResponse.json();
+  // Issue #133: this fixture closes its own stdin at startup, emits one
+  // assistant event, and exits without a terminal `result` line (no budget
+  // trigger drives a second turn any more); the bridge must still surface
+  // this as a clean provider_error rather than crashing.
   assert.equal(epipe.dropped_out, true);
-  assert.equal(epipe.graceful_finalization.requested, true);
-  assert.ok(epipe.graceful_finalization.sent === true
-    || epipe.graceful_finalization.reason === 'provider_input_write_failed',
-  'Windows may acknowledge a buffered pipe write before surfacing EPIPE; either state must remain nonfatal');
+  assert.equal(epipe.failureClass, 'provider_error');
+  assert.match(epipe.stderr, /claude_json parse failed: document type is not result/);
+  assert.equal(epipe.graceful_finalization, null);
 
   const writerRepo = path.join(tempRoot, 'writer-repo');
   fs.mkdirSync(writerRepo);
@@ -1898,46 +1875,27 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   });
   assert.equal(writerBudgetResponse.status, 200);
   const writerBudget = await writerBudgetResponse.json();
-  assert.equal(writerBudget.stop_reason, 'token_budget');
-  assert.equal(writerBudget.partial_result, true);
-  assert.equal(writerBudget.partial_checkpoint, 'writer checkpoint api_key=[REDACTED]');
-  assert.doesNotMatch(JSON.stringify(writerBudget), /must-not-leak|STREAM_TOOL_ARG_MUST_NOT_ESCAPE|STREAM_THINKING_MUST_NOT_ESCAPE/);
-  assert.equal(writerBudget.writer_diff_summary.available, true);
-  assert.equal(writerBudget.writer_diff_summary.changedFileCount, 1);
-  assert.equal(writerBudget.writer_diff_summary.files[0].path, 'writer-change.txt');
-  assert.equal(writerBudget.writer_diff_summary.files[0].afterStatus, '??');
-  assert.match(writerBudget.writer_diff_summary.statusHash, /^[0-9a-f]{64}$/);
+  // Issue #133: an exceeded providerBudget during a dangerous writer run is
+  // informational only; the run completes normally with its writer output.
+  assert.equal(writerBudget.stdout, 'WRITER_BUDGET_COMPLETE');
+  assert.equal(writerBudget.dropped_out, false);
+  assert.equal(writerBudget.stop_reason, null);
+  assert.equal(writerBudget.failureClass, null);
+  assert.equal(writerBudget.provider_budget_enforcement, 'terminal');
+  assert.equal(writerBudget.usage.total_tokens, 1100);
+  assert.equal(fs.readFileSync(path.join(writerRepo, 'writer-change.txt'), 'utf8'), 'partial writer output\n');
 
   const budgetReceipts = fs.readFileSync(
     path.join(tempRoot, 'data', 'receipts', new Date().toISOString().slice(0, 10) + '.jsonl'), 'utf8',
   ).trim().split(/\r?\n/).map(JSON.parse);
   const multiTurnReceipt = budgetReceipts.find((row) => row.receiptId === multiTurnBudgetResult.receiptId);
   const boundedReceipt = budgetReceipts.find((row) => row.receiptId === boundedBudgetResult.receiptId);
-  assert.equal(multiTurnReceipt.partialResult, true);
-  assert.equal(multiTurnReceipt.partialDiagnosticChars, multiTurnBudgetResult.partial_diagnostic.length);
-  assert.equal(multiTurnReceipt.partialDiagnosticTruncated, false);
-  assert.equal(multiTurnReceipt.cleanedOutputUnavailable, true);
-  assert.equal(multiTurnReceipt.status, 'dropped');
-  assert.equal(multiTurnReceipt.failureClass, 'token_budget');
-  assert.equal(multiTurnReceipt.stopReason, 'token_budget');
-  assert.equal(multiTurnReceipt.supervisorStopReason, 'token_budget');
-  assert.equal(multiTurnReceipt.resultSubtype, null);
-  assert.equal(multiTurnReceipt.outputChars, 0);
-  assert.equal(multiTurnReceipt.actualTotalTokens, 1695);
-  assert.equal(multiTurnReceipt.providerNumTurns, 3);
-  assert.equal(multiTurnReceipt.providerBudgetEnforcement, 'incremental');
-  assert.ok(multiTurnReceipt.transportOutputChars > 0,
-    'late terminal bytes remain represented only by transport diagnostic evidence');
-  assert.equal(multiTurnReceipt.partialCheckpointBytes, Buffer.byteLength('turn 3'));
-  assert.equal(multiTurnReceipt.partialCheckpointEventType, 'assistant');
-  assert.equal(multiTurnReceipt.partialCheckpointTruncated, false);
-  assert.equal(multiTurnReceipt.cleanedOutputUnavailableReason, 'incomplete_or_malformed_terminal_result');
-  assert.equal(boundedReceipt.partialResult, true);
-  assert.equal(boundedReceipt.partialDiagnosticChars, 12000);
-  assert.equal(boundedReceipt.partialDiagnosticTruncated, true);
-  assert.equal(boundedReceipt.partialDiagnosticHash,
-    crypto.createHash('sha256').update(boundedBudgetResult.partial_diagnostic).digest('hex'));
-  assert.equal(boundedReceipt.stopReason, 'token_budget');
+  // Issue #133: an exceeded providerBudget must still be persisted to the
+  // receipt for observability, without ever recording a kill/failure.
+  assert.ok(multiTurnReceipt);
+  assert.equal(multiTurnReceipt.failureClass, null);
+  assert.ok(boundedReceipt);
+  assert.equal(boundedReceipt.failureClass, null);
 
   const groupedUsage = await (await fetch(baseUrl + '/api/usage/gauges', { headers: auth })).json();
   const usageGauge = groupedUsage.gauges.usage_json;
@@ -2561,8 +2519,10 @@ test('prompt-file transport preserves long special-character prompts and cleans 
     if (['done', 'failed', 'cancelled', 'interrupted'].includes(completedControlledTask.status)) break;
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
-  assert.equal(completedControlledTask.status, 'failed');
-  assert.match(completedControlledTask.error, /total_tokens/);
+  // Issue #133: an exceeded providerBudget on a queued/background task is
+  // informational only and must never fail the task.
+  assert.equal(completedControlledTask.status, 'done');
+  assert.equal(completedControlledTask.result, 'STRUCTURED_OK');
   assert.equal(completedControlledTask.route.requested_model, 'heavy-fixture');
   assert.equal(completedControlledTask.route.requested_effort, 'max');
   assert.equal(completedControlledTask.route.max_effort_override, true);
@@ -4050,11 +4010,15 @@ test('local Ollama adapter uses loopback HTTP, returns final-only text, and reco
     }),
   });
   const terminalBudget = await terminalBudgetResponse.json();
-  assert.equal(terminalBudget.failureClass, 'token_budget');
-  assert.equal(terminalBudget.stop_reason, 'token_budget');
+  // Issue #133: an exceeded providerBudget is informational only and never
+  // kills a run; the HTTP one-shot still completes normally.
+  assert.equal(terminalBudget.stdout, 'FINAL_ONLY');
+  assert.equal(terminalBudget.failureClass, null);
+  assert.equal(terminalBudget.stop_reason, null);
   assert.equal(terminalBudget.provider_budget_enforcement, 'terminal');
-  assert.equal(terminalBudget.timed_out, false);
-  assert.equal(terminalBudget.dropped_out, true);
+  assert.equal(terminalBudget.timed_out, undefined);
+  assert.equal(terminalBudget.dropped_out, false);
+  assert.equal(terminalBudget.usage.total_tokens, 15);
 
   const ambiguousFailureResponse = await fetch(`${baseUrl}/api/oneshot`, {
     method: 'POST',
