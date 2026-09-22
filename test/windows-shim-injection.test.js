@@ -22,7 +22,7 @@ function write(file, content) {
 
 function fixture(t, kind = 'npm-package.cmd') {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relaybridge-shim-'));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 50, retryDelay: 200 }));
   const shim = path.join(root, 'provider.cmd');
   const executable = path.join(root, 'node.exe');
   write(shim, fs.readFileSync(path.join(FIXTURES, kind)));
