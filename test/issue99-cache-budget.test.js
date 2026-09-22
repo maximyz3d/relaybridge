@@ -64,7 +64,7 @@ test('issue #99: Claude utility work keeps the conservative global token budget'
   assert.equal(opts.providerBudget.maxCacheReadTokens, 2500000);
 });
 
-test('issue #99: non-Claude default maxCacheReadTokens stays unchanged at 2.5M and stops when exceeded', () => {
+test('issue #99: non-Claude default maxCacheReadTokens stays resolved at 2.5M but is never enforced (Refs #133)', () => {
   const cfg = {
     _supervisor: {
       providerBudget: {
@@ -83,17 +83,17 @@ test('issue #99: non-Claude default maxCacheReadTokens stays unchanged at 2.5M a
     globals: cfg._supervisor,
   });
 
-  assert.equal(opts.providerBudget.maxCacheReadTokens, 2500000, 'non-Claude provider retains default 2.5M cap');
+  assert.equal(opts.providerBudget.maxCacheReadTokens, 2500000, 'non-Claude provider retains default 2.5M cap as a resolved, informational value');
 
   const supervisor = new RunSupervisor(opts);
   supervisor.recordProviderUsage({ cache_read_input_tokens: 2500001 }, { phase: 'incremental' });
   const verdict = supervisor.evaluate();
-  assert.equal(verdict.action, 'kill', 'non-Claude provider stops when exceeding 2.5M cache read tokens');
-  assert.equal(verdict.reason, 'token_budget');
-  assert.match(verdict.detail, /cache_read_input_tokens/);
+  assert.equal(verdict.action, 'continue', 'a non-Claude provider past the resolved cache-read ceiling is never stopped for it');
+  assert.equal(supervisor.snapshot().ignoredCaps.providerBudget.maxCacheReadTokens, 2500000,
+    'the resolved-but-unenforced ceiling is still visible via ignoredCaps');
 });
 
-test('issue #99: explicit per-call lower providerBudget override wins over provider default and stops deterministically', () => {
+test('issue #99: explicit per-call lower providerBudget override resolves but never stops or auto-finalizes (Refs #133)', () => {
   const cfg = {
     _supervisor: {
       providerBudget: {
@@ -127,15 +127,19 @@ test('issue #99: explicit per-call lower providerBudget override wins over provi
 
   const supervisor = new RunSupervisor({ ...opts, finalizationSupported: true });
   supervisor.recordProviderUsage({ cache_read_input_tokens: 89999 }, { phase: 'incremental' });
-  assert.equal(supervisor.evaluate().action, 'continue', 'below the finalization reserve runs safely');
+  assert.equal(supervisor.evaluate().action, 'continue', 'below the resolved ceiling runs safely');
   supervisor.recordProviderUsage({ cache_read_input_tokens: 100000 }, { phase: 'incremental' });
-  assert.equal(supervisor.evaluate().action, 'finalize', 'the checkpoint reserve finalizes without increasing the per-call ceiling');
+  assert.equal(supervisor.evaluate().action, 'continue', 'reaching the resolved ceiling no longer auto-finalizes');
 
   supervisor.recordProviderUsage({ cache_read_input_tokens: 100001 }, { phase: 'incremental' });
   const verdict = supervisor.evaluate();
-  assert.equal(verdict.action, 'kill', 'stops deterministically when exceeding per-call budget');
-  assert.equal(verdict.reason, 'token_budget');
-  assert.match(verdict.detail, /cache_read_input_tokens/);
+  assert.equal(verdict.action, 'continue', 'exceeding the per-call budget never stops the run any more');
+  assert.equal(supervisor.snapshot().providerUsage.cache_read_input_tokens, 100001, 'usage is still tracked');
+  // Graceful finalization remains a manually-invokable advisory, just no
+  // longer auto-triggered by proximity to a budget ceiling.
+  const manual = supervisor.requestGracefulFinalization({ maxCacheReadTokens: 5000 });
+  assert.equal(manual.maxCacheReadTokens, 5000);
+  assert.equal(supervisor.finalizationRequested.maxCacheReadTokens, 5000);
 });
 
 test('issue #99: explicit null per-call budget disables one tier-specific ceiling', () => {

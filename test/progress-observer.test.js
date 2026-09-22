@@ -4,19 +4,23 @@ const { ProgressObserver } = require('../lib/progress-observer');
 const { RunSupervisor } = require('../lib/run-supervisor');
 const { resolveAttemptTiming } = require('../lib/cli-deadline');
 const { parseCodexOutput } = require('../lib/codex-output');
-test('productive default work survives 30, 45, 60 and 120 minutes; explicit deadline wins', () => {
+test('productive default work survives 30, 45, 60 and 120 minutes; no explicit deadline is ever enforced (Refs #133)', () => {
   const supervisor = new RunSupervisor(resolveAttemptTiming({ startedAt: 0 }));
   for (let at = 60000; at <= 120 * 60000; at += 60000) {
     supervisor.recordOutput(`Completed work item ${at / 60000}\n`, at);
     assert.equal(supervisor.evaluate(at).action, 'continue');
   }
-  assert.equal(supervisor.snapshot(7200000).hardCapRemainingMs, null);
+  assert.equal(supervisor.snapshot(7200000).hardCapRemainingMs, undefined, 'the field no longer exists on snapshot');
   const bounded = new RunSupervisor(resolveAttemptTiming({ startedAt: 0, timeoutMs: 30000 }));
-  bounded.recordOutput('New progress\n', 30000); assert.equal(bounded.evaluate(30000).reason, 'hard_cap');
+  bounded.recordOutput('New progress\n', 30000);
+  assert.notEqual(bounded.evaluate(30000).action, 'kill');
+  assert.equal(bounded.snapshot().ignoredCaps.hardCapMs, 30000, 'the requested timeout is exposed, not enforced');
   const operator = new RunSupervisor(resolveAttemptTiming({ startedAt: 0, entry: { supervisor: { hardCapMs: 2700000 } } }));
-  assert.equal(operator.evaluate(2700000).reason, 'hard_cap');
+  assert.notEqual(operator.evaluate(2700000).action, 'kill');
+  assert.equal(operator.snapshot().ignoredCaps.hardCapMs, 2700000);
   const disabled = new RunSupervisor(resolveAttemptTiming({ startedAt: 0, globals: { adaptive: false } }));
-  disabled.recordOutput('Still progressing\n', 2700000); assert.equal(disabled.evaluate(2700000).reason, 'hard_cap');
+  disabled.recordOutput('Still progressing\n', 2700000);
+  assert.notEqual(disabled.evaluate(2700000).action, 'kill');
 });
 test('private reasoning, command input/output, stderr and metadata do not become public progress', () => {
   const p = new ProgressObserver({ parser: 'codex_json', startedAt: 0 });
