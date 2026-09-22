@@ -2333,7 +2333,7 @@ async function runHttpProviderOneShot({ entry, prompt, effectivePrompt, res, rou
     } else {
       if (hosted) {
         const text = await readProviderBody(response, { signal: controller.signal,
-          maxBytes: Math.min(supervisor.opts.maxOutputBytes, HTTP_PROVIDER_LIMITS.maxWireBytes), onWireBytes: wireProgress });
+          maxBytes: Math.min(supervisor.opts.spillAfterBytes, HTTP_PROVIDER_LIMITS.maxWireBytes), onWireBytes: wireProgress });
         let document;
         try { document = JSON.parse(text); } catch { throw Object.assign(new Error('Provider body contains malformed JSON.'), { failureClass: 'provider_protocol_error' }); }
         const parsed = parseHostedTerminal(document);
@@ -2341,7 +2341,7 @@ async function runHttpProviderOneShot({ entry, prompt, effectivePrompt, res, rou
         sealTerminal();
       } else {
         await readOllamaStream(response, { signal: controller.signal,
-          maxOutputBytes: Math.min(supervisor.opts.maxOutputBytes, HTTP_PROVIDER_LIMITS.maxOutputBytes),
+          maxOutputBytes: Math.min(supervisor.opts.spillAfterBytes, HTTP_PROVIDER_LIMITS.maxOutputBytes),
           onWireBytes: wireProgress,
           onTerminal: (value) => acceptTerminal(value, usageFromTerminal(value)),
           onDelta: (delta) => {
