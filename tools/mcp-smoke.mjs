@@ -9,6 +9,12 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
 const DEFAULT_COMMITTEE_PROVIDERS = Object.freeze(['ollama_fast', 'ollama_coder']);
 const DEFAULT_CLEANUP_BUDGET_MS = 5000;
+// oneShotDefaultMs is no longer a number (null means "no enforced default"),
+// so it can't be added to mcpHostGraceMs for this tool's own SDK-client call
+// patience. This budget is local smoke-test tooling only, not a provider
+// deadline: it governs how long this diagnostic script waits on a call
+// before declaring the smoke run itself failed, never the run underneath it.
+const SMOKE_CALL_TIMEOUT_MS = 1200000 + TIMEOUT_POLICY.mcpHostGraceMs;
 
 function content(result) {
   return result?.structuredContent && typeof result.structuredContent === 'object'
@@ -275,8 +281,8 @@ export async function runSmoke({
   const call = (name, args) => client.callTool(
     { name, arguments: args },
     {
-      timeout: TIMEOUT_POLICY.oneShotDefaultMs + TIMEOUT_POLICY.mcpHostGraceMs,
-      maxTotalTimeout: TIMEOUT_POLICY.oneShotDefaultMs + TIMEOUT_POLICY.mcpHostGraceMs,
+      timeout: SMOKE_CALL_TIMEOUT_MS,
+      maxTotalTimeout: SMOKE_CALL_TIMEOUT_MS,
     },
   );
 

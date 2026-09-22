@@ -66,29 +66,59 @@ test('HTTP >10KB prompt is active before first byte and streams under the same d
   await waitFor(async () => (await bridge.request('/api/runs/active')).body.count === 0);
 });
 
-test('HTTP disconnect persists one terminal receipt after local cleanup, hard cap settles silent transport', { timeout: 15000 }, async (t) => {
+test('HTTP disconnect detaches (not cancels); explicit cancel still stops the run; hard cap never kills a silent transport', { timeout: 15000 }, async (t) => {
   const { bridge, requests, receipts } = await fixture(t);
   const controller = new AbortController();
-  const pending = bridge.request('/api/oneshot', { kind: 'ollama_fast', prompt: 'bounded disconnect', requestId: 'http-lifecycle-cancel', dangerous: false }, { signal: controller.signal });
+  const pending = bridge.request('/api/oneshot', { kind: 'ollama_fast', prompt: 'bounded disconnect', requestId: 'http-lifecycle-disconnect', dangerous: false }, { signal: controller.signal });
   const rejected = assert.rejects(pending, { name: 'AbortError' });
   await waitFor(() => requests.length === 1);
   requests[0].res.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
   requests[0].res.write('{"response":"Partial progress.","done":false}\n');
   await waitFor(async () => (await bridge.request('/api/runs/active')).body.runs[0]?.bytes > 0);
   controller.abort(); await rejected;
-  await waitFor(() => receipts().some((row) => row.requestId === 'http-lifecycle-cancel'));
-  const cancelled = receipts().filter((row) => row.requestId === 'http-lifecycle-cancel');
-  assert.equal(cancelled.length, 1); assert.equal(cancelled[0].status, 'cancelled');
-  assert.equal(cancelled[0].modelInvocation, true); assert.equal(cancelled[0].physicalAttemptCount, 1);
-  assert.equal(cancelled[0].transportLifecycle.physicalEvidence, 'http_transport_settled');
-  assert.equal(cancelled[0].transportLifecycle.cleanupStatus, 'complete');
+  // A client disconnect detaches rather than cancels (Refs #133): the run
+  // stays active and the upstream fetch is not aborted.
+  await waitFor(async () => (await bridge.request('/api/runs/active')).body.runs.length === 1);
+  requests[0].res.end('{"response":" more.","done":true,"model":"fixture","prompt_eval_count":12,"eval_count":6}');
+  await waitFor(() => receipts().some((row) => row.requestId === 'http-lifecycle-disconnect'));
+  const completed = receipts().filter((row) => row.requestId === 'http-lifecycle-disconnect' && row.event === 'bridge_provider_call');
+  assert.equal(completed.length, 1); assert.equal(completed[0].status, 'completed');
+  assert.equal(completed[0].modelInvocation, true); assert.equal(completed[0].physicalAttemptCount, 1);
+  assert.equal(completed[0].transportLifecycle.physicalEvidence, 'http_transport_settled');
+  assert.equal(completed[0].transportLifecycle.cleanupStatus, 'complete');
   await waitFor(async () => (await bridge.request('/api/runs/active')).body.count === 0);
-  const silent = bridge.request('/api/oneshot', { kind: 'ollama_fast', prompt: 'silent bounded request', requestId: 'http-lifecycle-silent', dangerous: false });
+
+  // An explicit cancel of an HTTP-provider run still aborts the upstream
+  // fetch and produces exactly one 'cancelled' receipt.
+  const pending2 = bridge.request('/api/oneshot', { kind: 'ollama_fast', prompt: 'bounded explicit cancel', requestId: 'http-lifecycle-explicit-cancel', dangerous: false });
   await waitFor(() => requests.length === 2);
-  const timed = (await silent).body;
-  assert.equal(timed.failureClass, 'timeout'); assert.equal(timed.stop_reason, 'hard_cap');
-  assert.equal(timed.timed_out, true); assert.equal(timed.model_invocation, null);
-  assert.equal(timed.route.effective_timeout_ms, 3000);
+  requests[1].res.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+  requests[1].res.write('{"response":"Partial progress.","done":false}\n');
+  await waitFor(async () => (await bridge.request('/api/runs/active')).body.runs[0]?.bytes > 0);
+  const active = (await bridge.request('/api/runs/active')).body.runs[0];
+  const cancelResult = await bridge.request(`/api/runs/${active.runId}/cancel`, {
+    requestId: active.route.request_id, invocationId: active.route.invocation_id, attemptId: active.route.attempt_id,
+  });
+  assert.equal(cancelResult.status, 202); assert.equal(cancelResult.body.stopRequested, true);
+  const settledCancel = (await pending2).body;
+  assert.equal(settledCancel.cancelled, true); assert.equal(settledCancel.stop_reason, 'operator_cancelled');
+  await waitFor(() => receipts().some((row) => row.requestId === 'http-lifecycle-explicit-cancel'));
+  const cancelledRows = receipts().filter((row) => row.requestId === 'http-lifecycle-explicit-cancel' && row.event === 'bridge_provider_call');
+  assert.equal(cancelledRows.length, 1); assert.equal(cancelledRows[0].status, 'cancelled');
+  await waitFor(async () => (await bridge.request('/api/runs/active')).body.count === 0);
+
+  // hardCapMs is configured (3000ms) but is informational only now (Refs
+  // #133, lib/run-supervisor.js:165-169): a silent transport that answers
+  // well past that window must still complete, never be killed at the cap.
+  const silentStarted = Date.now();
+  const silent = bridge.request('/api/oneshot', { kind: 'ollama_fast', prompt: 'silent bounded request', requestId: 'http-lifecycle-silent', dangerous: false });
+  await waitFor(() => requests.length === 3);
+  await new Promise((resolve) => setTimeout(resolve, 3500));
+  requests[2].res.end('{"response":"Completed well past the old hard cap.","done":true,"model":"fixture","prompt_eval_count":12,"eval_count":6}');
+  const settled2 = (await silent).body;
+  assert.ok(Date.now() - silentStarted >= 3500, 'the old hard cap window must not cut the run off early');
+  assert.equal(settled2.stdout, 'Completed well past the old hard cap.');
+  assert.equal(settled2.dropped_out, false); assert.equal(settled2.stop_reason, null);
   await waitFor(async () => (await bridge.request('/api/runs/active')).body.count === 0);
 });
 
@@ -118,12 +148,26 @@ test('MCP HTTP result and both receipt layers preserve physical lifecycle identi
   }
 });
 
-test('explicit HTTP timeout is not widened to the default twenty-minute idle window', { timeout: 15000 }, async (t) => {
-  const { bridge } = await fixture(t, { supervisor: {} });
+test('an explicit HTTP timeoutMs is recorded but never enforced as a deadline', { timeout: 15000 }, async (t) => {
+  const { bridge, requests } = await fixture(t, { supervisor: {} });
   const started = Date.now();
-  const result = (await bridge.request('/api/oneshot', { kind: 'ollama_fast', prompt: 'bounded explicit deadline', timeoutMs: 1000, dangerous: false })).body;
-  assert.equal(result.stop_reason, 'hard_cap'); assert.equal(result.route.effective_timeout_ms, 1000);
-  assert.ok(Date.now() - started < 5000, 'caller deadline must remain an absolute ceiling');
+  const pending = bridge.request('/api/oneshot', { kind: 'ollama_fast', prompt: 'bounded explicit deadline', timeoutMs: 1000, dangerous: false });
+  await waitFor(() => requests.length === 1);
+  const active = (await bridge.request('/api/runs/active')).body.runs[0];
+  // Refs #133 (lib/cli-deadline.js:11-16 maps a caller's timeoutMs into the
+  // supervisor's hardCapMs; run-supervisor.js:165-169 makes hardCapMs
+  // informational only): the deadline is recorded via ignoredCaps.hardCapMs
+  // but never enforced -- no run is ever stopped by elapsed time.
+  assert.equal(active.ignoredCaps.hardCapMs, 1000);
+  await new Promise((resolve) => setTimeout(resolve, 1500));
+  assert.equal((await bridge.request('/api/runs/active')).body.count, 1,
+    'the explicit timeoutMs must not have killed the run past its own deadline');
+  requests[0].res.end('{"response":"Completed past the caller deadline.","done":true,"model":"fixture","prompt_eval_count":12,"eval_count":6}');
+  const result = (await pending).body;
+  assert.ok(Date.now() - started >= 1500, 'the explicit deadline must not remain an absolute ceiling');
+  assert.equal(result.stdout, 'Completed past the caller deadline.');
+  assert.equal(result.dropped_out, false); assert.equal(result.stop_reason, null);
+  await waitFor(async () => (await bridge.request('/api/runs/active')).body.count === 0);
 });
 
 test('validated HTTP terminal seals before EOF and survives disconnect with full accepted usage', { timeout: 15000 }, async (t) => {

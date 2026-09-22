@@ -107,28 +107,53 @@ test('configured limits retain a cancelled process slot until physical exit with
   skip: process.platform === 'win32', timeout: 30000,
 }, async (t) => {
   const bridge = await fixture(t, { RELAYBRIDGE_MAX_ACTIVE_ONESHOTS: '3', RELAYBRIDGE_MAX_ACTIVE_PER_PROVIDER: '2' });
-  const controller = new AbortController();
-  const cancelled = bridge.call('claude', 'RB_CASE_cancel', { signal: controller.signal });
-  const rejected = assert.rejects(cancelled, { name: 'AbortError' });
+  const cancelId = 'RB_CASE_cancel';
+  const cancelled = bridge.call('claude', cancelId);
   const sibling = bridge.call('claude', 'RB_CASE_sibling');
-  const codex = bridge.call('codex', 'RB_CASE_codex');
+  const codexController = new AbortController();
+  const codex = bridge.call('codex', 'RB_CASE_codex', { signal: codexController.signal });
+  const codexRejected = assert.rejects(codex, { name: 'AbortError' });
   await waitFor(() => bridge.started().length === 3);
-  controller.abort(); await rejected;
-  await waitFor(() => bridge.events().some((event) => event.id === 'RB_CASE_cancel' && event.event === 'termination_requested'));
+
+  // A plain client disconnect (HTTP abort) now detaches under F2/F5: the run
+  // keeps going and its slot is NOT freed early. Only an explicit cancel does.
+  codexController.abort(); await codexRejected;
+  const afterAbort = await bridge.call('copilot', 'RB_CASE_afterAbort');
+  assert.equal(afterAbort.status, 429);
+  assert.equal(afterAbort.body.activeOneShotCount, 3);
+  assert.equal(bridge.events().filter((event) => event.event === 'termination_requested').length, 0);
+
+  // Explicit cancel via POST /api/runs/:runId/cancel -> cancelActiveRun.
+  const cancelStartedEvent = bridge.started().find((event) => event.id === cancelId);
+  const activeRuns = (await bridge.request('/api/runs/active')).body.runs;
+  const cancelRun = activeRuns.find((run) => run.pid === cancelStartedEvent.pid);
+  assert.ok(cancelRun, 'active run for RB_CASE_cancel not found');
+  const cancelResponse = await bridge.request(`/api/runs/${cancelRun.runId}/cancel`, {
+    requestId: `parallel:${cancelId}`, invocationId: `parallel:${cancelId}`, attemptId: `parallel:${cancelId}:attempt:1`,
+  });
+  assert.equal(cancelResponse.status, 202);
+  assert.equal(cancelResponse.body.stopRequested, true);
+  await waitFor(() => bridge.events().some((event) => event.id === cancelId && event.event === 'termination_requested'));
   const held = await bridge.call('claude', 'RB_CASE_stillHeld');
   assert.equal(held.status, 429);
   assert.equal(held.body.activeForKind, 2);
   assert.equal(held.body.activeOneShotCount, 3);
-  bridge.release('RB_CASE_cancel');
+  bridge.release(cancelId);
   await waitFor(async () => (await bridge.health()).activeOneShotCount === 2);
   const replacement = bridge.call('claude', 'RB_CASE_replacement');
   await waitFor(() => bridge.started().length === 4);
   assert.equal(bridge.events().filter((event) => event.event === 'termination_requested').length, 1);
   bridge.releaseEverything();
-  for (const response of await Promise.all([sibling, codex, replacement])) assert.equal(response.status, 200);
+  for (const response of await Promise.all([sibling, replacement])) assert.equal(response.status, 200);
   await waitFor(async () => (await bridge.health()).activeOneShotCount === 0);
-  const rows = bridge.receipts().filter((row) => row.requestId === 'parallel:RB_CASE_cancel');
-  assert.equal(rows.length, 1); assert.equal(rows[0].status, 'cancelled');
+  // Two receipt rows are expected: the operator-cancel intent binding
+  // (event: 'active_run_cancel_requested') and the final delivery receipt
+  // once the process physically exits (status: 'cancelled').
+  const rows = bridge.receipts().filter((row) => row.requestId === `parallel:${cancelId}`);
+  assert.equal(rows.length, 2);
+  assert.equal(rows.filter((row) => row.event === 'active_run_cancel_requested').length, 1);
+  const delivered = rows.filter((row) => row.status === 'cancelled');
+  assert.equal(delivered.length, 1);
 });
 
 test('background tasks use all eight default slots and queued overflow completes', { timeout: 30000 }, async (t) => {
@@ -172,7 +197,7 @@ test('two independent MCP clients overlap same-provider calls and preserve each 
   }
   const calls = clients.flatMap((client, i) => ['claude', 'codex'].map((kind) => {
     const id = `RB_CASE_mcp${kind}${i}`;
-    return { id, promise: client.callTool({ name: 'ask_provider', arguments: {
+    return { id, client, promise: client.callTool({ name: 'ask_provider', arguments: {
       kind, prompt: `Return the result for ${id}.`, cwd: bridge.root, useCache: false,
     } }) };
   }));
@@ -180,18 +205,35 @@ test('two independent MCP clients overlap same-provider calls and preserve each 
   assert.deepEqual((await bridge.health()).activeOneShotsByProvider, { claude: 2, codex: 2 });
   bridge.releaseEverything();
   const requests = new Set(), invocations = new Set(), receipts = new Set();
-  for (const { id, promise } of calls) {
+  for (const { id, client, promise } of calls) {
     const response = await promise;
     assert.notEqual(response.isError, true, JSON.stringify(response));
-    const result = response.structuredContent;
-    assert.equal(result.stdout, `Completed result for ${id}.`);
+    let result = response.structuredContent;
+    if (result.pending === true) {
+      // The 10 s inline collection window (callProvider's default
+      // collectionMs) can end before releaseEverything() unblocks the
+      // fixture under CI load; follow the documented pending contract.
+      const task = await waitFor(async () => {
+        const taskResponse = await client.callTool({ name: 'get_task', arguments: { id: result.taskId } });
+        const value = taskResponse.structuredContent;
+        return ['done', 'failed', 'cancelled', 'interrupted'].includes(value.status) ? value : null;
+      }, 20000);
+      assert.equal(task.result, `Completed result for ${id}.`);
+    } else {
+      assert.equal(result.stdout, `Completed result for ${id}.`);
+    }
     const outer = bridge.receipts().find((entry) => entry.receiptId === result.receiptId);
     assert.ok(outer.requestId); assert.ok(outer.invocationId); assert.ok(result.receiptId);
     requests.add(outer.requestId); invocations.add(outer.invocationId); receipts.add(result.receiptId);
-    const row = bridge.receipts().find((entry) => entry.receiptId === result.transportReceiptId);
-    assert.equal(row.requestId, outer.requestId);
-    assert.equal(row.invocationId, outer.invocationId);
-    assert.equal(result.route.request_id, outer.requestId);
+    if (result.pending !== true) {
+      const row = bridge.receipts().find((entry) => entry.receiptId === result.transportReceiptId);
+      assert.equal(row.requestId, outer.requestId);
+      assert.equal(row.invocationId, outer.invocationId);
+      assert.equal(result.route.request_id, outer.requestId);
+    } else {
+      assert.equal(result.requestId, outer.requestId);
+      assert.equal(result.invocationId, outer.invocationId);
+    }
   }
   assert.equal(requests.size, 4); assert.equal(invocations.size, 4); assert.equal(receipts.size, 4);
 });

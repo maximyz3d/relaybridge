@@ -48,16 +48,20 @@ test('stopping and cleanup retain active membership and admission until physical
   assert.equal(result.snapshot.transport.remoteTermination, 'unverified');
 });
 
-test('budget stop is sticky across disconnect, late usage and CPU observations', async () => {
-  const f = fixture({ supervisor: { providerBudget: { maxTotalTokens: 10 } } }); f.bind('cli'); f.life.markDispatched();
+test('a check-in-driven kill is sticky across disconnect, late usage and CPU observations', async () => {
+  // providerBudget is tracked but never enforced (Refs #133); the sticky-stop
+  // contract is instead exercised through the burn_without_progress check-in
+  // rule, which still fires from inside the same observeUsage call.
+  const f = fixture({ supervisor: { checkInIntervalMs: 1, burnCheckins: 1, burnTokens: 10 } }); f.bind('cli'); f.life.markDispatched();
+  f.advance(1);
   f.life.observeUsage({ total_tokens: 11 }, 'terminal');
   f.life.clientDetached();
-  assert.equal(f.life.snapshot().stop.reason, 'token_budget');
+  assert.equal(f.life.snapshot().stop.reason, 'burn_without_progress');
   assert.equal(f.life.observeUsage({ total_tokens: 9000 }), false);
   assert.equal(f.life.observeCpu(9000), false);
   assert.equal(f.supervisor.snapshot().providerUsage.total_tokens, 11);
   assert.deepEqual(f.counts(), { releases: 0, stops: 1, boundaries: 1 });
-  f.life.sealOutcome({ failureClass: 'token_budget' });
+  f.life.sealOutcome({ failureClass: 'burn_without_progress' });
   await f.life.settlePhysical({ evidence: 'process_tree_settled' });
 });
 
@@ -107,15 +111,23 @@ test('CLI can register before spawn and bind its resulting PID without replacing
   assert.throws(() => f.life.identifyProcess(321), /identity handoff/);
 });
 
-test('timer verdict stops once and late timer callback cannot resurrect settlement', async () => {
+test('timer-driven check-in kill stops once and late timer callback cannot resurrect settlement', async () => {
+  // No clock-based hard_cap kill exists any more, and an unsampled-CPU stall
+  // (http has no CPU sample) only ever raises an incident and never kills
+  // (S4, Refs #133). The periodic tick still kills through a remaining
+  // check-in rule that does not depend on CPU sampling -- here
+  // burn_without_progress, fired by consecutive no-progress check-ins that
+  // together burned at least burnTokens.
   let tick, clears = 0, stops = 0, releases = 0, now = 0;
   const registry = new Map();
   const life = createAttemptLifecycle({ runId: 'timed', kind: 'fixture', route: {}, registry,
-    supervisor: new RunSupervisor({ startedAt: 0, idleMs: 1000, hardCapMs: 1500 }),
+    supervisor: new RunSupervisor({ startedAt: 0, checkInIntervalMs: 500, burnCheckins: 2, burnTokens: 5 }),
     now: () => now, releaseAdmission: () => { releases++; },
     schedule: (fn) => { tick = fn; return 1; }, clearSchedule: () => { clears++; } });
   life.bindTransport({ type: 'http', requestStop: () => { stops++; } }); life.markDispatched();
-  now = 1500; tick(); tick(); assert.equal(stops, 1); assert.equal(life.snapshot().stop.reason, 'hard_cap');
+  now = 500; life.observeUsage({ total_tokens: 5 }, 'terminal');
+  now = 1000; tick();
+  assert.equal(stops, 1); assert.equal(life.snapshot().stop.reason, 'burn_without_progress');
   await life.settlePhysical({ evidence: 'http_transport_settled' });
   tick(); assert.equal(clears, 1); assert.equal(releases, 1); assert.equal(registry.size, 0);
 });
@@ -132,18 +144,27 @@ test('sealed outcome retains a separate bounded drain stop without rewriting sem
 });
 
 test('accepted triggering text and usage are committed before semantic-stop notification', async () => {
+  // Kills now only land at a check-in boundary; drive one deterministically
+  // (loopCheckins/burnCheckins:1 with a 1ms interval) so the same observeX
+  // call both accepts the payload and triggers the stop synchronously after.
   let output = '', frozen;
-  const f = fixture({ supervisor: { loopRepeatThreshold: 2 }, onSemanticStop: () => { frozen = output; } });
+  const f = fixture({ supervisor: { loopRepeatThreshold: 2, checkInIntervalMs: 1, loopCheckins: 1 },
+    onSemanticStop: () => { frozen = output; } });
   f.bind(); f.life.markDispatched();
   const text = 'Repeated substantial output line.\n';
   f.life.observeOutput(text, (chunk) => { output += chunk; });
+  f.advance(1);
   f.life.observeOutput(text, (chunk) => { output += chunk; });
+  assert.equal(f.life.snapshot().stop.reason, 'loop_confirmed');
   assert.equal(frozen, text + text);
   await f.life.settlePhysical({ evidence: 'http_transport_settled' });
   let terminal = null, sealed;
-  const usage = fixture({ supervisor: { providerBudget: { maxTotalTokens: 10 } }, onSemanticStop: () => { sealed = terminal; } });
+  const usage = fixture({ supervisor: { checkInIntervalMs: 1, burnCheckins: 1, burnTokens: 10 },
+    onSemanticStop: () => { sealed = terminal; } });
   usage.bind(); usage.life.markDispatched();
+  usage.advance(1);
   usage.life.observeUsage({ total_tokens: 11 }, 'terminal', (value) => { terminal = value; });
+  assert.equal(usage.life.snapshot().stop.reason, 'burn_without_progress');
   assert.equal(sealed.total_tokens, 11);
   await usage.life.settlePhysical({ evidence: 'http_transport_settled' });
 });
@@ -224,8 +245,8 @@ test('startup quarantine cannot be revived by late identity, output, usage, CPU 
 
 test('quarantine preserves the first stop reason and rejects non-CLI transports', async () => {
   const f = fixture(); f.bind('cli'); f.life.markDispatched();
-  f.life.requestStop({ reason: 'token_budget', source: 'supervisor' }); f.life.quarantinePhysical();
-  f.life.clientDetached(); assert.equal(f.life.snapshot().stop.reason, 'token_budget');
+  f.life.requestStop({ reason: 'wedged', source: 'supervisor' }); f.life.quarantinePhysical();
+  f.life.clientDetached(); assert.equal(f.life.snapshot().stop.reason, 'wedged');
   assert.deepEqual(f.counts(), { releases: 0, stops: 1, boundaries: 1 });
   await f.life.settlePhysical({ evidence: 'process_tree_settled' });
   const http = fixture(); http.bind(); assert.throws(() => http.life.quarantinePhysical(), /CLI transport/);

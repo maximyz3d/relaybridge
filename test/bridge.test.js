@@ -30,25 +30,33 @@ function readCompleteReceiptRows(tempRoot) {
   return bytes.slice(0, bytes.lastIndexOf('\n') + 1).split(/\r?\n/).filter(Boolean).map(JSON.parse);
 }
 
-test('one-shot timeout policy is centralized: 20 min default, ceiling equals the supervisor hard cap', () => {
-  assert.equal(TIMEOUT_POLICY.oneShotDefaultMs, 1200000);
-  // The explicit-timeout ceiling matches _supervisor.hardCapMs (45 min) so the
-  // MCP transport bound (max + grace) covers everything supervision permits —
-  // otherwise the client aborts the HTTP request under a still-healthy run.
-  assert.equal(TIMEOUT_POLICY.oneShotMaxMs, 2700000);
-  assert.equal(TIMEOUT_POLICY.broadcastQueueWaitMs, 2700000);
+test('one-shot timeout policy is uncapped: no default, no ceiling, timeoutMs is a check-in hint only', () => {
+  // A run or queued task is never stopped or refused purely for elapsed time
+  // (that is a separate supervisor-kill/progress-check-in lane); null here
+  // means "no caller deadline / no enforced maximum", not zero and not
+  // Infinity.
+  assert.equal(TIMEOUT_POLICY.oneShotDefaultMs, null);
+  assert.equal(TIMEOUT_POLICY.oneShotMaxMs, null);
+  assert.equal(TIMEOUT_POLICY.broadcastQueueWaitMs, null);
+  // An explicit caller hint is floored at minimumMs but never clamped down to
+  // a maximum, since there no longer is one.
   assert.equal(TIMEOUT_POLICY.normalizeOneShotTimeoutMs(600001), 600001);
-  assert.equal(TIMEOUT_POLICY.normalizeOneShotTimeoutMs(3000000), 2700000);
+  assert.equal(TIMEOUT_POLICY.normalizeOneShotTimeoutMs(3000000), 3000000);
+  assert.equal(TIMEOUT_POLICY.normalizeOneShotTimeoutMs(1), TIMEOUT_POLICY.minimumMs);
+  // No hint at all (default missing) stays null, not coerced to a number.
+  assert.equal(TIMEOUT_POLICY.normalizeOneShotTimeoutMs(undefined), null);
   assert.equal(TIMEOUT_POLICY.transportTimeoutMs(2700000), 2715000);
+  assert.equal(TIMEOUT_POLICY.transportTimeoutMs(undefined), null, 'no hint means no transport timeout either');
   const supervisorCfg = readConfig()._supervisor;
-  assert.equal(TIMEOUT_POLICY.oneShotMaxMs, supervisorCfg.hardCapMs, 'transport ceiling must cover the supervisor hard cap');
-  assert.equal(supervisorCfg.idleMs, 1200000, 'buffered providers get the full default window before idle-stall');
-  assert.ok(supervisorCfg.idleMs >= TIMEOUT_POLICY.oneShotDefaultMs);
+  assert.equal(supervisorCfg.hardCapMs, undefined, 'the supervisor hard wall-clock cap is gone from the template');
+  assert.equal(supervisorCfg.idleMs, 1200000, 'buffered providers still get an idle-stall check-in window');
   const routing = JSON.parse(fs.readFileSync(path.join(ROOT, 'config', 'routing-policy.json'), 'utf8'));
-  assert.deepEqual(
-    Object.fromEntries(Object.entries(routing.tiers).map(([tier, policy]) => [tier, policy.defaultTimeoutMs])),
-    { utility: 1200000, standard: 1200000, complex: 1200000, critical: 1200000 },
-  );
+  // defaultTimeoutMs was removed from the schema entirely (not nulled): a
+  // tier has no per-tier timeout concept any more, not even an explicit "no
+  // timeout" value.
+  for (const [tier, policy] of Object.entries(routing.tiers)) {
+    assert.ok(!('defaultTimeoutMs' in policy), `${tier} tier must not carry a defaultTimeoutMs key`);
+  }
 });
 
 test('shutdown stops queue dispatch and workflow timers before owned children', () => {
@@ -205,8 +213,11 @@ test('provider config uses the installed subscription CLIs and safe headless mod
   assert.ok(config.grok.oneshot_safe.includes('{prompt_file}'));
   assert.equal(config.grok.oneshot_safe[config.grok.oneshot_safe.indexOf('--permission-mode') + 1], 'dontAsk');
   assert.equal(config.grok.oneshot_safe[config.grok.oneshot_safe.indexOf('--sandbox') + 1], 'read-only');
-  assert.equal(config.grok.oneshot_safe[config.grok.oneshot_safe.indexOf('--max-turns') + 1], '32');
-  assert.equal(config.grok.oneshot_dangerous[config.grok.oneshot_dangerous.indexOf('--max-turns') + 1], '32');
+  // A run is never stopped or refused for hitting a fixed turn count any
+  // more than for elapsed time: grok's --max-turns cap was removed from both
+  // arg slots.
+  assert.ok(!config.grok.oneshot_safe.includes('--max-turns'));
+  assert.ok(!config.grok.oneshot_dangerous.includes('--max-turns'));
   assert.ok(config.grok.oneshot_safe.includes('--no-leader'));
   assert.ok(config.grok.oneshot_dangerous.includes('--no-leader'));
   assert.ok(config.grok.oneshot_safe.includes('--no-plan'));
@@ -834,7 +845,15 @@ test('prompt-file transport preserves long special-character prompts and cleans 
       oneshot_safe: [...baseSlot, '--claude-json-retry-hang'],
       oneshot_dangerous: [...baseSlot, '--claude-json-retry-hang'],
       oneshot_output_parser: 'claude_json',
-      supervisor: { idleMs: 1000, hardCapMs: 1000, graceExtensions: 0 },
+      // No wall-clock cap: a silent, CPU-idle helper is killed as wedged at
+      // the second check-in (the first sees its startup output).
+      // S4 (Refs #133): unsampled CPU silence alone can no longer kill via
+      // 'wedged' -- only a CPU-confirmed-idle streak can. If this sandbox
+      // cannot sample the helper's CPU (cpuUnavailable), noNewContentMs is
+      // kept just as small so loop_confirmed fires instead as the remaining
+      // signal, so this fixture never hangs waiting on a kill that will not
+      // come through the wedged path alone.
+      supervisor: { checkInIntervalMs: 500, wedgedCheckins: 1, unsampledWedgedCheckins: 1, noNewContentMs: 500 },
     },
     fail: {
       label: 'Fail',
@@ -967,7 +986,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.match(dashboard.headers.get('content-security-policy') || '', /script-src-attr 'none'/);
   const dashboardHtml = await dashboard.text();
   assert.match(dashboardHtml, /<script nonce="[A-Za-z0-9+/=]+">\s*const API/);
-  assert.match(dashboardHtml, /const ONE_SHOT_DEFAULT_TIMEOUT_MS = 1200000;/);
+  assert.match(dashboardHtml, /const ONE_SHOT_DEFAULT_TIMEOUT_MS = null;/);
   assert.doesNotMatch(dashboardHtml, /__ONE_SHOT_DEFAULT_TIMEOUT_MS__/);
   assert.match(dashboardHtml, /provider budgets are unenforceable and character estimates are disabled/);
   const runningHealth = await (await fetch(baseUrl + '/api/health')).json();
@@ -981,7 +1000,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(typeof runningHealth.runtime.platform, 'string');
   assert.equal(runningHealth.runtime.wslNative.ok, true);
   assert.equal(runningHealth.runtime.nativeProviderBinariesOnly, true);
-  assert.deepEqual(runningHealth.oneShotTimeoutPolicy, { minimumMs: 1000, defaultMs: 1200000, maxMs: 2700000 });
+  assert.deepEqual(runningHealth.oneShotTimeoutPolicy, { minimumMs: 1000, defaultMs: null, maxMs: null });
   assert.ok(Object.prototype.hasOwnProperty.call(runningHealth, 'tokenAcl'));
   if (process.platform === 'win32') {
     assert.equal(runningHealth.tokenAcl.applicable, true);
@@ -1212,10 +1231,15 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(fs.existsSync(path.join(realProviderHome, 'provider-artifact.txt')), false);
   assert.deepEqual(fs.readdirSync(promptTemp), []);
 
-  const abortController = new AbortController();
+  // Under detach semantics (F2/F5), a plain client disconnect no longer kills
+  // the process; only an explicit cancel does. Drive this race with the
+  // explicit cancel route (POST /api/runs/:runId/cancel -> cancelActiveRun)
+  // instead of an HTTP abort, so the physical-exit-before-cleanup property is
+  // still exercised without waiting out the fixture's 10s delayed child.
+  const raceRequestId = 'race:isolated-disconnect-cleanup';
   const racedRequest = fetch(baseUrl + '/api/oneshot', {
-    method: 'POST', headers: jsonAuth, signal: abortController.signal,
-    body: JSON.stringify({ kind: 'isolated_race', prompt: 'disconnect cleanup race', dangerous: false }),
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ kind: 'isolated_race', prompt: 'disconnect cleanup race', dangerous: false, requestId: raceRequestId }),
   }).catch(() => null);
   const raceStartDeadline = Date.now() + 5000;
   while (Date.now() < raceStartDeadline
@@ -1223,7 +1247,14 @@ test('prompt-file transport preserves long special-character prompts and cleans 
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   assert.ok(fs.readdirSync(promptTemp).some((name) => name.startsWith('RelayBridge-provider-home-')));
-  abortController.abort();
+  const raceActive = await (await fetch(baseUrl + '/api/runs/active', { headers: jsonAuth })).json();
+  const raceRun = raceActive.runs.find((run) => run.route?.request_id === raceRequestId);
+  assert.ok(raceRun, 'active run for the disconnect-cleanup race not found');
+  const raceCancelResponse = await fetch(`${baseUrl}/api/runs/${raceRun.runId}/cancel`, {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ requestId: raceRequestId, invocationId: raceRequestId, attemptId: `${raceRequestId}:attempt:1` }),
+  });
+  assert.equal(raceCancelResponse.status, 202);
   await racedRequest;
   const raceCleanupDeadline = Date.now() + 5000;
   while (Date.now() < raceCleanupDeadline && fs.readdirSync(promptTemp).length) {
@@ -1630,6 +1661,9 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(longRunResult.provider_num_turns, 36);
   assert.equal(longRunResult.usage.total_tokens, 39960);
 
+  // Issue #133: providerBudget (including an explicit maxTurns ceiling) is
+  // recorded for callers but never enforced as a kill — only corroborated
+  // stall/loop/burn evidence at check-in boundaries may stop a run.
   const longRunCappedResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST',
     headers: jsonAuth,
@@ -1640,12 +1674,13 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   });
   assert.equal(longRunCappedResponse.status, 200);
   const longRunCappedResult = await longRunCappedResponse.json();
-  assert.equal(longRunCappedResult.stop_reason, 'token_budget',
-    'an operator who asks for a turn ceiling still gets one');
-  assert.equal(longRunCappedResult.failureClass, 'token_budget');
-  assert.equal(longRunCappedResult.dropped_out, true);
-  assert.equal(longRunCappedResult.provider_budget_enforcement, 'incremental');
-  assert.notEqual(longRunCappedResult.stdout, 'LONGRUN_OK');
+  assert.equal(longRunCappedResult.stop_reason, null,
+    'an explicit provider budget is informational only and never kills a run');
+  assert.equal(longRunCappedResult.failureClass, null);
+  assert.equal(longRunCappedResult.dropped_out, false);
+  assert.equal(longRunCappedResult.provider_budget.maxTurns, 24,
+    'the requested ceiling is still recorded even though it is not enforced');
+  assert.equal(longRunCappedResult.stdout, 'LONGRUN_OK');
 
   const multiTurnBudgetResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST',
@@ -1660,14 +1695,14 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   });
   assert.equal(multiTurnBudgetResponse.status, 200);
   const multiTurnBudgetResult = await multiTurnBudgetResponse.json();
-  assert.equal(multiTurnBudgetResult.stop_reason, 'token_budget');
-  assert.equal(multiTurnBudgetResult.failureClass, 'token_budget');
+  assert.equal(multiTurnBudgetResult.stop_reason, null,
+    'a maxTurns:2 request must not cut off a 3-turn run that finishes on its own');
+  assert.equal(multiTurnBudgetResult.failureClass, null);
   assert.equal(multiTurnBudgetResult.rate_limited, false,
-    'a late rate-limit phrase cannot override the sticky local budget verdict');
-  assert.equal(multiTurnBudgetResult.rate_limited, false, 'partial tool prose is not vendor quota evidence');
-  assert.ok(!multiTurnBudgetResult.cooldown, 'local budget stop must not cool the shared seat');
+    'a rate-limit phrase riding along in a successful final answer is not vendor quota evidence');
+  assert.ok(!multiTurnBudgetResult.cooldown, 'a completed run must not cool the shared seat');
   assert.equal(multiTurnBudgetResult.timed_out, false);
-  assert.equal(multiTurnBudgetResult.dropped_out, true);
+  assert.equal(multiTurnBudgetResult.dropped_out, false);
   assert.equal(multiTurnBudgetResult.provider_num_turns, 3);
   assert.equal(multiTurnBudgetResult.usage.total_tokens, 1995);
   assert.deepEqual({
@@ -1676,36 +1711,23 @@ test('prompt-file transport preserves long special-character prompts and cleans 
     cache_read_input_tokens: multiTurnBudgetResult.usage.cache_read_input_tokens,
     cache_creation_input_tokens: multiTurnBudgetResult.usage.cache_creation_input_tokens,
   }, {
-    input_tokens: 0,
+    input_tokens: 300,
     output_tokens: 120,
     cache_read_input_tokens: 1500,
     cache_creation_input_tokens: 75,
   });
-  assert.equal(multiTurnBudgetResult.provider_budget_enforcement, 'incremental');
-  assert.equal(multiTurnBudgetResult.stdout, '');
-  assert.equal(multiTurnBudgetResult.partial_result, true);
-  assert.equal(multiTurnBudgetResult.partial_diagnostic, 'turn 2\n\nturn 3');
-  assert.equal(multiTurnBudgetResult.partial_diagnostic_truncated, false);
-  assert.equal(multiTurnBudgetResult.partial_checkpoint, 'turn 3');
-  assert.equal(multiTurnBudgetResult.partial_checkpoint_bytes, Buffer.byteLength('turn 3'));
-  assert.equal(multiTurnBudgetResult.partial_checkpoint_original_bytes, Buffer.byteLength('turn 3'));
-  assert.equal(multiTurnBudgetResult.partial_checkpoint_truncated, false);
-  assert.equal(multiTurnBudgetResult.partial_checkpoint_event_type, 'assistant');
-  assert.match(multiTurnBudgetResult.partial_checkpoint_hash, /^[0-9a-f]{64}$/);
-  assert.match(multiTurnBudgetResult.partial_checkpoint_message_id_hash, /^[0-9a-f]{64}$/);
-  assert.equal(multiTurnBudgetResult.partial_checkpoint_unavailable_reason, null);
-  assert.equal(multiTurnBudgetResult.cleaned_output_unavailable, true);
-  assert.equal(multiTurnBudgetResult.cleaned_output_unavailable_reason, 'incomplete_or_malformed_terminal_result');
-  assert.doesNotMatch(multiTurnBudgetResult.partial_diagnostic,
+  assert.equal(multiTurnBudgetResult.stdout, 'LATE RATE LIMIT 429 MUST NOT CHANGE THE VERDICT');
+  assert.ok(!multiTurnBudgetResult.partial_result);
+  assert.doesNotMatch(multiTurnBudgetResult.stdout,
     /THINKING_MUST_NOT_ESCAPE|TOOL_INPUT_MUST_NOT_ESCAPE|DUPLICATE_ID_MUST_NOT_ESCAPE/);
   const lateFinalPid = Number(fs.readFileSync(lateFinalPidMarker, 'utf8').trim());
   assert.ok(Number.isSafeInteger(lateFinalPid) && lateFinalPid > 0);
   assert.equal(isLiveProcess(lateFinalPid), false,
-    'the late-final provider must be gone before its terminal response is returned');
+    'the provider process must be gone before its terminal response is returned');
   const postBudgetCooldowns = await (await fetch(baseUrl + '/api/cooldowns', { headers: auth })).json();
   assert.equal(postBudgetCooldowns.cooling.some((item) =>
     item.seat === 'subscription:anthropic:default'), false,
-  'a late success after a local budget stop must neither clear nor create account cooldown state');
+  'a completed run must neither clear nor create account cooldown state');
 
   // Issue #97: the budget overage is only discoverable from the terminal
   // `result` line itself, written last with no trailing newline, so the kill
@@ -1725,15 +1747,14 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   });
   assert.equal(terminalOnlyBudgetResponse.status, 200);
   const terminalOnlyBudgetResult = await terminalOnlyBudgetResponse.json();
-  assert.equal(terminalOnlyBudgetResult.stop_reason, 'token_budget');
-  assert.equal(terminalOnlyBudgetResult.failureClass, 'token_budget');
+  // Issue #133: an exceeded providerBudget observed only in the terminal
+  // document is informational only and never kills or recolors the run.
+  assert.equal(terminalOnlyBudgetResult.stdout, 'you are near your rate limit, but here is the answer');
+  assert.equal(terminalOnlyBudgetResult.failureClass, null);
+  assert.equal(terminalOnlyBudgetResult.stop_reason, null);
+  assert.equal(terminalOnlyBudgetResult.dropped_out, false);
   assert.equal(terminalOnlyBudgetResult.provider_budget_enforcement, 'terminal');
-  assert.equal(terminalOnlyBudgetResult.rate_limited, false,
-    'a rate-limit phrase inside the suppressed terminal result must not override the budget verdict');
-  assert.equal(terminalOnlyBudgetResult.dropped_out, true);
-  assert.equal(terminalOnlyBudgetResult.stdout, '');
-  assert.equal(terminalOnlyBudgetResult.usage.total_tokens, 10000,
-    'suppressing terminal answer content must retain authoritative provider usage');
+  assert.equal(terminalOnlyBudgetResult.usage.total_tokens, 10000);
   const postTerminalBudgetCooldowns = await (await fetch(baseUrl + '/api/cooldowns', { headers: auth })).json();
   assert.equal(postTerminalBudgetCooldowns.cooling.some((item) =>
     item.seat === 'subscription:anthropic:default'), false,
@@ -1747,28 +1768,18 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   });
   assert.equal(olderTerminalResponse.status, 200);
   const olderTerminal = await olderTerminalResponse.json();
-  assert.equal(olderTerminal.stop_reason, 'token_budget');
-  assert.equal(olderTerminal.failureClass, 'token_budget');
-  assert.equal(olderTerminal.budget_exceeded, true);
+  // Issue #133: this fixture's stall-recovery scenario is unrelated to budget
+  // enforcement; with the setInterval hang removed (nothing kills a run for
+  // budget any more), it surfaces a pre-existing, independent claude_json
+  // parser protocol violation (a terminal result arriving before a newer
+  // assistant event) rather than a recovered "newer accepted checkpoint".
+  assert.equal(olderTerminal.stdout, '');
+  assert.match(olderTerminal.stderr, /claude_json parse failed: result precedes newer assistant output/);
+  assert.equal(olderTerminal.failureClass, 'provider_error');
+  assert.equal(olderTerminal.stop_reason, null);
   assert.equal(olderTerminal.dropped_out, true);
   assert.equal(olderTerminal.provider_budget_enforcement, 'incremental');
-  assert.equal(olderTerminal.stdout, '');
-  assert.equal(olderTerminal.partial_result, true);
-  assert.equal(olderTerminal.partial_checkpoint, 'NEWER_ACCEPTED_CHECKPOINT');
-  assert.equal(olderTerminal.partial_checkpoint_event_type, 'assistant');
-  assert.equal(olderTerminal.partial_checkpoint_unavailable_reason, null);
-  assert.equal(olderTerminal.partial_checkpoint_hash,
-    crypto.createHash('sha256').update('NEWER_ACCEPTED_CHECKPOINT').digest('hex'));
-  assert.equal(olderTerminal.usage.total_tokens, 1202, 'an older terminal must not overwrite the budget-tripping cumulative');
-  assert.equal(olderTerminal.progress.providerUsage.total_tokens, 1202);
-  assert.equal(olderTerminal.progress.providerUsagePhase, 'incremental');
-  assert.equal(olderTerminal.provider_num_turns, 2);
-  assert.equal(olderTerminal.provider_terminal_reason, null);
-  assert.equal(olderTerminal.provider_stop_reason, null);
-  assert.equal(olderTerminal.provider_duration_ms, null);
-  assert.equal(olderTerminal.provider_api_duration_ms, null);
-  assert.equal(olderTerminal.provider_api_error_status, null);
-  assert.match(olderTerminal.stderr, /result precedes newer assistant output/);
+  assert.equal(olderTerminal.usage.total_tokens, 1202);
 
   const boundedBudgetResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST',
@@ -1783,20 +1794,16 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   });
   assert.equal(boundedBudgetResponse.status, 200);
   const boundedBudgetResult = await boundedBudgetResponse.json();
-  assert.equal(boundedBudgetResult.stop_reason, 'token_budget');
-  assert.equal(boundedBudgetResult.supervisor_stop_reason, 'token_budget');
-  assert.equal(boundedBudgetResult.failureClass, 'token_budget');
-  assert.equal(boundedBudgetResult.dropped_out, true);
-  assert.equal(boundedBudgetResult.stdout, '');
-  assert.equal(boundedBudgetResult.partial_result, true);
-  assert.equal(boundedBudgetResult.partial_diagnostic.length, 12000);
-  assert.equal(boundedBudgetResult.partial_diagnostic_truncated, true);
-  assert.match(boundedBudgetResult.partial_diagnostic, /TAIL_KEPT\n\nfinal bounded turn$/);
-  assert.doesNotMatch(boundedBudgetResult.partial_diagnostic,
-    /HEAD_SHOULD_TRUNCATE|BOUNDED_THINKING_MUST_NOT_ESCAPE|BOUNDED_TOOL_INPUT_MUST_NOT_ESCAPE/);
-  assert.equal(boundedBudgetResult.cleaned_output_unavailable, true);
-  assert.equal(boundedBudgetResult.partial_checkpoint, 'final bounded turn');
-  assert.equal(boundedBudgetResult.partial_checkpoint_truncated, false);
+  // Issue #133: a maxTurns budget exceeded mid-run (provider_num_turns 2 >
+  // maxTurns 1) is informational only ("MUST_BE_KILLED" must survive).
+  assert.equal(boundedBudgetResult.stdout, 'MUST_BE_KILLED');
+  assert.equal(boundedBudgetResult.failureClass, null);
+  assert.equal(boundedBudgetResult.stop_reason, null);
+  assert.equal(boundedBudgetResult.dropped_out, false);
+  assert.equal(boundedBudgetResult.budget_exceeded, false);
+  assert.equal(boundedBudgetResult.provider_budget_enforcement, 'terminal');
+  assert.equal(boundedBudgetResult.provider_budget.maxTurns, 1);
+  assert.equal(boundedBudgetResult.provider_num_turns, 2);
 
   const healthyStreamPrompt = 'finish one healthy stream turn\n' + 'unicode 😀 quotes " and backslash \\ newline\n'.repeat(1000);
   const healthyStreamResponse = await fetch(baseUrl + '/api/oneshot', {
@@ -1830,19 +1837,17 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   });
   assert.equal(gracefulFinalizeResponse.status, 200);
   const gracefulFinalize = await gracefulFinalizeResponse.json();
+  // Issue #133: graceful finalization is no longer auto-requested on budget
+  // proximity (only quota_reserve still triggers it directly, elsewhere in
+  // server.js), so the fixture completes its single turn normally and no
+  // finalization is requested or sent.
   assert.equal(gracefulFinalize.stdout, 'FINALIZED_OK');
   assert.equal(gracefulFinalize.dropped_out, false);
   assert.equal(gracefulFinalize.stop_reason, null);
   assert.equal(gracefulFinalize.route.prompt_transport, 'stdin_stream_json');
-  assert.equal(gracefulFinalize.graceful_finalization.supported, true);
-  assert.equal(gracefulFinalize.graceful_finalization.requested, true);
-  assert.equal(gracefulFinalize.graceful_finalization.sent, true);
-  assert.equal(gracefulFinalize.graceful_finalization.method, 'claude_stream_json_user_message');
-  assert.equal(gracefulFinalize.graceful_finalization.reserve.budgetField, 'maxTotalTokens');
-  assert.equal(gracefulFinalize.graceful_finalization.reserve.usageField, 'total_tokens');
-  assert.equal(gracefulFinalize.graceful_finalization.reserve.threshold, 900);
-  assert.equal(gracefulFinalize.graceful_finalization.reserve.limit, 1000);
-  assert.equal(gracefulFinalize.usage.total_tokens, 910);
+  assert.equal(gracefulFinalize.graceful_finalization, null);
+  assert.equal(gracefulFinalize.provider_budget_enforcement, 'terminal');
+  assert.equal(gracefulFinalize.usage.total_tokens, 900);
 
   const epipeResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST',
@@ -1857,11 +1862,14 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   });
   assert.equal(epipeResponse.status, 200, 'an asynchronous stdin EPIPE must not crash the bridge');
   const epipe = await epipeResponse.json();
+  // Issue #133: this fixture closes its own stdin at startup, emits one
+  // assistant event, and exits without a terminal `result` line (no budget
+  // trigger drives a second turn any more); the bridge must still surface
+  // this as a clean provider_error rather than crashing.
   assert.equal(epipe.dropped_out, true);
-  assert.equal(epipe.graceful_finalization.requested, true);
-  assert.ok(epipe.graceful_finalization.sent === true
-    || epipe.graceful_finalization.reason === 'provider_input_write_failed',
-  'Windows may acknowledge a buffered pipe write before surfacing EPIPE; either state must remain nonfatal');
+  assert.equal(epipe.failureClass, 'provider_error');
+  assert.match(epipe.stderr, /claude_json parse failed: document type is not result/);
+  assert.equal(epipe.graceful_finalization, null);
 
   const writerRepo = path.join(tempRoot, 'writer-repo');
   fs.mkdirSync(writerRepo);
@@ -1887,46 +1895,27 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   });
   assert.equal(writerBudgetResponse.status, 200);
   const writerBudget = await writerBudgetResponse.json();
-  assert.equal(writerBudget.stop_reason, 'token_budget');
-  assert.equal(writerBudget.partial_result, true);
-  assert.equal(writerBudget.partial_checkpoint, 'writer checkpoint api_key=[REDACTED]');
-  assert.doesNotMatch(JSON.stringify(writerBudget), /must-not-leak|STREAM_TOOL_ARG_MUST_NOT_ESCAPE|STREAM_THINKING_MUST_NOT_ESCAPE/);
-  assert.equal(writerBudget.writer_diff_summary.available, true);
-  assert.equal(writerBudget.writer_diff_summary.changedFileCount, 1);
-  assert.equal(writerBudget.writer_diff_summary.files[0].path, 'writer-change.txt');
-  assert.equal(writerBudget.writer_diff_summary.files[0].afterStatus, '??');
-  assert.match(writerBudget.writer_diff_summary.statusHash, /^[0-9a-f]{64}$/);
+  // Issue #133: an exceeded providerBudget during a dangerous writer run is
+  // informational only; the run completes normally with its writer output.
+  assert.equal(writerBudget.stdout, 'WRITER_BUDGET_COMPLETE');
+  assert.equal(writerBudget.dropped_out, false);
+  assert.equal(writerBudget.stop_reason, null);
+  assert.equal(writerBudget.failureClass, null);
+  assert.equal(writerBudget.provider_budget_enforcement, 'terminal');
+  assert.equal(writerBudget.usage.total_tokens, 1100);
+  assert.equal(fs.readFileSync(path.join(writerRepo, 'writer-change.txt'), 'utf8'), 'partial writer output\n');
 
   const budgetReceipts = fs.readFileSync(
     path.join(tempRoot, 'data', 'receipts', new Date().toISOString().slice(0, 10) + '.jsonl'), 'utf8',
   ).trim().split(/\r?\n/).map(JSON.parse);
   const multiTurnReceipt = budgetReceipts.find((row) => row.receiptId === multiTurnBudgetResult.receiptId);
   const boundedReceipt = budgetReceipts.find((row) => row.receiptId === boundedBudgetResult.receiptId);
-  assert.equal(multiTurnReceipt.partialResult, true);
-  assert.equal(multiTurnReceipt.partialDiagnosticChars, multiTurnBudgetResult.partial_diagnostic.length);
-  assert.equal(multiTurnReceipt.partialDiagnosticTruncated, false);
-  assert.equal(multiTurnReceipt.cleanedOutputUnavailable, true);
-  assert.equal(multiTurnReceipt.status, 'dropped');
-  assert.equal(multiTurnReceipt.failureClass, 'token_budget');
-  assert.equal(multiTurnReceipt.stopReason, 'token_budget');
-  assert.equal(multiTurnReceipt.supervisorStopReason, 'token_budget');
-  assert.equal(multiTurnReceipt.resultSubtype, null);
-  assert.equal(multiTurnReceipt.outputChars, 0);
-  assert.equal(multiTurnReceipt.actualTotalTokens, 1695);
-  assert.equal(multiTurnReceipt.providerNumTurns, 3);
-  assert.equal(multiTurnReceipt.providerBudgetEnforcement, 'incremental');
-  assert.ok(multiTurnReceipt.transportOutputChars > 0,
-    'late terminal bytes remain represented only by transport diagnostic evidence');
-  assert.equal(multiTurnReceipt.partialCheckpointBytes, Buffer.byteLength('turn 3'));
-  assert.equal(multiTurnReceipt.partialCheckpointEventType, 'assistant');
-  assert.equal(multiTurnReceipt.partialCheckpointTruncated, false);
-  assert.equal(multiTurnReceipt.cleanedOutputUnavailableReason, 'incomplete_or_malformed_terminal_result');
-  assert.equal(boundedReceipt.partialResult, true);
-  assert.equal(boundedReceipt.partialDiagnosticChars, 12000);
-  assert.equal(boundedReceipt.partialDiagnosticTruncated, true);
-  assert.equal(boundedReceipt.partialDiagnosticHash,
-    crypto.createHash('sha256').update(boundedBudgetResult.partial_diagnostic).digest('hex'));
-  assert.equal(boundedReceipt.stopReason, 'token_budget');
+  // Issue #133: an exceeded providerBudget must still be persisted to the
+  // receipt for observability, without ever recording a kill/failure.
+  assert.ok(multiTurnReceipt);
+  assert.equal(multiTurnReceipt.failureClass, null);
+  assert.ok(boundedReceipt);
+  assert.equal(boundedReceipt.failureClass, null);
 
   const groupedUsage = await (await fetch(baseUrl + '/api/usage/gauges', { headers: auth })).json();
   const usageGauge = groupedUsage.gauges.usage_json;
@@ -2432,12 +2421,12 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(cappedTimeoutResponse.status, 200);
   const cappedTimeoutResult = await cappedTimeoutResponse.json();
   assert.equal(cappedTimeoutResult.route.requested_timeout_ms, 1500000);
-  // 1.5M ms sits under the raised ceiling (2.7M), so it passes through unclamped.
+  // 1.5M ms passes through unclamped.
   assert.equal(cappedTimeoutResult.route.effective_timeout_ms, 1500000);
   assert.equal(cappedTimeoutResult.route.timeout_clamped, false);
 
-  // Above the ceiling the policy clamps; an OMITTED timeout arms no clock at
-  // all (effective is null) — supervision governs instead.
+  // There is no ceiling any more: a large timeoutMs passes through unclamped
+  // as a hint, and an OMITTED timeout arms no clock (effective is null).
   const overCapResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST',
     headers: jsonAuth,
@@ -2445,8 +2434,8 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   });
   assert.equal(overCapResponse.status, 200);
   const overCapResult = await overCapResponse.json();
-  assert.equal(overCapResult.route.effective_timeout_ms, 2700000);
-  assert.equal(overCapResult.route.timeout_clamped, true);
+  assert.equal(overCapResult.route.effective_timeout_ms, 9000000);
+  assert.equal(overCapResult.route.timeout_clamped, false);
 
   const noTimeoutResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST',
@@ -2550,8 +2539,10 @@ test('prompt-file transport preserves long special-character prompts and cleans 
     if (['done', 'failed', 'cancelled', 'interrupted'].includes(completedControlledTask.status)) break;
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
-  assert.equal(completedControlledTask.status, 'failed');
-  assert.match(completedControlledTask.error, /total_tokens/);
+  // Issue #133: an exceeded providerBudget on a queued/background task is
+  // informational only and must never fail the task.
+  assert.equal(completedControlledTask.status, 'done');
+  assert.equal(completedControlledTask.result, 'STRUCTURED_OK');
   assert.equal(completedControlledTask.route.requested_model, 'heavy-fixture');
   assert.equal(completedControlledTask.route.requested_effort, 'max');
   assert.equal(completedControlledTask.route.max_effort_override, true);
@@ -2659,8 +2650,23 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(busyShutdownResult.code, 'BRIDGE_BUSY');
   assert.ok(busyShutdownResult.busy.oneShots > 0);
   assert.equal((await fetch(baseUrl + '/api/health')).status, 200, 'busy shutdown refusal must leave the bridge running');
+  // Under detach semantics (F2/F5), a plain HTTP abort no longer kills the
+  // run: it just drops the client. The slot stays held until an explicit
+  // cancel (POST /api/runs/:runId/cancel -> cancelActiveRun).
   firstController.abort();
   await firstSlow.catch(() => {});
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  assert.equal((await (await fetch(baseUrl + '/api/health')).json()).activeOneShotCount, 1,
+    'a plain client disconnect detaches; it must not free the slot');
+  const firstActive = await (await fetch(baseUrl + '/api/runs/active', { headers: jsonAuth })).json();
+  const firstRun = firstActive.runs.find((run) => run.route?.request_id === 'test:client-cancel:one');
+  assert.ok(firstRun, 'detached run for test:client-cancel:one must still be tracked active');
+  const firstCancelResponse = await fetch(`${baseUrl}/api/runs/${firstRun.runId}/cancel`, {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ requestId: 'test:client-cancel:one', invocationId: 'test:client-cancel:one',
+      attemptId: 'test:client-cancel:one:attempt:1' }),
+  });
+  assert.equal(firstCancelResponse.status, 202);
   const admissionDeadline = Date.now() + 5000;
   let activeOneShotCount = -1;
   while (Date.now() < admissionDeadline) {
@@ -2677,11 +2683,11 @@ test('prompt-file transport preserves long special-character prompts and cleans 
     if (cancelledReceipts.length) break;
     await new Promise((resolve) => setTimeout(resolve, 50));
   } while (Date.now() < cancellationReceiptDeadline);
-  assert.equal(cancelledReceipts.length, 1, 'client disconnect writes exactly one terminal receipt');
+  assert.equal(cancelledReceipts.length, 1, 'explicit cancel writes exactly one terminal receipt');
   const cancelledReceipt = cancelledReceipts[0];
-  assert.ok(cancelledReceipt, 'client disconnect must persist a terminal provider receipt');
-  assert.equal(cancelledReceipt.failureClass, 'client_cancelled');
-  assert.equal(cancelledReceipt.stopReason, 'client_cancelled');
+  assert.ok(cancelledReceipt, 'explicit cancel must persist a terminal provider receipt');
+  assert.equal(cancelledReceipt.failureClass, 'operator_cancelled');
+  assert.equal(cancelledReceipt.stopReason, 'operator_cancelled');
   assert.equal(cancelledReceipt.modelInvocation, true);
   assert.equal(cancelledReceipt.tokenUsageSource, 'unknown');
   assert.equal(cancelledReceipt.invocationId, 'test:client-cancel:one');
@@ -2691,6 +2697,14 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(cancelledReceipt.cleanedOutputUnavailable, true);
   assert.ok(cancelledReceipt.progressAtCancellation);
 
+  // Under detach semantics (F2/F5, Refs #133) an MCP client's past-due
+  // deadline header no longer kills the run on disconnect -- finalFailureClass
+  // (server.js) has no 'mcp_deadline_cancelled'/'client_cancelled' branch any
+  // more, and disconnectFailureClass/resolveCancellationTerminalState in
+  // lib/cancellation-state.js are now unreachable from an ordinary admitted
+  // disconnect (they only cover the pre-spawn isolation-cleanup-deferred
+  // fallback). Only an explicit cancel (POST /api/runs/:runId/cancel) stops
+  // the run, and it always reports failureClass/stopReason 'operator_cancelled'.
   const deadlineController = new AbortController();
   const deadlineRequest = fetch(baseUrl + '/api/oneshot', {
     method: 'POST',
@@ -2717,16 +2731,28 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(deadlineAdmitted, true, 'deadline fixture must reach provider admission before disconnect');
   deadlineController.abort();
   await deadlineRequest.catch(() => {});
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  assert.equal((await (await fetch(baseUrl + '/api/health')).json()).activeOneShotCount, 1,
+    'a past-due MCP deadline header on a plain disconnect must not free the slot; only explicit cancel does');
+  const deadlineActive = await (await fetch(baseUrl + '/api/runs/active', { headers: jsonAuth })).json();
+  const deadlineRun = deadlineActive.runs.find((run) => run.route?.request_id === 'test:mcp-deadline:one');
+  assert.ok(deadlineRun, 'detached run for test:mcp-deadline:one must still be tracked active');
+  const deadlineCancelResponse = await fetch(`${baseUrl}/api/runs/${deadlineRun.runId}/cancel`, {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ requestId: 'test:mcp-deadline:one', invocationId: 'test:mcp-deadline:one',
+      attemptId: 'test:mcp-deadline:one:attempt:1' }),
+  });
+  assert.equal(deadlineCancelResponse.status, 202);
   let deadlineReceipt = null;
   const deadlineReceiptWait = Date.now() + 5000;
   while (Date.now() < deadlineReceiptWait && !deadlineReceipt) {
     const rows = readCompleteReceiptRows(tempRoot);
-    deadlineReceipt = rows.find((row) => row.requestId === 'test:mcp-deadline:one') || null;
+    deadlineReceipt = rows.find((row) => row.requestId === 'test:mcp-deadline:one' && row.status === 'cancelled') || null;
     if (!deadlineReceipt) await new Promise((resolve) => setTimeout(resolve, 50));
   }
   assert.ok(deadlineReceipt);
-  assert.equal(deadlineReceipt.failureClass, 'mcp_deadline_cancelled');
-  assert.equal(deadlineReceipt.stopReason, 'mcp_deadline_cancelled');
+  assert.equal(deadlineReceipt.failureClass, 'operator_cancelled');
+  assert.equal(deadlineReceipt.stopReason, 'operator_cancelled');
   assert.equal(deadlineReceipt.modelInvocation, true);
   assert.equal(deadlineReceipt.tokenUsageSource, 'unknown');
   assert.equal(deadlineReceipt.physicalAttemptCount, 1);
@@ -2769,10 +2795,15 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   }
   assert.equal(raceActiveCount, 0, 'completion/cancellation race leaves no provider survivor');
 
+  // retry_hang never exits on its own (setInterval after the retry event), so
+  // under detach semantics a plain disconnect leaves it running forever; only
+  // an explicit cancel (POST /api/runs/:runId/cancel) terminates it.
   const retryHangController = new AbortController();
+  const retryHangRequestId = 'test:retry-hang:one';
   const retryHang = fetch(baseUrl + '/api/oneshot', {
     method: 'POST', headers: jsonAuth,
-    body: JSON.stringify({ kind: 'retry_hang', prompt: 'preserve retry metrics on cancellation', dangerous: false }),
+    body: JSON.stringify({ kind: 'retry_hang', prompt: 'preserve retry metrics on cancellation', dangerous: false,
+      requestId: retryHangRequestId }),
     signal: retryHangController.signal,
   });
   // Windows process startup can exceed 250 ms after the expanded structured
@@ -2782,6 +2813,15 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   await new Promise((resolve) => setTimeout(resolve, 1000));
   retryHangController.abort();
   await retryHang.catch(() => {});
+  const retryHangActive = await (await fetch(baseUrl + '/api/runs/active', { headers: jsonAuth })).json();
+  const retryHangRun = retryHangActive.runs.find((run) => run.route?.request_id === retryHangRequestId);
+  assert.ok(retryHangRun, 'detached retry_hang run must still be tracked active after a plain disconnect');
+  const retryHangCancelResponse = await fetch(`${baseUrl}/api/runs/${retryHangRun.runId}/cancel`, {
+    method: 'POST', headers: jsonAuth,
+    body: JSON.stringify({ requestId: retryHangRequestId, invocationId: retryHangRequestId,
+      attemptId: `${retryHangRequestId}:attempt:1` }),
+  });
+  assert.equal(retryHangCancelResponse.status, 202);
   const retryHangDeadline = Date.now() + 5000;
   let retryHangReceipt = null;
   while (Date.now() < retryHangDeadline) {
@@ -2813,6 +2853,11 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(retryTimeout.provider_retries.count, 1);
   assert.equal(retryTimeout.provider_retries.total_delay_ms, 250);
   assert.equal(retryTimeout.stdout, '');
+  // S3 (Refs #133): a supervisor kill must carry the checkpoint saved just
+  // before the process died, sourced from continuity.saveRun.
+  assert.ok(retryTimeout.stop_checkpoint_id, 'kill receipt carries stop_checkpoint_id');
+  assert.ok(retryTimeout.stop_checkpoint_path, 'kill receipt carries stop_checkpoint_path');
+  assert.ok(fs.existsSync(retryTimeout.stop_checkpoint_path), 'stop_checkpoint_path points at a real checkpoint file');
   const retryTimeoutReceipt = fs.readFileSync(path.join(tempRoot, 'data', 'receipts', new Date().toISOString().slice(0, 10) + '.jsonl'), 'utf8')
     .trim().split(/\r?\n/).map((line) => JSON.parse(line))
     .find((row) => row.receiptId === retryTimeout.receiptId);
@@ -2821,6 +2866,8 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   assert.equal(retryTimeoutReceipt.providerTimeoutSource, 'relay_supervisor');
   assert.equal(retryTimeoutReceipt.providerRetryCount, 1);
   assert.equal(retryTimeoutReceipt.estimatedOutputTokens, 0);
+  assert.equal(retryTimeoutReceipt.stopCheckpointId, retryTimeout.stop_checkpoint_id);
+  assert.equal(retryTimeoutReceipt.stopCheckpointPath, retryTimeout.stop_checkpoint_path);
 
   const diag = await (await fetch(baseUrl + '/api/diag', { headers: auth })).json();
   assert.equal(diag.results.echo.found, true);
@@ -4039,11 +4086,15 @@ test('local Ollama adapter uses loopback HTTP, returns final-only text, and reco
     }),
   });
   const terminalBudget = await terminalBudgetResponse.json();
-  assert.equal(terminalBudget.failureClass, 'token_budget');
-  assert.equal(terminalBudget.stop_reason, 'token_budget');
+  // Issue #133: an exceeded providerBudget is informational only and never
+  // kills a run; the HTTP one-shot still completes normally.
+  assert.equal(terminalBudget.stdout, 'FINAL_ONLY');
+  assert.equal(terminalBudget.failureClass, null);
+  assert.equal(terminalBudget.stop_reason, null);
   assert.equal(terminalBudget.provider_budget_enforcement, 'terminal');
-  assert.equal(terminalBudget.timed_out, false);
-  assert.equal(terminalBudget.dropped_out, true);
+  assert.equal(terminalBudget.timed_out, undefined);
+  assert.equal(terminalBudget.dropped_out, false);
+  assert.equal(terminalBudget.usage.total_tokens, 15);
 
   const ambiguousFailureResponse = await fetch(`${baseUrl}/api/oneshot`, {
     method: 'POST',
@@ -4274,14 +4325,26 @@ test('agents listing, tag updates, and broadcast fan-out respect auth, autoRoute
   assert.deepEqual(explicit.targets, ['optin', 'beta_only']);
   assert.ok(explicit.results.find((member) => member.provider === 'optin').ok);
 
+  // A caller disconnect detaches rather than cancels (Refs #133): the
+  // member run stays active after the caller goes away, and only an
+  // explicit cancel through the real cancel route stops it.
   const broadcastController = new AbortController();
-  const cancelledBroadcast = broadcast({
-    prompt: 'cancel this broadcast',
+  const detachedBroadcast = broadcast({
+    prompt: 'detach this broadcast',
     providers: ['slow_cancel'],
     timeoutMs: 600001,
   }, { signal: broadcastController.signal });
-  setTimeout(() => broadcastController.abort(new Error('broadcast cancellation test')), 150);
-  await assert.rejects(cancelledBroadcast);
+  setTimeout(() => broadcastController.abort(new Error('broadcast disconnect test')), 150);
+  await assert.rejects(detachedBroadcast);
+  const activeAfterDisconnect = await (await fetch(baseUrl + '/api/runs/active', { headers: jsonAuth })).json();
+  const detachedRun = activeAfterDisconnect.runs.find((run) => run.kind === 'slow_cancel');
+  assert.ok(detachedRun, 'detached broadcast member run must still be active after its caller disconnected');
+  const cancelRes = await fetch(baseUrl + `/api/runs/${detachedRun.runId}/cancel`, {
+    method: 'POST', headers: jsonAuth, body: JSON.stringify({
+      requestId: detachedRun.route.request_id, invocationId: detachedRun.route.invocation_id, attemptId: detachedRun.route.attempt_id,
+    }),
+  });
+  assert.equal(cancelRes.status, 202, 'explicit cancel of the detached broadcast member run must be accepted');
   const cancellationDeadline = Date.now() + 5000;
   let cancellationHealth;
   while (Date.now() < cancellationDeadline) {
@@ -4289,8 +4352,8 @@ test('agents listing, tag updates, and broadcast fan-out respect auth, autoRoute
     if (cancellationHealth.activeTaskCount === 0 && cancellationHealth.activeOneShotCount === 0) break;
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  assert.equal(cancellationHealth.activeTaskCount, 0, 'cancelled broadcast provider must not outlive its caller');
-  assert.equal(cancellationHealth.activeOneShotCount, 0, 'cancelled broadcast must release its admission slot');
+  assert.equal(cancellationHealth.activeTaskCount, 0, 'explicitly cancelled broadcast member run must not outlive the cancel');
+  assert.equal(cancellationHealth.activeOneShotCount, 0, 'explicitly cancelled broadcast member run must release its admission slot');
 
   // all:true fans out to every AI provider except opt-in seats, queues past the
   // global cap of 2, and reports per-member failures without failing the run.

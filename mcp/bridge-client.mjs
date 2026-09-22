@@ -36,7 +36,6 @@ export const localAdapterIdentity = Object.freeze({
 const START_LOCK = path.join(BRIDGE_ROOT, '.mcp-start.lock');
 const OUT_LOG = path.join(BRIDGE_ROOT, 'bridge.mcp.out.log');
 const ERR_LOG = path.join(BRIDGE_ROOT, 'bridge.mcp.err.log');
-const MAX_BRIDGE_REQUEST_TIMEOUT_MS = TIMEOUT_POLICY.oneShotMaxMs + TIMEOUT_POLICY.transportGraceMs;
 // Accommodates the provider output ceiling even after JSON escaping, while
 // refusing an unbounded response from a broken local server.
 const MAX_BRIDGE_RESPONSE_BYTES = 128 * 1024 * 1024;
@@ -44,7 +43,7 @@ const MAX_BRIDGE_RESPONSE_CHUNKS = 65536;
 
 function requestBridgeText(url, { method, headers, body, signal }) {
   return new Promise((resolve, reject) => {
-    const fail = (error) => reject(signal.aborted && signal.reason instanceof Error ? signal.reason : error);
+    const fail = (error) => reject(signal?.aborted && signal.reason instanceof Error ? signal.reason : error);
     let responseReceived = false;
     // fetch has an independent 300s header timeout in supported Node releases.
     // A buffered provider may legitimately need longer. This dedicated socket
@@ -105,10 +104,12 @@ function requestBridgeText(url, { method, headers, body, signal }) {
   });
 }
 
+// No enforced ceiling: a caller's timeoutMs (or the 30s default for routine
+// bridge calls) is only ever floored, never clamped down to a policy max.
 function boundedBridgeRequestTimeoutMs(value) {
   const parsed = Number(value);
   const selected = Number.isFinite(parsed) && parsed > 0 ? Math.trunc(parsed) : 30000;
-  return Math.max(TIMEOUT_POLICY.minimumMs, Math.min(selected, MAX_BRIDGE_REQUEST_TIMEOUT_MS));
+  return Math.max(TIMEOUT_POLICY.minimumMs, selected);
 }
 
 function validatedBaseUrl(value) {
@@ -216,15 +217,23 @@ export async function bridgeRequest(route, {
   if (route === '/api/oneshot') {
     headers['X-RelayBridge-Client-Deadline-At'] = String(Date.now() + requestTimeoutMs);
   }
+  // A caller's timeoutMs is a check-in hint recorded via the deadline header
+  // above, never an enforced ceiling on the transport (B2, Refs #133): the
+  // provider run detaches rather than getting killed on a timed-out HTTP
+  // socket. /api/oneshot's fetch is therefore bounded only by the caller's
+  // own signal (an explicit cancel or the MCP host's real disconnect), not
+  // by AbortSignal.timeout(requestTimeoutMs). Every other bridge route is a
+  // routine, short-lived call and keeps the timeout-bounded signal.
+  const transportSignal = route === '/api/oneshot'
+    ? signal
+    : (signal ? AbortSignal.any([signal, AbortSignal.timeout(requestTimeoutMs)]) : AbortSignal.timeout(requestTimeoutMs));
   let response;
   try {
     response = await requestBridgeText(new URL(route, BASE_URL), {
       method,
       headers,
       body: body === undefined ? undefined : JSON.stringify(body),
-      signal: signal
-        ? AbortSignal.any([signal, AbortSignal.timeout(requestTimeoutMs)])
-        : AbortSignal.timeout(requestTimeoutMs),
+      signal: transportSignal,
     });
   } catch (error) {
     throw new BridgeError(`RelayBridge request failed: ${error.message}`, { route, cause: error });

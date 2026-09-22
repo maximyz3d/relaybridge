@@ -840,6 +840,10 @@ function appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt, 
       ? payload.writer_diff_summary : null,
     stopReason: normalizeClaudeResultString(payload.stop_reason),
     supervisorStopReason: normalizeClaudeResultString(payload.supervisor_stop_reason),
+    // S3 (Refs #133): a supervisor kill must carry the checkpoint saved just
+    // before the process died, sourced from continuity.saveRun.
+    stopCheckpointId: payload.stop_checkpoint_id || null,
+    stopCheckpointPath: payload.stop_checkpoint_path || null,
     providerTimeoutSource: normalizeClaudeResultString(payload.provider_timeout_source),
     providerBudget: payload.provider_budget || null,
     providerBudgetEnforcement: normalizeClaudeResultString(payload.provider_budget_enforcement),
@@ -1645,6 +1649,15 @@ function createProviderUsageObserver(parserName, supervisor, { onTerminal = null
     input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0,
     cache_creation_input_tokens: 0, total_tokens: 0, turns: 0,
   };
+  // G5 follow-up (Refs #133): flush() is only ever called once, from
+  // settleFromClose, and both providerExited call sites now call
+  // supervisor.markExited() before consume()/flush() can run, which sets a
+  // sticky RunSupervisor#exited flag. evaluate() itself now defaults latch
+  // to false whenever that flag is set, so these calls no longer need to
+  // thread a latch option explicitly -- record() during mid-stream 'data'
+  // handling (process still alive, exited not yet set) keeps latching as
+  // before, and anything reached after markExited() (flush(), or a
+  // late-arriving 'data' event) never does.
   const consume = (line) => {
     if (supervisor.evaluate().action === 'kill') return false;
     let event;
@@ -1701,7 +1714,10 @@ function createProviderUsageObserver(parserName, supervisor, { onTerminal = null
       partial = combined.slice(lineStart);
       return text.length;
     },
-    flush() { if (partial.trim() && supervisor.evaluate().action !== 'kill') consume(partial); partial = ''; },
+    flush() {
+      if (partial.trim() && supervisor.evaluate().action !== 'kill') consume(partial);
+      partial = '';
+    },
   };
 }
 
@@ -2004,9 +2020,9 @@ function parseConfiguredOneShotOutput(entry, rawOutput, { ignoreTerminalResult =
     };
   }
   let events = [];
+  let document = null;
   try {
     const text = String(rawOutput || '').trim();
-    let document;
     try {
       document = JSON.parse(text);
       events = document && typeof document === 'object' && !Array.isArray(document) ? [document] : [];
@@ -2083,6 +2099,12 @@ function parseConfiguredOneShotOutput(entry, rawOutput, { ignoreTerminalResult =
       partialDiagnostic: partial?.text || '', partialDiagnosticTruncated: partial?.truncated === true,
       partialCheckpoint: ignoreTerminalResult ? extractClaudeAssistantCheckpoint(events) : null,
       parseError: null,
+      // Only a clean success (no typed or subtype-signalled error) blocks the
+      // prose heuristic below. A valid document that is itself a real error
+      // (error_during_execution, etc.) with no numeric api_error_status still
+      // needs errors[]/diagnostic text as its only rate-limit evidence, same
+      // as before the check-in change.
+      terminalDocumentFound: !isError,
     };
   } catch (error) {
     const partial = extractClaudeAssistantDiagnostic(events);
@@ -2091,6 +2113,12 @@ function parseConfiguredOneShotOutput(entry, rawOutput, { ignoreTerminalResult =
       output: '', usage: null, isError: true,
       resultSubtype: null, failureClass: 'provider_error',
       diagnostic: '', errorCount: 0, providerStopReason: null,
+      // A result document was present but had a malformed/unsupported field
+      // (bad subtype, non-numeric api_error_status, etc). That still counts
+      // as a typed terminal artifact: stderr/text prose must not be used to
+      // recolor it as a rate limit. Only a genuine crash with no result
+      // document at all (document === null) falls back to prose evidence.
+      terminalDocumentFound: document !== null,
       errorObserved: 0, errorInvalid: 0, errorDiagnosticTruncated: false,
       terminalReason: null, apiErrorStatus: null,
       permissionDenials: normalizeClaudePermissionDenials([]),
@@ -2244,16 +2272,34 @@ async function runHttpProviderOneShot({ entry, prompt, effectivePrompt, res, rou
   lifecycle.physicalDone.then(() => { runControl.settled = true; continuity.saveRun(runControl); continuityControls.delete(runId); }).catch(() => {});
   res._relayLifecycle = lifecycle;
   lifecycle.bindTransport({ type: 'http', requestStop: () => controller.abort() });
-  const detach = () => {
-    if (!res.writableEnded) lifecycle.clientDetached({ reason: disconnectFailureClass({
-      client: route.client_surface, deadlineAt: route.client_deadline_at,
-    }) });
-  };
+  // A client disconnect detaches rather than cancels (Refs #133): the
+  // upstream fetch keeps running to natural completion and the real
+  // terminal receipt persists via meta.persistAfterDisconnect below. Only an
+  // explicit cancel (POST /api/runs/:runId/cancel -> cancelActiveRun ->
+  // runControl.stop -> lifecycle.requestStop) aborts the controller. This
+  // mirrors the CLI provider path (executeOneShot), which never calls
+  // lifecycle on res 'close' either.
+  const detach = () => {};
   res.once('close', detach);
-  if (res.destroyed) detach();
   let requestStarted = false, responseStatus = null, semanticOutput = '', terminal = null, payload;
   let acceptedUsage = null, sealedPayload = null, transportDiagnostic = null;
   const wireProgress = (bytes) => { route.transport_wire_bytes += bytes; };
+  // Ollama stream output past supervisor.opts.spillAfterBytes no longer
+  // throws output_cap (Refs #133): it spills to the same
+  // <runId>.output-spill.log convention as the CLI path, and only a bounded
+  // tail is kept in memory so semanticOutput cannot grow unbounded.
+  let outputSpillFd = null, outputSpillPath = null;
+  const OUTPUT_SPILL_TAIL_BYTES = 8 * 1024 * 1024;
+  const spillOverflow = (chunk) => {
+    if (!chunk) return;
+    if (!outputSpillPath) {
+      outputSpillPath = path.join(DATA_DIR, 'runs', `${runId}.output-spill.log`);
+      try { fs.mkdirSync(path.dirname(outputSpillPath), { recursive: true }); } catch {}
+      try { outputSpillFd = fs.openSync(outputSpillPath, 'a'); } catch { outputSpillFd = null; }
+      supervisor.recordOutputSpillPath(outputSpillPath);
+    }
+    if (outputSpillFd !== null) { try { fs.writeSync(outputSpillFd, chunk); } catch {} }
+  };
   const meta = { kind: route.provider, prompt, route, startedAt, accountId, cwd, persistAfterDisconnect: true };
   const usageFromTerminal = (value) => {
     const input = nonnegativeUsageNumber(value.prompt_eval_count);
@@ -2333,7 +2379,7 @@ async function runHttpProviderOneShot({ entry, prompt, effectivePrompt, res, rou
     } else {
       if (hosted) {
         const text = await readProviderBody(response, { signal: controller.signal,
-          maxBytes: Math.min(supervisor.opts.maxOutputBytes, HTTP_PROVIDER_LIMITS.maxWireBytes), onWireBytes: wireProgress });
+          maxBytes: Math.min(supervisor.opts.spillAfterBytes, HTTP_PROVIDER_LIMITS.maxWireBytes), onWireBytes: wireProgress });
         let document;
         try { document = JSON.parse(text); } catch { throw Object.assign(new Error('Provider body contains malformed JSON.'), { failureClass: 'provider_protocol_error' }); }
         const parsed = parseHostedTerminal(document);
@@ -2341,11 +2387,18 @@ async function runHttpProviderOneShot({ entry, prompt, effectivePrompt, res, rou
         sealTerminal();
       } else {
         await readOllamaStream(response, { signal: controller.signal,
-          maxOutputBytes: Math.min(supervisor.opts.maxOutputBytes, HTTP_PROVIDER_LIMITS.maxOutputBytes),
+          maxOutputBytes: Math.min(supervisor.opts.spillAfterBytes, HTTP_PROVIDER_LIMITS.maxOutputBytes),
+          outputTailBytes: OUTPUT_SPILL_TAIL_BYTES,
           onWireBytes: wireProgress,
+          onOutputSpill: spillOverflow,
           onTerminal: (value) => acceptTerminal(value, usageFromTerminal(value)),
           onDelta: (delta) => {
-            lifecycle.observeOutput(delta, (accepted) => { semanticOutput += accepted; });
+            lifecycle.observeOutput(delta, (accepted) => {
+              semanticOutput += accepted;
+              if (Buffer.byteLength(semanticOutput, 'utf8') > OUTPUT_SPILL_TAIL_BYTES) {
+                semanticOutput = semanticOutput.slice(-OUTPUT_SPILL_TAIL_BYTES);
+              }
+            });
             return !lifecycle.snapshot().stop;
           }, onTerminalAccepted: sealTerminal });
       }
@@ -2360,6 +2413,7 @@ async function runHttpProviderOneShot({ entry, prompt, effectivePrompt, res, rou
       errorCode: error.code || null, auth_failed: isHostedApiKeyMissingError(error),
       dropped_out: true, model_invocation: requestStarted ? (responseStatus && responseStatus >= 200 && responseStatus < 300 ? true : null) : false };
   } finally {
+    if (outputSpillFd !== null) { try { fs.closeSync(outputSpillFd); } catch {} outputSpillFd = null; }
     res.removeListener('close', detach);
     lifecycle.sealOutcome(payload);
     const state = lifecycle.snapshot();
@@ -4739,28 +4793,69 @@ async function executeOneShot(body, res, privateContext = null) {
   const nativeDispatchSnapshot = Object.freeze({ ...nativeDispatchConfig, quotaSeat: selectedQuotaSeat });
   let nativeLaunchIdentity = captureClaudeLaunchIdentity(kind, dispatchAccount.account?.id || 'default', null,
     nativeDispatchSnapshot);
+  // Set when admission falls back to a prior same-identity observation instead of a fresh
+  // probe result (see the quota_unknown gate below). Not yet threaded into the eventual
+  // success receipt/response: that assembly lives outside this lane's owned server.js regions.
+  let staleAdmittedNativeUsage = false;
+  // S5: which fallback condition justified the stale admit, threaded onto the receipt
+  // alongside native_usage_freshness so a window-reset admit is distinguishable from a
+  // headroom-above-reserve admit after the fact.
+  let staleAdmitReason = null;
   if (nativeLaunchIdentity.required) {
     if (!nativeLaunchIdentity.identity) return rejectBeforeAdmission(409, 'account_identity_unavailable', {
       error: 'The selected native Claude profile identity is unavailable.', model_invocation: false, physical_attempt_count: 0 });
     observeClaudeNativeSnapshot(nativeLaunchIdentity);
     const nativeUsage = subscriptionUsage.verdict(nativeLaunchIdentity.identity.quotaSeat,
       { accountFingerprint: nativeLaunchIdentity.identity.accountFingerprint });
+    let nativeProbeReason = null;
     if (nativeUsage.freshness !== 'fresh') {
-      const refreshed = await probeClaudeNativeAdmission(nativeLaunchIdentity, nativeDispatchSnapshot);
+      const probe = await probeClaudeNativeAdmission(nativeLaunchIdentity, nativeDispatchSnapshot);
       if (res.destroyed) return;
-      if (refreshed) {
-        nativeLaunchIdentity = refreshed;
+      nativeProbeReason = probe?.reason || null;
+      if (probe?.ok && probe.identity) {
+        nativeLaunchIdentity = probe.identity;
         observeClaudeNativeSnapshot(nativeLaunchIdentity);
       }
       try { progressAssessor.assertDispatch(body); }
       catch (error) { return rejectBeforeAdmission(409, 'assessment_revoked', { error: error.message }); }
     }
     if (!validateClaudeLaunchAdmission(nativeLaunchIdentity)) {
-      if (nativeUsage.freshness !== 'fresh') {
+      // The probe itself did not establish fresh admission (or was never attempted because
+      // nativeUsage was already fresh at capture but drifted stale between here and now).
+      // Fall back to the last same-identity observation rather than rejecting outright: admit
+      // as stale when its binding window has already reset, or its last known headroom is
+      // still above the protected-reserve trigger that validateClaudeLaunchAdmission enforces.
+      // B1: never stale-admit on an identity mismatch. A probe that itself detected a mismatch
+      // (identity_mismatch_pre/post) means the captured identity cannot be trusted for a
+      // fallback decision, even if a cheap re-capture still looks identical; and
+      // validateClaudeLaunchAdmission's own sameClaudeLaunchIdentity() check must independently
+      // hold, since a validation failure can also mean the identity itself drifted, not just
+      // freshness/headroom.
+      const probeIdentityMismatch = typeof nativeProbeReason === 'string' && nativeProbeReason.startsWith('identity_mismatch');
+      const identityStillMatches = !probeIdentityMismatch && sameClaudeLaunchIdentity(nativeLaunchIdentity);
+      const priorSeat = subscriptionUsage.verdict(nativeLaunchIdentity.identity.quotaSeat,
+        { accountFingerprint: nativeLaunchIdentity.identity.accountFingerprint });
+      const hasPriorObservation = Array.isArray(priorSeat.windows) && priorSeat.windows.length > 0
+        && priorSeat.reason !== 'no_native_observation' && priorSeat.reason !== 'native_account_capacity_unbound';
+      const bindingWindow = hasPriorObservation
+        ? priorSeat.windows.reduce((a, b) => (a.percentRemaining ?? 100) <= (b.percentRemaining ?? 100) ? a : b) : null;
+      // S5: trust the store's own anchored rollover boundary, not a raw resetsAt --
+      // a forged or moved resetsAt must not release protection early.
+      // B1: a stale window-reset admit is not enough when the prior seat is itself
+      // vendor-blocked (spend control / rate-limit / credits-depleted); the vendor
+      // block must independently clear before we trust a fallback admission.
+      const windowReset = !!bindingWindow && !priorSeat.vendorBlocked
+        && subscriptionUsage.anchoredRolloverOccurred(bindingWindow);
+      const headroomAboveReserve = hasPriorObservation && priorSeat.admit === true;
+      if (identityStillMatches && hasPriorObservation && (windowReset || headroomAboveReserve)) {
+        staleAdmittedNativeUsage = true;
+        staleAdmitReason = windowReset ? 'window_reset' : 'headroom_above_reserve';
+      } else {
         claudeUsageProbeFailures.set(claudeUsageProbeKey(nativeLaunchIdentity.identity), Date.now());
+        return rejectBeforeAdmission(409, 'quota_unknown', {
+          error: 'Native Claude requires fresh capacity bound to the selected profile and protected reserve.',
+          probe_reason: nativeProbeReason, model_invocation: false, physical_attempt_count: 0 });
       }
-      return rejectBeforeAdmission(409, 'quota_unknown', {
-        error: 'Native Claude requires fresh capacity bound to the selected profile and protected reserve.', model_invocation: false, physical_attempt_count: 0 });
     }
   }
   const providerCooldown = cooldowns.status(kind);
@@ -4889,6 +4984,14 @@ async function executeOneShot(body, res, privateContext = null) {
     account: dispatchAccount.account && !dispatchAccount.account.implicit
       ? dispatchAccount.account.id : null,
     quota_seat: dispatchAccount.quotaSeat || null,
+    // Threads the native-Claude admission freshness onto both the response
+    // (route is spread into oneshot payloads) and the persisted receipt
+    // (appendBridgeProviderReceipt embeds `route` wholesale). null for any
+    // non-native-identity dispatch, so existing receipts are unchanged.
+    native_usage_freshness: nativeLaunchIdentity?.required
+      ? (staleAdmittedNativeUsage ? 'stale_admitted' : 'fresh')
+      : null,
+    stale_reason: staleAdmittedNativeUsage ? staleAdmitReason : null,
     transport: entry.transport || 'cli',
     configured_binary: bin,
     resolved_binary: resolvedBin,
@@ -5037,12 +5140,13 @@ async function executeOneShot(body, res, privateContext = null) {
   res.once('close', () => {
     if (res._relayLifecycle) return;
     if (res.writableEnded || res._relayReceiptPersisted) return;
-    if (res._relayOwnedTransport) { res._relayIsolationReceiptDeferred = true; return; }
-    if (route.isolated_home_cleanup === 'pending') {
-      res._relayIsolationReceiptDeferred = true;
-      return;
-    }
-    persistCancellationReceipt();
+    // A client disconnect detaches rather than cancels (Refs #133): the
+    // provider keeps running to natural completion and the real terminal
+    // receipt is persisted from proc.on('error')/settleFromClose via
+    // sendOneShotResult's persistAfterDisconnect escape hatch, not here.
+    // Deferring uniformly (rather than eagerly stubbing a "cancelled"
+    // receipt) avoids a stale receipt pre-empting the real result.
+    res._relayIsolationReceiptDeferred = true;
   });
   if (['ollama_api', 'openai_chat_api'].includes(entry.oneshot_adapter)) {
     if (privateContext?.requiresOwner) return rejectBeforeAdmission(409, 'owned_transport_unsupported', {
@@ -5079,7 +5183,10 @@ async function executeOneShot(body, res, privateContext = null) {
     resolvedCwd = spawnCwdIdentity.resolved;
     ownedExecutionBackend?.assertWorkspaceLaunchAllowed({ cwd: resolvedCwd, privateContext, dangerous: useDanger });
     if (useDanger) writerWorkspaceBaseline = captureWriterWorkspaceSnapshot(resolvedCwd);
-    if (!validateClaudeLaunchAdmission(nativeLaunchIdentity, launch.env)) throw Object.assign(new Error('Native Claude launch identity or capacity changed.'), { code: 'NATIVE_LAUNCH_ADMISSION_CHANGED' });
+    // B1: a stale admit still must verify account/identity against the actual spawn env;
+    // only the freshness/headroom comparison is skipped for a stale admit.
+    if (staleAdmittedNativeUsage ? !sameClaudeLaunchIdentity(nativeLaunchIdentity, launch.env)
+      : !validateClaudeLaunchAdmission(nativeLaunchIdentity, launch.env)) throw Object.assign(new Error('Native Claude launch identity or capacity changed.'), { code: 'NATIVE_LAUNCH_ADMISSION_CHANGED' });
     const spawnOpts = {
       cwd: resolvedCwd,
       env: launch.env,
@@ -5121,7 +5228,8 @@ async function executeOneShot(body, res, privateContext = null) {
       ownedChildStops.set(proc, () => ownedHandle.stop());
       route.execution_owner = { ownerId: ownedHandle.ownerId, bindingHash: ownedHandle.bindingHash };
     } else {
-      if (!validateClaudeLaunchAdmission(nativeLaunchIdentity, launch.env)) throw Object.assign(new Error('Native Claude launch admission changed.'), { code: 'NATIVE_LAUNCH_ADMISSION_CHANGED' });
+      if (staleAdmittedNativeUsage ? !sameClaudeLaunchIdentity(nativeLaunchIdentity, launch.env)
+        : !validateClaudeLaunchAdmission(nativeLaunchIdentity, launch.env)) throw Object.assign(new Error('Native Claude launch admission changed.'), { code: 'NATIVE_LAUNCH_ADMISSION_CHANGED' });
       proc = trackChild(spawn(launch.file, launch.args, spawnOpts));
     }
     // ChildProcess stdin errors are emitted asynchronously and are not caught
@@ -5159,6 +5267,11 @@ async function executeOneShot(body, res, privateContext = null) {
     return sendOneShotResult(res, { kind, route, exitCode: -1, stdout: '', stderr: err.message, error: 'spawn failed', dropped_out: true, model_invocation: false }, {
       kind, prompt, route, startedAt, cwd: resolvedCwd,
       accountId: dispatchAccount.account?.id || null,
+      // Finding 2 (Refs #133): the non-owned launch-throw path must still
+      // persist exactly one terminal receipt even when the client already
+      // disconnected before spawn failed here -- sendOneShotResult otherwise
+      // silently no-ops on a dead socket (line ~1112), leaving zero receipts.
+      persistAfterDisconnect: true,
     });
   }
   let stdout = '';
@@ -5350,7 +5463,11 @@ async function executeOneShot(body, res, privateContext = null) {
   let stopReason = null;
   let stopDetail = '';
   let stopBudgetEnforcement = null;
+  let stopCheckpointPath = null;
   let sampling = false;
+  let outputSpillFd = null;
+  let outputSpillPath = null;
+  const OUTPUT_SPILL_TAIL_BYTES = 8 * 1024 * 1024;
   const censusCpu = createCensusCpuTracker();
   const copilotDenials = createCopilotDenialObserver(kind);
   const usageObserver = createProviderUsageObserver(entry.oneshot_output_parser, supervisor, {
@@ -5366,16 +5483,48 @@ async function executeOneShot(body, res, privateContext = null) {
       if (supportsClaudeStreamFinalization) closeProviderInput();
     },
   });
+  // Kills are the only supervisor-driven stops now (wedged, loop_confirmed,
+  // burn_without_progress, assessor_stuck; Refs #133). Every kill path must
+  // save a continuity checkpoint before the process actually dies, so a
+  // resumed run has the latest public state; the checkpoint path is attached
+  // to the stop detail as evidence.
   const latchSupervisorVerdict = (verdict) => {
     if (verdict.action !== 'kill' || stopReason) return false;
     stopReason = verdict.reason;
     stopDetail = verdict.detail;
     supervisorStdout = stdout;
-    if (verdict.reason === 'token_budget') {
-      stopBudgetEnforcement = supervisor.snapshot().providerUsagePhase;
-    }
-    timedOut = ['hard_cap', 'idle_stall', 'loop_detected'].includes(verdict.reason);
+    timedOut = ['wedged', 'loop_confirmed', 'burn_without_progress'].includes(verdict.reason);
+    // Evidence: the check-in fingerprints that justified the kill (verdict.evidence,
+    // populated by lib/run-supervisor.js #stopOrNotify) plus the checkpoint saved
+    // just before the process actually dies.
+    continuityControl.stopEvidence = verdict.evidence || null;
+    continuityControl.handoffPath = continuity.saveRun(continuityControl);
+    stopCheckpointPath = continuityControl.handoffPath;
+    continuityControl.stopCheckpointPath = stopCheckpointPath;
     return true;
+  };
+  // S2/S4 (Refs #133): stallAction:"notify" (this.stall) and unverifiable
+  // CPU silence (this.unsampledStall) never kill, but they must still be
+  // visible as incidents, once each per run, with the check-in evidence
+  // that triggered them.
+  let stallIncidentReported = false;
+  let unsampledStallIncidentReported = false;
+  const reportSupervisorIncidents = () => {
+    const snap = supervisor.snapshot();
+    const lastCheckin = snap.checkins?.length ? snap.checkins[snap.checkins.length - 1] : null;
+    const lastDetectors = lastCheckin?.detectors?.length ? ` [last check-in detectors: ${lastCheckin.detectors.join(',')}]` : '';
+    if (snap.stall && !stallIncidentReported) {
+      stallIncidentReported = true;
+      incidentLog.report({ classification: 'supervision_stall', runId, phase: 'supervision',
+        provider: kind, summary: `stallAction notify: ${snap.stall.reason} -- ${snap.stall.detail}${lastDetectors}`.slice(0, 299),
+        nextAction: 'Inspect the run; stallAction:"notify" never kills, evidence is in the check-in log.' });
+    }
+    if (snap.unsampledStall && !unsampledStallIncidentReported) {
+      unsampledStallIncidentReported = true;
+      incidentLog.report({ classification: 'supervision_stall', runId, phase: 'supervision',
+        provider: kind, summary: `unsampled CPU silence (never killed): ${snap.unsampledStall.detail}${lastDetectors}`.slice(0, 299),
+        nextAction: 'CPU could not be sampled to confirm idleness; inspect the run manually.' });
+    }
   };
 
   continuityControl.stop = (reason = 'quota_reserve') => {
@@ -5385,6 +5534,7 @@ async function executeOneShot(body, res, privateContext = null) {
   };
   const finishSupervision = () => {
     clearInterval(tick);
+    if (outputSpillFd !== null) { try { fs.closeSync(outputSpillFd); } catch {} outputSpillFd = null; }
     if (!ownedHandle) activeRuns.delete(runId);
   };
   const tick = setInterval(() => {
@@ -5398,12 +5548,13 @@ async function executeOneShot(body, res, privateContext = null) {
     }
     if (nativeState?.stopNeeded) continuityControl.stop('native_transport_limit');
     const applyVerdict = () => {
+      // Auto-finalization on budget proximity was removed with the provider
+      // budget kill (Refs #133); evaluate() never returns 'finalize' any
+      // more, only 'continue' or 'kill'. requestGracefulFinalization remains
+      // directly callable by other code paths.
       const verdict = supervisor.evaluate();
-      if (verdict.action === 'finalize') {
-        requestGracefulFinalization(verdict);
-        return;
-      }
       if (latchSupervisorVerdict(verdict)) killProcessTree(proc);
+      else reportSupervisorIncidents();
     };
     // Sample descendants even while model output is buffered. This is
     // observational evidence, never termination or filesystem authority.
@@ -5427,17 +5578,40 @@ async function executeOneShot(body, res, privateContext = null) {
 
 
   res.on('close', () => {
-    if (!res.writableEnded) {
-      clientGone = true;
-      if (!ownedHandle) finishSupervision();
-      killProcessTree(proc);
-      if (!ownedHandle) cleanupPromptFile();
-    }
+    // Detach, not cancel (B2, Refs #133): a client disconnect used to kill
+    // the provider process and record mcp_deadline_cancelled, which is a
+    // disguised time cap. The run now keeps running to natural completion;
+    // proc.on('error')/settleFromClose still persist the real terminal
+    // receipt (see sendOneShotResult's persistAfterDisconnect below). An
+    // explicit cancel (cancel_active_run/cancel_task/notifications/cancelled)
+    // goes through /api/runs/:runId/cancel -> cancelActiveRun(), which is
+    // independent of this handler and still kills.
+    if (!res.writableEnded) clientGone = true;
   });
   proc.stdout.setEncoding('utf8');
   proc.stderr.setEncoding('utf8');
-  // recordOutput returns false once the output cap is reached, which stops the
-  // buffer growing before the kill lands â€” a runaway CLI cannot OOM the bridge.
+  // Output bytes are never a kill trigger (Refs #133): recordOutput keeps
+  // accepting and parsing every chunk for progress/loop detection regardless
+  // of size, and returns false once total bytes pass spillAfterBytes. Past
+  // that point we stop growing the in-memory buffer without bound — instead
+  // the overflow is appended to a spill file under the run's data directory
+  // and only the most recent OUTPUT_SPILL_TAIL_BYTES are kept in memory, so
+  // stream-json result parsing still sees the final events.
+  const spillOverflow = (chunk) => {
+    if (!chunk) return;
+    if (!outputSpillPath) {
+      outputSpillPath = path.join(DATA_DIR, 'runs', `${runId}.output-spill.log`);
+      try { fs.mkdirSync(path.dirname(outputSpillPath), { recursive: true }); } catch {}
+      try { outputSpillFd = fs.openSync(outputSpillPath, 'a'); } catch { outputSpillFd = null; }
+      supervisor.recordOutputSpillPath(outputSpillPath);
+      continuityControl.outputSpillPath = outputSpillPath;
+    }
+    if (outputSpillFd !== null) { try { fs.writeSync(outputSpillFd, chunk); } catch {} }
+    stdout += chunk;
+    if (Buffer.byteLength(stdout, 'utf8') > OUTPUT_SPILL_TAIL_BYTES) {
+      stdout = stdout.slice(-OUTPUT_SPILL_TAIL_BYTES);
+    }
+  };
   proc.stdout.on('data', (d) => {
     if (stopReason) {
       // Retain a bounded tail solely for transport byte/hash evidence. It is
@@ -5449,12 +5623,18 @@ async function executeOneShot(body, res, privateContext = null) {
     const semanticChars = usageObserver.record(chunk);
     const semanticChunk = chunk.slice(0, semanticChars);
     const lateChunk = chunk.slice(semanticChars);
-    if (semanticChunk && supervisor.recordOutput(semanticChunk)) stdout += semanticChunk;
+    if (semanticChunk) {
+      if (supervisor.recordOutput(semanticChunk)) stdout += semanticChunk;
+      else spillOverflow(semanticChunk);
+    }
+    // Auto-finalization on budget proximity was removed (Refs #133);
+    // evaluate() only ever returns 'continue' or 'kill' here.
     const verdict = supervisor.evaluate();
-    if (verdict.action === 'finalize') requestGracefulFinalization(verdict);
-    else if (latchSupervisorVerdict(verdict)) {
+    if (latchSupervisorVerdict(verdict)) {
       retainLateStdout(lateChunk);
       killProcessTree(proc);
+    } else {
+      reportSupervisorIncidents();
     }
   });
   proc.stderr.on('data', (d) => {
@@ -5465,6 +5645,12 @@ async function executeOneShot(body, res, privateContext = null) {
     if (ownedHandle) { ownedHandle.stop(); return; }
     if (settled) return;
     providerExited = true;
+    // G5 follow-up (Refs #133): sticky exit flag. From here on every
+    // supervisor.evaluate() call (periodic tick, stdout 'data' still in
+    // flight, usageObserver flush) defaults to record-only (latch: false),
+    // regardless of call site, closing the post-exit-but-pre-close latch
+    // window.
+    supervisor.markExited();
     settled = true;
     continuityControl.settled = true;
     continuity.saveRun(continuityControl);
@@ -5473,19 +5659,22 @@ async function executeOneShot(body, res, privateContext = null) {
     cleanupPromptFile();
     const isolationCleanup = cleanupProviderHome();
     releaseAdmission();
-    if (clientGone || res.writableEnded) {
-      if (res._relayIsolationReceiptDeferred) persistCancellationReceipt();
-      return;
-    }
+    // Detached (client gone) still gets the real terminal receipt persisted
+    // via persistAfterDisconnect; only the HTTP response write is skipped.
     const spawnProjection = entry.oneshot_output_parser === 'codex_json' ? parseCodexOutput(stdout, { ignoreTerminalResult: true }) : null;
     sendOneShotResult(res, { kind, route, exitCode: -1, stdout: spawnProjection ? '' : stdout, stderr: spawnProjection ? 'Provider process failed.' : stderr + '\n' + err.message, error: spawnProjection ? 'Provider process failed.' : err.message, failureClass: isolationCleanup.ok ? null : 'isolation_cleanup', dropped_out: true }, {
       kind, prompt, route, startedAt, cwd: resolvedCwd,
       accountId: dispatchAccount.account?.id || null,
+      persistAfterDisconnect: true,
     });
   });
   const settleFromClose = (code) => {
     if (settled) return;
     providerExited = true;
+    // G5 follow-up (Refs #133): see the proc.on('error') site above -- same
+    // sticky exit flag, closing the tick/stdout-data latch window between
+    // process exit and this close handler running.
+    supervisor.markExited();
     settled = true;
     continuityControl.settled = true;
     continuity.saveRun(continuityControl);
@@ -5498,10 +5687,9 @@ async function executeOneShot(body, res, privateContext = null) {
       try { ownedExecutionBackend.requestFinalizeTask(ownedHandle.ownerId); }
       catch (error) { console.error('[RelayBridge] owned result remains held:', error.code || 'OWNER_RESULT_UNCONFIRMED'); }
     });
-    if (clientGone || res.writableEnded) {
-      if (res._relayIsolationReceiptDeferred) persistCancellationReceipt();
-      return;
-    }
+    // Detached (client gone) still computes and persists the real terminal
+    // result below; sendOneShotResult's persistAfterDisconnect meta flag
+    // skips only the now-dead HTTP write, not receipt persistence.
     usageObserver.flush();
     copilotDenials.flush();
     const semanticStdout = supervisorStdout ?? stdout;
@@ -5513,23 +5701,15 @@ async function executeOneShot(body, res, privateContext = null) {
       supervisor.recordProviderUsage({ ...(parsedOutput.usage || {}), turns: parsedOutput.numTurns }, { phase: 'terminal' });
     }
     // flush() can accept usage from a final non-newline envelope whose other
-    // terminal fields fail parsing. The independently validated usage must
-    // still latch the local budget stop before any free-text classification.
-    if (supervisor.snapshot().providerUsage) {
-      const terminalVerdict = supervisor.evaluate();
-      if (terminalVerdict.action === 'kill' && !stopReason) {
-        stopReason = terminalVerdict.reason;
-        stopDetail = terminalVerdict.detail;
-        if (terminalVerdict.reason === 'token_budget') stopBudgetEnforcement = 'terminal';
-        // The kill was only discoverable from the terminal result itself, so it
-        // was parsed as authoritative content above. Re-parse with the same
-        // suppression the mid-stream same-chunk cutoff applies, so that result
-        // can never surface as output, rate-limit prose, or a completed answer.
-        if (stopReason === 'token_budget') {
-          parsedOutput = parseConfiguredOneShotOutput(entry, semanticStdout, { ignoreTerminalResult: true, stderr, exitCode:code });
-        }
-      }
-    }
+    // terminal fields fail parsing. This call still records that usage as a
+    // check-in (evidence, checkins history). N2/G5 (Refs #133): the provider
+    // has already exited by the time settleFromClose runs, and
+    // supervisor.markExited() was already called above (sticky #exited
+    // flag), so this is belt-and-suspenders record-only evaluation -- it can
+    // never latch `stopped` even on a fresh RunSupervisor instance that
+    // reached this call site some other way. Only a verdict latched while
+    // the process was alive may ever set stopReason or `stopped`.
+    if (supervisor.snapshot().providerUsage) supervisor.markExited();
     const supervisedUsage = supervisor.snapshot().providerUsage;
     const authoritativeUsage = acceptedProviderUsage(parsedOutput, supervisedUsage);
     const cleanedStdout = parsedOutput.output;
@@ -5602,17 +5782,32 @@ async function executeOneShot(body, res, privateContext = null) {
     });
     const cursorActionRequired = runClassification.actionRequired || null;
     const cursorUsageQuotaExhausted = cursorActionRequired?.kind === 'usage_quota_exhausted';
-    // A token-budget kill must never be recolored as a rate limit by ordinary
-    // prose (stderr or model text discussing limits) once the budget has
-    // already tripped. An authoritative provider API 429 status still counts,
-    // since it reflects evidence that preceded/caused the cutoff rather than
-    // free text caught in the failure blob.
+    // A token-budget check-in must never be recolored as a rate limit by
+    // ordinary prose (stderr or model text discussing limits). An
+    // authoritative provider API 429 status still counts, since it reflects
+    // typed evidence rather than free text caught in the failure blob. Any
+    // run that produced a typed terminal result document (a clean success,
+    // or a malformed-field parse failure) is never reclassified from
+    // stderr/text prose either: only a genuine crash with no result document
+    // at all may fall back to the prose heuristic.
+    // Only a genuinely typed terminal document exempts prose from the
+    // rate-limit heuristic. claude_json reports terminalDocumentFound
+    // directly; native JSON parsers (grok_json/gemini_cli_json/codex_json)
+    // fall back to the exit/output/error shape since they don't set that
+    // field. Plain-text output (the codex default parser, and any other
+    // unstructured provider) is never a typed document -- a clean-looking
+    // exit-zero/stdout text run must still be reclassifiable from stderr
+    // prose (Refs #181), since text parsing carries no real success/failure
+    // typing at all.
+    const hadTypedTerminal = parsedOutput.terminalDocumentFound !== undefined
+      ? parsedOutput.terminalDocumentFound
+      : (nativeStructuredOutput && code === 0 && !!cleanedStdout && !parsedOutput.isError && !parsedOutput.parseError && !parsedOutput.failureClass);
     const rate_limited = !!terminalQuotaEvidence || (parsedOutput.resultSubtype !== 'error_max_budget_usd'
       && !cursorUsageQuotaExhausted
       && (authoritativeApiFailure === 'rate_limit'
         || !!copilotQuotaEvidence
         || !!runClassification.quotaEvidence
-        || (!stopReason && rate_signals.some(s => failureBlob.includes(s)))));
+        || (!stopReason && !hadTypedTerminal && rate_signals.some(s => failureBlob.includes(s)))));
     const budget_exceeded = tokenBudgetExceeded || parsedOutput.resultSubtype === 'error_max_budget_usd'
       || authoritativeApiFailure === 'budget'
       || cursorUsageQuotaExhausted
@@ -5662,6 +5857,12 @@ async function executeOneShot(body, res, privateContext = null) {
       partial_checkpoint: parsedOutput.partialCheckpoint?.text, writer_diff_summary: collectWriterDiffSummary(), stop_reason: stopReason });
     const sentPayload = sendOneShotResult(res, {
       continuity: { handoffPath: continuityControl.handoffPath, continuityId: continuityControl.continuityId },
+      // S3 (Refs #133): the checkpoint saved by latchSupervisorVerdict just
+      // before a supervisor kill (wedged/loop_confirmed/burn_without_progress/
+      // assessor_stuck) must survive onto the receipt, not just live on
+      // continuityControl -- the terminal continuity.saveRun() above
+      // reassigns handoffPath to a later, non-stop checkpoint.
+      ...(stopCheckpointPath ? { stop_checkpoint_id: runId, stop_checkpoint_path: stopCheckpointPath } : {}),
       kind,
       route,
       exitCode: code,
@@ -5742,6 +5943,7 @@ async function executeOneShot(body, res, privateContext = null) {
     }, {
       kind, prompt, route, startedAt, cwd: resolvedCwd, transportStdout: semanticStdout,
       accountId: dispatchAccount.account?.id || null,
+      persistAfterDisconnect: true,
     });
     // GitHub middleware: only successful runs checkpoint — a dropped-out run
     // may have left half-applied edits, which the human should triage first.
@@ -6583,25 +6785,33 @@ const claudeUsageProbes = new Map(), claudeUsageProbeFailures = new Map();
 const CLAUDE_USAGE_PROBE_FAILURE_COOLDOWN_MS = 60000;
 const claudeUsageProbeKey = identity => JSON.stringify([identity.quotaSeat, identity.profileHash,
   identity.accountFingerprint]);
+// One stderr line per probe failure, reason code only: no config values, tokens, prompts or
+// filesystem contents. quotaSeat/accountFingerprint are already-opaque identifiers used
+// throughout the bridge's own logs and receipts.
+function logClaudeNativeProbeFailure(identity, reason) {
+  try { console.error(`[claude-native-probe] reason=${reason} quotaSeat=${identity?.quotaSeat || 'unknown'}`); } catch {}
+}
 async function probeClaudeNativeAdmission(captured, dispatchSnapshot = null) {
-  if (!captured?.identity || !pty) return null;
+  const fail = (reason) => ({ ok: false, reason, identity: null });
+  if (!captured?.identity) return fail('probe_identity_missing');
+  if (!pty) return fail('probe_pty_unavailable');
   const key = claudeUsageProbeKey(captured.identity);
-  if (Date.now() - (claudeUsageProbeFailures.get(key) || 0) < CLAUDE_USAGE_PROBE_FAILURE_COOLDOWN_MS) return null;
+  if (Date.now() - (claudeUsageProbeFailures.get(key) || 0) < CLAUDE_USAGE_PROBE_FAILURE_COOLDOWN_MS) return fail('probe_cooldown');
   let task = claudeUsageProbes.get(key);
   if (!task) {
     task = (async () => {
       try {
         const cfg = loadConfig(), entry = cfg[captured.identity.kind], settings = entry?.native_usage_probe;
         if (!settings || settings.enabled !== true || !Array.isArray(settings.command)
-          || typeof settings.command[0] !== 'string' || !settings.command[0]) return false;
+          || typeof settings.command[0] !== 'string' || !settings.command[0]) return fail('probe_config_missing');
         const probeStat = fs.lstatSync(CLAUDE_USAGE_PROBE_DIR);
         if (!probeStat.isDirectory() || probeStat.isSymbolicLink()
-          || path.resolve(fs.realpathSync(CLAUDE_USAGE_PROBE_DIR)) !== path.resolve(CLAUDE_USAGE_PROBE_DIR)) return false;
+          || path.resolve(fs.realpathSync(CLAUDE_USAGE_PROBE_DIR)) !== path.resolve(CLAUDE_USAGE_PROBE_DIR)) return fail('probe_dir_invalid');
         const env = buildEnv(normalizeEnvOverrides(entry.oneshot_env), entry.strip_env || []);
         const trusted = readClaudeNativeUsage({ env, quotaSeat: captured.identity.quotaSeat,
           projectCwd: CLAUDE_USAGE_PROBE_DIR });
         if (!trusted.identity || trusted.identity.accountFingerprint !== captured.identity.accountFingerprint
-          || trusted.identity.profileHash !== captured.identity.profileHash || !trusted.projectTrustAccepted) return false;
+          || trusted.identity.profileHash !== captured.identity.profileHash || !trusted.projectTrustAccepted) return fail('identity_mismatch_pre');
         const command = resolveExecutable(settings.command[0], env), args = settings.command.slice(1).map(String);
         const timeoutMs = Number.isSafeInteger(settings.timeout_ms)
           ? Math.min(30000, Math.max(1000, settings.timeout_ms)) : 15000;
@@ -6609,24 +6819,42 @@ async function probeClaudeNativeAdmission(captured, dispatchSnapshot = null) {
           projectCwd: CLAUDE_USAGE_PROBE_DIR });
         const result = await refreshClaudeUsageViaPty({ ptyImpl: pty, command, args, env, cwd: CLAUDE_USAGE_PROBE_DIR,
           readSample, expectedIdentity: captured.identity, baselineFetchedAt: captured.cacheFetchedAt, timeoutMs });
-        if (!result.refreshed) { claudeUsageProbeFailures.set(key, Date.now()); return false; }
-        return true;
+        if (!result.refreshed) return fail(`probe_not_refreshed:${result.reason || 'unknown'}`);
+        return { ok: true, reason: null };
       } catch {
-        claudeUsageProbeFailures.set(key, Date.now()); return false;
+        return fail('probe_threw');
       }
     })().finally(() => claudeUsageProbes.delete(key));
     claudeUsageProbes.set(key, task);
   }
-  if (!await task) {
+  const taskResult = await task;
+  if (!taskResult.ok) {
     claudeUsageProbeFailures.set(key, Date.now());
-    return null;
+    logClaudeNativeProbeFailure(captured.identity, taskResult.reason);
+    return taskResult;
   }
   const current = captureClaudeLaunchIdentity(captured.identity.kind, captured.identity.accountId, null, dispatchSnapshot);
-  if (!current.identity || JSON.stringify(current.identity) !== JSON.stringify(captured.identity)
-    || !current.observation || current.observation.observedAt <= (captured.cacheFetchedAt || 0)) {
-    claudeUsageProbeFailures.set(key, Date.now()); return null;
+  // Compare only account + profile identity here, not `generation`: `generation` hashes the
+  // whole native-Claude config plus registry, so an unrelated config edit racing the probe
+  // (e.g. another provider's entry changing) must not turn a successful, correctly-attributed
+  // usage refresh into a false quota_unknown. `generation` still gates admission through
+  // sameClaudeLaunchIdentity()/validateClaudeLaunchAdmission() immediately after this returns,
+  // so a config change that actually matters to this account is still caught there.
+  const sameAccountProfile = !!current.identity
+    && current.identity.accountFingerprint === captured.identity.accountFingerprint
+    && current.identity.profileHash === captured.identity.profileHash
+    && current.identity.quotaSeat === captured.identity.quotaSeat;
+  if (!sameAccountProfile) {
+    claudeUsageProbeFailures.set(key, Date.now());
+    logClaudeNativeProbeFailure(captured.identity, 'identity_mismatch_post');
+    return fail('identity_mismatch_post');
   }
-  return current;
+  if (!current.observation || current.observation.observedAt <= (captured.cacheFetchedAt || 0)) {
+    claudeUsageProbeFailures.set(key, Date.now());
+    logClaudeNativeProbeFailure(captured.identity, 'observation_not_newer');
+    return fail('observation_not_newer');
+  }
+  return { ok: true, reason: null, identity: current };
 }
 function refreshClaudeNativeUsage() {
   const cfg = loadConfig(), registry = providerAccounts.loadRegistry(DATA_DIR, { strict: true });
@@ -7776,14 +8004,25 @@ app.post('/api/broadcast', trackedHandler(async (req, res) => {
   } catch (err) { return rejectInvalidIntent(res, req.body || {}, err); }
   const startedAt = Date.now();
   const budgetTaskTier = classifyTask(prompt).tier;
-  const deadlineAt = startedAt + effectiveTimeoutMs;
-  const queueDeadline = Math.min(deadlineAt, startedAt + TIMEOUT_POLICY.broadcastQueueWaitMs);
+  // effectiveTimeoutMs is null when the caller gave no timeoutMs and
+  // oneShotDefaultMs is unset: that means no deadline, not an immediate one.
+  // The queue-wait ceiling (broadcastQueueWaitMs) is likewise no longer
+  // enforced, so admission-limited members retry until deadlineAt (or
+  // forever, if there is none) rather than being cut off by a separate,
+  // shorter queue deadline.
+  const deadlineAt = effectiveTimeoutMs === null ? null : startedAt + effectiveTimeoutMs;
   const activeCaptured = new Set();
   let clientGone = false;
+  // A caller disconnect detaches rather than cancels (Refs #133): member
+  // runs keep going to natural completion (each persists its own terminal
+  // receipt via executeOneShot's persistAfterDisconnect path) instead of
+  // being force-cancelled here. clientGone only stops this handler's own
+  // admission-retry loop and HTTP write; it no longer reaches into
+  // activeCaptured to cancel members. An explicit cancel of a member run
+  // goes through POST /api/runs/:runId/cancel like any other run.
   res.once('close', () => {
     if (res.writableEnded) return;
     clientGone = true;
-    for (const captured of activeCaptured) captured.cancel();
   });
   let run = writeBroadcastRun({
     mode: 'broadcast',
@@ -7793,15 +8032,15 @@ app.post('/api/broadcast', trackedHandler(async (req, res) => {
     selection: { tag: typeof tag === 'string' ? tag : null, all: all === true, explicitProviders: Array.isArray(providers) ? providers : [] },
     targets,
     members: [],
-    deadlineAt: new Date(deadlineAt).toISOString(),
+    deadlineAt: deadlineAt === null ? null : new Date(deadlineAt).toISOString(),
     timeoutMs: effectiveTimeoutMs,
   });
   const callOnce = async (kind) => {
     if (clientGone || res.destroyed) {
       return { statusCode: 499, body: { error: 'broadcast client disconnected', dropped_out: true, cancelled: true } };
     }
-    const remainingMs = deadlineAt - Date.now();
-    if (remainingMs < TIMEOUT_POLICY.minimumMs) {
+    const remainingMs = deadlineAt === null ? null : deadlineAt - Date.now();
+    if (remainingMs !== null && remainingMs < TIMEOUT_POLICY.minimumMs) {
       return { statusCode: 408, body: { error: 'broadcast deadline exceeded', dropped_out: true, timed_out: true } };
     }
     const captured = new CapturedOneShotResponse();
@@ -7823,8 +8062,7 @@ app.post('/api/broadcast', trackedHandler(async (req, res) => {
     while (
       response.statusCode === 429 &&
       response.body?.failureClass === 'admission_limit' &&
-      Date.now() < queueDeadline &&
-      Date.now() < deadlineAt &&
+      (deadlineAt === null || Date.now() < deadlineAt) &&
       !clientGone &&
       !res.destroyed
     ) {
@@ -7861,7 +8099,7 @@ app.post('/api/broadcast', trackedHandler(async (req, res) => {
     runId: run.runId,
     status: run.status,
     timeoutMs: effectiveTimeoutMs,
-    deadlineAt: new Date(deadlineAt).toISOString(),
+    deadlineAt: deadlineAt === null ? null : new Date(deadlineAt).toISOString(),
   });
 }));
 

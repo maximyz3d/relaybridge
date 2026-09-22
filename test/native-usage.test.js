@@ -61,9 +61,25 @@ test('native default profile reader separates identity from stale or mismatched 
   fs.writeFileSync(file, '{'); assert.equal(readClaudeNativeUsage(options).identity, null);
   fs.writeFileSync(file, ' '.repeat(1024 * 1024 + 1)); assert.equal(readClaudeNativeUsage(options).identity, null);
   fs.writeFileSync(file, JSON.stringify(cachePayload()));
+  // A single, transient rename-race (one concurrent atomic tmp+rename writer, the normal
+  // Claude Code CLI pattern) must recover on retry rather than failing the whole read closed.
   const io = Object.create(fs); let changed = false;
   io.readSync = (...args) => { const n = fs.readSync(...args); if (!changed) { changed = true; fs.renameSync(file, file + '.old'); fs.writeFileSync(file, JSON.stringify(cachePayload())); } return n; };
-  assert.equal(readClaudeNativeUsage({ ...options, fsImpl: io }).identity, null);
+  const recovered = readClaudeNativeUsage({ ...options, fsImpl: io, statRetryDelayMs: 1, sleepImpl: () => {} });
+  assert.ok(recovered.identity && recovered.observation, 'a single transient race must recover on retry');
+  fs.unlinkSync(file + '.old');
+  // A race that keeps recurring on every attempt must still fail closed once retries
+  // are exhausted; the safety checks themselves are never relaxed.
+  fs.writeFileSync(file, JSON.stringify(cachePayload()));
+  const persistentIo = Object.create(fs); let raceAttempts = 0;
+  persistentIo.readSync = (...args) => {
+    const n = fs.readSync(...args);
+    if (args[2] === 0) { fs.renameSync(file, `${file}.race${raceAttempts++}`); fs.writeFileSync(file, JSON.stringify(cachePayload())); }
+    return n;
+  };
+  const exhausted = readClaudeNativeUsage({ ...options, fsImpl: persistentIo, statRetries: 3, statRetryDelayMs: 1, sleepImpl: () => {} });
+  assert.equal(exhausted.identity, null, 'a persistent race must fail closed after exhausting retries');
+  assert.equal(raceAttempts, 3, 'exactly statRetries attempts must be made');
   fs.unlinkSync(file); fs.symlinkSync(file + '.old', file); assert.equal(readClaudeNativeUsage(options).identity, null);
 });
 test('default profile identity refuses effective alternate authentication and backend selectors', t => {

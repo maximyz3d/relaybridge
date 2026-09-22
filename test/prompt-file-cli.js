@@ -168,8 +168,12 @@ if (process.argv.includes('--claude-json-older-terminal-budget')) {
       usage: { input_tokens: 600, output_tokens: 600, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
       content: [{ type: 'text', text: 'NEWER_ACCEPTED_CHECKPOINT' }] } },
   ];
+  // Issue #133: this fixture used to hang forever via setInterval, relying on
+  // the (now-removed) budget-kill path to eventually terminate the process
+  // and force recovery from the newer accepted checkpoint. With budgets
+  // informational-only, the process must exit on its own so the run finishes
+  // normally and the newer checkpoint content is asserted directly.
   process.stdout.write(events.map((event) => JSON.stringify(event) + '\n').join(''));
-  setInterval(() => {}, 1000);
   return;
 }
 

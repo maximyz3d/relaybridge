@@ -4,8 +4,13 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import TIMEOUT_POLICY from '../timeout-policy.cjs';
 import receiptStoreIdentityModule from '../lib/receipt-store-identity.cjs';
+import runSupervisorModule from '../lib/run-supervisor.js';
 
 const { receiptStoreIdentity } = receiptStoreIdentityModule;
+// N2 (Refs #133): a no-deadline run's liveness signal is the supervisor's
+// own wedged window, not a deadline. Read the shared defaults rather than
+// hardcoding a second copy of these numbers here.
+const { checkInIntervalMs: SUPERVISOR_CHECKIN_MS, wedgedCheckins: SUPERVISOR_WEDGED_CHECKINS } = runSupervisorModule.DEFAULTS;
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
@@ -276,10 +281,16 @@ export function readRun(runId) {
 function staleRunHorizon(run) {
   const deadline = Date.parse(run.deadlineAt || '');
   if (Number.isFinite(deadline)) return deadline + TIMEOUT_POLICY.mcpHostGraceMs;
-  // Legacy records have only an estimated progress horizon, never death proof.
-  const lastProgress = Date.parse(run.updatedAt || run.createdAt || '');
-  if (!Number.isFinite(lastProgress)) return null;
-  return lastProgress + TIMEOUT_POLICY.oneShotMaxMs + TIMEOUT_POLICY.mcpHostGraceMs;
+  // No usable deadline (absent, null, or an unparseable value): fall back to
+  // the bridge's own run-activity heartbeat rather than a time cap. This
+  // record has no dedicated lastActivityAt field, so createdAt is the
+  // oldest-known-alive
+  // timestamp; a run silent since createdAt for longer than the supervisor's
+  // own wedged window (wedgedCheckins * checkInIntervalMs) is flagged
+  // progressOverdue for display only — it is never used to kill anything.
+  const activitySignal = Date.parse(run.createdAt || '');
+  if (!Number.isFinite(activitySignal)) return null;
+  return activitySignal + (SUPERVISOR_WEDGED_CHECKINS * SUPERVISOR_CHECKIN_MS);
 }
 
 function allRunSummaries() {

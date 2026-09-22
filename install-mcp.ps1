@@ -189,8 +189,11 @@ if (-not (Test-Path -LiteralPath $buildInfoTool -PathType Leaf)) {
   throw "Build identity tool not found: $buildInfoTool"
 }
 $timeoutPolicy = [IO.File]::ReadAllText($timeoutPolicyPath, [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
+if ($null -eq $timeoutPolicy.mcpInlineWaitMs -or [double]$timeoutPolicy.mcpInlineWaitMs -le 0) {
+  throw "Invalid timeout policy: $timeoutPolicyPath (mcpInlineWaitMs must be a positive number)"
+}
 $mcpToolTimeoutSec = [int][Math]::Ceiling((
-  [double]$timeoutPolicy.oneShotMaxMs +
+  [double]$timeoutPolicy.mcpInlineWaitMs +
   [double]$timeoutPolicy.transportGraceMs +
   [double]$timeoutPolicy.mcpHostGraceMs
 ) / 1000)
