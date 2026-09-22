@@ -56,6 +56,11 @@ test('terminal usage that crosses the burn streak only at exit still completes a
   assert.notEqual(result.stop_reason, 'burn_without_progress');
   assert.notEqual(result.stop_reason, 'loop_confirmed');
   assert.equal(result.stop_reason, null, JSON.stringify(result));
+  // G5 (Refs #133): the discarded local verdict alone was not enough -- the
+  // supervisor's own internal `stopped` state must never latch either, since
+  // snapshot()/phase() surface it to the dashboard as progress.stopped
+  // independent of stop_reason.
+  assert.equal(result.progress.stopped, null, JSON.stringify(result.progress));
   // The usage jump genuinely reached the supervisor (proving this is not a
   // no-op fixture): the terminal cache_read_input_tokens value is authoritative.
   assert.equal(result.usage.cache_read_input_tokens, 900000, JSON.stringify(result.usage));

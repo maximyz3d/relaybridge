@@ -1649,8 +1649,16 @@ function createProviderUsageObserver(parserName, supervisor, { onTerminal = null
     input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0,
     cache_creation_input_tokens: 0, total_tokens: 0, turns: 0,
   };
-  const consume = (line) => {
-    if (supervisor.evaluate().action === 'kill') return false;
+  // G5/N-postexit (Refs #133): flush() is only ever called once, from
+  // settleFromClose after the provider process has already exited (see the
+  // server.js call site's comment). consume()'s own evaluate() calls used to
+  // always latch (default), so a burn/loop streak that only crossed its
+  // threshold on the final, no-trailing-newline line -- only reachable via
+  // flush() -- could still relabel an already-completed run. `latch` threads
+  // through so record() (mid-stream, process alive) keeps latching as before
+  // and flush() (post-exit) never does.
+  const consume = (line, { latch = true } = {}) => {
+    if (supervisor.evaluate(undefined, { latch }).action === 'kill') return false;
     let event;
     try { event = JSON.parse(line); } catch { return true; }
     if (onEvent) onEvent(event);
@@ -1663,7 +1671,7 @@ function createProviderUsageObserver(parserName, supervisor, { onTerminal = null
           && !parseConfiguredOneShotOutput({ oneshot_output_parser: 'claude_json' }, line).parseError) {
         onTerminal(event);
       }
-      return supervisor.evaluate().action !== 'kill';
+      return supervisor.evaluate(undefined, { latch }).action !== 'kill';
     }
     if (event?.type !== 'assistant' || !event.message || typeof event.message !== 'object') return true;
     const id = typeof event.message.id === 'string' ? event.message.id.trim() : '';
@@ -1684,7 +1692,7 @@ function createProviderUsageObserver(parserName, supervisor, { onTerminal = null
     cumulative.total_tokens += total;
     cumulative.turns += 1;
     supervisor.recordProviderUsage(cumulative, { phase: 'incremental' });
-    return supervisor.evaluate().action !== 'kill';
+    return supervisor.evaluate(undefined, { latch }).action !== 'kill';
   };
   return {
     record(chunk) {
@@ -1705,7 +1713,10 @@ function createProviderUsageObserver(parserName, supervisor, { onTerminal = null
       partial = combined.slice(lineStart);
       return text.length;
     },
-    flush() { if (partial.trim() && supervisor.evaluate().action !== 'kill') consume(partial); partial = ''; },
+    flush() {
+      if (partial.trim() && supervisor.evaluate(undefined, { latch: false }).action !== 'kill') consume(partial, { latch: false });
+      partial = '';
+    },
   };
 }
 
@@ -5688,8 +5699,13 @@ async function executeOneShot(body, res, privateContext = null) {
     // by latchSupervisorVerdict() during proc.stdout 'data' handling (i.e.
     // while the process was still running) may ever set stopReason; a
     // completed run must never be relabelled burn_without_progress /
-    // loop_confirmed / wedged / assessor_stuck after the fact.
-    if (supervisor.snapshot().providerUsage) supervisor.evaluate();
+    // loop_confirmed / wedged / assessor_stuck after the fact. G5/N-postexit
+    // (Refs #133): the discarded local verdict above was not enough -- the
+    // plain evaluate() call still latched supervisor.stopped internally, so
+    // snapshot()/phase() (surfaced to the dashboard as `progress.stopped`)
+    // kept showing a kill even though stop_reason stayed null. markExited()
+    // records the check-in/evidence without ever setting `stopped`.
+    if (supervisor.snapshot().providerUsage) supervisor.markExited();
     const supervisedUsage = supervisor.snapshot().providerUsage;
     const authoritativeUsage = acceptedProviderUsage(parsedOutput, supervisedUsage);
     const cleanedStdout = parsedOutput.output;
