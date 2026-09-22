@@ -15,12 +15,19 @@ test('a notify-only supervisor stall never kills the run and is filed as a super
         label: 'Stall Notify Fixture',
         safe: [process.execPath, helper, '--version'],
         dangerous: [process.execPath, helper, '--version'],
-        // The supervisor polls on a fixed 5s tick (server.js executeOneShot),
-        // so the fixture must stay silent across at least one tick before it
-        // produces output, or the only check-in coincides with fresh bytes
-        // arriving and no stall detector fires.
-        oneshot_safe: [process.execPath, helper, '--prompt-file', '{prompt_file}', '--delay', '5500'],
-        oneshot_dangerous: [process.execPath, helper, '--prompt-file', '{prompt_file}', '--delay', '5500'],
+        // The supervisor polls on a fixed 5s tick (server.js ~5555-5576), but
+        // each tick's verdict is only applied in applyVerdict(), which runs
+        // in sampleProcessCensus().finally() -- so the tick's effective time
+        // is "5s plus however long the process census takes". On Windows
+        // that census can take 1-3s, so a fixture silent for only one tick
+        // (5500ms) can have its output already parsed by the time the census
+        // resolves, and no stall detector fires (Refs #133, Round 7 G8).
+        // Staying silent across two ticks (10s) plus census-latency margin
+        // guarantees at least one fully-silent check-in regardless of census
+        // speed. Dedup (server.js:5510-5527) files each stall kind at most
+        // once per run, however many silent check-ins occur (see below).
+        oneshot_safe: [process.execPath, helper, '--prompt-file', '{prompt_file}', '--delay', '14000'],
+        oneshot_dangerous: [process.execPath, helper, '--prompt-file', '{prompt_file}', '--delay', '14000'],
         supervisor: {
           stallAction: 'notify',
           checkInIntervalMs: 1000,
@@ -54,7 +61,29 @@ test('a notify-only supervisor stall never kills the run and is filed as a super
   const stallIncidents = incidentsResponse.body.incidents.filter(
     (incident) => incident.classification === 'supervision_stall',
   );
-  assert.equal(stallIncidents.length, 1, JSON.stringify(incidentsResponse.body.incidents));
-  assert.ok(stallIncidents[0].runId, 'incident carries the correlated runId');
-  assert.ok(stallIncidents[0].summary.length < 300, 'summary must stay bounded under 300 chars');
+  // server.js:5510-5527 tracks two independent dedupe flags: stallIncidentReported
+  // (snap.stall, summary prefix "stallAction notify:") and
+  // unsampledStallIncidentReported (snap.unsampledStall, summary prefix
+  // "unsampled CPU silence"). Each fires at most once per run, but both can
+  // legitimately fire in the same run -- e.g. when a 14s-silent fixture hits
+  // a tick whose census is still in flight or fails (recordCpuSample(null)),
+  // producing an unsampledStall on top of a stall. So the correct assertion
+  // is "at least one incident, and every incident is one of the two known
+  // kinds, each appearing at most once" -- not an exact count of 1.
+  assert.ok(stallIncidents.length >= 1, JSON.stringify(incidentsResponse.body.incidents));
+  const notifyStalls = stallIncidents.filter((i) => i.summary.startsWith('stallAction notify:'));
+  const unsampledStalls = stallIncidents.filter((i) => i.summary.startsWith('unsampled CPU silence'));
+  assert.ok(notifyStalls.length <= 1, 'at most one stallAction notify incident per run');
+  assert.ok(unsampledStalls.length <= 1, 'at most one unsampled CPU silence incident per run');
+  assert.equal(
+    notifyStalls.length + unsampledStalls.length,
+    stallIncidents.length,
+    'every supervision_stall incident must be one of the two known kinds',
+  );
+  const runIds = new Set(stallIncidents.map((incident) => incident.runId));
+  assert.equal(runIds.size, 1, 'all stall incidents must correlate to the same run');
+  for (const incident of stallIncidents) {
+    assert.ok(incident.runId, 'incident carries the correlated runId');
+    assert.ok(incident.summary.length < 300, 'summary must stay bounded under 300 chars');
+  }
 });
