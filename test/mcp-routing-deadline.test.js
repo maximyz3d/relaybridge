@@ -67,3 +67,29 @@ test('account-aware routing returns when both stages fit inside the shared deadl
   assert.equal(forwardedDiagnostics, cachedDiagnostics,
     'cached readiness crosses a bridge restart by being sent to the new route endpoint');
 });
+
+// Regression (Refs #133): a caller's timeoutMs is now only a hint, so
+// deadlineAt (and thus remainingTime(deadlineAt)) is null by default. That
+// null must still mean "wait the full default collection window", not
+// Math.max(100, null) === 100 or Math.min(override, null) === 0.
+test('collectionBudgetMs treats null/undefined as no caller deadline (full 30000ms window)', async () => {
+  const { collectionBudgetMs } = await import('../mcp/server.mjs');
+
+  assert.equal(collectionBudgetMs(null, NaN), 30000, 'null collectionMs must not collapse to 100ms');
+  assert.equal(collectionBudgetMs(undefined, NaN), 30000, 'undefined collectionMs must not collapse to 100ms');
+
+  // Numeric caller deadline still clamps to [100, 30000].
+  assert.equal(collectionBudgetMs(50, NaN), 100);
+  assert.equal(collectionBudgetMs(45000, NaN), 30000);
+  assert.equal(collectionBudgetMs(5000, NaN), 5000);
+
+  // RELAYBRIDGE_COLLECTION_MS override still applies in every case.
+  assert.equal(collectionBudgetMs(null, 2000), 2000, 'override must apply when there is no caller deadline');
+  assert.equal(collectionBudgetMs(undefined, 2000), 2000, 'override must apply when there is no caller deadline');
+  assert.equal(collectionBudgetMs(5000, 2000), 2000, 'override must still intersect a numeric caller deadline');
+  assert.equal(collectionBudgetMs(1000, 5000), 1000, 'override never widens a numeric caller deadline');
+
+  // Out-of-range override values are ignored (fall back to the base budget).
+  assert.equal(collectionBudgetMs(null, 50), 30000);
+  assert.equal(collectionBudgetMs(null, 40000), 30000);
+});
