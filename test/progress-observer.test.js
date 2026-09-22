@@ -10,7 +10,7 @@ test('productive default work survives 30, 45, 60 and 120 minutes; no explicit d
     supervisor.recordOutput(`Completed work item ${at / 60000}\n`, at);
     assert.equal(supervisor.evaluate(at).action, 'continue');
   }
-  assert.equal(supervisor.snapshot(7200000).hardCapRemainingMs, undefined, 'the field no longer exists on snapshot');
+  assert.equal(supervisor.snapshot(7200000).hardCapRemainingMs, null, 'compat field stays present as null, never a number (server.js reads it)');
   const bounded = new RunSupervisor(resolveAttemptTiming({ startedAt: 0, timeoutMs: 30000 }));
   bounded.recordOutput('New progress\n', 30000);
   assert.notEqual(bounded.evaluate(30000).action, 'kill');
