@@ -5455,16 +5455,18 @@ async function executeOneShot(body, res, privateContext = null) {
   let unsampledStallIncidentReported = false;
   const reportSupervisorIncidents = () => {
     const snap = supervisor.snapshot();
+    const lastCheckin = snap.checkins?.length ? snap.checkins[snap.checkins.length - 1] : null;
+    const lastDetectors = lastCheckin?.detectors?.length ? ` [last check-in detectors: ${lastCheckin.detectors.join(',')}]` : '';
     if (snap.stall && !stallIncidentReported) {
       stallIncidentReported = true;
-      incidentLog.report({ classification: 'capacity_unknown', runId, phase: 'supervision',
-        provider: kind, summary: `stallAction notify: ${snap.stall.reason} -- ${snap.stall.detail}`,
+      incidentLog.report({ classification: 'supervision_stall', runId, phase: 'supervision',
+        provider: kind, summary: `stallAction notify: ${snap.stall.reason} -- ${snap.stall.detail}${lastDetectors}`.slice(0, 299),
         nextAction: 'Inspect the run; stallAction:"notify" never kills, evidence is in the check-in log.' });
     }
     if (snap.unsampledStall && !unsampledStallIncidentReported) {
       unsampledStallIncidentReported = true;
-      incidentLog.report({ classification: 'capacity_unknown', runId, phase: 'supervision',
-        provider: kind, summary: `unsampled CPU silence (never killed): ${snap.unsampledStall.detail}`,
+      incidentLog.report({ classification: 'supervision_stall', runId, phase: 'supervision',
+        provider: kind, summary: `unsampled CPU silence (never killed): ${snap.unsampledStall.detail}${lastDetectors}`.slice(0, 299),
         nextAction: 'CPU could not be sampled to confirm idleness; inspect the run manually.' });
     }
   };
