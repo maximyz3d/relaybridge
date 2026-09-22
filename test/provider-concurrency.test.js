@@ -197,7 +197,7 @@ test('two independent MCP clients overlap same-provider calls and preserve each 
   }
   const calls = clients.flatMap((client, i) => ['claude', 'codex'].map((kind) => {
     const id = `RB_CASE_mcp${kind}${i}`;
-    return { id, promise: client.callTool({ name: 'ask_provider', arguments: {
+    return { id, client, promise: client.callTool({ name: 'ask_provider', arguments: {
       kind, prompt: `Return the result for ${id}.`, cwd: bridge.root, useCache: false,
     } }) };
   }));
@@ -205,18 +205,35 @@ test('two independent MCP clients overlap same-provider calls and preserve each 
   assert.deepEqual((await bridge.health()).activeOneShotsByProvider, { claude: 2, codex: 2 });
   bridge.releaseEverything();
   const requests = new Set(), invocations = new Set(), receipts = new Set();
-  for (const { id, promise } of calls) {
+  for (const { id, client, promise } of calls) {
     const response = await promise;
     assert.notEqual(response.isError, true, JSON.stringify(response));
-    const result = response.structuredContent;
-    assert.equal(result.stdout, `Completed result for ${id}.`);
+    let result = response.structuredContent;
+    if (result.pending === true) {
+      // The 10 s inline collection window (callProvider's default
+      // collectionMs) can end before releaseEverything() unblocks the
+      // fixture under CI load; follow the documented pending contract.
+      const task = await waitFor(async () => {
+        const taskResponse = await client.callTool({ name: 'get_task', arguments: { id: result.taskId } });
+        const value = taskResponse.structuredContent;
+        return ['done', 'failed', 'cancelled', 'interrupted'].includes(value.status) ? value : null;
+      }, 20000);
+      assert.equal(task.result, `Completed result for ${id}.`);
+    } else {
+      assert.equal(result.stdout, `Completed result for ${id}.`);
+    }
     const outer = bridge.receipts().find((entry) => entry.receiptId === result.receiptId);
     assert.ok(outer.requestId); assert.ok(outer.invocationId); assert.ok(result.receiptId);
     requests.add(outer.requestId); invocations.add(outer.invocationId); receipts.add(result.receiptId);
-    const row = bridge.receipts().find((entry) => entry.receiptId === result.transportReceiptId);
-    assert.equal(row.requestId, outer.requestId);
-    assert.equal(row.invocationId, outer.invocationId);
-    assert.equal(result.route.request_id, outer.requestId);
+    if (result.pending !== true) {
+      const row = bridge.receipts().find((entry) => entry.receiptId === result.transportReceiptId);
+      assert.equal(row.requestId, outer.requestId);
+      assert.equal(row.invocationId, outer.invocationId);
+      assert.equal(result.route.request_id, outer.requestId);
+    } else {
+      assert.equal(result.requestId, outer.requestId);
+      assert.equal(result.invocationId, outer.invocationId);
+    }
   }
   assert.equal(requests.size, 4); assert.equal(invocations.size, 4); assert.equal(receipts.size, 4);
 });
