@@ -284,6 +284,31 @@ test('a burn streak crossing after markExited() records evidence but never latch
   assert.equal(s.snapshot(now).postExitSignal.reason, 'burn_without_progress');
 });
 
+// G5 follow-up (Refs #133): #exited is sticky once markExited() has been
+// called once -- a later PLAIN evaluate() call (no options, as every real
+// call site in server.js makes: the periodic tick, a stdout 'data' event
+// that lands after exit but before close, or the usage observer's flush())
+// must default to record-only from then on, without any caller having to
+// remember to pass { latch: false } itself.
+test('sticky exited flag: a plain evaluate() after markExited() never latches, even without options', () => {
+  const s = make({ checkInIntervalMs: 60000, burnCheckins: 2, burnTokens: 1000000 });
+  let now = T0;
+  now += 60000;
+  s.recordProviderUsage({ total_tokens: 600000 }, { phase: 'incremental' });
+  assert.equal(s.evaluate(now).action, 'continue');
+  // Mark the process exited (record-only from here on), *before* the streak
+  // actually crosses its threshold -- mirroring providerExited being set at
+  // the proc 'error'/close call sites ahead of any later tick/data/flush.
+  s.markExited(now);
+  now += 60000;
+  s.recordProviderUsage({ total_tokens: 1300000 }, { phase: 'incremental' });
+  const verdict = s.evaluate(now); // plain call, no { latch } option
+  assert.equal(verdict.action, 'continue');
+  assert.notEqual(verdict.action, 'kill');
+  assert.equal(s.snapshot(now).stopped, null);
+  assert.equal(s.snapshot(now).postExitSignal.reason, 'burn_without_progress');
+});
+
 test('the same burn streak crossing still latches stopped before exit (evaluate() default latch:true)', () => {
   const s = make({ checkInIntervalMs: 60000, burnCheckins: 2, burnTokens: 1000000 });
   let now = T0;
