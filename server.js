@@ -1649,6 +1649,15 @@ function createProviderUsageObserver(parserName, supervisor, { onTerminal = null
     input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0,
     cache_creation_input_tokens: 0, total_tokens: 0, turns: 0,
   };
+  // G5 follow-up (Refs #133): flush() is only ever called once, from
+  // settleFromClose, and both providerExited call sites now call
+  // supervisor.markExited() before consume()/flush() can run, which sets a
+  // sticky RunSupervisor#exited flag. evaluate() itself now defaults latch
+  // to false whenever that flag is set, so these calls no longer need to
+  // thread a latch option explicitly -- record() during mid-stream 'data'
+  // handling (process still alive, exited not yet set) keeps latching as
+  // before, and anything reached after markExited() (flush(), or a
+  // late-arriving 'data' event) never does.
   const consume = (line) => {
     if (supervisor.evaluate().action === 'kill') return false;
     let event;
@@ -1705,7 +1714,10 @@ function createProviderUsageObserver(parserName, supervisor, { onTerminal = null
       partial = combined.slice(lineStart);
       return text.length;
     },
-    flush() { if (partial.trim() && supervisor.evaluate().action !== 'kill') consume(partial); partial = ''; },
+    flush() {
+      if (partial.trim() && supervisor.evaluate().action !== 'kill') consume(partial);
+      partial = '';
+    },
   };
 }
 
@@ -5633,6 +5645,12 @@ async function executeOneShot(body, res, privateContext = null) {
     if (ownedHandle) { ownedHandle.stop(); return; }
     if (settled) return;
     providerExited = true;
+    // G5 follow-up (Refs #133): sticky exit flag. From here on every
+    // supervisor.evaluate() call (periodic tick, stdout 'data' still in
+    // flight, usageObserver flush) defaults to record-only (latch: false),
+    // regardless of call site, closing the post-exit-but-pre-close latch
+    // window.
+    supervisor.markExited();
     settled = true;
     continuityControl.settled = true;
     continuity.saveRun(continuityControl);
@@ -5653,6 +5671,10 @@ async function executeOneShot(body, res, privateContext = null) {
   const settleFromClose = (code) => {
     if (settled) return;
     providerExited = true;
+    // G5 follow-up (Refs #133): see the proc.on('error') site above -- same
+    // sticky exit flag, closing the tick/stdout-data latch window between
+    // process exit and this close handler running.
+    supervisor.markExited();
     settled = true;
     continuityControl.settled = true;
     continuity.saveRun(continuityControl);
@@ -5680,16 +5702,14 @@ async function executeOneShot(body, res, privateContext = null) {
     }
     // flush() can accept usage from a final non-newline envelope whose other
     // terminal fields fail parsing. This call still records that usage as a
-    // check-in (evidence, checkins history) via supervisor.evaluate(). N2/Refs
-    // #133: the provider has already exited by the time settleFromClose runs
-    // (providerExited is set above), so a 'kill' action here is a post-exit
-    // artifact of the burn/loop streak crossing at the very last sample, not a
-    // kill that happened while the process was alive. Only a verdict latched
-    // by latchSupervisorVerdict() during proc.stdout 'data' handling (i.e.
-    // while the process was still running) may ever set stopReason; a
-    // completed run must never be relabelled burn_without_progress /
-    // loop_confirmed / wedged / assessor_stuck after the fact.
-    if (supervisor.snapshot().providerUsage) supervisor.evaluate();
+    // check-in (evidence, checkins history). N2/G5 (Refs #133): the provider
+    // has already exited by the time settleFromClose runs, and
+    // supervisor.markExited() was already called above (sticky #exited
+    // flag), so this is belt-and-suspenders record-only evaluation -- it can
+    // never latch `stopped` even on a fresh RunSupervisor instance that
+    // reached this call site some other way. Only a verdict latched while
+    // the process was alive may ever set stopReason or `stopped`.
+    if (supervisor.snapshot().providerUsage) supervisor.markExited();
     const supervisedUsage = supervisor.snapshot().providerUsage;
     const authoritativeUsage = acceptedProviderUsage(parsedOutput, supervisedUsage);
     const cleanedStdout = parsedOutput.output;
