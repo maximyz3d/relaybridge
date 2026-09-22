@@ -5066,12 +5066,13 @@ async function executeOneShot(body, res, privateContext = null) {
   res.once('close', () => {
     if (res._relayLifecycle) return;
     if (res.writableEnded || res._relayReceiptPersisted) return;
-    if (res._relayOwnedTransport) { res._relayIsolationReceiptDeferred = true; return; }
-    if (route.isolated_home_cleanup === 'pending') {
-      res._relayIsolationReceiptDeferred = true;
-      return;
-    }
-    persistCancellationReceipt();
+    // A client disconnect detaches rather than cancels (Refs #133): the
+    // provider keeps running to natural completion and the real terminal
+    // receipt is persisted from proc.on('error')/settleFromClose via
+    // sendOneShotResult's persistAfterDisconnect escape hatch, not here.
+    // Deferring uniformly (rather than eagerly stubbing a "cancelled"
+    // receipt) avoids a stale receipt pre-empting the real result.
+    res._relayIsolationReceiptDeferred = true;
   });
   if (['ollama_api', 'openai_chat_api'].includes(entry.oneshot_adapter)) {
     if (privateContext?.requiresOwner) return rejectBeforeAdmission(409, 'owned_transport_unsupported', {
@@ -5470,12 +5471,15 @@ async function executeOneShot(body, res, privateContext = null) {
 
 
   res.on('close', () => {
-    if (!res.writableEnded) {
-      clientGone = true;
-      if (!ownedHandle) finishSupervision();
-      killProcessTree(proc);
-      if (!ownedHandle) cleanupPromptFile();
-    }
+    // Detach, not cancel (B2, Refs #133): a client disconnect used to kill
+    // the provider process and record mcp_deadline_cancelled, which is a
+    // disguised time cap. The run now keeps running to natural completion;
+    // proc.on('error')/settleFromClose still persist the real terminal
+    // receipt (see sendOneShotResult's persistAfterDisconnect below). An
+    // explicit cancel (cancel_active_run/cancel_task/notifications/cancelled)
+    // goes through /api/runs/:runId/cancel -> cancelActiveRun(), which is
+    // independent of this handler and still kills.
+    if (!res.writableEnded) clientGone = true;
   });
   proc.stdout.setEncoding('utf8');
   proc.stderr.setEncoding('utf8');
@@ -5540,14 +5544,13 @@ async function executeOneShot(body, res, privateContext = null) {
     cleanupPromptFile();
     const isolationCleanup = cleanupProviderHome();
     releaseAdmission();
-    if (clientGone || res.writableEnded) {
-      if (res._relayIsolationReceiptDeferred) persistCancellationReceipt();
-      return;
-    }
+    // Detached (client gone) still gets the real terminal receipt persisted
+    // via persistAfterDisconnect; only the HTTP response write is skipped.
     const spawnProjection = entry.oneshot_output_parser === 'codex_json' ? parseCodexOutput(stdout, { ignoreTerminalResult: true }) : null;
     sendOneShotResult(res, { kind, route, exitCode: -1, stdout: spawnProjection ? '' : stdout, stderr: spawnProjection ? 'Provider process failed.' : stderr + '\n' + err.message, error: spawnProjection ? 'Provider process failed.' : err.message, failureClass: isolationCleanup.ok ? null : 'isolation_cleanup', dropped_out: true }, {
       kind, prompt, route, startedAt, cwd: resolvedCwd,
       accountId: dispatchAccount.account?.id || null,
+      persistAfterDisconnect: true,
     });
   });
   const settleFromClose = (code) => {
@@ -5565,10 +5568,9 @@ async function executeOneShot(body, res, privateContext = null) {
       try { ownedExecutionBackend.requestFinalizeTask(ownedHandle.ownerId); }
       catch (error) { console.error('[RelayBridge] owned result remains held:', error.code || 'OWNER_RESULT_UNCONFIRMED'); }
     });
-    if (clientGone || res.writableEnded) {
-      if (res._relayIsolationReceiptDeferred) persistCancellationReceipt();
-      return;
-    }
+    // Detached (client gone) still computes and persists the real terminal
+    // result below; sendOneShotResult's persistAfterDisconnect meta flag
+    // skips only the now-dead HTTP write, not receipt persistence.
     usageObserver.flush();
     copilotDenials.flush();
     const semanticStdout = supervisorStdout ?? stdout;
@@ -5809,6 +5811,7 @@ async function executeOneShot(body, res, privateContext = null) {
     }, {
       kind, prompt, route, startedAt, cwd: resolvedCwd, transportStdout: semanticStdout,
       accountId: dispatchAccount.account?.id || null,
+      persistAfterDisconnect: true,
     });
     // GitHub middleware: only successful runs checkpoint — a dropped-out run
     // may have left half-applied edits, which the human should triage first.

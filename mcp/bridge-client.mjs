@@ -43,7 +43,7 @@ const MAX_BRIDGE_RESPONSE_CHUNKS = 65536;
 
 function requestBridgeText(url, { method, headers, body, signal }) {
   return new Promise((resolve, reject) => {
-    const fail = (error) => reject(signal.aborted && signal.reason instanceof Error ? signal.reason : error);
+    const fail = (error) => reject(signal?.aborted && signal.reason instanceof Error ? signal.reason : error);
     let responseReceived = false;
     // fetch has an independent 300s header timeout in supported Node releases.
     // A buffered provider may legitimately need longer. This dedicated socket
@@ -217,15 +217,23 @@ export async function bridgeRequest(route, {
   if (route === '/api/oneshot') {
     headers['X-RelayBridge-Client-Deadline-At'] = String(Date.now() + requestTimeoutMs);
   }
+  // A caller's timeoutMs is a check-in hint recorded via the deadline header
+  // above, never an enforced ceiling on the transport (B2, Refs #133): the
+  // provider run detaches rather than getting killed on a timed-out HTTP
+  // socket. /api/oneshot's fetch is therefore bounded only by the caller's
+  // own signal (an explicit cancel or the MCP host's real disconnect), not
+  // by AbortSignal.timeout(requestTimeoutMs). Every other bridge route is a
+  // routine, short-lived call and keeps the timeout-bounded signal.
+  const transportSignal = route === '/api/oneshot'
+    ? signal
+    : (signal ? AbortSignal.any([signal, AbortSignal.timeout(requestTimeoutMs)]) : AbortSignal.timeout(requestTimeoutMs));
   let response;
   try {
     response = await requestBridgeText(new URL(route, BASE_URL), {
       method,
       headers,
       body: body === undefined ? undefined : JSON.stringify(body),
-      signal: signal
-        ? AbortSignal.any([signal, AbortSignal.timeout(requestTimeoutMs)])
-        : AbortSignal.timeout(requestTimeoutMs),
+      signal: transportSignal,
     });
   } catch (error) {
     throw new BridgeError(`RelayBridge request failed: ${error.message}`, { route, cause: error });

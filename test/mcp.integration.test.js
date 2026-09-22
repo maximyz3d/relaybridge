@@ -267,6 +267,7 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   const configPath = path.join(tempRoot, 'config.json');
   const invocationMarker = path.join(tempRoot, 'identity-provider-invocations.txt');
   const lateFinalPidMarker = path.join(tempRoot, 'late-final-provider.pid');
+  const detachPidMarker = path.join(tempRoot, 'detach-provider.pid');
   const allowedRootA = path.join(tempRoot, 'allowed-a');
   const allowedRootB = path.join(tempRoot, 'allowed-b');
   const outsideRoot = path.join(tempRoot, 'outside');
@@ -410,6 +411,14 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
       label: 'Slow cancellable provider',
       oneshot_safe: [process.execPath, helper, '--prompt-file', '{prompt_file}', '--delay', '10000'],
     },
+    slow_detach: {
+      ...echoProvider,
+      label: 'Detach-on-disconnect fixture',
+      oneshot_safe: [
+        process.execPath, helper, '--prompt-file', '{prompt_file}',
+        '--delay', '900', '--pid-marker', detachPidMarker,
+      ],
+    },
   }), 'utf8');
 
   fs.mkdirSync(dataDir, { recursive: true });
@@ -542,7 +551,13 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   for (const toolName of ['ask_provider', 'route_and_ask', 'run_committee', 'broadcast']) {
     const timeoutSchema = listedTools.tools.find((tool) => tool.name === toolName).inputSchema.properties.timeoutMs;
     assert.equal(timeoutSchema.default, undefined, `${toolName} leaves execution adaptive unless explicitly bounded`);
-    assert.equal(timeoutSchema.maximum, 2700000, `${toolName} accepts up to the transport ceiling (supervisor hard cap)`);
+    // B2 (Refs #133): timeoutMs is a check-in hint that a caller MAY supply,
+    // never an enforced ceiling — a run is never stopped by elapsed time.
+    // The schema floors it (z.number().int().min(...), no vendor max()), so
+    // zod-to-json-schema reports Number.MAX_SAFE_INTEGER — an int-safety
+    // artifact of the schema library, not a real 2700000ms (45m) cap.
+    assert.equal(timeoutSchema.maximum, Number.MAX_SAFE_INTEGER,
+      `${toolName} has no enforced timeoutMs ceiling; it is a check-in hint only`);
   }
   assert.ok(!toolNames.has('exec'), 'raw command execution must not be exposed over MCP');
   assert.ok(!toolNames.has('set_full_permissions'), 'the sticky dangerous toggle must not be exposed over MCP');
@@ -740,7 +755,9 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   assert.match(storedIdentitySeed, /^[0-9a-f]{64}$/);
   assert.notEqual(storedIdentitySeed, healthPayload.receiptStoreId, 'the exposed identity must bind the seed to its canonical store without exposing either');
   assert.equal(healthPayload.capabilityAuth, true);
-  assert.deepEqual(healthPayload.oneShotTimeoutPolicy, { minimumMs: 1000, defaultMs: 1200000, maxMs: 2700000 });
+  // B2 (Refs #133): timeoutMs is a check-in hint, never an enforced ceiling;
+  // oneShotDefaultMs/oneShotMaxMs are null in TIMEOUT_POLICY (no ceiling).
+  assert.deepEqual(healthPayload.oneShotTimeoutPolicy, { minimumMs: 1000, defaultMs: null, maxMs: null });
 
   const capability = await (await fetch(`${baseUrl}/api/capability`)).json();
   const collabHeaders = { 'X-PS-Bridge-Token': capability.token, 'Content-Type': 'application/json' };
@@ -1597,7 +1614,12 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   const cancelledTransportReceipt = receipts.structuredContent.receipts.find((receipt) =>
     receipt.event === 'bridge_provider_call' && receipt.provider === 'slow' && receipt.status === 'cancelled');
   assert.ok(cancelledTransportReceipt, 'client disconnect must persist a transport cancellation receipt');
-  assert.equal(cancelledTransportReceipt.failureClass, 'client_cancelled');
+  // B2 (Refs #133): an MCP client AbortSignal now drives the same
+  // cancelActiveRun() path as the cancel_active_run/cancel_task tools
+  // (explicitlyCancelActiveRun in mcp/server.mjs), so the transport receipt
+  // is tagged operator_cancelled -- it is an explicit cancel, not a bare
+  // disconnect (which stays client_cancelled with no supervisorStopReason).
+  assert.equal(cancelledTransportReceipt.failureClass, 'operator_cancelled');
   assert.equal(cancelledTransportReceipt.tokenUsageSource, 'unknown');
   assert.equal(cancelledTransportReceipt.modelInvocation, true);
   assert.equal(cancelledTransportReceipt.physicalAttemptCount, 1);
@@ -1618,12 +1640,20 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   assert.equal(cancelledOuterReceipt.attemptId, cancelledTransportReceipt.attemptId);
   assert.deepEqual(cancelledOuterReceipt.progressAtCancellation,
     cancelledTransportReceipt.progressAtCancellation);
+  // B2 (Refs #133): explicitlyCancelActiveRun drives the client's abort
+  // through the same cancelActiveRun() path as cancel_active_run, which
+  // also appends its own 'active_run_cancel_requested' receipt for this
+  // attemptId -- a third, distinct row alongside the transport/outer pair.
   const linkedCancellationRows = receipts.structuredContent.receipts.filter((receipt) =>
-    receipt.attemptId === cancelledTransportReceipt.attemptId);
+    receipt.attemptId === cancelledTransportReceipt.attemptId
+    && ['bridge_provider_call', 'provider_call'].includes(receipt.event));
   assert.equal(linkedCancellationRows.length, 2,
     'one physical attempt has exactly one transport row and one reconciled outer row');
   assert.deepEqual(new Set(linkedCancellationRows.map((receipt) => receipt.event)),
     new Set(['bridge_provider_call', 'provider_call']));
+  assert.ok(receipts.structuredContent.receipts.some((receipt) =>
+    receipt.attemptId === cancelledTransportReceipt.attemptId && receipt.event === 'active_run_cancel_requested'),
+    'the explicit cancel must also record the operator-cancellation request receipt');
   const usageOuterReceipt = receipts.structuredContent.receipts.find((receipt) => receipt.receiptId === usageProvider.structuredContent.receiptId);
   assert.equal(usageOuterReceipt.actualTotalTokens, 35453);
   assert.equal(usageOuterReceipt.tokenUsageSource, 'provider_reported');
@@ -1770,4 +1800,74 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   assert.equal(identityTransportReceipt.structuredContent.receipt.receiptStoreId, identityOuterReceipt.receiptStoreId);
   assert.ok(Array.isArray(dereferencedReceipt.structuredContent.chain));
   assert.ok(fs.existsSync(path.join(dataDir, 'receipts')));
+
+  // LANE test 8 (B2, Refs #133): a disconnect mid-run detaches rather than
+  // cancels. Close a second MCP client's transport (a real disconnect, not
+  // an explicit notifications/cancelled) while its provider run is still in
+  // flight and confirm: (a) the provider is never killed early, it exits on
+  // its own once it finishes, and (b) the terminal receipt/result stay
+  // retrievable through the still-connected primary client, and are not
+  // recorded as a cancellation.
+  const [{ Client: DetachClient }, { StdioClientTransport: DetachStdioTransport }] = await Promise.all([
+    import('@modelcontextprotocol/client'),
+    import('@modelcontextprotocol/client/stdio'),
+  ]);
+  const detachTransport = new DetachStdioTransport({
+    command: process.execPath,
+    args: [path.join(ROOT, 'mcp', 'server.mjs')],
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      PS_BRIDGE_URL: baseUrl,
+      PS_BRIDGE_TOKEN_FILE: tokenPath,
+      PS_BRIDGE_DATA_DIR: dataDir,
+      PS_BRIDGE_CONFIG_FILE: configPath,
+      NODE_ENV: 'test',
+      RELAYBRIDGE_TEST_BUILD_ID: 'integration-current',
+    },
+    stderr: 'ignore',
+  });
+  const detachClient = new DetachClient({ name: 'ps-bridge-detach-test', version: '1.0.0' });
+  await detachClient.connect(detachTransport);
+  const detachPending = detachClient.callTool({
+    name: 'ask_provider', arguments: { kind: 'slow_detach', prompt: 'MCP_DETACH_MARKER', useCache: false },
+  }).catch(() => {});
+  const detachStartDeadline = Date.now() + 5000;
+  while (Date.now() < detachStartDeadline && !fs.existsSync(detachPidMarker)) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.ok(fs.existsSync(detachPidMarker), 'slow_detach provider must have started');
+  const detachPid = Number(fs.readFileSync(detachPidMarker, 'utf8').trim());
+  assert.ok(isLiveProcess(detachPid), 'provider must still be alive when the client disconnects');
+  await detachTransport.close();
+  await detachPending;
+  const detachExitDeadline = Date.now() + 5000;
+  while (Date.now() < detachExitDeadline && isLiveProcess(detachPid)) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.equal(isLiveProcess(detachPid), false, 'detached provider must exit on its own after finishing, not be killed by the disconnect');
+  const detachReceipts = await client.callTool({ name: 'list_receipts', arguments: { limit: 500 } });
+  const detachTransportReceipt = detachReceipts.structuredContent.receipts.find((receipt) =>
+    receipt.event === 'bridge_provider_call' && receipt.provider === 'slow_detach');
+  assert.ok(detachTransportReceipt, 'a disconnect must still persist exactly one terminal receipt');
+  assert.notEqual(detachTransportReceipt.status, 'cancelled', 'a disconnect detaches; it must not record a cancellation');
+  assert.equal(detachTransportReceipt.failureClass, null);
+  assert.match(detachTransportReceipt.outerReceiptId, /^rcpt_/);
+  assert.equal(detachTransportReceipt.status, 'completed',
+    'the detached provider must have actually finished, not been dropped or timed out');
+  // Receipts never persist raw stdout (see the 'PRIVATE_STDOUT' guard
+  // elsewhere in this file) -- only its hash and length -- so "the real
+  // completed result stays retrievable" is verified against those, plus the
+  // reconciled outer receipt, rather than a literal stdout field.
+  const crypto = await import('node:crypto');
+  assert.equal(detachTransportReceipt.outputHash,
+    crypto.createHash('sha256').update('MCP_DETACH_MARKER').digest('hex'),
+    'the real completed result must stay retrievable even though the disconnecting client never received it');
+  assert.equal(detachTransportReceipt.outputChars, 'MCP_DETACH_MARKER'.length);
+  const detachOuter = await client.callTool({
+    name: 'get_receipt', arguments: { receiptId: detachTransportReceipt.outerReceiptId },
+  });
+  assert.equal(detachOuter.structuredContent.receipt.receiptId, detachTransportReceipt.outerReceiptId);
+  assert.notEqual(detachOuter.structuredContent.receipt.cancelled, true,
+    'the reconciled outer receipt must not be recorded as a cancellation either');
 });
