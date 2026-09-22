@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { McpServer } from '@modelcontextprotocol/server';
+import { McpServer, SdkError, SdkErrorCode } from '@modelcontextprotocol/server';
 import { serveStdio } from '@modelcontextprotocol/server/stdio';
 import { z } from 'zod';
 import TIMEOUT_POLICY from '../timeout-policy.cjs';
@@ -1531,8 +1531,16 @@ async function reconcileCancelledTransportAttempt({ requestId, outerReceiptId, k
   return reconcileTransportReceipt({ requestId, sanitized, transportReceipt });
 }
 
+// B2 (Refs #133): explicitlyCancelActiveRun stops the run through the same
+// cancelActiveRun() path as cancel_active_run/cancel_task, which records an
+// explicit supervisorStopReason of 'operator_cancelled'. That is a real
+// cancellation, not a genuine supervisor verdict (budget/wedged/etc)
+// racing the client's own cancel, so it must not flip cancelled to false.
+const CANCELLATION_STOP_REASONS = new Set(['operator_cancelled', 'client_cancelled', 'mcp_deadline_cancelled']);
+
 export function reconcileTransportReceipt({ requestId, sanitized, transportReceipt }) {
-  const supervisorWon = !!transportReceipt.supervisorStopReason;
+  const supervisorWon = !!transportReceipt.supervisorStopReason
+    && !CANCELLATION_STOP_REASONS.has(transportReceipt.supervisorStopReason);
   const failureClass = supervisorWon
     ? (transportReceipt.failureClass || 'timeout')
     : ['client_cancelled', 'mcp_deadline_cancelled'].includes(transportReceipt.failureClass)
@@ -1580,6 +1588,35 @@ export function reconcileTransportReceipt({ requestId, sanitized, transportRecei
   };
 }
 
+// B2 (Refs #133): an explicit client cancel (notifications/cancelled routed
+// through the SDK's per-request AbortSignal, distinct from a bare transport
+// deadline) must still actually stop the provider run, the same as calling
+// cancel_active_run. Aborting our own fetch to the bridge only drops this
+// MCP server's HTTP connection to it -- server.js's disconnect handler now
+// detaches instead of killing (B2), so without this the run would keep
+// going unattended. Look the run up by the request_id/invocation_id/
+// attempt_id we already generated for it and cancel it the same way
+// cancel_active_run does. Best-effort: swallow all failures, this only ever
+// supplements the abort of our own request, never blocks or replaces it.
+async function explicitlyCancelActiveRun({ requestId, invocationId, attemptId }, deadlineMs = 2000) {
+  const deadline = Date.now() + deadlineMs;
+  try {
+    do {
+      let runs;
+      try { ({ runs } = await bridgeRequest('/api/runs/active', { timeoutMs: 2000 })); }
+      catch { runs = []; }
+      const match = (runs || []).find((run) => run.route?.request_id === requestId);
+      if (match) {
+        await bridgeRequest(`/api/runs/${encodeURIComponent(match.runId)}/cancel`, {
+          method: 'POST', body: { requestId, invocationId, attemptId }, actionIdentity: true, timeoutMs: 2000,
+        });
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    } while (Date.now() < deadline);
+  } catch { /* best-effort; the request's own abort still applies */ }
+}
+
 async function callProvider({
   kind,
   prompt,
@@ -1610,19 +1647,14 @@ async function callProvider({
   // A host/transport deadline (SDK TimeoutError) must not abort the bridge
   // request: the provider process keeps running and the bridge still stores
   // the receipt, retrievable later by requestId via get_receipt/get_run. An
-  // explicit client cancel (any other abort reason) still cancels normally.
+  // explicit client cancel (any other abort reason) still cancels normally:
+  // it both aborts our own fetch to the bridge (below) and, once requestId/
+  // invocationId/attemptId are known, actively cancels the run server-side
+  // (explicitlyCancelActiveRun) so a plain disconnect vs. a real cancel are
+  // no longer indistinguishable at the HTTP layer (B2, Refs #133).
   let bridgeSignal = signal;
   let hostDeadlineDetached = false;
-  if (signal) {
-    const bridgeController = new AbortController();
-    const forwardOrDetach = () => {
-      if (signal.reason?.name === 'TimeoutError') hostDeadlineDetached = true;
-      else bridgeController.abort(signal.reason);
-    };
-    if (signal.aborted) forwardOrDetach();
-    else signal.addEventListener('abort', forwardOrDetach, { once: true });
-    bridgeSignal = bridgeController.signal;
-  }
+  let detachedBy = null;
   const durableTaskId = timeoutMs === undefined ? `t_mcp_${crypto.randomBytes(12).toString('hex')}` : null;
   const collectionOverride = Number(process.env.RELAYBRIDGE_COLLECTION_MS);
   const collectionBudget = Number.isSafeInteger(collectionOverride) && collectionOverride >= 100 && collectionOverride <= 30000
@@ -1632,6 +1664,40 @@ async function callProvider({
   const requestId = durableTaskId ? `queued:${durableTaskId}` : `mcp:${crypto.randomUUID()}`;
   const invocationId = requestId;
   const attemptId = `${requestId}:attempt:1`;
+  if (signal) {
+    const bridgeController = new AbortController();
+    const forwardOrDetach = () => {
+      const reason = signal.reason;
+      // Every notifications/cancelled reason the SDK surfaces here is either
+      // the Error we set below or the raw string from CancelledNotification
+      // params.reason (see server.mjs's notification wiring in
+      // @modelcontextprotocol/server: controller.abort(notification.params.reason)).
+      const reasonText = typeof reason === 'string' ? reason : (reason?.message || '');
+      // (a) host/transport deadline (explicit TimeoutError from our own code).
+      const isHostTimeout = reason?.name === 'TimeoutError';
+      // (b) BLOCKER fix: Protocol._onclose() aborts every in-flight handler
+      // with SdkError(SdkErrorCode.ConnectionClosed, ...) on ANY transport
+      // close (host restart, disconnect, session teardown) -- not just a
+      // real user cancel. Match by code, not message text (Refs #133 review).
+      const isConnectionClosed = reason instanceof SdkError && reason.code === SdkErrorCode.ConnectionClosed;
+      // (c) a notifications/cancelled reason that is itself a client-side
+      // request timeout (e.g. "McpError: MCP error -32001: Request timed
+      // out"), which is a deadline, not a user-initiated cancel.
+      const isClientTimeoutCancel = !isHostTimeout && !isConnectionClosed
+        && (reason?.code === SdkErrorCode.RequestTimeout || /-32001|RequestTimeout|timed out/i.test(reasonText));
+      if (isHostTimeout || isConnectionClosed || isClientTimeoutCancel) {
+        hostDeadlineDetached = true;
+        detachedBy = isHostTimeout ? 'host_timeout' : isConnectionClosed ? 'transport_closed' : 'client_timeout_cancel';
+        return;
+      }
+      // Every other notifications/cancelled reason is a genuine user cancel.
+      bridgeController.abort(signal.reason);
+      explicitlyCancelActiveRun({ requestId, invocationId, attemptId }).catch(() => {});
+    };
+    if (signal.aborted) forwardOrDetach();
+    else signal.addEventListener('abort', forwardOrDetach, { once: true });
+    bridgeSignal = bridgeController.signal;
+  }
   const outerReceiptId = `rcpt_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 8)}`;
   const classification = classifyTask(prompt);
   const effectiveTaskTier = taskTier !== undefined ? taskTier : execution ? undefined : classification.tier;
@@ -2014,6 +2080,15 @@ async function callProvider({
     // true when a host/transport deadline fired but the run was NOT cancelled:
     // it continued in the background and this result reflects its completion.
     hostDeadlineDetached,
+    // Which of the three detach causes applied (null when not detached):
+    // 'transport_closed' (SDK ConnectionClosed on any transport close),
+    // 'host_timeout' (our own TimeoutError), or 'client_timeout_cancel' (a
+    // notifications/cancelled reason that is itself a request timeout).
+    detachedBy,
+    // A caller timeoutMs is a check-in hint, never an enforced ceiling (B2,
+    // Refs #133): record it here so callers can see it was received and
+    // ignored, rather than silently dropping it.
+    ...(timeoutMs !== undefined ? { ignoredCaps: { timeoutMs } } : {}),
   };
   const { policy } = loadRoutingData();
   let cachePersistenceError = null;
