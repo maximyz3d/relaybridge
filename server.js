@@ -5679,23 +5679,17 @@ async function executeOneShot(body, res, privateContext = null) {
       supervisor.recordProviderUsage({ ...(parsedOutput.usage || {}), turns: parsedOutput.numTurns }, { phase: 'terminal' });
     }
     // flush() can accept usage from a final non-newline envelope whose other
-    // terminal fields fail parsing. The independently validated usage must
-    // still latch the local budget stop before any free-text classification.
-    if (supervisor.snapshot().providerUsage) {
-      const terminalVerdict = supervisor.evaluate();
-      if (terminalVerdict.action === 'kill' && !stopReason) {
-        stopReason = terminalVerdict.reason;
-        stopDetail = terminalVerdict.detail;
-        if (terminalVerdict.reason === 'token_budget') stopBudgetEnforcement = 'terminal';
-        // The kill was only discoverable from the terminal result itself, so it
-        // was parsed as authoritative content above. Re-parse with the same
-        // suppression the mid-stream same-chunk cutoff applies, so that result
-        // can never surface as output, rate-limit prose, or a completed answer.
-        if (stopReason === 'token_budget') {
-          parsedOutput = parseConfiguredOneShotOutput(entry, semanticStdout, { ignoreTerminalResult: true, stderr, exitCode:code });
-        }
-      }
-    }
+    // terminal fields fail parsing. This call still records that usage as a
+    // check-in (evidence, checkins history) via supervisor.evaluate(). N2/Refs
+    // #133: the provider has already exited by the time settleFromClose runs
+    // (providerExited is set above), so a 'kill' action here is a post-exit
+    // artifact of the burn/loop streak crossing at the very last sample, not a
+    // kill that happened while the process was alive. Only a verdict latched
+    // by latchSupervisorVerdict() during proc.stdout 'data' handling (i.e.
+    // while the process was still running) may ever set stopReason; a
+    // completed run must never be relabelled burn_without_progress /
+    // loop_confirmed / wedged / assessor_stuck after the fact.
+    if (supervisor.snapshot().providerUsage) supervisor.evaluate();
     const supervisedUsage = supervisor.snapshot().providerUsage;
     const authoritativeUsage = acceptedProviderUsage(parsedOutput, supervisedUsage);
     const cleanedStdout = parsedOutput.output;
