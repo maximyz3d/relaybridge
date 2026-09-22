@@ -2008,9 +2008,9 @@ function parseConfiguredOneShotOutput(entry, rawOutput, { ignoreTerminalResult =
     };
   }
   let events = [];
+  let document = null;
   try {
     const text = String(rawOutput || '').trim();
-    let document;
     try {
       document = JSON.parse(text);
       events = document && typeof document === 'object' && !Array.isArray(document) ? [document] : [];
@@ -2087,6 +2087,12 @@ function parseConfiguredOneShotOutput(entry, rawOutput, { ignoreTerminalResult =
       partialDiagnostic: partial?.text || '', partialDiagnosticTruncated: partial?.truncated === true,
       partialCheckpoint: ignoreTerminalResult ? extractClaudeAssistantCheckpoint(events) : null,
       parseError: null,
+      // Only a clean success (no typed or subtype-signalled error) blocks the
+      // prose heuristic below. A valid document that is itself a real error
+      // (error_during_execution, etc.) with no numeric api_error_status still
+      // needs errors[]/diagnostic text as its only rate-limit evidence, same
+      // as before the check-in change.
+      terminalDocumentFound: !isError,
     };
   } catch (error) {
     const partial = extractClaudeAssistantDiagnostic(events);
@@ -2095,6 +2101,12 @@ function parseConfiguredOneShotOutput(entry, rawOutput, { ignoreTerminalResult =
       output: '', usage: null, isError: true,
       resultSubtype: null, failureClass: 'provider_error',
       diagnostic: '', errorCount: 0, providerStopReason: null,
+      // A result document was present but had a malformed/unsupported field
+      // (bad subtype, non-numeric api_error_status, etc). That still counts
+      // as a typed terminal artifact: stderr/text prose must not be used to
+      // recolor it as a rate limit. Only a genuine crash with no result
+      // document at all (document === null) falls back to prose evidence.
+      terminalDocumentFound: document !== null,
       errorObserved: 0, errorInvalid: 0, errorDiagnosticTruncated: false,
       terminalReason: null, apiErrorStatus: null,
       permissionDenials: normalizeClaudePermissionDenials([]),
@@ -5741,17 +5753,23 @@ async function executeOneShot(body, res, privateContext = null) {
     });
     const cursorActionRequired = runClassification.actionRequired || null;
     const cursorUsageQuotaExhausted = cursorActionRequired?.kind === 'usage_quota_exhausted';
-    // A token-budget kill must never be recolored as a rate limit by ordinary
-    // prose (stderr or model text discussing limits) once the budget has
-    // already tripped. An authoritative provider API 429 status still counts,
-    // since it reflects evidence that preceded/caused the cutoff rather than
-    // free text caught in the failure blob.
+    // A token-budget check-in must never be recolored as a rate limit by
+    // ordinary prose (stderr or model text discussing limits). An
+    // authoritative provider API 429 status still counts, since it reflects
+    // typed evidence rather than free text caught in the failure blob. Any
+    // run that produced a typed terminal result document (a clean success,
+    // or a malformed-field parse failure) is never reclassified from
+    // stderr/text prose either: only a genuine crash with no result document
+    // at all may fall back to the prose heuristic.
+    const hadTypedTerminal = !nativeStructuredOutput && parsedOutput.terminalDocumentFound !== undefined
+      ? parsedOutput.terminalDocumentFound
+      : (code === 0 && !!cleanedStdout && !parsedOutput.isError && !parsedOutput.parseError && !parsedOutput.failureClass);
     const rate_limited = !!terminalQuotaEvidence || (parsedOutput.resultSubtype !== 'error_max_budget_usd'
       && !cursorUsageQuotaExhausted
       && (authoritativeApiFailure === 'rate_limit'
         || !!copilotQuotaEvidence
         || !!runClassification.quotaEvidence
-        || (!stopReason && rate_signals.some(s => failureBlob.includes(s)))));
+        || (!stopReason && !hadTypedTerminal && rate_signals.some(s => failureBlob.includes(s)))));
     const budget_exceeded = tokenBudgetExceeded || parsedOutput.resultSubtype === 'error_max_budget_usd'
       || authoritativeApiFailure === 'budget'
       || cursorUsageQuotaExhausted

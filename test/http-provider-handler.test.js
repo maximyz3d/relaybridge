@@ -57,7 +57,8 @@ test('production hosted handler preserves terminal reasons, nonadditive usage an
   const refused = await run(new Response(JSON.stringify(completion('stop', { refusal: 'Cannot answer.' }))));
   assert.equal(refused.failureClass, 'refusal'); assert.equal(refused.stdout, '');
   const budget = await run(new Response(JSON.stringify(completion('length'))), { maxTotalTokens: 10 });
-  assert.equal(budget.failureClass, 'token_budget'); assert.equal(budget.provider_stop_reason, 'length');
+  assert.equal(budget.failureClass, 'max_tokens', 'a local budget no longer forces a token_budget stop; the natural length classification wins');
+  assert.equal(budget.provider_stop_reason, 'length');
   assert.equal(budget.usage.input_tokens, 12); assert.equal(budget.usage.total_tokens, 18); assert.equal(budget.stdout, '');
 });
 
