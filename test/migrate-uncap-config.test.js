@@ -122,3 +122,20 @@ test('migrate-uncap-config: refuses a missing config file', () => {
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /config not found/);
 });
+
+test('migrate-uncap-config: strips --max-turns=N, keeps file mode, and leaves no temp file', () => {
+  const dir = tmpdir();
+  const cfgPath = writeFixture(dir);
+  const cfg = fixtureConfig();
+  cfg.grok = { oneshot_safe: ['--max-turns=32', '--keep'] };
+  fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + '\n');
+  fs.chmodSync(cfgPath, 0o640);
+
+  const result = run(['--config', cfgPath, '--backup-dir', path.join(dir, 'backup')]);
+
+  assert.equal(result.status, 0, result.stderr);
+  const migrated = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+  assert.deepEqual(migrated.grok.oneshot_safe, ['--keep']);
+  assert.equal(fs.statSync(cfgPath).mode & 0o777, 0o640, 'config mode must survive the atomic replace');
+  assert.deepEqual(fs.readdirSync(path.dirname(cfgPath)), ['cli-config.json'], 'no temp file may be left beside the config');
+});

@@ -840,6 +840,10 @@ function appendBridgeProviderReceipt({ kind, prompt, route, payload, startedAt, 
       ? payload.writer_diff_summary : null,
     stopReason: normalizeClaudeResultString(payload.stop_reason),
     supervisorStopReason: normalizeClaudeResultString(payload.supervisor_stop_reason),
+    // S3 (Refs #133): a supervisor kill must carry the checkpoint saved just
+    // before the process died, sourced from continuity.saveRun.
+    stopCheckpointId: payload.stop_checkpoint_id || null,
+    stopCheckpointPath: payload.stop_checkpoint_path || null,
     providerTimeoutSource: normalizeClaudeResultString(payload.provider_timeout_source),
     providerBudget: payload.provider_budget || null,
     providerBudgetEnforcement: normalizeClaudeResultString(payload.provider_budget_enforcement),
@@ -2004,9 +2008,9 @@ function parseConfiguredOneShotOutput(entry, rawOutput, { ignoreTerminalResult =
     };
   }
   let events = [];
+  let document = null;
   try {
     const text = String(rawOutput || '').trim();
-    let document;
     try {
       document = JSON.parse(text);
       events = document && typeof document === 'object' && !Array.isArray(document) ? [document] : [];
@@ -2083,6 +2087,12 @@ function parseConfiguredOneShotOutput(entry, rawOutput, { ignoreTerminalResult =
       partialDiagnostic: partial?.text || '', partialDiagnosticTruncated: partial?.truncated === true,
       partialCheckpoint: ignoreTerminalResult ? extractClaudeAssistantCheckpoint(events) : null,
       parseError: null,
+      // Only a clean success (no typed or subtype-signalled error) blocks the
+      // prose heuristic below. A valid document that is itself a real error
+      // (error_during_execution, etc.) with no numeric api_error_status still
+      // needs errors[]/diagnostic text as its only rate-limit evidence, same
+      // as before the check-in change.
+      terminalDocumentFound: !isError,
     };
   } catch (error) {
     const partial = extractClaudeAssistantDiagnostic(events);
@@ -2091,6 +2101,12 @@ function parseConfiguredOneShotOutput(entry, rawOutput, { ignoreTerminalResult =
       output: '', usage: null, isError: true,
       resultSubtype: null, failureClass: 'provider_error',
       diagnostic: '', errorCount: 0, providerStopReason: null,
+      // A result document was present but had a malformed/unsupported field
+      // (bad subtype, non-numeric api_error_status, etc). That still counts
+      // as a typed terminal artifact: stderr/text prose must not be used to
+      // recolor it as a rate limit. Only a genuine crash with no result
+      // document at all (document === null) falls back to prose evidence.
+      terminalDocumentFound: document !== null,
       errorObserved: 0, errorInvalid: 0, errorDiagnosticTruncated: false,
       terminalReason: null, apiErrorStatus: null,
       permissionDenials: normalizeClaudePermissionDenials([]),
@@ -2254,6 +2270,22 @@ async function runHttpProviderOneShot({ entry, prompt, effectivePrompt, res, rou
   let requestStarted = false, responseStatus = null, semanticOutput = '', terminal = null, payload;
   let acceptedUsage = null, sealedPayload = null, transportDiagnostic = null;
   const wireProgress = (bytes) => { route.transport_wire_bytes += bytes; };
+  // Ollama stream output past supervisor.opts.spillAfterBytes no longer
+  // throws output_cap (Refs #133): it spills to the same
+  // <runId>.output-spill.log convention as the CLI path, and only a bounded
+  // tail is kept in memory so semanticOutput cannot grow unbounded.
+  let outputSpillFd = null, outputSpillPath = null;
+  const OUTPUT_SPILL_TAIL_BYTES = 8 * 1024 * 1024;
+  const spillOverflow = (chunk) => {
+    if (!chunk) return;
+    if (!outputSpillPath) {
+      outputSpillPath = path.join(DATA_DIR, 'runs', `${runId}.output-spill.log`);
+      try { fs.mkdirSync(path.dirname(outputSpillPath), { recursive: true }); } catch {}
+      try { outputSpillFd = fs.openSync(outputSpillPath, 'a'); } catch { outputSpillFd = null; }
+      supervisor.recordOutputSpillPath(outputSpillPath);
+    }
+    if (outputSpillFd !== null) { try { fs.writeSync(outputSpillFd, chunk); } catch {} }
+  };
   const meta = { kind: route.provider, prompt, route, startedAt, accountId, cwd, persistAfterDisconnect: true };
   const usageFromTerminal = (value) => {
     const input = nonnegativeUsageNumber(value.prompt_eval_count);
@@ -2342,10 +2374,17 @@ async function runHttpProviderOneShot({ entry, prompt, effectivePrompt, res, rou
       } else {
         await readOllamaStream(response, { signal: controller.signal,
           maxOutputBytes: Math.min(supervisor.opts.spillAfterBytes, HTTP_PROVIDER_LIMITS.maxOutputBytes),
+          outputTailBytes: OUTPUT_SPILL_TAIL_BYTES,
           onWireBytes: wireProgress,
+          onOutputSpill: spillOverflow,
           onTerminal: (value) => acceptTerminal(value, usageFromTerminal(value)),
           onDelta: (delta) => {
-            lifecycle.observeOutput(delta, (accepted) => { semanticOutput += accepted; });
+            lifecycle.observeOutput(delta, (accepted) => {
+              semanticOutput += accepted;
+              if (Buffer.byteLength(semanticOutput, 'utf8') > OUTPUT_SPILL_TAIL_BYTES) {
+                semanticOutput = semanticOutput.slice(-OUTPUT_SPILL_TAIL_BYTES);
+              }
+            });
             return !lifecycle.snapshot().stop;
           }, onTerminalAccepted: sealTerminal });
       }
@@ -2360,6 +2399,7 @@ async function runHttpProviderOneShot({ entry, prompt, effectivePrompt, res, rou
       errorCode: error.code || null, auth_failed: isHostedApiKeyMissingError(error),
       dropped_out: true, model_invocation: requestStarted ? (responseStatus && responseStatus >= 200 && responseStatus < 300 ? true : null) : false };
   } finally {
+    if (outputSpillFd !== null) { try { fs.closeSync(outputSpillFd); } catch {} outputSpillFd = null; }
     res.removeListener('close', detach);
     lifecycle.sealOutcome(payload);
     const state = lifecycle.snapshot();
@@ -4743,6 +4783,10 @@ async function executeOneShot(body, res, privateContext = null) {
   // probe result (see the quota_unknown gate below). Not yet threaded into the eventual
   // success receipt/response: that assembly lives outside this lane's owned server.js regions.
   let staleAdmittedNativeUsage = false;
+  // S5: which fallback condition justified the stale admit, threaded onto the receipt
+  // alongside native_usage_freshness so a window-reset admit is distinguishable from a
+  // headroom-above-reserve admit after the fact.
+  let staleAdmitReason = null;
   if (nativeLaunchIdentity.required) {
     if (!nativeLaunchIdentity.identity) return rejectBeforeAdmission(409, 'account_identity_unavailable', {
       error: 'The selected native Claude profile identity is unavailable.', model_invocation: false, physical_attempt_count: 0 });
@@ -4767,6 +4811,14 @@ async function executeOneShot(body, res, privateContext = null) {
       // Fall back to the last same-identity observation rather than rejecting outright: admit
       // as stale when its binding window has already reset, or its last known headroom is
       // still above the protected-reserve trigger that validateClaudeLaunchAdmission enforces.
+      // B1: never stale-admit on an identity mismatch. A probe that itself detected a mismatch
+      // (identity_mismatch_pre/post) means the captured identity cannot be trusted for a
+      // fallback decision, even if a cheap re-capture still looks identical; and
+      // validateClaudeLaunchAdmission's own sameClaudeLaunchIdentity() check must independently
+      // hold, since a validation failure can also mean the identity itself drifted, not just
+      // freshness/headroom.
+      const probeIdentityMismatch = typeof nativeProbeReason === 'string' && nativeProbeReason.startsWith('identity_mismatch');
+      const identityStillMatches = !probeIdentityMismatch && sameClaudeLaunchIdentity(nativeLaunchIdentity);
       const priorSeat = subscriptionUsage.verdict(nativeLaunchIdentity.identity.quotaSeat,
         { accountFingerprint: nativeLaunchIdentity.identity.accountFingerprint });
       const hasPriorObservation = Array.isArray(priorSeat.windows) && priorSeat.windows.length > 0
@@ -4775,8 +4827,9 @@ async function executeOneShot(body, res, privateContext = null) {
         ? priorSeat.windows.reduce((a, b) => (a.percentRemaining ?? 100) <= (b.percentRemaining ?? 100) ? a : b) : null;
       const windowReset = !!bindingWindow && Number.isSafeInteger(bindingWindow.resetsAt) && Date.now() > bindingWindow.resetsAt;
       const headroomAboveReserve = hasPriorObservation && priorSeat.admit === true;
-      if (hasPriorObservation && (windowReset || headroomAboveReserve)) {
+      if (identityStillMatches && hasPriorObservation && (windowReset || headroomAboveReserve)) {
         staleAdmittedNativeUsage = true;
+        staleAdmitReason = windowReset ? 'window_reset' : 'headroom_above_reserve';
       } else {
         claudeUsageProbeFailures.set(claudeUsageProbeKey(nativeLaunchIdentity.identity), Date.now());
         return rejectBeforeAdmission(409, 'quota_unknown', {
@@ -4918,6 +4971,7 @@ async function executeOneShot(body, res, privateContext = null) {
     native_usage_freshness: nativeLaunchIdentity?.required
       ? (staleAdmittedNativeUsage ? 'stale_admitted' : 'fresh')
       : null,
+    stale_reason: staleAdmittedNativeUsage ? staleAdmitReason : null,
     transport: entry.transport || 'cli',
     configured_binary: bin,
     resolved_binary: resolvedBin,
@@ -5109,7 +5163,10 @@ async function executeOneShot(body, res, privateContext = null) {
     resolvedCwd = spawnCwdIdentity.resolved;
     ownedExecutionBackend?.assertWorkspaceLaunchAllowed({ cwd: resolvedCwd, privateContext, dangerous: useDanger });
     if (useDanger) writerWorkspaceBaseline = captureWriterWorkspaceSnapshot(resolvedCwd);
-    if (!staleAdmittedNativeUsage && !validateClaudeLaunchAdmission(nativeLaunchIdentity, launch.env)) throw Object.assign(new Error('Native Claude launch identity or capacity changed.'), { code: 'NATIVE_LAUNCH_ADMISSION_CHANGED' });
+    // B1: a stale admit still must verify account/identity against the actual spawn env;
+    // only the freshness/headroom comparison is skipped for a stale admit.
+    if (staleAdmittedNativeUsage ? !sameClaudeLaunchIdentity(nativeLaunchIdentity, launch.env)
+      : !validateClaudeLaunchAdmission(nativeLaunchIdentity, launch.env)) throw Object.assign(new Error('Native Claude launch identity or capacity changed.'), { code: 'NATIVE_LAUNCH_ADMISSION_CHANGED' });
     const spawnOpts = {
       cwd: resolvedCwd,
       env: launch.env,
@@ -5151,7 +5208,8 @@ async function executeOneShot(body, res, privateContext = null) {
       ownedChildStops.set(proc, () => ownedHandle.stop());
       route.execution_owner = { ownerId: ownedHandle.ownerId, bindingHash: ownedHandle.bindingHash };
     } else {
-      if (!staleAdmittedNativeUsage && !validateClaudeLaunchAdmission(nativeLaunchIdentity, launch.env)) throw Object.assign(new Error('Native Claude launch admission changed.'), { code: 'NATIVE_LAUNCH_ADMISSION_CHANGED' });
+      if (staleAdmittedNativeUsage ? !sameClaudeLaunchIdentity(nativeLaunchIdentity, launch.env)
+        : !validateClaudeLaunchAdmission(nativeLaunchIdentity, launch.env)) throw Object.assign(new Error('Native Claude launch admission changed.'), { code: 'NATIVE_LAUNCH_ADMISSION_CHANGED' });
       proc = trackChild(spawn(launch.file, launch.args, spawnOpts));
     }
     // ChildProcess stdin errors are emitted asynchronously and are not caught
@@ -5420,6 +5478,29 @@ async function executeOneShot(body, res, privateContext = null) {
     continuityControl.stopCheckpointPath = stopCheckpointPath;
     return true;
   };
+  // S2/S4 (Refs #133): stallAction:"notify" (this.stall) and unverifiable
+  // CPU silence (this.unsampledStall) never kill, but they must still be
+  // visible as incidents, once each per run, with the check-in evidence
+  // that triggered them.
+  let stallIncidentReported = false;
+  let unsampledStallIncidentReported = false;
+  const reportSupervisorIncidents = () => {
+    const snap = supervisor.snapshot();
+    const lastCheckin = snap.checkins?.length ? snap.checkins[snap.checkins.length - 1] : null;
+    const lastDetectors = lastCheckin?.detectors?.length ? ` [last check-in detectors: ${lastCheckin.detectors.join(',')}]` : '';
+    if (snap.stall && !stallIncidentReported) {
+      stallIncidentReported = true;
+      incidentLog.report({ classification: 'supervision_stall', runId, phase: 'supervision',
+        provider: kind, summary: `stallAction notify: ${snap.stall.reason} -- ${snap.stall.detail}${lastDetectors}`.slice(0, 299),
+        nextAction: 'Inspect the run; stallAction:"notify" never kills, evidence is in the check-in log.' });
+    }
+    if (snap.unsampledStall && !unsampledStallIncidentReported) {
+      unsampledStallIncidentReported = true;
+      incidentLog.report({ classification: 'supervision_stall', runId, phase: 'supervision',
+        provider: kind, summary: `unsampled CPU silence (never killed): ${snap.unsampledStall.detail}${lastDetectors}`.slice(0, 299),
+        nextAction: 'CPU could not be sampled to confirm idleness; inspect the run manually.' });
+    }
+  };
 
   continuityControl.stop = (reason = 'quota_reserve') => {
     continuityControl.handoffPath = continuity.saveRun(continuityControl);
@@ -5448,6 +5529,7 @@ async function executeOneShot(body, res, privateContext = null) {
       // directly callable by other code paths.
       const verdict = supervisor.evaluate();
       if (latchSupervisorVerdict(verdict)) killProcessTree(proc);
+      else reportSupervisorIncidents();
     };
     // Sample descendants even while model output is buffered. This is
     // observational evidence, never termination or filesystem authority.
@@ -5526,6 +5608,8 @@ async function executeOneShot(body, res, privateContext = null) {
     if (latchSupervisorVerdict(verdict)) {
       retainLateStdout(lateChunk);
       killProcessTree(proc);
+    } else {
+      reportSupervisorIncidents();
     }
   });
   proc.stderr.on('data', (d) => {
@@ -5671,17 +5755,23 @@ async function executeOneShot(body, res, privateContext = null) {
     });
     const cursorActionRequired = runClassification.actionRequired || null;
     const cursorUsageQuotaExhausted = cursorActionRequired?.kind === 'usage_quota_exhausted';
-    // A token-budget kill must never be recolored as a rate limit by ordinary
-    // prose (stderr or model text discussing limits) once the budget has
-    // already tripped. An authoritative provider API 429 status still counts,
-    // since it reflects evidence that preceded/caused the cutoff rather than
-    // free text caught in the failure blob.
+    // A token-budget check-in must never be recolored as a rate limit by
+    // ordinary prose (stderr or model text discussing limits). An
+    // authoritative provider API 429 status still counts, since it reflects
+    // typed evidence rather than free text caught in the failure blob. Any
+    // run that produced a typed terminal result document (a clean success,
+    // or a malformed-field parse failure) is never reclassified from
+    // stderr/text prose either: only a genuine crash with no result document
+    // at all may fall back to the prose heuristic.
+    const hadTypedTerminal = !nativeStructuredOutput && parsedOutput.terminalDocumentFound !== undefined
+      ? parsedOutput.terminalDocumentFound
+      : (code === 0 && !!cleanedStdout && !parsedOutput.isError && !parsedOutput.parseError && !parsedOutput.failureClass);
     const rate_limited = !!terminalQuotaEvidence || (parsedOutput.resultSubtype !== 'error_max_budget_usd'
       && !cursorUsageQuotaExhausted
       && (authoritativeApiFailure === 'rate_limit'
         || !!copilotQuotaEvidence
         || !!runClassification.quotaEvidence
-        || (!stopReason && rate_signals.some(s => failureBlob.includes(s)))));
+        || (!stopReason && !hadTypedTerminal && rate_signals.some(s => failureBlob.includes(s)))));
     const budget_exceeded = tokenBudgetExceeded || parsedOutput.resultSubtype === 'error_max_budget_usd'
       || authoritativeApiFailure === 'budget'
       || cursorUsageQuotaExhausted
@@ -5731,6 +5821,12 @@ async function executeOneShot(body, res, privateContext = null) {
       partial_checkpoint: parsedOutput.partialCheckpoint?.text, writer_diff_summary: collectWriterDiffSummary(), stop_reason: stopReason });
     const sentPayload = sendOneShotResult(res, {
       continuity: { handoffPath: continuityControl.handoffPath, continuityId: continuityControl.continuityId },
+      // S3 (Refs #133): the checkpoint saved by latchSupervisorVerdict just
+      // before a supervisor kill (wedged/loop_confirmed/burn_without_progress/
+      // assessor_stuck) must survive onto the receipt, not just live on
+      // continuityControl -- the terminal continuity.saveRun() above
+      // reassigns handoffPath to a later, non-stop checkpoint.
+      ...(stopCheckpointPath ? { stop_checkpoint_id: runId, stop_checkpoint_path: stopCheckpointPath } : {}),
       kind,
       route,
       exitCode: code,
