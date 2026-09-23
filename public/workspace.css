@@ -11,3 +11,9 @@ dialog{width:min(480px,calc(100vw - 32px));max-height:calc(100dvh - 48px);overfl
 @media(prefers-reduced-motion:reduce){*,*:before,*:after{scroll-behavior:auto!important;transition:none!important}}
 
 .welcome h1{overflow-wrap:anywhere}
+
+.native-panel{display:flex;flex:1;min-width:0;min-height:0;flex-direction:column;padding:24px 28px 14px;gap:14px}
+.native-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}.native-heading h1{font:400 28px var(--serif);margin:0 0 5px}.native-heading p{font-size:12px;margin:0;max-width:700px}.native-toolbar,.native-views{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.native-toolbar{justify-content:space-between}.native-views [aria-pressed=true]{color:var(--accent);background:var(--accent-bg);border-color:var(--accent)}
+.native-terminal{flex:1;min-height:180px;min-width:0;overflow:hidden;background:#171e1a;border-radius:12px;padding:14px}.native-terminal .xterm{height:100%}.native-history{flex:1;min-height:0;overflow:auto;padding:12px 24px;scrollbar-gutter:stable}.native-history .message{max-width:860px;margin-left:auto;margin-right:auto}.native-history-note,.native-footnote{font-size:11px;color:var(--muted);margin:0}.native-history-note{margin-bottom:24px}.native-notice{font-size:12px;margin:0;color:var(--danger)}.native-nav-status{margin-left:auto;font-size:9px;color:var(--accent);flex-shrink:0}
+body.native-active .work-panel,body.native-active #work-toggle{display:none!important}body.native-active #project-chat{display:none}
+@media(max-width:720px){.native-panel{padding:18px 12px 10px;gap:10px}.native-heading h1{font-size:23px}.native-heading{flex-direction:column;gap:8px}.native-terminal{padding:8px}.native-history{padding:8px}.native-toolbar .secondary-button{padding:8px 12px}.native-footnote{font-size:10px}}

@@ -46,6 +46,45 @@ function fakeDom(){const byId=new Map(),created=[],root={children:[]};
  const document={createElement:tag=>new Node(tag),createTextNode:text=>Object.assign(new Node('#text'),{text}),body:new Node('body'),documentElement:{dataset:{}},hidden:false,activeElement:null,addEventListener(){},querySelectorAll:()=>[],
   getElementById(id){if(!byId.has(id)){const node=new Node('div');node.id=id;node.parent=null;root.children.push(node);}return byId.get(id);}};
  return{document,created,byId};}
+test('native selection blocks project composer, pending retry and open task form; project selection restores routing',async()=>{
+ const dom=fakeDom(),posts=[],project={id:'p_fixture',name:'Existing project',cwd:'/fixture'};
+ const state={projects:[project],project,threads:[{id:'th_fixture',title:'Project conversation'}],thread:{id:'th_fixture',title:'Project conversation',state:'idle',messages:[]},activity:[],tasks:[],attachedCalls:[],settings:{}};
+ const store=new Map([['rb:workspace:pending',JSON.stringify({route:'messages',body:{threadId:'th_fixture',text:'Pending project message'},actionId:'fixture_action_01'})]]);
+ const native={active:'claude_duet_copy',deactivate(){this.active=null;}};
+ const context={document:dom.document,console,URLSearchParams,URL,AbortSignal,TextEncoder,crypto:require('node:crypto'),WorkspaceState:S,RBNative:native,matchMedia:()=>({matches:false}),requestAnimationFrame:f=>f(),setInterval:()=>0,setTimeout,addEventListener(){},
+  localStorage:{getItem:k=>store.get(k),setItem:(k,v)=>store.set(k,String(v)),removeItem:k=>store.delete(k)},
+  fetch:async(url,options={})=>{if(options.method==='POST')posts.push({url,body:JSON.parse(options.body)});return{ok:true,status:200,json:async()=>url==='/api/capability'?{token:'fixture'}:state};}};context.window=context;
+ const vm=require('node:vm'),flush=async()=>{for(let i=0;i<15;i++)await new Promise(r=>setImmediate(r));};
+ vm.runInNewContext(fs.readFileSync(path.join(__dirname,'../public/workspace.js'),'utf8'),vm.createContext(context));await flush();
+ const get=id=>dom.document.getElementById(id);get('composer-input').value='Must not reach Codex';
+ assert.equal(get('composer-input').disabled,true);await get('composer').onsubmit({preventDefault(){}});await get('retry-button').onclick();
+ const form=get('task-form'),button=dom.document.createElement('button'),error=dom.document.createElement('p');button.type='submit';error.className='form-error';form.append(button,error);
+ get('task-title').value='Must not start';get('task-prompt').value='No project task';
+ get('task-form').onsubmit({preventDefault(){},currentTarget:form});await flush();
+ assert.deepEqual(posts,[]);assert.ok(store.has('rb:workspace:pending'),'native mode preserves unresolved project submission');
+ dom.byId.get('project-list').children[0].onclick();await flush();assert.equal(native.active,null);assert.equal(get('composer-input').disabled,false);
+ await get('retry-button').onclick();await flush();assert.deepEqual(posts.map(x=>x.url),['/api/project-workspace/messages']);
+});
+test('new conversation leaves native mode and posts a thread for the current project',async()=>{
+ const dom=fakeDom(),posts=[],project={id:'p_fixture',name:'Existing project',cwd:'/fixture'};
+ const state={projects:[project],project,threads:[{id:'th_fixture',title:'Project conversation'}],thread:{id:'th_fixture',title:'Project conversation',state:'idle',messages:[]},activity:[],tasks:[],attachedCalls:[],settings:{}};
+ const native={active:'claude_duet_copy',deactivate(){this.active=null;}};
+ const store=new Map();
+ const context={document:dom.document,console,URLSearchParams,URL,AbortSignal,TextEncoder,crypto:require('node:crypto'),WorkspaceState:S,RBNative:native,matchMedia:()=>({matches:false}),requestAnimationFrame:f=>f(),setInterval:()=>0,setTimeout,addEventListener(){},
+  localStorage:{getItem:k=>store.get(k),setItem:(k,v)=>store.set(k,String(v)),removeItem:k=>store.delete(k)},
+  fetch:async(url,options={})=>{if(url==='/api/capability')return{ok:true,status:200,json:async()=>({token:'fixture'})};
+   if(options.method==='POST'){posts.push({url,body:JSON.parse(options.body)});return{ok:true,status:200,json:async()=>({projectId:project.id,threadId:'th_new'})};}
+   return{ok:true,status:200,json:async()=>state};}};context.window=context;
+ const vm=require('node:vm'),flush=async()=>{for(let i=0;i<15;i++)await new Promise(r=>setImmediate(r));};
+ vm.runInNewContext(fs.readFileSync(path.join(__dirname,'../public/workspace.js'),'utf8'),vm.createContext(context));await flush();
+ const get=id=>dom.document.getElementById(id);
+ assert.equal(native.active,'claude_duet_copy','sanity: native mode starts active');
+ assert.equal(get('new-chat').disabled,false,'new conversation stays enabled while native mode is active');
+ await get('new-chat').onclick();await flush();
+ assert.equal(native.active,null,'new conversation leaves native mode before requesting a thread');
+ assert.deepEqual(posts.map(p=>p.url),['/api/project-workspace/threads']);
+ assert.equal(posts[0].body.projectId,project.id);
+});
 test('workspace renders attached call detail and caller text as full plain text and posts attach without other routes',async()=>{
  const dom=fakeDom(),posts=[],large='Synthetic line of pasted caller output.\n'.repeat(160),hostile='<img src=x onerror=alert(1)><script>alert(1)</script>';assert.ok(Buffer.byteLength(large)>4096);
  const call={id:'pc_'+'a'.repeat(24),projectId:'p_'+'b'.repeat(24),label:'Synthetic direct call',refs:{requestId:'fx-request-ui1'},attachedAt:1,observedAt:Date.now(),

@@ -2981,6 +2981,7 @@ app.use('/vendor/xterm-addon-fit', express.static(path.join(ROOT, 'node_modules'
 app.get(['/', '/control-center.html', '/terminal', '/index.html'], (req, res) => {
   const nonce = crypto.randomBytes(18).toString('base64');
   const html = (['/terminal', '/index.html'].includes(req.path) ? INDEX_TEMPLATE : WORKSPACE_TEMPLATE)
+    .replaceAll('__CSP_NONCE__', nonce)
     .replace('<style>', `<style nonce="${nonce}">`)
     .replace('<script>', `<script nonce="${nonce}">`)
     .replace('__ONE_SHOT_DEFAULT_TIMEOUT_MS__', String(TIMEOUT_POLICY.oneShotDefaultMs));

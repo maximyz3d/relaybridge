@@ -5,6 +5,10 @@
 <meta name="color-scheme" content="light dark"><title>RelayBridge — Project workspace</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%2338584c'/%3E%3Cpath d='M10 10h8a5 5 0 010 10h-8m0-10v16m8-6 6 6' fill='none' stroke='%23fff' stroke-width='2.5'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/workspace.css">
+<link rel="stylesheet" href="/vendor/xterm/css/xterm.css">
+<script src="/vendor/xterm/lib/xterm.js" defer></script>
+<script src="/vendor/xterm-addon-fit/lib/addon-fit.js" defer></script>
+<script src="/native-conversations.js" nonce="__CSP_NONCE__" defer></script>
 <script src="/workspace-state.js" defer></script><script src="/workspace.js" defer></script>
 </head>
 <body>
@@ -14,7 +18,7 @@
 <a class="brand" href="/" aria-label="RelayBridge home"><span class="brand-mark" aria-hidden="true">r<span>↗</span></span><span>RelayBridge<span class="brand-sub">Your team, in one place.</span></span></a>
 <button class="new-chat" id="new-chat"><span aria-hidden="true">+</span> New conversation <kbd>⌘ K</kbd></button>
 <nav aria-label="Projects"><div class="nav-heading"><span>Projects</span><button class="icon-button" id="new-project" aria-label="Create project">+</button></div><div id="project-list" class="nav-list"><p class="muted small">Connecting to your workspace…</p></div></nav>
-<nav class="conversation-nav" aria-label="Conversations"><div class="nav-heading"><span>Conversations</span></div><div id="thread-list" class="nav-list"></div></nav>
+<nav class="conversation-nav" aria-label="Conversations"><div class="nav-heading"><span>Conversations</span></div><div id="native-list" class="nav-list" aria-label="Connected CLI conversations"></div><div id="thread-list" class="nav-list"></div></nav>
 <div class="sidebar-bottom"><a class="nav-link" href="/terminal"><span aria-hidden="true">⌘</span> Advanced tools <span class="external-arrow" aria-hidden="true">↗</span></a><button class="nav-link" id="settings-open"><span aria-hidden="true">⚙</span> Workspace settings</button><div class="account-row"><span class="avatar">Y</span><div><strong>Your workspace</strong><span class="connection" id="connection">Connecting</span></div><button class="icon-button" id="theme-toggle" aria-label="Switch color theme">◐</button></div></div>
 </aside>
 <button class="rail-backdrop" id="rail-backdrop" aria-label="Close navigation" hidden></button>
@@ -22,13 +26,21 @@
 <header class="workspace-header"><button class="icon-button mobile-menu" id="menu-toggle" aria-label="Open navigation" aria-expanded="false">☰</button><div class="breadcrumb"><span class="project-glyph" aria-hidden="true">▧</span><span id="project-name">Workspace</span><span class="breadcrumb-slash">/</span><span class="thread-name" id="thread-name">New conversation</span></div><button class="work-toggle" id="work-toggle" aria-controls="work-panel" aria-expanded="true"><span aria-hidden="true">▤</span> Tasks <span id="task-total" class="count">0</span></button></header>
 <div class="notice-banner" id="error-banner" role="alert" hidden><span id="error-text"></span><button id="retry-button">Retry</button></div>
 <div class="workspace-body">
-<section class="chat-column" aria-label="Project conversation">
+<section class="chat-column" id="project-chat" aria-label="Project conversation">
 <div class="chat-scroll" id="chat-scroll">
 <div class="welcome" id="welcome"><div class="welcome-symbol" aria-hidden="true">✳</div><p class="eyebrow">A little direction. A whole team.</p><h1 id="welcome-title">What are we building?</h1><p id="welcome-description">Bring the idea. Codex will shape the next steps,<br class="desktop-break"> bring in the right models, and keep the work moving.</p><div class="suggestions"><button data-suggestion="Review this project and suggest the most useful next steps."><span aria-hidden="true">⌕</span><strong>Find the next step</strong><small>Turn the project into a clear plan</small></button><button data-suggestion="Consult a senior advisor about this project's architecture, then propose a focused improvement plan."><span aria-hidden="true">◇</span><strong>Think it through</strong><small>Bring in a stronger advisor</small></button><button data-suggestion="Help me break down a new feature into small, well-scoped tasks."><span aria-hidden="true">▤</span><strong>Make a plan</strong><small>Give every task the right model</small></button></div><button class="primary-button welcome-create" id="welcome-create">Create your first project <span aria-hidden="true">↗</span></button></div>
 <div class="transcript" id="messages" role="log" aria-live="polite" aria-relevant="additions" aria-label="Conversation messages"></div>
 <div class="turn-status" id="turn-status" role="status" hidden></div>
 </div>
 <div class="composer-area"><div class="draft-context" id="draft-context">A focused workspace for your next idea</div><form class="composer" id="composer"><label class="sr-only" for="composer-input">Message the Codex delegator</label><textarea id="composer-input" rows="3" maxlength="12000" placeholder="Tell Codex what you'd like to work on…" disabled></textarea><div class="composer-tools"><span class="model-chip"><span class="model-spark" aria-hidden="true">✳</span> Codex <span class="muted">· Balanced</span></span><div class="composer-right"><span class="key-hint">Shift ↵ for a new line</span><button class="send-button" type="submit" id="send-button" aria-label="Send message" disabled>↑</button></div></div></form><p class="composer-footnote">Codex coordinates. Your team does the focused work. <span id="reserve-note">Usage reserve protected.</span></p></div>
+</section>
+<section class="native-panel" id="native-panel" aria-label="Connected conversation" hidden>
+<div class="native-heading"><div><h1 id="native-title"></h1><p id="native-description" class="muted"></p></div><span id="native-status" class="status-pill" role="status"></span></div>
+<div class="native-toolbar"><div class="native-views" role="group" aria-label="Conversation view"><button id="native-live-button" class="secondary-button" aria-pressed="true">Live conversation</button><button id="native-history-button" class="secondary-button" aria-pressed="false">Saved history</button></div><button id="native-resume" class="primary-button" hidden>Resume conversation</button></div>
+<p id="native-notice" class="native-notice" role="status" hidden></p>
+<div id="native-terminal" class="native-terminal" aria-label="Live CLI conversation"></div>
+<div id="native-history" class="native-history" aria-label="Saved conversation history" hidden></div>
+<p class="native-footnote">Type in the live conversation to continue with the same context. Saved history is the snapshot taken when this copy was created.</p>
 </section>
 <aside class="work-panel" id="work-panel" aria-label="Project tasks and team"><div class="panel-heading"><h2>Project activity</h2><button class="icon-button" id="add-task" aria-label="Add project task">+</button></div><section class="current-work"><p class="eyebrow">CURRENT WORK</p><div id="current-work"><span class="status-orbit" aria-hidden="true">○</span><h3>Room for your next idea</h3><p>No work is running in this project.</p></div></section><div class="queue-heading"><h3>Task queue</h3><button class="text-button" id="add-task-text">Add task</button></div><div id="task-list" class="task-list"><p class="panel-empty">A plan becomes a task list here.<br>Start a conversation or add a task.</p></div><section class="team-section"><p class="eyebrow">YOUR PROJECT TEAM</p><div class="team-member"><span class="team-avatar codex-avatar">✳</span><div><strong>Codex</strong><span>Delegator · balanced reasoning</span></div><span class="role-pill">Lead</span></div><div class="team-member"><span class="team-avatar advisor-avatar">◇</span><div><strong id="advisor-name">Claude</strong><span>Advisor · high reasoning</span></div></div><p class="team-note">Advice comes back to Codex before it assigns the next steps.</p><button class="text-button" id="export-handoff">↓ Save conversation handoff</button></section></aside>
 </div>
