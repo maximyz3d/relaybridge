@@ -1,3 +1,6 @@
+## v2.5.2 - 2026-09-26
+- #136 fix(quota): prevent false Claude context-failure cooldowns
+
 ## v2.5.1 - 2026-09-22
 - #134 fix(supervisor): remove time/token caps; progress check-ins decide kills
 
