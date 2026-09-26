@@ -135,15 +135,18 @@ test('cooldown startup and refresh normalize own keys and reject malformed numer
   assert.equal(Object.hasOwn(Object.prototype, 'until'), false);
 });
 
-test('cooldown normalized refresh keeps newer clocks, accepts equal-clock clear and rejects stale overwrite', (t) => {
+test('cooldown normalized refresh adopts serialized writers despite clock rollback and accepts equal-clock clear', (t) => {
   const dir = temporary(t);
   const file = path.join(dir, 'cooldowns.json');
   const store = createCooldownStore({ file, now: () => 5000 });
   store.noteFailure('claude', 'rate_limited');
-  const baseline = { ...store._state().claude };
-  fs.writeFileSync(file, JSON.stringify({ claude: { ...baseline, lastOffenceAt: 4000, until: 0 } }, null, 3));
+  const writer = createCooldownStore({ file, now: () => 4000 });
+  writer.noteFailure('claude', 'rate_limited');
   assert.equal(store.status('claude').cooling, true);
+  assert.equal(store.status('claude').offences, 2);
+  assert.equal(store.status('claude').lastOffenceAt, 4000);
+  const baseline = { ...writer._state().claude };
   fs.writeFileSync(file, JSON.stringify({ claude: { ...baseline, until: 0, reason: null, source: null } }, null, 4));
   assert.equal(store.status('claude').cooling, false);
-  assert.equal(store.status('claude').offences, 1);
+  assert.equal(store.status('claude').offences, 2);
 });
