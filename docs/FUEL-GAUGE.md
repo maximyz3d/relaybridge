@@ -172,12 +172,37 @@ out-of-band "don't use that seat right now" rule.
 
 `lib/provider-cooldown.js` makes that state first-class:
 
-- **Durable** — survives a bridge restart; a corrupt file resets loudly rather
-  than blocking startup.
+- **Durable** — survives a bridge restart; corrupt authority blocks admission
+  until repaired.
 - **Shared** — Claude Code, Cowork and the dashboard schedule against one picture.
 - **Explained** — `/api/cooldowns` and the `provider_cooldowns` MCP tool report
   the seat, the reason, time remaining, and whether the window came from the
   provider's `Retry-After` or our backoff.
+
+Claude's `rapid_refill_breaker` is a context failure (`context_refill_breaker`),
+not quota evidence. A genuine terminal HTTP 429 or terminal error diagnostic
+still establishes a rate limit. Assistant/tool transcripts and auxiliary stderr
+cannot establish quota authority when a Claude terminal envelope exists.
+
+For the historical no-status/no-diagnostic refill defect only, authenticated
+`POST /api/cooldowns/corrections` accepts exactly `quotaSeat`, `sourceReceiptId`,
+`sourceObservationId`, `until`, `lastOffenceAt`, and `offences` from the current
+`GET /api/cooldowns` row. The server loads its own receipts and rejects unknown,
+ambiguous, genuine-quota, newer, and unexpired predecessor evidence. It removes
+one false offence, retaining the conservative offence clock. This is not a
+general reset endpoint. The original execution remains NO VERDICT.
+
+All updated cooldown writers share a filesystem lock; stop older binaries
+sharing this data store before deployment. Never automatically steal an orphaned
+lock: confirm all writers stopped before operator recovery. Admission and mutation
+remain unavailable if `cooldowns.json.unavailable/` records a failed writer
+intent. Reconcile those intents (especially genuine rate limits) before manually
+removing that marker while all writers are stopped; a valid JSON reload does not
+clear it automatically. Correction audit and
+state are persisted atomically in `cooldowns.json`; the journal mirror is
+reported separately. Failed persistence never reports success. Receipt scans
+are bounded and refuse incomplete evidence rather than authorizing a partial
+scan. No MCP clear operation or account-wide override is provided.
 
 Rules:
 

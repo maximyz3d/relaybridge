@@ -1873,7 +1873,7 @@ function claudeResultFailureClass(subtype) {
 
 function claudeTerminalReasonFailureClass(reason) {
   if (!reason || reason === 'completed') return null;
-  if (reason === 'rapid_refill_breaker') return 'rate_limit';
+  if (reason === 'rapid_refill_breaker') return 'context_refill_breaker';
   if (reason === 'budget_exhausted') return 'budget';
   if (reason === 'image_error' || reason === 'model_error') return 'provider_error';
   return reason;
@@ -2105,6 +2105,7 @@ function parseConfiguredOneShotOutput(entry, rawOutput, { ignoreTerminalResult =
       // needs errors[]/diagnostic text as its only rate-limit evidence, same
       // as before the check-in change.
       terminalDocumentFound: !isError,
+      terminalEnvelopePresent: true,
     };
   } catch (error) {
     const partial = extractClaudeAssistantDiagnostic(events);
@@ -2119,6 +2120,7 @@ function parseConfiguredOneShotOutput(entry, rawOutput, { ignoreTerminalResult =
       // recolor it as a rate limit. Only a genuine crash with no result
       // document at all (document === null) falls back to prose evidence.
       terminalDocumentFound: document !== null,
+      terminalEnvelopePresent: document !== null,
       errorObserved: 0, errorInvalid: 0, errorDiagnosticTruncated: false,
       terminalReason: null, apiErrorStatus: null,
       permissionDenials: normalizeClaudePermissionDenials([]),
@@ -5725,7 +5727,8 @@ async function executeOneShot(body, res, privateContext = null) {
     const nativeStructuredOutput = ['grok_json','gemini_cli_json','codex_json'].includes(entry.oneshot_output_parser);
     // Native JSON's diagnostic channel can contain startup/MCP noise. Only
     // parsed provider error fields establish failure or account authority.
-    const providerStderr = codexProgressTranscript || nativeStructuredOutput ? '' : stderr;
+    const claudeTerminalEnvelope = entry.oneshot_output_parser === 'claude_json' && parsedOutput.terminalEnvelopePresent;
+    const providerStderr = codexProgressTranscript || nativeStructuredOutput || claudeTerminalEnvelope ? '' : stderr;
     const providerFailureDiagnostic = nativeStructuredOutput && !parsedOutput.diagnosticIsProviderError ? '' : parsedOutput.diagnostic;
     if (Array.isArray(parsedOutput.usage?.model_usage) && parsedOutput.usage.model_usage.length) {
       const dominant = [...parsedOutput.usage.model_usage].sort((left, right) =>
@@ -5748,7 +5751,9 @@ async function executeOneShot(body, res, privateContext = null) {
     // being misclassified as a provider failure.
     const failureBlob = vendorEvidenceText({
       stderr: providerStderr, stdout: semanticStdout, diagnostic: providerFailureDiagnostic,
-      includeStdout: !nativeStructuredOutput && (code !== 0 || !cleanedStdout || parsedOutput.isError || parsedOutput.parseError),
+      // Once Claude supplied an envelope, only its parsed errors[]/status
+      // establish failure; streamed assistant/tool prose is never authority.
+      includeStdout: !nativeStructuredOutput && !claudeTerminalEnvelope && (code !== 0 || !cleanedStdout || parsedOutput.isError || parsedOutput.parseError),
       supervisorStopReason: stopReason,
     }).toLowerCase();
     const rate_signals = [
@@ -6496,6 +6501,7 @@ app.post('/api/workflows/:runId/cancel', (req, res) => {
 // evenly and "what would this cost on metered pricing" is answerable while on
 // subscription plans.
 const { createCooldownStore, parseRetryAfter } = require('./lib/provider-cooldown');
+const { validCorrectionRequest, readCorrectionReceipts, authorizeContextCorrection } = require('./lib/cooldown-correction');
 const { checkGrounding, prepareGroundedPrompt, verifyReferencedPaths } = require('./lib/workspace-grounding');
 const {
   classifyRunFailure,
@@ -7762,6 +7768,27 @@ app.delete('/api/usage/operator-quota', (req, res) => {
 });
 app.get('/api/cooldowns', (req, res) => {
   res.json({ cooldowns: cooldowns.all(), cooling: coolingQuotaStates(), quotaSeats: currentQuotaSeatGroups() });
+});
+
+app.post('/api/cooldowns/corrections', (req, res) => {
+  if (!validCorrectionRequest(req.body)) return res.status(400).json({ error: 'Exact cooldown identity required; unsupported or invalid fields.' });
+  const { quotaSeat, ...expected } = req.body;
+  if (!currentQuotaSeatGroups()[quotaSeat]) return res.status(400).json({ error: 'Unknown configured quota seat.' });
+  try {
+    // Load bounded immutable evidence before taking the mutation lock. Exact
+    // row CAS inside the lock still rejects every intervening observation.
+    const rows = readCorrectionReceipts(RECEIPTS_DIR);
+    const result = cooldowns.correctObservation(quotaSeat, expected, (current) => authorizeContextCorrection({
+      rows, receiptStoreId: RECEIPT_STORE_IDENTITY.id, seat: quotaSeat, current,
+    }));
+    if (!result.ok) return res.status(409).json(result);
+    let journalMirrored = true;
+    try { appendBridgeReceiptRecord({ ...result.correction, receiptStoreId: RECEIPT_STORE_IDENTITY.id,
+      bridgeBuildId: BRIDGE_BUILD_ID, after: result.after }); } catch { journalMirrored = false; }
+    return res.json({ ...result, auditPersisted: true, journalMirrored });
+  } catch (error) {
+    return res.status(503).json({ ok: false, code: 'correction_authority_unavailable' });
+  }
 });
 
 app.get('/api/usage/totals', (req, res) => {

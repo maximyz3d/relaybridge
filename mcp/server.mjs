@@ -850,7 +850,7 @@ const PROVIDER_FAILURE_CLASSES = new Set([
   'cancelled', 'rate_limit', 'budget', 'auth', 'timeout', 'provider_timeout_unclassified', 'policy',
   'max_tokens', 'refusal', 'max_turns', 'structured_output_retry_exhausted',
   'tool_deferred', 'aborted_streaming', 'aborted_tools', 'hook_stopped',
-  'stop_hook_prevented', 'blocking_limit', 'prompt_too_long',
+  'stop_hook_prevented', 'blocking_limit', 'prompt_too_long', 'context_refill_breaker',
   'provider_error', 'provider_protocol_error', 'output_cap', 'admission_limit', 'bridge_identity_mismatch',
   'incomplete_response', 'provider_incomplete_response', 'provider_refusal', 'token_budget', 'plan_restriction',
   'client_cancelled', 'mcp_deadline_cancelled', 'quota_reserve', 'quota_unknown', 'assessor_stuck',
