@@ -5,7 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
 
-const { parseModelList, classifyModel, reconcileProvider, buildRegistry, pinIsRetired } = require('../lib/model-registry');
+const { parseModelList, parseModelCatalog, supportedEffortsFor, classifyModel, reconcileProvider, buildRegistry, pinIsRetired } = require('../lib/model-registry');
 const config = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'cli-config.json'), 'utf8'));
 
 test('parses the output shapes real CLIs actually emit', () => {
@@ -100,6 +100,93 @@ test('registry builds from the shipped config without throwing', () => {
 });
 
 test('claude declares stable aliases so it is known without a list command', () => {
-  assert.deepEqual(config.claude.models_static, ['opus', 'sonnet', 'haiku']);
+  // Claude Code has no list command; its aliases ARE the selection interface,
+  // and fable names the same CLI as the others.
+  assert.deepEqual(config.claude.models_static, ['opus', 'sonnet', 'haiku', 'fable']);
   assert.ok(config._models.discoverOnBoot, 'discovery should run at boot by default');
+  // Zero means every boot re-polls. A positive window lets a newly shipped or
+  // newly retired model go unnoticed for that long.
+  assert.equal(config._models.discoveryMaxAgeMs, 0);
+});
+
+test('claude declares its effort ceiling because the CLI stops at max', () => {
+  for (const kind of ['claude', 'claude_fable']) {
+    assert.deepEqual(config[kind].supported_efforts, ['low', 'medium', 'high', 'xhigh', 'max']);
+    assert.ok(!config[kind].supported_efforts.includes('ultra'), `${kind} has no ultra rung`);
+  }
+});
+
+test('codex is discovered from its own JSON catalog, not a frozen pin list', () => {
+  assert.deepEqual(config.codex.models_probe, ['codex', 'debug', 'models']);
+  assert.equal(config.codex.models_format, 'json');
+  // The catalog runs ~500 KB; the default 32 KB probe ceiling truncated it into
+  // invalid JSON, which read as "this CLI has no models".
+  assert.ok(config.codex.models_probe_max_bytes > 512 * 1024);
+});
+
+test('codex sends every effort level literally, max included', () => {
+  const flags = config.codex.effort_flags;
+  for (const level of ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']) {
+    assert.deepEqual(flags[level], ['--config', `model_reasoning_effort=${level}`],
+      `${level} must be sent as itself, not remapped to a weaker level`);
+  }
+});
+
+test('a JSON catalog yields ids, vendor ranking, and per-model effort levels', () => {
+  const entry = { models_format: 'json', models_json_array: 'models', models_json_id: 'slug' };
+  const raw = JSON.stringify({ models: [
+    { slug: 'gpt-6-astra', display_name: 'GPT-6-Astra', priority: 1, visibility: 'list',
+      default_reasoning_level: 'medium',
+      supported_reasoning_levels: [{ effort: 'high' }, { effort: 'xhigh' }, { effort: 'max' }, { effort: 'ultra' }] },
+    { slug: 'gpt-6-luna', priority: 3, visibility: 'list',
+      supported_reasoning_levels: [{ effort: 'high' }, { effort: 'max' }] },
+    { slug: 'gpt-reserve', priority: 3, visibility: 'hide', supported_reasoning_levels: [{ effort: 'high' }] },
+  ] });
+  const catalog = parseModelCatalog(raw, entry);
+  assert.deepEqual(catalog.map((row) => row.id), ['gpt-6-astra', 'gpt-6-luna'],
+    'a model the vendor hides is not on offer');
+  assert.deepEqual(catalog[0].efforts, ['high', 'xhigh', 'max', 'ultra']);
+  assert.equal(catalog[0].priority, 1);
+
+  const registry = buildRegistry({
+    probeResults: { codex: { models: catalog.map((row) => row.id), catalog } },
+    config: { codex: { label: 'Codex', model_tiers: { heavy: { model: 'gpt-6-astra' } } } },
+  });
+  assert.deepEqual(supportedEffortsFor(registry, 'codex', 'gpt-6-astra'), ['high', 'xhigh', 'max', 'ultra']);
+  assert.deepEqual(supportedEffortsFor(registry, 'codex', 'gpt-6-luna'), ['high', 'max']);
+  assert.equal(supportedEffortsFor(registry, 'codex', 'not-a-model'), null,
+    'no catalog row means no evidence, never a denial');
+});
+
+test('a malformed or truncated catalog degrades to no list, never a throw', () => {
+  const entry = { models_format: 'json' };
+  for (const raw of ['', '{"models":[', 'not json at all', '{"models":{}}', JSON.stringify({ models: [] })]) {
+    assert.deepEqual(parseModelCatalog(raw, entry), []);
+  }
+});
+
+test('a pin that has fallen behind the vendor ranking is reported', () => {
+  const catalog = [
+    { id: 'gpt-6-astra', priority: 1, efforts: ['max', 'ultra'], displayName: null, defaultEffort: null },
+    { id: 'gpt-5.6-sol', priority: 4, efforts: ['max'], displayName: null, defaultEffort: null },
+  ];
+  const lagging = buildRegistry({
+    probeResults: { codex: { models: catalog.map((row) => row.id), catalog } },
+    config: { codex: { label: 'Codex', model_tiers: { heavy: { model: 'gpt-5.6-sol' } } } },
+  });
+  assert.match(lagging.warnings.join(' '), /gpt-6-astra/);
+  assert.equal(lagging.providers.codex.configured.heavy.newerAvailable, 'gpt-6-astra');
+
+  const current = buildRegistry({
+    probeResults: { codex: { models: catalog.map((row) => row.id), catalog } },
+    config: { codex: { label: 'Codex', model_tiers: { heavy: { model: 'gpt-6-astra' } } } },
+  });
+  assert.deepEqual(current.warnings, [], 'a pin on the top-ranked model is not a warning');
+
+  // Pinning a heavier model into a cheaper slot is a cost decision, not a lag.
+  const deliberate = buildRegistry({
+    probeResults: { codex: { models: catalog.map((row) => row.id), catalog } },
+    config: { codex: { label: 'Codex', model_tiers: { standard: { model: 'gpt-5.6-sol' } } } },
+  });
+  assert.deepEqual(deliberate.warnings, []);
 });
