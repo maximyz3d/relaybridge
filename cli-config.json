@@ -104,19 +104,20 @@
   },
   "_models": {
     "_note": "Model selection inside a provider. Routing tiers map to weight classes: utility->light, standard->standard, complex/critical->heavy. Provider lineups change on weeks-long cycles, so prefer stable aliases (claude opus/sonnet/haiku) over versioned ids, and leave model_tiers unset where the account decides which models exist (cursor, copilot, grok) \u2014 a missing flag runs, a retired one fails every call. Discovery at boot reconciles these pins against each CLI's own model list.",
-    "modelsCheckedAt": "2026-09-03",
+    "modelsCheckedAt": "2026-09-26",
     "staleAfterDays": 45,
     "discoverOnBoot": true,
     "discoveryTimeoutMs": 20000,
-    "discoveryMaxAgeMs": 86400000,
+    "discoveryMaxAgeMs": 0,
     "verifyCommands": {
-      "claude": "claude --help (aliases: fable, opus, sonnet, haiku)",
-      "codex": "codex --help; see developers.openai.com/codex/models",
+      "claude": "claude --help (aliases: fable, opus, sonnet, haiku; --effort low..max)",
+      "codex": "codex debug models (JSON catalog; also see developers.openai.com/codex/models)",
       "cursor": "agent models",
       "gemini": "agy models",
       "copilot": "copilot --help (org model policy applies)",
       "grok": "grok --help"
-    }
+    },
+    "_discovery_note": "discoveryMaxAgeMs 0 means every boot re-polls each CLI. The cached registry still loads first so the bridge answers immediately while the probe runs. A positive value reinstates a staleness window and lets a new or retired model go unnoticed for that long."
   },
   "powershell": {
     "oneshot_capabilities": {
@@ -189,7 +190,8 @@
     "models_static": [
       "opus",
       "sonnet",
-      "haiku"
+      "haiku",
+      "fable"
     ],
     "model_tiers": {
       "light": {
@@ -337,7 +339,15 @@
       "CLAUDE_CODE_USE_VERTEX",
       "CLAUDE_CODE_USE_FOUNDRY"
     ],
-    "npm_package": "@anthropic-ai/claude-code"
+    "npm_package": "@anthropic-ai/claude-code",
+    "supported_efforts": [
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max"
+    ],
+    "_effort_note": "claude --effort accepts low, medium, high, xhigh, max. There is no ultra rung; an ultra request resolves to max, the strongest this CLI offers."
   },
   "claude_fable": {
     "native_usage_probe": { "enabled": true, "command": ["claude", "--safe-mode", "--restricted", "--strict-mcp-config", "--mcp-config", "{\"mcpServers\":{}}", "--tools", "Read", "--permission-mode", "plan"], "timeout_ms": 15000 },
@@ -476,7 +486,15 @@
       "CLAUDE_CODE_USE_FOUNDRY"
     ],
     "npm_package": "@anthropic-ai/claude-code",
-    "_note": "Fable 5 is an explicit heavy planning/review tier on the same Claude subscription. It has no writer slot; revisions use the Claude Sonnet writer so route metadata matches the invoked model. Readiness proves the installed CLI and login; an actual receipt is required before claiming end-to-end model availability."
+    "_note": "Fable 5 is an explicit heavy planning/review tier on the same Claude subscription. It has no writer slot; revisions use the Claude Sonnet writer so route metadata matches the invoked model. Readiness proves the installed CLI and login; an actual receipt is required before claiming end-to-end model availability.",
+    "supported_efforts": [
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max"
+    ],
+    "_effort_note": "claude --effort accepts low, medium, high, xhigh, max. There is no ultra rung; an ultra request resolves to max, the strongest this CLI offers."
   },
   "codex": {
     "oneshot_capabilities": {
@@ -521,17 +539,21 @@
       ],
       "max": [
         "--config",
-        "model_reasoning_effort=xhigh"
+        "model_reasoning_effort=max"
       ],
       "ultra": [
         "--config",
         "model_reasoning_effort=ultra"
       ]
     },
-    "_effort_note": "Explicit ultra is supported only for gpt-6-astra with a compatible Codex CLI. It is never downgraded. The historical cross-provider max alias still maps to xhigh.",
+    "_effort_note": "Every level is sent literally. max used to be remapped to xhigh, which silently capped every max request one rung short; the catalog lists max and ultra as real levels, so they are sent as asked. A model that does not accept a level steps down to the strongest it does accept, and the receipt says so.",
+    "_ultra_note": "ultra stays gated per model on purpose: it is not a level every model accepts. This list is exactly the slugs whose own catalog entry lists ultra (codex debug models); regenerate it from the catalog rather than by hand.",
     "effort_model_allowlist": {
       "ultra": [
-        "gpt-6-astra"
+        "gpt-6-astra",
+        "gpt-6-sol",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra"
       ]
     },
     "login_command": [
@@ -542,18 +564,18 @@
       "light": {
         "args": [
           "--model",
-          "gpt-5.6-luna"
+          "gpt-6-luna"
         ],
-        "model": "gpt-5.6-luna",
-        "note": "fast subagent tier; replaced gpt-5.4-mini"
+        "model": "gpt-6-luna",
+        "note": "fast subagent tier; replaced gpt-5.6-luna"
       },
       "standard": {
         "args": [
           "--model",
-          "gpt-5.6-terra"
+          "gpt-6-sol"
         ],
-        "model": "gpt-5.6-terra",
-        "note": "everyday coding; replaced gpt-5.4"
+        "model": "gpt-6-sol",
+        "note": "everyday coding; replaced gpt-5.6-terra"
       },
       "heavy": {
         "args": [
@@ -561,7 +583,7 @@
           "gpt-6-astra"
         ],
         "model": "gpt-6-astra",
-        "note": "Astra for hard work; explicit workflow profiles pin their own effort"
+        "note": "frontier tier: coding, computer use, professional work. Accepts ultra."
       }
     },
     "tags": [
@@ -627,7 +649,17 @@
       "turns": "unavailable",
       "verified_runtime_version": "0.154.0",
       "evidence": "Codex exec --json turn.completed usage; terminal-only, cached input is included in input tokens."
-    }
+    },
+    "models_probe": [
+      "codex",
+      "debug",
+      "models"
+    ],
+    "models_format": "json",
+    "models_json_array": "models",
+    "models_json_id": "slug",
+    "models_probe_max_bytes": 4194304,
+    "_models_note": "codex debug models prints the account catalog as JSON: every slug plus the reasoning levels each one accepts. That is the only source that knows gpt-6-astra takes ultra while gpt-6-luna stops at max. The catalog runs ~500 KB, hence models_probe_max_bytes."
   },
   "copilot": {
     "oneshot_capabilities": {

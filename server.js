@@ -36,7 +36,7 @@ const { resolveProviderControls, validateControlRequest, modelControls } = requi
 const { validationError } = require('./lib/validation-contract');
 const { normalizeEffort } = require('./lib/effort-controls');
 const { modelConfigStaleness, modelTierForTaskTier } = require('./lib/model-tiers');
-const { buildRegistry, parseModelList } = require('./lib/model-registry');
+const { buildRegistry, parseModelList, parseModelCatalog } = require('./lib/model-registry');
 const { extractClaudeAssistantCheckpoint, redactCheckpointSecrets } = require('./lib/partial-checkpoint');
 const { guardProviderInput } = require('./lib/provider-input-guard');
 const {
@@ -2543,21 +2543,35 @@ async function discoverModels() {
           : { error: readiness.modelCatalog?.diagnosticCode || 'model catalog unavailable' };
         continue;
       }
-      if (Array.isArray(entry.models_static) && entry.models_static.length) {
-        probeResults[kind] = { models: entry.models_static.slice() };
+      // A declared alias list and a live probe are not alternatives: Claude's
+      // aliases are its selection interface, but a CLI can also be asked what
+      // it actually holds. Probe when one is configured, and fall back to the
+      // declared list rather than losing it.
+      const staticModels = Array.isArray(entry.models_static) && entry.models_static.length
+        ? entry.models_static.slice() : null;
+      if (!Array.isArray(entry.models_probe) || !entry.models_probe.length) {
+        if (staticModels) probeResults[kind] = { models: staticModels };
         continue;
       }
-      if (!Array.isArray(entry.models_probe) || !entry.models_probe.length) continue;
       try {
-        const result = await Promise.race([runProbe(entry.models_probe, timeoutMs, entry.strip_env || []), new Promise((r) => setTimeout(() => r({ exitCode: -1, stdout: "", stderr: "probe timeout" }), timeoutMs + 5000))]);
+        const budget = Number(entry.models_probe_max_bytes) > 0
+          ? Math.min(Number(entry.models_probe_max_bytes), PROBE_STDOUT_CEILING) : undefined;
+        const result = await Promise.race([runProbe(entry.models_probe, timeoutMs, entry.strip_env || [], undefined, budget), new Promise((r) => setTimeout(() => r({ exitCode: -1, stdout: "", stderr: "probe timeout" }), timeoutMs + 5000))]);
         if (result.exitCode === 0) {
-          const models = parseModelList(result.stdout, entry);
-          probeResults[kind] = models.length ? { models } : { error: 'probe returned no recognizable model ids' };
+          // A CLI that prints a JSON catalog reports each model's reasoning
+          // levels and the vendor's own ranking; a text list reports only ids.
+          const catalog = entry.models_format === 'json' ? parseModelCatalog(result.stdout, entry) : null;
+          const models = catalog?.length ? catalog.map((row) => row.id) : parseModelList(result.stdout, entry);
+          probeResults[kind] = models.length
+            ? { models, ...(catalog?.length ? { catalog } : {}) }
+            : (staticModels ? { models: staticModels } : { error: 'probe returned no recognizable model ids' });
+        } else if (staticModels) {
+          probeResults[kind] = { models: staticModels };
         } else {
           probeResults[kind] = { error: [result.code, (result.stderr || 'probe failed').split('\n')[0]].filter(Boolean).join(': ').slice(0, 200) };
         }
       } catch (err) {
-        probeResults[kind] = { error: err.message };
+        probeResults[kind] = staticModels ? { models: staticModels } : { error: err.message };
       }
     }
     if (generation !== diagnosticGeneration(loadConfig())) throw Object.assign(new Error('model discovery authority changed; refresh again'), { code: 'diagnostic_stale' });
@@ -3282,7 +3296,13 @@ app.post('/api/workspace/validate', (req, res) => {
   }
 });
 
-async function runProbe(slotRaw, timeoutMs = 15000, stripEnv = [], signal) {
+// A catalog probe returns far more than a readiness probe: the Codex model
+// catalog is ~500 KB, and the default 32 KB ceiling truncated it into invalid
+// JSON — which read as "this CLI has no models" rather than as a clipped read.
+// The ceiling stays at 32 KB for every other probe.
+const PROBE_STDOUT_LIMIT = 32768;
+const PROBE_STDOUT_CEILING = 8 * 1024 * 1024;
+async function runProbe(slotRaw, timeoutMs = 15000, stripEnv = [], signal, maxStdoutBytes = PROBE_STDOUT_LIMIT) {
   const notRun = (error, extra = {}) => ({ exitCode: -1, stdout: '', stderr: error.message,
     code: error.code || null, validation: error.validation || null, timedOut: false,
     model_invocation: false, ...extra });
@@ -3294,13 +3314,13 @@ async function runProbe(slotRaw, timeoutMs = 15000, stripEnv = [], signal) {
   try { launch = qualifiedProviderLaunch(resolveExecutable(configuredBinary, env), args, env); }
   catch (error) { return notRun(error); }
   const key = crypto.createHash('sha256').update(JSON.stringify({ file: launch.file, args: launch.args,
-    env: launch.env, adapter: launch.adapter, template: launch.templateHash, cwd: ROOT, timeoutMs, authGeneration })).digest('hex');
+    env: launch.env, adapter: launch.adapter, template: launch.templateHash, cwd: ROOT, timeoutMs, maxStdoutBytes, authGeneration })).digest('hex');
   const deadline = new AbortController();
   const callerSignal = signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal;
   const deadlineTimer = setTimeout(() => deadline.abort(), timeoutMs + 2000);
   deadlineTimer.unref?.();
   try {
-    return await probePool.run(key, (workerSignal) => runPhysicalProbe(launch, timeoutMs, workerSignal), { signal: callerSignal });
+    return await probePool.run(key, (workerSignal) => runPhysicalProbe(launch, timeoutMs, workerSignal, maxStdoutBytes), { signal: callerSignal });
   } catch (error) {
     return notRun(error, { timedOut: deadline.signal.aborted && !signal?.aborted,
       aborted: !!signal?.aborted, admissionRejected: error.code === 'operation_admission_limit' });
@@ -3309,7 +3329,7 @@ async function runProbe(slotRaw, timeoutMs = 15000, stripEnv = [], signal) {
 
 // This promise represents PHYSICAL lifetime, not the HTTP caller's patience.
 // Only actual close or a confirmed no-child startup failure frees admission.
-function runPhysicalProbe(launch, timeoutMs, signal) {
+function runPhysicalProbe(launch, timeoutMs, signal, maxStdoutBytes = PROBE_STDOUT_LIMIT) {
   return new Promise((resolve) => {
     if (admissionClosed) return resolve({ exitCode:-1, stdout:'', stderr:'bridge shutting down', model_invocation:false });
     if (signal.aborted) return resolve({ exitCode: -1, stdout: '', stderr: 'diagnostic cancelled', timedOut: false, aborted: true, model_invocation: false });
@@ -3353,7 +3373,7 @@ function runPhysicalProbe(launch, timeoutMs, signal) {
     if (signal.aborted) abortHandler();
     proc.stdout.setEncoding('utf8');
     proc.stderr.setEncoding('utf8');
-    proc.stdout.on('data', (d) => { stdout = (stdout + d).slice(0, 32768); });
+    proc.stdout.on('data', (d) => { stdout = (stdout + d).slice(0, maxStdoutBytes); });
     proc.stderr.on('data', (d) => { stderr = (stderr + d).slice(0, 32768); });
     proc.on('error', (err) => { if (!proc.pid) finish(-1, err); else killProcessTree(proc); });
     proc.on('close', (code) => finish(code));
@@ -8457,9 +8477,15 @@ async function startBridgeListener() {
   loadCachedRegistry();
   const modelGlobals = loadConfig()._models || {};
   if (modelGlobals.discoverOnBoot !== false) {
-    const maxAge = Number(modelGlobals.discoveryMaxAgeMs) > 0 ? Number(modelGlobals.discoveryMaxAgeMs) : 86400000;
+    // Poll on every boot. The cache used to suppress discovery for a whole day,
+    // so a vendor could ship a new model — or retire a pinned one — and the
+    // bridge would keep serving yesterday's answer until the cache aged out.
+    // The cache still loads first, so the registry answers immediately while
+    // the probe runs; set discoveryMaxAgeMs to reinstate a staleness window.
+    const maxAge = Number(modelGlobals.discoveryMaxAgeMs) > 0 ? Number(modelGlobals.discoveryMaxAgeMs) : 0;
     const cachedAge = modelRegistry?.generatedAt ? Date.now() - Date.parse(modelRegistry.generatedAt) : Infinity;
-    if (!(cachedAge < maxAge)) {
+    if (!(maxAge > 0 && cachedAge < maxAge)) {
+      if (Number.isFinite(cachedAge)) console.log(`[RelayBridge] model registry cache is ${Math.round(cachedAge / 3600000)}h old; re-polling each CLI for its current models`);
       discoverModels().catch((err) => console.warn('[RelayBridge] model discovery failed: ' + err.message));
     } else {
       console.log(`[RelayBridge] model registry loaded from cache (${Math.round(cachedAge / 3600000)}h old)`);

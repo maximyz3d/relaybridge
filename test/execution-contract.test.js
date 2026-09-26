@@ -20,7 +20,23 @@ test('explicit Astra ultra is pinned, consented, and never synthesized or downgr
   assert.equal(resolved.execution.appliedEffort, 'ultra');
   assert.ok(resolved.slot.includes('model_reasoning_effort=ultra'));
   assert.equal(resolved.slot[resolved.slot.indexOf('--model') + 1], 'gpt-6-astra');
-  assert.throws(() => resolveProviderControls({ ...input, model: 'gpt-5.6-terra', maxEffortOverride: true }), { code: 'unsupported_effort' });
+  // A configured model that is not on the ultra allowlist must not receive it.
+  assert.throws(() => resolveProviderControls({ ...input, model: 'gpt-6-luna', maxEffortOverride: true }), { code: 'unsupported_effort' });
+  // With the account catalog in hand, that same request steps down to the
+  // strongest level the model does accept instead of failing outright — and
+  // says so, rather than presenting max as though ultra had been honoured.
+  const lunaCatalog = { providers: { codex: { probed: true, models: [
+    { id: 'gpt-6-luna', efforts: ['low', 'medium', 'high', 'xhigh', 'max'] },
+    { id: 'gpt-6-astra', efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] },
+  ] } } };
+  const stepped = resolveProviderControls({ ...input, model: 'gpt-6-luna', maxEffortOverride: true, registry: lunaCatalog });
+  assert.equal(stepped.execution.appliedEffort, 'max');
+  assert.equal(stepped.execution.targetEffort, 'ultra');
+  assert.match(stepped.execution.effortFallbackReason, /does not accept effort=ultra/);
+  // Astra still reaches ultra with the same catalog present.
+  const astra = resolveProviderControls({ ...input, maxEffortOverride: true, registry: lunaCatalog });
+  assert.equal(astra.execution.appliedEffort, 'ultra');
+  assert.equal(astra.execution.effortFallbackReason, null);
   const old = structuredClone(entry); delete old.effort_flags.ultra;
   assert.throws(() => resolveProviderControls({ ...input, entry: old, maxEffortOverride: true }), { code: 'unsupported_effort' });
   const changed = structuredClone(entry); changed.effort_model_allowlist.ultra = [];
