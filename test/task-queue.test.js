@@ -853,3 +853,142 @@ test('unsettledInWorkspace keeps claiming a workspace for still-queued work and 
   assert.equal(q.unsettledInWorkspace(cwd), false,
     'a cancelled never-started task must not block the workspace forever');
 });
+
+// Cancelling a task used to mark the record and leave the provider process
+// running to the supervisor's hard cap, still holding its admission slot. Cancel
+// a batch of four and the provider sat at its per-provider ceiling owned entirely
+// by dead work, so the next task queued forever with no error anywhere.
+test('cancelling a running task terminates the provider process and frees its slot', async (t) => {
+  const dir = tmpdir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  let closedWithoutEnding = 0;
+  let launched;
+  const q = createTaskQueue({
+    dataDir: dir,
+    // Stands in for a CLI provider: registers its listeners, then answers later.
+    // server.js keys killProcessTree and the acquireOneShot release on exactly
+    // this signal — 'close' with writableEnded still false.
+    executeOneShot: async (_body, res) => {
+      // A real CLI provider answers from its child 'close' handler after the
+      // kill, reporting that no model was invoked. Mirror that here.
+      res.on('close', () => {
+        if (res.writableEnded) return;
+        closedWithoutEnding++;
+        res.status(409).json({ failureClass: 'cancelled', model_invocation: false });
+      });
+      res._relayDeferredResponse = true;
+      launched();
+    },
+  });
+  const started = new Promise((resolve) => { launched = resolve; });
+  const task = q.submit({ kind: 'codex', prompt: 'a long astra run' });
+  q._pump();
+  await started;
+  assert.equal(q.get(task.id).status, 'running');
+
+  const cancelled = q.cancel(task.id);
+  assert.equal(cancelled.status, 'cancelled');
+  assert.match(cancelled.error, /process was terminated and its slot released/);
+  // captureResponse emits on setImmediate, mirroring a real socket.
+  // The record is terminal the instant cancel returns, so wait on the execution
+  // reaching its physical outcome rather than on the status.
+  for (let i = 0; i < 100 && q.get(task.id).execution.state === 'in_flight'; i++) {
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  assert.equal(closedWithoutEnding, 1, 'the disconnect must reach the process-kill path exactly once');
+  // The provider's own verdict still classifies it, so "no model was invoked"
+  // survives the cancel instead of being overwritten.
+  assert.equal(q.get(task.id).execution.state, 'not_invoked');
+  assert.equal(q.get(task.id).status, 'cancelled', 'cancellation intent is never resurrected');
+  assert.equal(q.stats().active, 0, 'a cancelled and reaped run must not keep holding a slot');
+});
+
+test('a second cancel neither re-aborts nor changes the record', async (t) => {
+  const dir = tmpdir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  let closes = 0, launched;
+  const q = createTaskQueue({
+    dataDir: dir,
+    executeOneShot: async (_body, res) => {
+      res.on('close', () => { if (res.writableEnded) return; closes++;
+        res.status(409).json({ failureClass: 'cancelled', model_invocation: false }); });
+      res._relayDeferredResponse = true;
+      launched();
+    },
+  });
+  const started = new Promise((resolve) => { launched = resolve; });
+  const task = q.submit({ kind: 'codex', prompt: 'cancel me twice' });
+  q._pump();
+  await started;
+  const first = q.cancel(task.id);
+  const again = q.cancel(task.id);
+  for (let i = 0; i < 100 && q.get(task.id).execution.state === 'in_flight'; i++) {
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  assert.equal(closes, 1, 'the disconnect handle is consumed, not re-fired');
+  assert.equal(again.status, 'cancelled');
+  assert.equal(again.error, first.error, 'a terminal task is returned unchanged');
+});
+
+test('cancelling a task that never started claims no kill it did not perform', async (t) => {
+  const dir = tmpdir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const q = createTaskQueue({ dataDir: dir, autoStart: false,
+    executeOneShot: fakeExecutor(async () => ({ payload: { stdout: 'never runs', exitCode: 0 } })) });
+  const task = q.submit({ kind: 'codex', prompt: 'queued only' });
+  assert.equal(q.get(task.id).status, 'queued');
+  const cancelled = q.cancel(task.id);
+  assert.equal(cancelled.error, 'cancelled before it started');
+  assert.doesNotMatch(cancelled.error, /terminated/);
+});
+
+// The disconnect frees the provider slot immediately, but server.js answers
+// nothing once the response's client has gone — so the verdict can never arrive.
+// Without a bound, runTask's promise stays pending and `active` leaks a slot for
+// the lifetime of the queue.
+test('a cancelled run whose outcome is never reported still releases queue capacity', async (t) => {
+  const dir = tmpdir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  let launched;
+  const q = createTaskQueue({
+    dataDir: dir, maxConcurrent: 1, cancelOutcomeGraceMs: 20,
+    // Deliberately silent after the kill, exactly as the real server is for a
+    // response whose client has disconnected.
+    executeOneShot: async (_body, res) => { res._relayDeferredResponse = true; launched(); },
+  });
+  const started = new Promise((resolve) => { launched = resolve; });
+  const first = q.submit({ kind: 'codex', prompt: 'never answers' });
+  q._pump();
+  await started;
+  assert.equal(q.stats().active, 1);
+  q.cancel(first.id);
+  for (let i = 0; i < 100 && q.stats().active !== 0; i++) await new Promise((r) => setTimeout(r, 10));
+  assert.equal(q.stats().active, 0, 'capacity must come back without the provider reporting');
+  assert.equal(q.get(first.id).execution.state, 'settled');
+  assert.equal(q.get(first.id).execution.outcomeReported, false, 'and it must not claim a verdict it never got');
+  assert.equal(q.get(first.id).status, 'cancelled');
+});
+
+// The window exists so a verdict that DOES arrive still wins — that is how a task
+// cancelled before any model ran keeps recording that no quota was spent.
+test('a verdict arriving inside the grace window still classifies the cancelled run', async (t) => {
+  const dir = tmpdir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  let launched;
+  const q = createTaskQueue({
+    dataDir: dir, cancelOutcomeGraceMs: 5000,
+    executeOneShot: async (_body, res) => {
+      res.on('close', () => { if (!res.writableEnded) res.status(409).json({ failureClass: 'cancelled', model_invocation: false }); });
+      res._relayDeferredResponse = true;
+      launched();
+    },
+  });
+  const started = new Promise((resolve) => { launched = resolve; });
+  const task = q.submit({ kind: 'codex', prompt: 'answers on close' });
+  q._pump();
+  await started;
+  q.cancel(task.id);
+  for (let i = 0; i < 100 && q.get(task.id).execution.state === 'in_flight'; i++) await new Promise((r) => setTimeout(r, 10));
+  assert.equal(q.get(task.id).execution.state, 'not_invoked', 'the provider verdict wins over the fallback');
+  assert.equal(q.get(task.id).execution.outcomeReported, undefined);
+});

@@ -5478,6 +5478,11 @@ async function executeOneShot(body, res, privateContext = null) {
   supervisor.progress.runId = runId; supervisor.progress.attemptId = route.attempt_id;
   supervisor.progress.parser = entry.oneshot_output_parser || 'text';
   const continuityControl = { runId, kind, route, startedAt, supervisor, pid: proc.pid, cwd: resolvedCwd,
+    // Which background task owns this run, so a cancel can find it by identity.
+    // Correlating on a caller-supplied requestId does not work: when none is
+    // supplied route.request_id is a generated `oneshot:<uuid>`, so the task's
+    // own body carries nothing that matches and the stop silently found no run.
+    taskId: privateContext?.taskId || null,
     objective: prompt, quotaFingerprint: subscriptionUsage.fingerprint(route.quota_seat), continuityId: body.continuityId || null, settled: false, reserve: null,
     nativeLaunchIdentity,
     finalizeSupported: supportsClaudeStreamFinalization,
@@ -5528,6 +5533,7 @@ async function executeOneShot(body, res, privateContext = null) {
     continuityControl.stopCheckpointPath = stopCheckpointPath;
     return true;
   };
+
   // S2/S4 (Refs #133): stallAction:"notify" (this.stall) and unverifiable
   // CPU silence (this.unsampledStall) never kill, but they must still be
   // visible as incidents, once each per run, with the check-in evidence
@@ -6076,8 +6082,12 @@ const taskQueue = createTaskQueue({
   executionOwners: ownedExecutionBackend.taskAuthority,
   requiresExecutionOwner: task => ownedExecutionBackend.requiresOwnedTask(task),
   appendDeliveryReceipt: createDeliveryReceiptSink({ directory: RECEIPTS_DIR, append: appendBridgeReceiptRecord }),
+  // Match on the task identity the run was stamped with, and keep the requestId
+  // match as a fallback for runs started outside the queue.
   stopExecution: (task) => { for (const run of continuityControls.values()) {
-    if (task.body?.requestId && run.route.request_id === task.body.requestId) run.stop?.('client_cancelled');
+    const mine = (run.taskId && run.taskId === task.id)
+      || (task.body?.requestId && run.route.request_id === task.body.requestId);
+    if (mine) run.stop?.('client_cancelled');
   } },
   receiptStoreId: RECEIPT_STORE_IDENTITY.ready ? RECEIPT_STORE_IDENTITY.id : null,
   maxConcurrent: CONCURRENCY_POLICY.maxConcurrentTasks,
