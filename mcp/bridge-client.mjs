@@ -5,14 +5,17 @@ import { fileURLToPath } from 'node:url';
 import TIMEOUT_POLICY from '../timeout-policy.cjs';
 import receiptStoreIdentityModule from '../lib/receipt-store-identity.cjs';
 import buildIdentityModule from '../lib/build-identity.cjs';
+import wireContractModule from '../lib/wire-contract.cjs';
 
 const { receiptStoreIdentity } = receiptStoreIdentityModule;
 const { loadBuildIdentity } = buildIdentityModule;
+const { wireContractId } = wireContractModule;
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const BRIDGE_ROOT = path.resolve(HERE, '..');
 const EXPECTED_BUILD_IDENTITY = loadBuildIdentity(BRIDGE_ROOT);
 const EXPECTED_BUILD_ID = EXPECTED_BUILD_IDENTITY.buildId;
+const EXPECTED_WIRE_CONTRACT_ID = wireContractId();
 function envFirst(...names) {
   for (const name of names) {
     const value = process.env[name];
@@ -187,14 +190,30 @@ function actionIdentityDetail(live) {
   const receiptStoreMatches = EXPECTED_RECEIPT_STORE_IDENTITY.ready
     && currentReceiptStoreId !== null
     && currentReceiptStoreId === EXPECTED_RECEIPT_STORE_IDENTITY.id;
+  // The protocol question, asked separately from the source-tree question. A
+  // bridge too old to advertise this cannot be assumed compatible, so an absent
+  // id counts as a mismatch rather than as agreement.
+  const currentWireContractId = typeof live?.wireContractId === 'string' && live.wireContractId
+    ? live.wireContractId : null;
+  const wireContractMatches = currentWireContractId !== null
+    && currentWireContractId === EXPECTED_WIRE_CONTRACT_ID;
+  // A rebuild of the same installation that did not touch the MCP contract is
+  // drift, not a mismatch: proceeding is safe and refusing only strands a live
+  // session. Anything else still fails closed.
+  const buildDrift = !buildMatches && receiptStoreMatches && wireContractMatches
+    && expectedBuildIdentityReady && currentBuildIdentityReady;
   return {
-    ok: buildMatches && receiptStoreMatches,
+    ok: receiptStoreMatches && (buildMatches || buildDrift),
     expectedBuildId: EXPECTED_BUILD_ID,
     currentBuildId: currentBuildId || null,
     expectedBuildIdentityReady,
     currentBuildIdentityReady,
     expectedReceiptStoreId: EXPECTED_RECEIPT_STORE_IDENTITY.id,
     currentReceiptStoreId,
+    expectedWireContractId: EXPECTED_WIRE_CONTRACT_ID,
+    currentWireContractId,
+    wireContractMatches,
+    buildDrift,
     buildMatches,
     receiptStoreMatches,
     // The mismatch a second checkout produces is otherwise undiagnosable: the
@@ -205,14 +224,47 @@ function actionIdentityDetail(live) {
   };
 }
 
+// A build-hash difference that the wire contract clears is worth saying once,
+// so an operator who later sees odd behaviour knows the two halves are not the
+// same build — but it is not worth failing the call over.
+let reportedBuildDrift = false;
+
+// Three different faults used to share one message, and its remedy ("point
+// RELAYBRIDGE_URL somewhere else") is actively wrong for the common one: after a
+// rebuild the receipt store proves it IS the right installation and the fix is
+// to restart this client. Name the fault that actually occurred.
+function identityMismatchMessage(preflight) {
+  if (!preflight.receiptStoreMatches) {
+    return 'RelayBridge action identity mismatch: a different RelayBridge installation is answering this port '
+      + `(its pid is ${preflight.currentPid ?? 'in actionPreflight.currentPid'}). Point RELAYBRIDGE_URL and `
+      + 'RELAYBRIDGE_DATA_DIR at the installation this MCP client was installed from, or stop the other bridge.';
+  }
+  if (!preflight.currentWireContractId) {
+    return 'RelayBridge action identity mismatch: this is the same installation (the receipt store matches), but the '
+      + 'bridge is too old to declare its MCP wire contract, so compatibility cannot be established. Restart the bridge '
+      + 'on the current build, then restart this client.';
+  }
+  return 'RelayBridge action identity mismatch: this is the same installation (the receipt store matches), but the bridge '
+    + `was rebuilt with a different MCP wire contract (client ${preflight.expectedWireContractId} vs bridge `
+    + `${preflight.currentWireContractId}) - the two disagree about the execution contract or an enum they both enforce. `
+    + 'Restart this MCP client so it loads the current build; no configuration change is needed.';
+}
+
 export async function requireExpectedActionIdentity({ signal } = {}) {
   const live = await health({ signal });
   const actionPreflight = actionIdentityDetail(live);
-  if (live?.capabilityAuth && actionPreflight.ok) return actionPreflight;
+  if (live?.capabilityAuth && actionPreflight.ok) {
+    if (actionPreflight.buildDrift && !reportedBuildDrift) {
+      reportedBuildDrift = true;
+      process.stderr.write('[RelayBridge] bridge build '
+        + `${actionPreflight.currentBuildId} differs from this client's ${actionPreflight.expectedBuildId}, but the MCP `
+        + `wire contract (${actionPreflight.expectedWireContractId}) and receipt store both match, so calls continue. `
+        + 'Restart this client to pick up the current build.\n');
+    }
+    return actionPreflight;
+  }
   throw new BridgeError(
-    'RelayBridge action identity mismatch: the bridge answering this port reports a different build or receipt store. '
-    + 'Restart/reinstall so MCP and REST use the same build and receipt store, or - if a second RelayBridge installation '
-    + 'owns the port (its pid is actionPreflight.currentPid) - point RELAYBRIDGE_URL and RELAYBRIDGE_DATA_DIR at the one this MCP was installed from',
+    identityMismatchMessage(actionPreflight),
     {
       route: '/api/health',
       status: 409,
