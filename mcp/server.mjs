@@ -3707,8 +3707,9 @@ export function buildServer() {
     inputSchema: z.object({}).strict(), annotations: READ_ONLY,
   }, safeHandler(async () => result(await bridgeRequest('/api/settings/continuity'))));
   server.registerTool('set_continuity_settings', { title: 'Set usage protection and supervision',
-    description: 'Persist usage protection, reserve (2–5 percent), automatic handoff, dynamic supervision and bounded low-tier assessments. Disabled protection does not erase checkpoints or quota evidence.',
+    description: 'Persist usage protection, reserve (2–5 percent), automatic handoff, dynamic supervision and bounded low-tier assessments. admitUnknownUsage (default true) lets native Claude launches proceed when allowance evidence is unknown or stale; false restores fail-closed quota_unknown rejections. Disabled protection does not erase checkpoints or quota evidence.',
     inputSchema: z.object({ usageProtection: z.boolean().optional(), reservePercent: z.number().min(2).max(5).optional(),
+      admitUnknownUsage: z.boolean().optional(),
       autoHandoff: z.boolean().optional(), dynamicSupervision: z.boolean().optional(), assessorEnabled: z.boolean().optional() }).strict(), annotations: ACTION,
   }, safeHandler(async (input) => result(await bridgeRequest('/api/settings/continuity', { method: 'PUT', body: input, actionIdentity: true }))));
   server.registerTool('native_usage', { title: 'Read native subscription allowance',

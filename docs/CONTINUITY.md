@@ -108,10 +108,29 @@ are not classified as native Anthropic merely because their kind is `claude`.
 Observations expire after three minutes. Repeated cached Claude status-line
 payloads do not make an old observation fresh. Explicit denial and stale low
 capacity remain protected until affirmative native evidence clears them.
-Unknown capacity allows ordinary calls on generic transports, but native
-Anthropic CLI launches require fresh capacity bound to the selected profile.
-Unknown capacity cannot qualify an automatic successor or assessor. Local token counts and operator estimates do not become
-subscription percentages.
+Unknown capacity allows ordinary calls on generic transports. For native
+Anthropic CLI launches the continuity setting `admitUnknownUsage` (default
+`true`) decides what unknown or stale capacity means at admission:
+
+- `true`: the launch is admitted when the launch identity still matches the
+  selected profile, the seat is not vendor-blocked, and no retained low reading
+  protects it. The route and receipt carry `native_usage_freshness:
+  "unknown_admitted"` with `stale_reason` set to the probe reason (for example
+  `probe_dir_untrusted`, `probe_not_refreshed:probe_timeout`, `probe_cooldown`),
+  and one `[claude-native-admission]` stderr line records the admit. Nothing is
+  written to the usage store: fail-open never fabricates evidence, so the reserve
+  is protected again the moment fresh evidence arrives.
+- `false`: the previous fail-closed behaviour, rejecting with `quota_unknown`
+  and `probe_reason`.
+
+Identity mismatches (`identity_mismatch_pre`/`identity_mismatch_post`), vendor
+blocks, retained low readings and dispatches that set `requireFreshUsage`
+remain fail-closed under either setting. `probe_dir_untrusted` means the account
+matched but `<data dir>/claude-usage-probe` has never been trusted in the CLI's
+own project list; open `claude` there once and accept the trust dialog to let
+the non-generating `/usage` refresh run. Unknown capacity cannot qualify an
+automatic successor or assessor. Local token counts and operator estimates do
+not become subscription percentages.
 
 A window's `usedPercent`/`utilization` outside its valid 0-100/0-1 range is
 rejected as invalid evidence, not clamped into a fabricated in-range value.

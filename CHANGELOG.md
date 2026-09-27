@@ -1,3 +1,6 @@
+## Unreleased
+- fix(admission): native Claude launches admit when allowance evidence is unknown or stale (`admitUnknownUsage`, default on; receipts say `native_usage_freshness: unknown_admitted`); an untrusted usage-probe directory is reported as `probe_dir_untrusted` instead of `identity_mismatch_pre`
+
 ## v2.5.1 - 2026-09-22
 - #134 fix(supervisor): remove time/token caps; progress check-ins decide kills
 

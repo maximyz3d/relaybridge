@@ -20,20 +20,27 @@ const unsetBridgeEnv = Object.fromEntries(inheritedBridgeKeys.map((key) => [key,
 // overwrites the seed (matches continuity.integration.test.js's confirmed behavior that a
 // stale-at-boot profile never produces a store observation on its own).
 async function staleNativeFixture(t, { initialUtilization = 20, initialResetOffsetMs = 86400000,
-  probeMode = null, patchStoreSeat = null, primeStore = true, trustProbeDir = true } = {}) {
+  probeMode = null, patchStoreSeat = null, primeStore = true, trustProbeDir = true, admitUnknownUsage = null } = {}) {
   let profile, events, usageFile;
   const bridge = await startTestBridge(t, root => {
     profile = path.join(root, 'native-home', '.claude.json'); events = path.join(root, 'native-events.jsonl');
     usageFile = path.join(root, 'data', 'usage', 'native-usage.json');
     const probeCwd = path.join(root, 'data', 'claude-usage-probe'); fs.mkdirSync(probeCwd, { recursive: true });
+    // Continuity settings are loaded once at boot (createSubscriptionUsage), so a pinned
+    // admitUnknownUsage has to be on disk before the bridge starts. null keeps the shipped default.
+    if (typeof admitUnknownUsage === 'boolean') {
+      fs.mkdirSync(path.join(root, 'data', 'usage'), { recursive: true });
+      fs.writeFileSync(path.join(root, 'data', 'usage', 'continuity-settings.json'),
+        JSON.stringify({ schemaVersion: 1, admitUnknownUsage }));
+    }
     const accountUuid = '11111111-2222-3333-4444-555555555555', at = Date.now(), reset = at + initialResetOffsetMs;
     const initial = { oauthAccount: { accountUuid }, cachedUsageUtilization: { accountUuid, fetchedAtMs: at, utilization:
       Object.fromEntries(['five_hour', 'seven_day'].map(name => [name, { utilization: initialUtilization, resets_at: new Date(reset).toISOString() }])) } };
-    // B1 fixture knob: when false, the probe's own project-trust read (a distinct
+    // Fixture knob: when false, the probe's own project-trust read (a distinct
     // readClaudeNativeUsage call bound to CLAUDE_USAGE_PROBE_DIR) never establishes trust, so
-    // probeClaudeNativeAdmission's pre-refresh identity comparison fails with
-    // reason 'identity_mismatch_pre' -- the same reason code an actual account/profile
-    // mismatch at that comparison would produce.
+    // probeClaudeNativeAdmission fails before its refresh command with reason
+    // 'probe_dir_untrusted'. The account/profile identity still matches, which is exactly why
+    // this must not be reported as (or handled like) an identity mismatch.
     if (trustProbeDir) initial.projects = { [probeCwd]: { hasTrustDialogAccepted: true } };
     fs.writeFileSync(profile, JSON.stringify(initial));
     if (primeStore) {
@@ -193,13 +200,13 @@ test('a prior observation at or below reserve whose window has not reset still r
   assert.equal(reply.body.probe_reason, undefined, JSON.stringify(reply.body));
 });
 
-test('no prior observation stays fail-closed with a probe reason', async t => {
+test('no prior observation stays fail-closed with a probe reason when admitUnknownUsage is off', async t => {
   // The live profile starts stale (never primed), so the server's own boot refresh
   // never records an observation for this identity (see
   // test/continuity.integration.test.js's "stale, future, mismatched and incomplete
   // native caches never authorize a fake model start", which asserts observedAt stays
   // undefined for a stale-at-boot profile).
-  const bridge = await staleNativeFixture(t, { primeStore: false, probeMode: 'fail' });
+  const bridge = await staleNativeFixture(t, { primeStore: false, probeMode: 'fail', admitUnknownUsage: false });
   const reply = await bridge.ask();
   assert.equal(reply.status, 409, JSON.stringify(reply.body));
   assert.equal(reply.body.failureClass, 'quota_unknown', JSON.stringify(reply.body));
@@ -236,17 +243,84 @@ test('requireFreshUsage stays fail-closed even when the stale-admit fallback wou
 // under the wrong login. Both tests below force an identity mismatch and assert the request
 // is refused with no provider ever started.
 
-test('an identity mismatch during the probe rejects and never stale-admits', async t => {
-  // trustProbeDir:false means probeClaudeNativeAdmission's own pre-refresh identity read
-  // (bound to CLAUDE_USAGE_PROBE_DIR) never establishes project trust, so the probe fails
-  // closed with reason identity_mismatch_pre before it ever runs the refresh command.
-  const bridge = await staleNativeFixture(t, { probeMode: 'fail', trustProbeDir: false });
+test('an untrusted probe directory is reported as probe_dir_untrusted and stays fail-closed when admitUnknownUsage is off', async t => {
+  // trustProbeDir:false means probeClaudeNativeAdmission's own pre-refresh read (bound to
+  // CLAUDE_USAGE_PROBE_DIR) sees the same account and profile but no accepted trust dialog,
+  // so the probe fails before it ever runs the refresh command. Nothing is primed, so there
+  // is no prior observation to stale-admit from, and fail-open is off: quota_unknown.
+  const bridge = await staleNativeFixture(t, { probeMode: 'fail', trustProbeDir: false, primeStore: false, admitUnknownUsage: false });
   const reply = await bridge.ask();
   assert.equal(reply.status, 409, JSON.stringify(reply.body));
   assert.equal(reply.body.failureClass, 'quota_unknown', JSON.stringify(reply.body));
-  assert.equal(reply.body.probe_reason, 'identity_mismatch_pre', JSON.stringify(reply.body));
+  assert.equal(reply.body.probe_reason, 'probe_dir_untrusted', JSON.stringify(reply.body));
   assert.equal(reply.body.model_invocation, false);
-  assert.equal(completeJsonLines(bridge.events).filter(e => e.type === 'started').length, 0);
+  const events = completeJsonLines(bridge.events);
+  assert.equal(events.filter(e => e.type === 'started').length, 0);
+  assert.equal(events.filter(e => e.type === 'usage_probe').length, 0, 'the refresh command never runs without trust');
+});
+
+test('an untrusted probe directory no longer masquerades as an identity mismatch for the stale-admit fallback', async t => {
+  // Live regression: every probe on a bridge whose probe dir was never trusted failed with
+  // reason identity_mismatch_pre, which the fallback treats as a wrong-login signal and so
+  // refused even a primed same-identity observation above reserve. The distinct reason lets
+  // the existing headroom_above_reserve fallback admit, with fail-open pinned off to prove
+  // this path does not depend on it.
+  const bridge = await staleNativeFixture(t, { probeMode: 'fail', trustProbeDir: false, admitUnknownUsage: false });
+  const reply = await bridge.ask();
+  assert.equal(reply.status, 200, JSON.stringify(reply.body));
+  assert.equal(reply.body.model_invocation, true);
+  assert.equal(reply.body.route.native_usage_freshness, 'stale_admitted', JSON.stringify(reply.body.route));
+  assert.equal(reply.body.route.stale_reason, 'headroom_above_reserve', JSON.stringify(reply.body.route));
+  assert.equal(completeJsonLines(bridge.events).filter(e => e.type === 'usage_probe').length, 0);
+});
+
+test('no prior observation and a failed probe admit as unknown_admitted by default', async t => {
+  const bridge = await staleNativeFixture(t, { primeStore: false, probeMode: 'fail' });
+  const reply = await bridge.ask();
+  assert.equal(reply.status, 200, JSON.stringify(reply.body));
+  assert.equal(reply.body.model_invocation, true);
+  assert.equal(reply.body.route.native_usage_freshness, 'unknown_admitted', JSON.stringify(reply.body.route));
+  assert.equal(reply.body.route.stale_reason, 'probe_not_refreshed:probe_timeout', JSON.stringify(reply.body.route));
+  const events = completeJsonLines(bridge.events);
+  assert.equal(events.filter(e => e.type === 'usage_probe').length, 1, 'the refresh is still attempted first');
+  assert.equal(events.filter(e => e.type === 'started').length, 1);
+  // Fail-open never fabricates evidence: only the provider's own stream observation may land.
+  const stored = JSON.parse(fs.readFileSync(bridge.usageFile, 'utf8')).claude;
+  assert.ok(stored.selectedFingerprint);
+  assert.notEqual(stored.source, 'claude_native_cache_v1');
+});
+
+test('an untrusted probe directory admits as unknown_admitted by default with the setup gap as the reason', async t => {
+  const bridge = await staleNativeFixture(t, { probeMode: 'fail', trustProbeDir: false, primeStore: false });
+  const reply = await bridge.ask();
+  assert.equal(reply.status, 200, JSON.stringify(reply.body));
+  assert.equal(reply.body.route.native_usage_freshness, 'unknown_admitted', JSON.stringify(reply.body.route));
+  assert.equal(reply.body.route.stale_reason, 'probe_dir_untrusted', JSON.stringify(reply.body.route));
+  assert.equal(completeJsonLines(bridge.events).filter(e => e.type === 'started').length, 1);
+});
+
+test('admitUnknownUsage toggles fail-open live through the continuity settings API', async t => {
+  // toggle-v2: turn fail-open off before any provider runs. A completed run leaves the
+  // provider's own stream observation behind, and the ordinary headroom_above_reserve
+  // fallback would then admit regardless of this setting.
+  const bridge = await staleNativeFixture(t, { primeStore: false, probeMode: 'fail' });
+  const off = await bridge.request('/api/settings/continuity', { admitUnknownUsage: false }, { method: 'PUT' });
+  assert.equal(off.status, 200, JSON.stringify(off.body)); assert.equal(off.body.settings.admitUnknownUsage, false);
+  const refused = await bridge.ask();
+  assert.equal(refused.status, 409, JSON.stringify(refused.body));
+  assert.equal(refused.body.failureClass, 'quota_unknown', JSON.stringify(refused.body));
+  assert.equal(refused.body.probe_reason, 'probe_not_refreshed:probe_timeout', JSON.stringify(refused.body));
+  assert.equal(refused.body.model_invocation, false);
+  const on = await bridge.request('/api/settings/continuity', { admitUnknownUsage: true }, { method: 'PUT' });
+  assert.equal(on.status, 200, JSON.stringify(on.body)); assert.equal(on.body.settings.admitUnknownUsage, true);
+  const admitted = await bridge.ask();
+  assert.equal(admitted.status, 200, JSON.stringify(admitted.body));
+  assert.equal(admitted.body.route.native_usage_freshness, 'unknown_admitted', JSON.stringify(admitted.body.route));
+  // The refused attempt armed the 60s probe-failure cooldown; fail-open still admits and says so.
+  assert.equal(admitted.body.route.stale_reason, 'probe_cooldown', JSON.stringify(admitted.body.route));
+  const events = completeJsonLines(bridge.events);
+  assert.equal(events.filter(e => e.type === 'usage_probe').length, 1);
+  assert.equal(events.filter(e => e.type === 'started').length, 1);
 });
 
 test('an account that drifts during the probe round-trip rejects with no spawn', async t => {

@@ -4826,6 +4826,12 @@ async function executeOneShot(body, res, privateContext = null) {
   // alongside native_usage_freshness so a window-reset admit is distinguishable from a
   // headroom-above-reserve admit after the fact.
   let staleAdmitReason = null;
+  // Fail-open admit: native usage evidence for the selected account is unknown or stale and
+  // the refresh probe could not establish fresh evidence, but nothing authoritative says the
+  // seat is low or vendor-blocked and the launch identity still matches. Governed by the
+  // continuity setting `admitUnknownUsage` (default on). Labelled `unknown_admitted` on the
+  // route/receipt so it is never mistaken for fresh or stale-but-evidenced admission.
+  let unknownAdmittedNativeUsage = false;
   if (nativeLaunchIdentity.required) {
     if (!nativeLaunchIdentity.identity) return rejectBeforeAdmission(409, 'account_identity_unavailable', {
       error: 'The selected native Claude profile identity is unavailable.', model_invocation: false, physical_attempt_count: 0 });
@@ -4875,6 +4881,17 @@ async function executeOneShot(body, res, privateContext = null) {
       if (identityStillMatches && hasPriorObservation && (windowReset || headroomAboveReserve)) {
         staleAdmittedNativeUsage = true;
         staleAdmitReason = windowReset ? 'window_reset' : 'headroom_above_reserve';
+      } else if (identityStillMatches && subscriptionUsage.getSettings().admitUnknownUsage === true
+        && !priorSeat.vendorBlocked && priorSeat.admit === true) {
+        // Unknown is not exhausted. The identity check above still holds (never under a
+        // mismatched login), a vendor block or a retained low reading still refuses through
+        // priorSeat.admit, and the usage store records nothing: fail-open never fabricates
+        // evidence. Operators who want the old fail-closed behaviour set admitUnknownUsage
+        // to false (PUT /api/settings/continuity), which rejects here as quota_unknown.
+        staleAdmittedNativeUsage = true;
+        unknownAdmittedNativeUsage = true;
+        staleAdmitReason = nativeProbeReason || priorSeat.reason || 'usage_unknown';
+        logClaudeNativeUnknownAdmit(nativeLaunchIdentity.identity, staleAdmitReason);
       } else {
         claudeUsageProbeFailures.set(claudeUsageProbeKey(nativeLaunchIdentity.identity), Date.now());
         return rejectBeforeAdmission(409, 'quota_unknown', {
@@ -5014,7 +5031,7 @@ async function executeOneShot(body, res, privateContext = null) {
     // (appendBridgeProviderReceipt embeds `route` wholesale). null for any
     // non-native-identity dispatch, so existing receipts are unchanged.
     native_usage_freshness: nativeLaunchIdentity?.required
-      ? (staleAdmittedNativeUsage ? 'stale_admitted' : 'fresh')
+      ? (unknownAdmittedNativeUsage ? 'unknown_admitted' : staleAdmittedNativeUsage ? 'stale_admitted' : 'fresh')
       : null,
     stale_reason: staleAdmittedNativeUsage ? staleAdmitReason : null,
     transport: entry.transport || 'cli',
@@ -5231,7 +5248,8 @@ async function executeOneShot(body, res, privateContext = null) {
       const identity = { provider: kind, accountId: dispatchAccount.account?.id || 'default',
         executionHash: ownerIdentityHash(execution), cwdIdentityHash: spawnCwdIdentity.cwdIdentityHash, cwdPolicyId: CWD_POLICY_IDENTITY };
       ownedDispatchIdentities.set(privateContext.taskId, Object.freeze(identity));
-      ownedNativeAdmissions.set(privateContext.taskId, { runId, identity: nativeLaunchIdentity, env: launch.env });
+      ownedNativeAdmissions.set(privateContext.taskId, { runId, identity: nativeLaunchIdentity, env: launch.env,
+        freshValidated: !staleAdmittedNativeUsage });
       ownedHandle = ownedExecutionBackend.prepareLaunch(privateContext, {
         binding: { requestId, invocationId, attemptId, runId, taskId: privateContext.taskId,
           reservationId: privateContext.reservationId, ...identity },
@@ -6072,7 +6090,12 @@ ownedExecutionBackend = createOwnedExecutionBackend({
   readExecutionIdentity: task => ownedDispatchIdentities.get(task.id) || null,
   validateLaunchAdmission: binding => {
     const captured = ownedNativeAdmissions.get(binding.taskId);
-    return !!captured && captured.runId === binding.runId && validateClaudeLaunchAdmission(captured.identity, captured.env);
+    if (!captured || captured.runId !== binding.runId) return false;
+    // A stale/unknown admit re-verifies the launch identity only, exactly like the direct
+    // spawn path: freshness was never established for it, so demanding it here would refuse
+    // every admitted-without-fresh-evidence launch at the owned start boundary.
+    return captured.freshValidated === false ? sameClaudeLaunchIdentity(captured.identity, captured.env)
+      : validateClaudeLaunchAdmission(captured.identity, captured.env);
   },
 });
 const taskQueue = createTaskQueue({
@@ -6826,6 +6849,11 @@ const claudeUsageProbeKey = identity => JSON.stringify([identity.quotaSeat, iden
 function logClaudeNativeProbeFailure(identity, reason) {
   try { console.error(`[claude-native-probe] reason=${reason} quotaSeat=${identity?.quotaSeat || 'unknown'}`); } catch {}
 }
+// One stderr line per fail-open admit so the journal shows work that ran without fresh
+// native usage evidence and why the evidence was missing. Reason codes only, as above.
+function logClaudeNativeUnknownAdmit(identity, reason) {
+  try { console.error(`[claude-native-admission] unknown usage admitted reason=${reason} quotaSeat=${identity?.quotaSeat || 'unknown'}`); } catch {}
+}
 async function probeClaudeNativeAdmission(captured, dispatchSnapshot = null) {
   const fail = (reason) => ({ ok: false, reason, identity: null });
   if (!captured?.identity) return fail('probe_identity_missing');
@@ -6846,7 +6874,12 @@ async function probeClaudeNativeAdmission(captured, dispatchSnapshot = null) {
         const trusted = readClaudeNativeUsage({ env, quotaSeat: captured.identity.quotaSeat,
           projectCwd: CLAUDE_USAGE_PROBE_DIR });
         if (!trusted.identity || trusted.identity.accountFingerprint !== captured.identity.accountFingerprint
-          || trusted.identity.profileHash !== captured.identity.profileHash || !trusted.projectTrustAccepted) return fail('identity_mismatch_pre');
+          || trusted.identity.profileHash !== captured.identity.profileHash) return fail('identity_mismatch_pre');
+        // Same account and profile, but the probe directory has never been trusted in the
+        // CLI's own project list, so the interactive refresh cannot run without a trust
+        // dialog. That is a setup gap, not a wrong login: report it distinctly so the
+        // admission fallback never treats it as an identity mismatch.
+        if (!trusted.projectTrustAccepted) return fail('probe_dir_untrusted');
         const command = resolveExecutable(settings.command[0], env), args = settings.command.slice(1).map(String);
         const timeoutMs = Number.isSafeInteger(settings.timeout_ms)
           ? Math.min(30000, Math.max(1000, settings.timeout_ms)) : 15000;

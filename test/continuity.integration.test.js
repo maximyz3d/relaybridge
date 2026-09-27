@@ -40,7 +40,7 @@ async function fixture(t) {
 // Explicitly declared native protocol with a disposable metadata profile and
 // an inert Node transport. No installed Claude binary/account is used here.
 async function nativeClaudeFixture(t, { mutate = () => {}, registry = null, changeConfig = () => {}, env = {}, interleaveConfig = null,
-  probeMode = null } = {}) {
+  probeMode = null, continuitySettings = null } = {}) {
   let profile, events, initial;
   const nodeArgs = [];
   const bridge = await startTestBridge(t, root => {
@@ -58,6 +58,12 @@ async function nativeClaudeFixture(t, { mutate = () => {}, registry = null, chan
     }
     profile = path.join(root, 'native-home', '.claude.json'); events = path.join(root, 'native-events.jsonl');
     const probeCwd = path.join(root, 'data', 'claude-usage-probe'); fs.mkdirSync(probeCwd, { recursive: true });
+    // Continuity settings load once at boot, so pinned values (e.g. admitUnknownUsage:false to
+    // keep a fail-closed assertion) must be on disk before the bridge starts.
+    if (continuitySettings) {
+      fs.mkdirSync(path.join(root, 'data', 'usage'), { recursive: true });
+      fs.writeFileSync(path.join(root, 'data', 'usage', 'continuity-settings.json'), JSON.stringify({ schemaVersion: 1, ...continuitySettings }));
+    }
     const accountUuid = '11111111-2222-3333-4444-555555555555', at = Date.now(), reset = Math.floor(at / 1000) * 1000 + 86400000;
     initial = { oauthAccount: { accountUuid }, cachedUsageUtilization: { accountUuid, fetchedAtMs: at, utilization:
       Object.fromEntries(['five_hour', 'seven_day'].map(name => [name, { utilization: 20, resets_at: new Date(reset - 437).toISOString() }])) } };
@@ -107,10 +113,10 @@ test('stale native Claude admission refreshes through a non-generating PTY probe
   assert.equal(events.filter(event => event.type === 'started').length, 2);
 });
 
-test('failed native Claude PTY refresh stays fail-closed and fresh capacity skips the probe', async t => {
+test('failed native Claude PTY refresh stays fail-closed with admitUnknownUsage off and fresh capacity skips the probe', async t => {
   await t.test('failed refresh', async sub => {
     const bridge = await nativeClaudeFixture(sub, {
-      probeMode: 'fail', env: { PTY_MODE: 'auto' },
+      probeMode: 'fail', env: { PTY_MODE: 'auto' }, continuitySettings: { admitUnknownUsage: false },
       mutate: profile => { profile.cachedUsageUtilization.fetchedAtMs -= 180001; },
     });
     const replies = [await bridge.ask(), await bridge.ask('Retry during probe cooldown.')];
@@ -206,15 +212,35 @@ test('verified native adapter refreshes stale counters while preserving unadmitt
   assert.equal(reply.body.model_invocation, true, 'fresh bound counter evidence authorizes only the isolated synthetic provider');
 });
 
-test('stale, future, mismatched and incomplete native caches never authorize a fake model start', async t => {
+test('stale, future, mismatched and incomplete native caches never authorize a fake model start when admitUnknownUsage is off', async t => {
   for (const [name, mutate] of Object.entries({ stale: p => p.cachedUsageUtilization.fetchedAtMs -= 180001,
     future: p => p.cachedUsageUtilization.fetchedAtMs += 60000, mismatch: p => p.cachedUsageUtilization.accountUuid = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
     incomplete: p => delete p.cachedUsageUtilization.utilization.seven_day })) await t.test(name, async sub => {
-    const bridge = await nativeClaudeFixture(sub, { mutate }); const reply = await bridge.ask();
+    const bridge = await nativeClaudeFixture(sub, { mutate, continuitySettings: { admitUnknownUsage: false } }); const reply = await bridge.ask();
     assert.equal(reply.body.failureClass, 'quota_unknown', JSON.stringify(reply.body)); assert.equal(reply.body.model_invocation, false);
     assert.equal(completeJsonLines(bridge.events).length, 0);
     const stored = JSON.parse(fs.readFileSync(bridge.usageFile)).claude;
     assert.ok(stored.selectedFingerprint); assert.equal(stored.observedAt, undefined);
+  });
+});
+test('unknown native capacity admits by default, labelled unknown_admitted, without fabricated evidence', async t => {
+  // Same unusable caches as the fail-closed case above, under the shipped default. The
+  // launch identity (oauthAccount) is intact in every case, so the selected login is the one
+  // that runs; only the allowance evidence is missing. No PTY here, so the probe reports
+  // probe_pty_unavailable and that reason rides on the route.
+  for (const [name, mutate] of Object.entries({ stale: p => p.cachedUsageUtilization.fetchedAtMs -= 180001,
+    incomplete: p => delete p.cachedUsageUtilization.utilization.seven_day })) await t.test(name, async sub => {
+    const bridge = await nativeClaudeFixture(sub, { mutate });
+    const before = fs.existsSync(bridge.usageFile) ? JSON.parse(fs.readFileSync(bridge.usageFile)).claude : undefined;
+    assert.equal(before?.observedAt, undefined, 'a stale-at-boot profile records no observation');
+    const reply = await bridge.ask();
+    assert.equal(reply.status, 200, JSON.stringify(reply.body)); assert.equal(reply.body.model_invocation, true);
+    assert.equal(reply.body.route.native_usage_freshness, 'unknown_admitted', JSON.stringify(reply.body.route));
+    assert.equal(reply.body.route.stale_reason, 'probe_pty_unavailable', JSON.stringify(reply.body.route));
+    assert.equal(completeJsonLines(bridge.events).filter(event => event.type === 'started').length, 1);
+    const stored = JSON.parse(fs.readFileSync(bridge.usageFile)).claude;
+    assert.ok(stored.selectedFingerprint);
+    assert.notEqual(stored.source, 'claude_native_cache_v1', 'the unusable cache is never adopted as evidence');
   });
 });
 test('inherited and explicit authentication overrides cannot authorize default-profile native launches', async t => {

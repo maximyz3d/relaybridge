@@ -441,6 +441,7 @@
       <legend>Usage protection and continuity</legend>
       <label><input id="continuity-protect" type="checkbox" checked> Protect remaining allowance</label>
       <label style="margin-left:12px;">Reserve <input id="continuity-reserve" type="number" min="2" max="5" step="0.1" value="5" style="width:60px;">%</label><br>
+      <label><input id="continuity-admit-unknown" type="checkbox" checked> Keep native Claude work moving when allowance is unknown (protect only on evidence)</label><br>
       <label><input id="continuity-handoff" type="checkbox" checked> Automatically hand off managed coordination</label><br>
       <label><input id="continuity-dynamic" type="checkbox" checked> Let productive jobs continue beyond default timers (new runs)</label><br>
       <label><input id="continuity-assessor" type="checkbox" checked> Use bounded low-tier progress assessments (active runs)</label>
@@ -2855,7 +2856,7 @@ function fuelBar(pct, basis){
 const continuityView = window.RelayBridgeContinuityView;
 const continuitySettings = continuityView.createSettingsState();
 let continuityRefreshGeneration = 0;
-for (const id of ['continuity-protect','continuity-reserve','continuity-handoff','continuity-dynamic','continuity-assessor']) {
+for (const id of ['continuity-protect','continuity-reserve','continuity-admit-unknown','continuity-handoff','continuity-dynamic','continuity-assessor']) {
   document.getElementById(id)?.addEventListener('input', () => { continuitySettings.edit(); $('#continuity-save-status').textContent = 'Unsaved changes'; });
 }
 async function refreshContinuityPanel() {
@@ -2868,6 +2869,7 @@ async function refreshContinuityPanel() {
       const values = config.settings;
       $('#continuity-protect').checked = values.usageProtection;
       $('#continuity-reserve').value = values.reservePercent;
+      $('#continuity-admit-unknown').checked = values.admitUnknownUsage !== false;
       $('#continuity-handoff').checked = values.autoHandoff;
       $('#continuity-dynamic').checked = values.dynamicSupervision;
       $('#continuity-assessor').checked = values.assessorEnabled;
@@ -2897,6 +2899,7 @@ $('#continuity-save')?.addEventListener('click', async () => {
   try {
     await api('/api/settings/continuity', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
       usageProtection: $('#continuity-protect').checked, reservePercent: Number($('#continuity-reserve').value),
+      admitUnknownUsage: $('#continuity-admit-unknown').checked,
       autoHandoff: $('#continuity-handoff').checked, dynamicSupervision: $('#continuity-dynamic').checked,
       assessorEnabled: $('#continuity-assessor').checked }) });
     continuitySettings.finishSave(ticket, true);

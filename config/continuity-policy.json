@@ -2,6 +2,7 @@
   "schemaVersion": 1,
   "usageProtection": true,
   "reservePercent": 5,
+  "admitUnknownUsage": true,
   "autoHandoff": true,
   "dynamicSupervision": true,
   "assessorEnabled": true
