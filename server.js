@@ -67,6 +67,7 @@ const { createRequestLimiter, createOperationSlots, createReadOperationPool } = 
 const { readBoundedJson } = require('./lib/bounded-json-read');
 const { validateBrowserUrl, browserOpeners } = require('./lib/browser-launch');
 const { receiptStoreIdentity } = require('./lib/receipt-store-identity.cjs');
+const { wireContractId } = require('./lib/wire-contract.cjs');
 const { loadBuildIdentity } = require('./lib/build-identity.cjs');
 const {
   resolveFilesystemPolicy, providerFilesystemEligibility,
@@ -562,6 +563,8 @@ const RUNS_DIR = path.join(DATA_DIR, 'runs');
 const RECEIPTS_DIR = path.join(DATA_DIR, 'receipts');
 const PROJECTS_FILE = path.join(DATA_DIR, 'projects.json');
 const RECEIPT_STORE_IDENTITY = receiptStoreIdentity(DATA_DIR);
+// What the MCP client must agree with us about, independent of the build hash.
+const WIRE_CONTRACT_ID = wireContractId();
 const COLLAB_ID_RE = /^c_[a-z0-9]+_[a-z0-9]+$/;
 for (const dir of [COLLABS_DIR, RUNS_DIR, RECEIPTS_DIR]) fs.mkdirSync(dir, { recursive: true });
 if (!fs.existsSync(PROJECTS_FILE)) fs.writeFileSync(PROJECTS_FILE, JSON.stringify([], null, 2));
@@ -3057,6 +3060,7 @@ app.get('/api/health', (req, res) => {
     buildIdentityReason: BRIDGE_BUILD_IDENTITY.reason,
     receiptStoreId: RECEIPT_STORE_IDENTITY.id,
     receiptStoreIdentityReady: RECEIPT_STORE_IDENTITY.ready,
+    wireContractId: WIRE_CONTRACT_ID,
     capabilityAuth: true,
     tokenAcl: TOKEN_ACL,
     stickyDangerousEnabled: envFirst('RELAYBRIDGE_ALLOW_STICKY_DANGEROUS', 'PS_BRIDGE_ALLOW_STICKY_DANGEROUS') === '1',
