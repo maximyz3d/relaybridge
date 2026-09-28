@@ -3310,7 +3310,7 @@ async function runProbe(slotRaw, timeoutMs = 15000, stripEnv = [], signal) {
 
 // This promise represents PHYSICAL lifetime, not the HTTP caller's patience.
 // Only actual close or a confirmed no-child startup failure frees admission.
-function runPhysicalProbe(launch, timeoutMs, signal) {
+function runPhysicalProbe(launch, timeoutMs, signal, probeCwd = ROOT) {
   return new Promise((resolve) => {
     if (admissionClosed) return resolve({ exitCode:-1, stdout:'', stderr:'bridge shutting down', model_invocation:false });
     if (signal.aborted) return resolve({ exitCode: -1, stdout: '', stderr: 'diagnostic cancelled', timedOut: false, aborted: true, model_invocation: false });
@@ -3319,12 +3319,13 @@ function runPhysicalProbe(launch, timeoutMs, signal) {
       // detached on POSIX so the timeout kill signals the probe's whole group
       // instead of orphaning whatever it spawned — see the one-shot spawnOpts
       // for why killTree's ps-walk fallback is not equivalent.
-      proc = trackChild(spawn(launch.file, launch.args, { cwd: ROOT, env: launch.env, windowsHide: true, detached: process.platform !== 'win32' }));
+      proc = trackChild(spawn(launch.file, launch.args, { cwd: probeCwd, env: launch.env, windowsHide: true, detached: process.platform !== 'win32' }));
     } catch (err) {
       return resolve({ exitCode: -1, stdout: '', stderr: err.message, timedOut: false, model_invocation: false });
     }
     let stdout = '';
     let stderr = '';
+    let outputTruncated = false;
     let settled = false;
     let timedOut = false;
     let abortHandler = null;
@@ -3339,7 +3340,7 @@ function runPhysicalProbe(launch, timeoutMs, signal) {
       // /api/auth/status). The most common failure on a fresh box, "that CLI is
       // not installed under this name", was therefore recorded as no error at
       // all: model-registry rows landed with error:null and no warning.
-      resolve({ exitCode, stdout, stderr: [stderr, error && error.message].filter(Boolean).join('\n'), timedOut, aborted: !!signal?.aborted, model_invocation: !!proc.pid });
+      resolve({ exitCode, stdout, stderr: [stderr, error && error.message].filter(Boolean).join('\n'), timedOut, outputTruncated, aborted: !!signal?.aborted, model_invocation: !!proc.pid });
     };
     const timer = setTimeout(() => {
       timedOut = true;
@@ -3354,8 +3355,8 @@ function runPhysicalProbe(launch, timeoutMs, signal) {
     if (signal.aborted) abortHandler();
     proc.stdout.setEncoding('utf8');
     proc.stderr.setEncoding('utf8');
-    proc.stdout.on('data', (d) => { stdout = (stdout + d).slice(0, 32768); });
-    proc.stderr.on('data', (d) => { stderr = (stderr + d).slice(0, 32768); });
+    proc.stdout.on('data', (d) => { outputTruncated ||= stdout.length + d.length > 32768; stdout = (stdout + d).slice(0, 32768); });
+    proc.stderr.on('data', (d) => { outputTruncated ||= stderr.length + d.length > 32768; stderr = (stderr + d).slice(0, 32768); });
     proc.on('error', (err) => { if (!proc.pid) finish(-1, err); else killProcessTree(proc); });
     proc.on('close', (code) => finish(code));
     try { proc.stdin.end(); } catch {}
@@ -6502,6 +6503,7 @@ app.post('/api/workflows/:runId/cancel', (req, res) => {
 // subscription plans.
 const { createCooldownStore, parseRetryAfter } = require('./lib/provider-cooldown');
 const { validCorrectionRequest, readCorrectionReceipts, authorizeContextCorrection } = require('./lib/cooldown-correction');
+const resetRecovery = require('./lib/cooldown-reset-reconciliation');
 const { checkGrounding, prepareGroundedPrompt, verifyReferencedPaths } = require('./lib/workspace-grounding');
 const {
   classifyRunFailure,
@@ -7769,6 +7771,150 @@ app.delete('/api/usage/operator-quota', (req, res) => {
 app.get('/api/cooldowns', (req, res) => {
   res.json({ cooldowns: cooldowns.all(), cooling: coolingQuotaStates(), quotaSeats: currentQuotaSeatGroups() });
 });
+
+// Administrative maintenance only. A closed request can recover one exact local
+// account backoff; it cannot choose a prompt, model, tool, command or directory.
+const resetRecoveryFlights = new Map();
+async function runClaudeResetAnswer(captured, signal) {
+  const entry = loadConfig()[captured.identity.kind];
+  const env = buildEnv(normalizeEnvOverrides(entry.oneshot_env), entry.strip_env || []);
+  const command = resetRecovery.fixedResetCommand(resolveSlot(entry.safe));
+  if (!command) return { ok: false, code: 'probe_command_unsupported' };
+  const { binary, prefix } = command;
+  if (!sameClaudeLaunchIdentity(captured, env)) return { ok: false, code: 'account_identity_changed' };
+  const args = [...prefix, '-p', 'Reply with exactly READY. Do not use tools.', '--model', 'sonnet',
+    '--max-turns', '1', '--tools', '', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}',
+    '--setting-sources', '', '--disable-slash-commands', '--no-session-persistence',
+    '--permission-mode', 'dontAsk', '--output-format', 'stream-json', '--verbose'];
+  const launch = qualifiedProviderLaunch(resolveExecutable(binary, env), args, env);
+  const release = acquireOneShot(captured.identity.kind);
+  if (!release) return { ok: false, code: 'probe_admission_busy' };
+  const startedAt = Date.now();
+  try {
+    const response = await runPhysicalProbe(launch, 30000, signal, CLAUDE_USAGE_PROBE_DIR);
+    const parsed = parseConfiguredOneShotOutput({ oneshot_output_parser: 'claude_json' }, response.stdout,
+      { stderr: response.stderr, exitCode: response.exitCode });
+    let events = [];
+    try { events = response.stdout.trim().split('\n').filter(Boolean).map(line => JSON.parse(line)); } catch {}
+    const results = events.filter(e => e.type === 'result');
+    const rateEvents = events.filter(e => e.type === 'rate_limit_event');
+    const allowed = rateEvents.length > 0 && rateEvents.every(e => ['allowed', 'allowed_warning'].includes(e.rate_limit_info?.status));
+    const model = events.find(e => e.type === 'system' && typeof e.model === 'string')?.model
+      || Object.keys(results[0]?.modelUsage || {})[0] || null;
+    const ok = response.exitCode === 0 && !response.timedOut && !response.outputTruncated && !response.aborted && !signal.aborted
+      && results.length === 1 && results[0].subtype === 'success' && results[0].is_error === false
+      && results[0].num_turns === 1 && allowed && model
+      && !parsed.parseError && !parsed.isError && !parsed.partialResult && !parsed.apiErrorStatus
+      && !parsed.errorCount && !parsed.permissionDenials?.count && !parsed.permissionDenials?.invalid
+      && parsed.output.trim() === 'READY'
+      && !events.some(e => e.type === 'assistant' && e.message?.content?.some(c => c.type === 'tool_use'));
+    recordRunUsage({ kind: captured.identity.kind, route: { quota_seat: captured.identity.quotaSeat },
+      usage: parsed.usage, model, startedAt, ok: !!ok, failureKind: ok ? null : 'reset_probe_failed' });
+    return { ok: !!ok, code: ok ? null : 'reset_probe_failed', events: rateEvents, startedAt,
+      proof: { model, exitCode: response.exitCode, timedOut: response.timedOut, aborted: response.aborted,
+        outputHash: resetRecovery.hash(response.stdout), status: results[0]?.subtype || null,
+        quotaStatuses: rateEvents.map(e => e.rate_limit_info?.status), usage: parsed.usage || null } };
+  } finally { release(); }
+}
+async function reconcileClaudeReset(body, signal) {
+  const { quotaSeat: seat } = body, expected = resetRecovery.expectedObservation(body), requestHash = resetRecovery.requestDigest(body);
+  const fail = code => ({ ok: false, code });
+  const stateCheck = cooldowns.resetState(seat, expected, requestHash);
+  if (!stateCheck.ok || stateCheck.replayed) return stateCheck;
+  const identity = captureClaudeLaunchIdentity(body.kind, body.accountId);
+  if (!identity.identity || identity.identity.quotaSeat !== seat
+    || subscriptionUsage.fingerprint(seat) !== identity.identity.accountFingerprint) return fail('account_identity_unavailable');
+  const blockedElsewhere = () => {
+    const scoped = cooldowns.status(body.kind);
+    return scoped.authority === 'unknown' || scoped.cooling && scoped.scope === 'model'
+      || !!usageLedger.activeVendorQuota(body.kind, null, seat);
+  };
+  if (blockedElsewhere()) return fail('independent_quota_hold');
+  const rows = readCorrectionReceipts(RECEIPTS_DIR);
+  const source = resetRecovery.authorizeResetSource({ rows, receiptStoreId: RECEIPT_STORE_IDENTITY.id,
+    seat, current: cooldowns.status(seat) });
+  if (!source.ok) return source;
+  if (signal.aborted || admissionClosed) return fail('reconciliation_cancelled');
+  const reservation = cooldowns.beginResetAttempt(seat, expected, requestHash);
+  if (!reservation.ok || reservation.replayed) return reservation;
+  // Both the durable row reservation and fsynced journal must exist before a probe.
+  appendBridgeReceiptRecord({ ...reservation.attempt, receiptStoreId: RECEIPT_STORE_IDENTITY.id, bridgeBuildId: BRIDGE_BUILD_ID });
+  const probe = await probeClaudeNativeAdmission(identity);
+  if (!probe.ok) return fail(probe.reason || 'native_probe_failed');
+  const fresh = probe.identity;
+  if (signal.aborted || admissionClosed || !sameClaudeLaunchIdentity(identity)
+    || !sameClaudeLaunchIdentity(fresh)) return fail('account_identity_changed_or_cancelled');
+  const capacity = resetRecovery.validateResetCapacity({ observation: fresh.observation, fingerprint: identity.identity.accountFingerprint,
+    seat, lastOffenceAt: expected.lastOffenceAt, reservePercent: subscriptionUsage.getSettings().reservePercent });
+  if (!capacity.ok) return capacity;
+  if (!observeClaudeNativeSnapshot(fresh)) return fail('native_capacity_not_accepted');
+  const prior = subscriptionUsage.headroom(seat, { accountFingerprint: identity.identity.accountFingerprint });
+  if (prior.freshness !== 'fresh' || prior.protectionWindow || !['headroom_available', 'vendor_usage_denied'].includes(prior.reason)) return fail('native_capacity_not_available');
+  const preAnswerCheck = cooldowns.resetState(seat, expected, requestHash);
+  if (!preAnswerCheck.ok || preAnswerCheck.replayed || blockedElsewhere()) return fail('observation_changed');
+  const answer = await runClaudeResetAnswer(fresh, signal);
+  appendBridgeReceiptRecord({ receiptId: `rcpt_${Date.now().toString(36)}_${crypto.randomBytes(4).toString('hex')}`,
+    timestamp: new Date().toISOString(), event: 'cooldown_reset_probe_result', seat, requestHash,
+    attemptReceiptId: reservation.attempt.receiptId, receiptStoreId: RECEIPT_STORE_IDENTITY.id,
+    bridgeBuildId: BRIDGE_BUILD_ID, ok: answer.ok, code: answer.code, evidence: answer.proof || null });
+  if (!answer.ok) return answer;
+  if (signal.aborted || admissionClosed || !sameClaudeLaunchIdentity(identity) || !sameClaudeLaunchIdentity(fresh)) return fail('account_identity_changed_or_cancelled');
+  const current = cooldowns.resetState(seat, expected, requestHash);
+  if (!current.ok || current.replayed || blockedElsewhere()) return fail('observation_changed');
+  // Never feed a success over any intervening seat observation/denial. The
+  // following observation and CAS commit are synchronous with no await boundary.
+  const latest = subscriptionUsage.headroom(seat, { accountFingerprint: identity.identity.accountFingerprint });
+  if (latest.evidenceHash !== prior.evidenceHash || latest.observedAt !== prior.observedAt
+    || latest.ordinaryUsageAllowed !== prior.ordinaryUsageAllowed) return fail('native_observation_changed');
+  const event = answer.events[answer.events.length - 1];
+  const observation = parseClaudeStreamRateLimit(event, { quotaSeat: seat,
+    accountFingerprint: identity.identity.accountFingerprint, observedAt: answer.startedAt });
+  const observedWindows = observation?.buckets?.[0]?.windows;
+  if (!observation || observation.ordinaryUsageAllowed !== true || observedWindows?.length !== 2
+    || !['five_hour', 'seven_day'].every(id => observedWindows.some(w => w.id === id && !w.invalid
+      && w.percentRemaining > Math.max(subscriptionUsage.getSettings().reservePercent, 2) && w.resetsAt > Date.now()))) {
+    return fail('latch_not_released');
+  }
+  if (!subscriptionUsage.observe(observation)) return fail('latch_not_released');
+  const verdict = subscriptionUsage.verdict(seat, { accountFingerprint: identity.identity.accountFingerprint });
+  if (verdict.freshness !== 'fresh' || !verdict.admit || verdict.vendorBlocked || verdict.protected) return fail('latch_not_released');
+  return cooldowns.reconcileObservation(seat, expected, requestHash, reservation.attempt.receiptId, { ok: true,
+    proof: { authority: 'server_owned_native_probe', identity: fresh.identity,
+      sourceReceiptHash: source.sourceReceiptHash, capacity: capacity.proof, answer: answer.proof,
+      evidenceHash: verdict.evidenceHash, attemptReceiptId: reservation.attempt.receiptId } });
+}
+app.post('/api/cooldowns/reset-reconciliations', trackedHandler(async (req, res) => {
+  if (!BRIDGE_BUILD_IDENTITY.ready || !RECEIPT_STORE_IDENTITY.ready
+    || req.get('x-relaybridge-expected-build-id') !== BRIDGE_BUILD_ID
+    || req.get('x-relaybridge-expected-receipt-store-id') !== RECEIPT_STORE_IDENTITY.id) {
+    return res.status(409).json({ ok: false, code: 'bridge_identity_mismatch' });
+  }
+  if (!resetRecovery.validResetRequest(req.body)) return res.status(400).json({ ok: false, code: 'invalid_reset_request' });
+  if (admissionClosed) return res.status(503).json({ ok: false, code: 'bridge_shutting_down' });
+  const key = req.body.quotaSeat, requestHash = resetRecovery.requestDigest(req.body);
+  const existing = resetRecoveryFlights.get(key);
+  if (existing && existing.requestHash !== requestHash) return res.status(409).json({ ok: false, code: 'reset_in_progress' });
+  const controller = new AbortController();
+  const onClose = () => { if (!res.writableEnded) controller.abort(); };
+  // A concurrent observer cannot abort the original owner's probe.
+  if (!existing) res.once('close', onClose);
+  let flight = existing;
+  if (!flight) {
+    flight = { requestHash, promise: null };
+    flight.promise = reconcileClaudeReset(req.body, controller.signal).finally(() => resetRecoveryFlights.delete(key));
+    resetRecoveryFlights.set(key, flight);
+  }
+  try {
+    const result = await flight.promise;
+    if (!result.ok) return res.status(409).json({ ok: false, code: result.code });
+    let journalMirrored = true;
+    if (!result.replayed && !existing) try { appendBridgeReceiptRecord({ ...result.reconciliation,
+      receiptStoreId: RECEIPT_STORE_IDENTITY.id, bridgeBuildId: BRIDGE_BUILD_ID, after: result.after }); }
+    catch { journalMirrored = false; }
+    return res.json({ ...result, auditPersisted: true, journalMirrored });
+  } catch { return res.status(503).json({ ok: false, code: 'reset_authority_unavailable' }); }
+  finally { res.removeListener('close', onClose); }
+}));
 
 app.post('/api/cooldowns/corrections', (req, res) => {
   if (!validCorrectionRequest(req.body)) return res.status(400).json({ error: 'Exact cooldown identity required; unsupported or invalid fields.' });
