@@ -316,7 +316,7 @@ test('reset CAS rejects newer shorter failure and disk failure leaves unknown bl
   assert.equal(s.status('claude').until, expected.until);
   assert.equal(s.reconcileObservation('claude', expected, 'hash', attempt.attempt.receiptId, { ok: true }).code, 'observation_changed');
   const next = s.status('claude'), before = fs.readFileSync(file, 'utf8'), rename = fs.renameSync;
-  fs.renameSync = (from, to) => { if (to === file) throw new Error('fixture write failure'); return rename(from, to); };
+  fs.renameSync = () => { throw new Error('fixture write failure'); };
   try {
     assert.equal(s.reconcileObservation('claude', next, 'hash', attempt.attempt.receiptId, { ok: true }).code, 'persistence_failed');
     assert.equal(s.status('claude').authority, 'unknown'); assert.equal(fs.readFileSync(file, 'utf8'), before);

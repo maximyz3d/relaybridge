@@ -19,9 +19,26 @@ function sourceReceipt(current, storeId) {
       source: 'backoff', reason: 'rate_limited', scope: 'account' } };
 }
 async function fixture(t, mode = 'success') {
-  let expected, events, profile, current, journal, cooldownFile;
+  let expected, events, profile, current, journal, cooldownFile, failJournalWrite;
+  const nodeArgs = [];
   const bridge = await startTestBridge(t, root => {
     const data = path.join(root, 'data'), nativeHome = path.join(root, 'native-home');
+    failJournalWrite = path.join(root, 'fail-attempt-journal-write');
+    const preload = path.join(root, 'attempt-journal-failure.cjs');
+    // Fixture-only fault at the actual descriptor write, after durable reservation.
+    // Marker stays absent in every other scenario; no permission/OS assumption.
+    fs.writeFileSync(preload, `const fs=require('node:fs');
+      const marker=${JSON.stringify(failJournalWrite)};
+      fs.writeFileSync=new Proxy(fs.writeFileSync,{apply(target,receiver,args){
+        if(typeof args[0]==='number'&&typeof args[1]==='string'&&fs.existsSync(marker)){
+          let receipt;try{receipt=JSON.parse(args[1]);}catch{}
+          if(receipt?.event==='cooldown_reset_attempt'&&receipt.seat===${JSON.stringify(seat)}){
+            const error=new Error('fixture attempt journal write failure');error.code='EIO';throw error;
+          }
+        }
+        return Reflect.apply(target,receiver,args);
+      }});`);
+    nodeArgs.push('--require', preload);
     const at = Date.now(), failureAt = at - 600000, oldAt = failureAt - 1000;
     const oldReset = at - 300000, weekReset = at + 604000000;
     profile = path.join(nativeHome, '.claude.json'); events = path.join(root, 'probe-events.jsonl');
@@ -90,11 +107,11 @@ async function fixture(t, mode = 'success') {
       oneshot_safe: [process.execPath, script, '-p'], oneshot_safe_filesystem_policy: 'read_only_enforced',
       oneshot_output_parser: 'claude_json', model: 'fixture-model',
       native_usage_probe: { enabled: true, command: [process.execPath, script], timeout_ms: 1000 } } };
-  }, { env: { ...unsetEnv, RELAYBRIDGE_WARM_DIAG: '0', RELAYBRIDGE_REMOTE_MCP: '0', PTY_MODE: 'auto' } });
+  }, { nodeArgs, env: { ...unsetEnv, RELAYBRIDGE_WARM_DIAG: '0', RELAYBRIDGE_REMOTE_MCP: '0', PTY_MODE: 'auto' } });
   const health = (await bridge.request('/api/health')).body;
   const headers = { ...bridge.headers, 'x-relaybridge-expected-build-id': health.buildId,
     'x-relaybridge-expected-receipt-store-id': health.receiptStoreId };
-  return { ...bridge, expected, events, current, journal, cooldownFile, headers,
+  return { ...bridge, expected, events, current, journal, cooldownFile, failJournalWrite, headers,
     reconcile: (body = expected, options = {}) => bridge.request(url, body, { headers, ...options }) };
 }
 test('closed reset request and source proof reject weaker/fabricated authority', () => {
@@ -164,7 +181,14 @@ test('actual endpoint refuses exact source, model hold, corrupt journal and appe
   await callExpectNoProbe(409); fs.writeFileSync(f.cooldownFile, before);
   // Read is permitted but the required attempt journal append fails. Reservation
   // is durable, so retrying after a disk repair cannot silently spend again.
-  fs.chmodSync(f.journal, 0o400); await callExpectNoProbe(503); fs.chmodSync(f.journal, 0o600);
+  fs.writeFileSync(f.failJournalWrite, 'armed');
+  await callExpectNoProbe(503);
+  fs.unlinkSync(f.failJournalWrite);
+  assert.equal(fs.readFileSync(f.journal, 'utf8'), journalBefore);
+  const retained = JSON.parse(fs.readFileSync(f.cooldownFile))[seat];
+  assert.equal(retained.sourceReceiptId, f.expected.sourceReceiptId);
+  assert.equal(retained.until, f.expected.until);
+  assert.equal(retained.resetAttempt.event, 'cooldown_reset_attempt');
   assert.equal((await f.reconcile()).body.code, 'reset_attempt_throttled');
 });
 test('cancelled generating probe never releases either hold', async t => {
