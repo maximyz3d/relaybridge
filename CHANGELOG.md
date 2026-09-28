@@ -1,3 +1,6 @@
+## v2.5.3 - 2026-09-28
+- #139 fix(quota): recover Claude after a verified native reset
+
 ## v2.5.2 - 2026-09-26
 - #136 fix(quota): prevent false Claude context-failure cooldowns
 
