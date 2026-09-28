@@ -1274,3 +1274,16 @@ test('permission-only persistence failure leaves the durable and in-memory denia
     assert.equal(storeBytes(f), before);
   } finally { fs.renameSync = rename; }
 });
+
+test('permission exact snapshot rejects denial hash change with unchanged timestamps', t => {
+  const f = permissionFixture(t), observation = f.stream();
+  const denial = { ...f.stream('rejected'), observedAt: f.expected.denialObservedAt, evidenceHash: 'e'.repeat(64) };
+  assert.equal(f.store.observe(denial), false);
+  const afterDenial = f.store.permissionState('claude');
+  assert.deepEqual(afterDenial, { ...f.expected, denialEvidenceHash: denial.evidenceHash });
+  assert.ok(observation.observedAt > afterDenial.denialObservedAt, 'timestamp guard alone permits this evidence');
+  assert.equal(f.store.observePermission(observation, f.expected, f.proof), false);
+  assert.equal(f.store.permissionState('claude').ordinaryUsageAllowed, false);
+  assert.equal(f.store.observePermission(observation, afterDenial, f.proof), true,
+    'matching exact snapshot accepts the same timestamp-valid evidence');
+});

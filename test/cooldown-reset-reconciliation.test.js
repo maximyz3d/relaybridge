@@ -30,9 +30,10 @@ async function fixture(t, mode = 'success') {
     fs.writeFileSync(preload, `const fs=require('node:fs');
       const marker=${JSON.stringify(failJournalWrite)};
       fs.writeFileSync=new Proxy(fs.writeFileSync,{apply(target,receiver,args){
-        if(typeof args[0]==='number'&&typeof args[1]==='string'&&fs.existsSync(marker)){
+        if(typeof args[0]==='number'&&typeof args[1]==='string'&&(fs.existsSync(marker)||['releaseauditfail','refusalauditfail'].includes(${JSON.stringify(mode)}))){
           let receipt;try{receipt=JSON.parse(args[1]);}catch{}
-          if(receipt?.event==='cooldown_reset_attempt'&&receipt.seat===${JSON.stringify(seat)}){
+          if(receipt?.seat===${JSON.stringify(seat)}&&((receipt.event==='cooldown_reset_attempt'&&fs.existsSync(marker))
+            ||(receipt.event==='cooldown_reset_release_result'&&['releaseauditfail','refusalauditfail'].includes(${JSON.stringify(mode)})))){
             const error=new Error('fixture attempt journal write failure');error.code='EIO';throw error;
           }
         }
@@ -111,7 +112,7 @@ async function fixture(t, mode = 'success') {
         if(mode==='race'){const {createCooldownStore}=require(${JSON.stringify(require.resolve('../lib/provider-cooldown'))});createCooldownStore({file:${JSON.stringify(cooldownFile)}}).noteFailure(${JSON.stringify(seat)},'overloaded');}
         const p=JSON.parse(fs.readFileSync(profile)); if(mode==='answerlow')p.cachedUsageUtilization.utilization.seven_day.utilization=100; const windows=Object.fromEntries(Object.entries(p.cachedUsageUtilization.utilization).map(([k,w])=>[k,{utilization:mode==='malformed'?1.5:mode==='answerlow'?1:k==='seven_day'?.30:w.utilization/100,resetsAt:Math.round(Date.parse(w.resets_at)/1000)}]));
         console.log(JSON.stringify({type:'system',subtype:'init',model:'claude-sonnet-5-5'}));
-        if(mode!=='missing')console.log(JSON.stringify({type:'rate_limit_event',rate_limit_info:{status:mode==='rejected'?'rejected':mode==='unknown'?'queued':'allowed_warning',unifiedWindows:windows}}));
+        if(mode!=='missing')console.log(JSON.stringify({type:'rate_limit_event',rate_limit_info:{status:['rejected','refusalauditfail'].includes(mode)?'rejected':mode==='unknown'?'queued':'allowed_warning',unifiedWindows:windows}}));
         console.log(JSON.stringify({type:'result',subtype:mode==='error'?'error_during_execution':'success',is_error:mode==='error',result:'READY',num_turns:1,permission_denials:mode==='denied'?[{tool_name:'Bash'}]:[],usage:{input_tokens:1,output_tokens:1}}));
       }`);
     return { _models: { discoverOnBoot: false }, claude: { label: 'Native fixture', npm_package: '@anthropic-ai/claude-code',
@@ -252,4 +253,25 @@ test('rate-event audit sanitization keeps bounded numeric quota facts only', () 
       five_hour:{utilization:.01,resetsAt:1790651400,token:'secret'},other:{secret:true}}}});
   assert.deepEqual(sanitized,{status:'allowed_warning',rateLimitType:null,utilization:null,resetsAt:null,
     unifiedWindows:{five_hour:{utilization:.01,resetsAt:1790651400}}});
+});
+
+test('committed reset reports missing release audit without misreporting recovery failure', async t => {
+  const f = await fixture(t, 'releaseauditfail'), response = await f.reconcile();
+  assert.equal(response.status, 200, JSON.stringify(response.body));
+  assert.equal(response.body.ok, true); assert.equal(response.body.releaseAuditPersisted, false);
+  assert.equal(response.body.journalMirrored, true); assert.equal(response.body.auditPersisted, true);
+  const row = JSON.parse(fs.readFileSync(f.cooldownFile))[seat];
+  assert.equal(row.until, 0); assert.equal(row.offences, 4);
+  assert.equal(row.reconciliation.receiptId, response.body.reconciliation.receiptId);
+  assert.equal(completeJsonLines(f.journal).some(e => e.event === 'cooldown_reset_release_result'), false);
+  assert.equal(completeJsonLines(f.journal).some(e => e.receiptId === row.reconciliation.receiptId), true);
+  const replay = await f.reconcile(); assert.equal(replay.status, 200); assert.equal(replay.body.replayed, true);
+  assert.deepEqual(completeJsonLines(f.events).map(e => e.type), ['usage','answer']);
+});
+test('refused reset keeps fail-closed response when its release audit cannot be persisted', async t => {
+  const f = await fixture(t, 'refusalauditfail'), response = await f.reconcile();
+  assert.equal(response.status, 503); assert.equal(response.body.code, 'reset_authority_unavailable');
+  assert.equal(JSON.parse(fs.readFileSync(f.cooldownFile))[seat].until, f.expected.until);
+  const usage = JSON.parse(fs.readFileSync(path.join(f.root, 'data', 'usage', 'native-usage.json')))[seat];
+  assert.equal(usage.ordinaryUsageAllowed, false);
 });

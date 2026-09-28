@@ -7863,7 +7863,8 @@ async function reconcileClaudeReset(body, signal) {
   const event = answer.events?.[answer.events.length - 1];
   const stream = resetRecovery.sanitizeRateEvent(event);
   const finish = (result, stage) => {
-    appendBridgeReceiptRecord({ receiptId: `rcpt_${Date.now().toString(36)}_${crypto.randomBytes(4).toString('hex')}`,
+    const committed = stage === 'cooldown_reconciliation' && result.ok === true;
+    try { appendBridgeReceiptRecord({ receiptId: `rcpt_${Date.now().toString(36)}_${crypto.randomBytes(4).toString('hex')}`,
       timestamp: new Date().toISOString(), event: 'cooldown_reset_release_result', seat,
       attemptReceiptId: reservation.attempt.receiptId, requestHash, receiptStoreId: RECEIPT_STORE_IDENTITY.id,
       bridgeBuildId: BRIDGE_BUILD_ID, ok: result.ok === true, code: result.code || null, stage,
@@ -7871,7 +7872,13 @@ async function reconcileClaudeReset(body, signal) {
       anchorBoundaryMs: { five_hour: prior.windows.find(w => w.id === 'five_hour')?.resetBoundaryMs ?? null,
         seven_day: prior.windows.find(w => w.id === 'seven_day')?.resetBoundaryMs ?? null },
       stream, priorDenial: { observedAt: priorPermission.denialObservedAt, evidenceHash: priorPermission.denialEvidenceHash } });
-    return result;
+    } catch (error) {
+      // The atomic cooldown record already contains its reconciliation audit.
+      // A missing supplemental journal entry cannot undo committed recovery.
+      if (committed) return { ...result, releaseAuditPersisted: false };
+      throw error;
+    }
+    return committed ? { ...result, releaseAuditPersisted: true } : result;
   };
   if (!answer.ok) return finish(answer, 'answer');
   if (signal.aborted || admissionClosed || !sameClaudeLaunchIdentity(identity) || !sameClaudeLaunchIdentity(fresh)) {
