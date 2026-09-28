@@ -37,7 +37,19 @@ async function fixture(t, mode = 'success') {
           }
         }
         return Reflect.apply(target,receiver,args);
-      }});`);
+      }});
+      if(${JSON.stringify(mode)}==='newerdenial'){
+        const module=require(${JSON.stringify(require.resolve('../lib/subscription-usage'))});
+        const create=module.createSubscriptionUsage;
+        module.createSubscriptionUsage=(...args)=>{
+          const store=create(...args),release=store.observePermission;
+          store.observePermission=(observation,...rest)=>{
+            const denied={...observation,ordinaryUsageAllowed:false,evidenceHash:'d'.repeat(64),observedAt:Date.now()};
+            store.observe(denied);
+            return release(observation,...rest);
+          };return store;
+        };
+      }`);
     nodeArgs.push('--require', preload);
     const at = Date.now(), failureAt = at - 600000, oldAt = failureAt - 1000;
     const oldReset = at - 300000, weekReset = at + 604000000;
@@ -87,18 +99,19 @@ async function fixture(t, mode = 'success') {
         process.stdin.on('data',chunk=>{input+=chunk;if(!input.includes('/usage'))return;input='';log('usage');
           if(mode==='stale')return;
           const value=JSON.parse(fs.readFileSync(profile));value.cachedUsageUtilization.fetchedAtMs=Date.now();
-          value.cachedUsageUtilization.utilization.five_hour={utilization:0,resets_at:new Date(Date.now()+18000000-(mode==='samewindow'?900000:0)).toISOString()};
+          value.cachedUsageUtilization.utilization.five_hour={utilization:1,resets_at:new Date(Math.floor((Date.now()+18000000-(mode==='samewindow'?900000:0))/1000)*1000+216).toISOString().replace('.216Z','.216318+00:00')};
+          value.cachedUsageUtilization.utilization.seven_day.utilization=31;
           if(mode==='weekly')value.cachedUsageUtilization.utilization.seven_day.utilization=99;
           if(mode==='identity'){value.oauthAccount.accountUuid='99999999-8888-7777-6666-555555555555';value.cachedUsageUtilization.accountUuid=value.oauthAccount.accountUuid;}
           fs.writeFileSync(profile,JSON.stringify(value));});setInterval(()=>{},1000);
-      }else{log('answer');
+      }else{log('answer');fs.copyFileSync(${JSON.stringify(path.join(data,'usage','native-usage.json'))},${JSON.stringify(path.join(root,'capacity-before-release.json'))});
         if(mode==='hang'){setInterval(()=>{},1000);return;}
         if(mode==='postidentity'){const p=JSON.parse(fs.readFileSync(profile));p.oauthAccount.accountUuid='99999999-8888-7777-6666-555555555555';p.cachedUsageUtilization.accountUuid=p.oauthAccount.accountUuid;fs.writeFileSync(profile,JSON.stringify(p));}
 
         if(mode==='race'){const {createCooldownStore}=require(${JSON.stringify(require.resolve('../lib/provider-cooldown'))});createCooldownStore({file:${JSON.stringify(cooldownFile)}}).noteFailure(${JSON.stringify(seat)},'overloaded');}
-        const p=JSON.parse(fs.readFileSync(profile)); if(mode==='answerlow')p.cachedUsageUtilization.utilization.seven_day.utilization=100; const windows=Object.fromEntries(Object.entries(p.cachedUsageUtilization.utilization).map(([k,w])=>[k,{utilization:w.utilization/100,resetsAt:Math.ceil(Date.parse(w.resets_at)/1000)}]));
+        const p=JSON.parse(fs.readFileSync(profile)); if(mode==='answerlow')p.cachedUsageUtilization.utilization.seven_day.utilization=100; const windows=Object.fromEntries(Object.entries(p.cachedUsageUtilization.utilization).map(([k,w])=>[k,{utilization:mode==='malformed'?1.5:mode==='answerlow'?1:k==='seven_day'?.30:w.utilization/100,resetsAt:Math.round(Date.parse(w.resets_at)/1000)}]));
         console.log(JSON.stringify({type:'system',subtype:'init',model:'claude-sonnet-5-5'}));
-        if(mode!=='missing')console.log(JSON.stringify({type:'rate_limit_event',rate_limit_info:{status:mode==='rejected'?'rejected':'allowed_warning',unifiedWindows:windows}}));
+        if(mode!=='missing')console.log(JSON.stringify({type:'rate_limit_event',rate_limit_info:{status:mode==='rejected'?'rejected':mode==='unknown'?'queued':'allowed_warning',unifiedWindows:windows}}));
         console.log(JSON.stringify({type:'result',subtype:mode==='error'?'error_during_execution':'success',is_error:mode==='error',result:'READY',num_turns:1,permission_denials:mode==='denied'?[{tool_name:'Bash'}]:[],usage:{input_tokens:1,output_tokens:1}}));
       }`);
     return { _models: { discoverOnBoot: false }, claude: { label: 'Native fixture', npm_package: '@anthropic-ai/claude-code',
@@ -144,11 +157,22 @@ test('actual reset endpoint checks authority then coalesces probes, clears both 
   assert.equal(createCooldownStore({ file: f.cooldownFile })._state()[seat].reconciliation.receiptId, results[0].body.reconciliation.receiptId);
   const usage = JSON.parse(fs.readFileSync(path.join(f.root, 'data', 'usage', 'native-usage.json')))[seat];
   assert.equal(usage.ordinaryUsageAllowed, true);
+  const beforeRelease = JSON.parse(fs.readFileSync(path.join(f.root, 'capacity-before-release.json')))[seat];
+  const { ordinaryUsageAllowed, permissionEvidence, ...retained } = usage;
+  const { ordinaryUsageAllowed: previousPermission, ...capacityBefore } = beforeRelease;
+  assert.equal(previousPermission, false); assert.deepEqual(retained, capacityBefore);
+  assert.equal(permissionEvidence.capacityEvidenceHash, usage.evidenceHash);
+  assert.equal(usage.buckets.account.windows.seven_day.percentRemaining, 69);
+  const release = completeJsonLines(f.journal).find(e => e.event === 'cooldown_reset_release_result');
+  assert.equal(release.code, null); assert.equal(release.ok, true);
+  assert.notEqual(release.stream.unifiedWindows.five_hour.resetsAt * 1000, release.anchorBoundaryMs.five_hour);
+  assert.equal(release.stream.unifiedWindows.seven_day.utilization, .30);
+  assert.equal(Object.hasOwn(release, 'stdout'), false); assert.equal(Object.hasOwn(release, 'prompt'), false);
   const response = await f.request('/api/oneshot', { kind: 'claude', prompt: 'fixed fixture', cwd: f.root, dangerous: false });
   assert.equal(response.status, 200, JSON.stringify(response.body));
   assert.equal(response.body.exitCode, 0, JSON.stringify(response.body));
 });
-for (const mode of ['stale', 'samewindow', 'weekly', 'identity', 'missing', 'rejected', 'error', 'denied', 'race', 'postidentity', 'answerlow']) {
+for (const mode of ['stale', 'samewindow', 'weekly', 'identity', 'missing', 'rejected', 'error', 'denied', 'race', 'postidentity', 'answerlow', 'unknown', 'malformed', 'newerdenial']) {
   test(`actual endpoint refuses ${mode}, retains denial/backoff and durable retry throttle`, async t => {
     const f = await fixture(t, mode), response = await f.reconcile();
     assert.equal(response.status, 409, JSON.stringify(response.body));
@@ -156,6 +180,14 @@ for (const mode of ['stale', 'samewindow', 'weekly', 'identity', 'missing', 'rej
     assert.ok(row.until > Date.now());
     const usage = JSON.parse(fs.readFileSync(path.join(f.root, 'data', 'usage', 'native-usage.json')))[seat];
     assert.equal(usage.ordinaryUsageAllowed, false);
+    if (['unknown', 'malformed', 'newerdenial', 'answerlow'].includes(mode)) {
+      const release = completeJsonLines(f.journal).find(e => e.event === 'cooldown_reset_release_result');
+      assert.equal(release.ok, false); assert.equal(release.code, response.body.code);
+      if (mode === 'newerdenial') {
+        assert.equal(release.stage, 'permission_observation');
+        assert.equal(usage.denialEvidenceHash, 'd'.repeat(64));
+      }
+    }
     const count = completeJsonLines(f.events).length;
     assert.equal((await f.reconcile()).status, 409);
     assert.equal(completeJsonLines(f.events).length, count);
@@ -212,4 +244,12 @@ test('fixed probe normalizes installed Claude safe slot and refuses wrappers/unk
   const slot = ['claude', '--safe-mode', '--restricted', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--tools', 'Read,Glob,Grep', '--permission-mode', 'plan', '--autocompact', '150k', '--model', 'sonnet', '--effort', 'medium'];
   assert.deepEqual(recovery.fixedResetCommand(slot), { binary: 'claude', prefix: ['--safe-mode', '--restricted'] });
   for (const bad of [['sh', '-c', 'claude'], ['claude', '--dangerously-skip-permissions'], ['claude', '--model'], ['claude', '--settings', 'untrusted.json']]) assert.equal(recovery.fixedResetCommand(bad), null);
+});
+
+test('rate-event audit sanitization keeps bounded numeric quota facts only', () => {
+  const sanitized = recovery.sanitizeRateEvent({rate_limit_info:{status:'allowed_warning',prompt:'secret',
+    rateLimitType:'anything',resetsAt:1.5,utilization:Infinity,unifiedWindows:{
+      five_hour:{utilization:.01,resetsAt:1790651400,token:'secret'},other:{secret:true}}}});
+  assert.deepEqual(sanitized,{status:'allowed_warning',rateLimitType:null,utilization:null,resetsAt:null,
+    unifiedWindows:{five_hour:{utilization:.01,resetsAt:1790651400}}});
 });

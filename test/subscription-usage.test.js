@@ -1193,3 +1193,84 @@ test('cached Claude repeats neither renew freshness nor clear a newer low reserv
   f.advance(1000); assert.equal(f.store.observe(line(80)), false);
   assert.equal(f.store.headroom('claude').percentRemaining, 3); assert.equal(f.store.verdict('claude').admit, false);
 });
+
+function permissionFixture(t) {
+  const f = fixture(t), resets = [new Date(T + 18000000 + 216).toISOString().replace('.216Z', '.216318Z'),
+    new Date(T + 604800000 - 335).toISOString().replace('.665Z', '.665718Z')];
+  const packet = preciseNative(f, resets, [99, 69]), fp = packet.accountFingerprint;
+  f.store.bindIdentity('claude', fp); assert.equal(f.store.observeNativeCache(packet), true);
+  const stream = (status = 'allowed_warning') => parseClaudeStreamRateLimit({ type: 'rate_limit_event', rate_limit_info: {
+    status, unifiedWindows: { five_hour: { utilization: .01, resetsAt: Math.round(Date.parse(resets[0]) / 1000) },
+      seven_day: { utilization: .30, resetsAt: Math.round(Date.parse(resets[1]) / 1000) } } } },
+  { quotaSeat: 'claude', observedAt: f.at(), accountFingerprint: fp });
+  f.advance(1000);
+  assert.equal(f.store.observe(stream('rejected')), false, 'ambiguous capacity still records a genuine denial');
+  f.advance(1000);
+  return { ...f, stream, fp, expected: f.store.permissionState('claude'),
+    proof: { status: 'allowed_warning', answerOutputHash: 'c'.repeat(64) } };
+}
+test('permission-only success preserves every native field despite reset rounding and coarser stream capacity', t => {
+  const f = permissionFixture(t), before = storedSeat(f), observation = f.stream();
+  assert.equal(f.store.observe(observation), false, 'ordinary capacity protections remain unchanged');
+  assert.deepEqual(storedSeat(f), before);
+  assert.equal(f.store.observePermission(observation, f.expected, f.proof), true);
+  const after = storedSeat(f), { ordinaryUsageAllowed, permissionEvidence, ...retained } = after;
+  const { ordinaryUsageAllowed: denied, ...original } = before;
+  assert.equal(denied, false); assert.equal(ordinaryUsageAllowed, true); assert.deepEqual(retained, original);
+  assert.equal(after.buckets.account.windows.seven_day.percentRemaining, 69, 'stream 70% never replenishes native capacity');
+  assert.equal(permissionEvidence.capacityEvidenceHash, before.evidenceHash);
+  assert.equal(permissionEvidence.supersededDenial.evidenceHash, before.denialEvidenceHash);
+  const reopened = createSubscriptionUsage({ dataDir: f.dir, now: f.at });
+  assert.deepEqual(reopened.permissionState('claude'), f.store.permissionState('claude'));
+  assert.equal(reopened.verdict('claude', { accountFingerprint: f.fp }).admit, true);
+  f.advance(1000); assert.equal(reopened.observe(f.stream('rejected')), false);
+  assert.equal(reopened.verdict('claude', { accountFingerprint: f.fp }).admit, false);
+});
+test('permission-only evidence refuses stale, foreign, invalid, low, blocked and raced authority without writes', t => {
+  const cases = {
+    'null permission': (f, o) => { o.ordinaryUsageAllowed = null; },
+    'denied permission': (f, o) => { o.ordinaryUsageAllowed = false; },
+    'foreign fingerprint': (f, o) => { o.accountFingerprint = 'a'.repeat(64); },
+    'missing output proof': f => { f.proof.answerOutputHash = null; },
+    'unrecognized status': f => { f.proof.status = 'queued'; },
+    'future evidence': (f, o) => { o.observedAt = f.at() + 1; },
+    'older denial': (f, o) => { o.observedAt = f.expected.denialObservedAt; },
+    'wrong expected hash': f => { f.expected.evidenceHash = 'f'.repeat(64); },
+    'invalid stream': (f, o) => { o.buckets[0].windows[0].invalid = true; },
+    'low stream': (f, o) => { o.buckets[0].windows[1].percentRemaining = 1; },
+    'null stream bucket': (f, o) => { o.buckets = [null]; },
+    'no stream windows': (f, o) => { o.buckets[0].windows = []; },
+    'expired stream': (f, o) => { o.buckets[0].windows[0].resetsAt = f.at(); },
+    'stale native': f => { f.advance(180001); },
+    'newer denial with same capacity hash': f => { f.advance(1000); f.store.observe(f.stream('rejected')); },
+    'unbound identity': f => { f.store.bindIdentity('claude', 'b'.repeat(64)); },
+  };
+  for (const [name, change] of Object.entries(cases)) {
+    const f = permissionFixture(t), observation = f.stream(); change(f, observation);
+    const before = storeBytes(f);
+    assert.equal(f.store.observePermission(observation, f.expected, f.proof), false, name);
+    assert.equal(storeBytes(f), before, name);
+  }
+  for (const [name, change] of Object.entries({
+    low: row => { row.buckets.account.windows.seven_day.percentRemaining = 1; },
+    spend: row => { row.buckets.account.spendControlReached = true; },
+    reached: row => { row.buckets.account.reachedType = 'weekly'; },
+    identity: row => { row.identityNeedsFreshEvidence = true; },
+  })) {
+    const f = permissionFixture(t), document = JSON.parse(storeBytes(f)); change(document.claude);
+    fs.writeFileSync(path.join(f.dir, 'native-usage.json'), JSON.stringify(document));
+    const reopened = createSubscriptionUsage({ dataDir: f.dir, now: f.at }), before = storeBytes(f);
+    assert.equal(reopened.observePermission(f.stream(), reopened.permissionState('claude'), f.proof), false, name);
+    assert.equal(storeBytes(f), before, name);
+  }
+});
+
+test('permission-only persistence failure leaves the durable and in-memory denial intact', t => {
+  const f = permissionFixture(t), before = storeBytes(f), rename = fs.renameSync;
+  fs.renameSync = () => { throw new Error('fixture permission persistence failure'); };
+  try {
+    assert.throws(() => f.store.observePermission(f.stream(), f.expected, f.proof), /fixture permission persistence failure/);
+    assert.equal(f.store.permissionState('claude').ordinaryUsageAllowed, false);
+    assert.equal(storeBytes(f), before);
+  } finally { fs.renameSync = rename; }
+});

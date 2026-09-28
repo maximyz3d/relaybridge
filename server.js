@@ -7813,7 +7813,8 @@ async function runClaudeResetAnswer(captured, signal) {
     return { ok: !!ok, code: ok ? null : 'reset_probe_failed', events: rateEvents, startedAt,
       proof: { model, exitCode: response.exitCode, timedOut: response.timedOut, aborted: response.aborted,
         outputHash: resetRecovery.hash(response.stdout), status: results[0]?.subtype || null,
-        quotaStatuses: rateEvents.map(e => e.rate_limit_info?.status), usage: parsed.usage || null } };
+        quotaStatuses: rateEvents.map(e => e.rate_limit_info?.status),
+        rateEvents: rateEvents.slice(-8).map(resetRecovery.sanitizeRateEvent), usage: parsed.usage || null } };
   } finally { release(); }
 }
 async function reconcileClaudeReset(body, signal) {
@@ -7850,6 +7851,8 @@ async function reconcileClaudeReset(body, signal) {
   if (!observeClaudeNativeSnapshot(fresh)) return fail('native_capacity_not_accepted');
   const prior = subscriptionUsage.headroom(seat, { accountFingerprint: identity.identity.accountFingerprint });
   if (prior.freshness !== 'fresh' || prior.protectionWindow || !['headroom_available', 'vendor_usage_denied'].includes(prior.reason)) return fail('native_capacity_not_available');
+  const priorPermission = subscriptionUsage.permissionState(seat);
+  if (!priorPermission || priorPermission.evidenceHash !== capacity.proof.evidenceHash) return fail('native_observation_changed');
   const preAnswerCheck = cooldowns.resetState(seat, expected, requestHash);
   if (!preAnswerCheck.ok || preAnswerCheck.replayed || blockedElsewhere()) return fail('observation_changed');
   const answer = await runClaudeResetAnswer(fresh, signal);
@@ -7857,31 +7860,46 @@ async function reconcileClaudeReset(body, signal) {
     timestamp: new Date().toISOString(), event: 'cooldown_reset_probe_result', seat, requestHash,
     attemptReceiptId: reservation.attempt.receiptId, receiptStoreId: RECEIPT_STORE_IDENTITY.id,
     bridgeBuildId: BRIDGE_BUILD_ID, ok: answer.ok, code: answer.code, evidence: answer.proof || null });
-  if (!answer.ok) return answer;
-  if (signal.aborted || admissionClosed || !sameClaudeLaunchIdentity(identity) || !sameClaudeLaunchIdentity(fresh)) return fail('account_identity_changed_or_cancelled');
+  const event = answer.events?.[answer.events.length - 1];
+  const stream = resetRecovery.sanitizeRateEvent(event);
+  const finish = (result, stage) => {
+    appendBridgeReceiptRecord({ receiptId: `rcpt_${Date.now().toString(36)}_${crypto.randomBytes(4).toString('hex')}`,
+      timestamp: new Date().toISOString(), event: 'cooldown_reset_release_result', seat,
+      attemptReceiptId: reservation.attempt.receiptId, requestHash, receiptStoreId: RECEIPT_STORE_IDENTITY.id,
+      bridgeBuildId: BRIDGE_BUILD_ID, ok: result.ok === true, code: result.code || null, stage,
+      capacityEvidenceHash: priorPermission.evidenceHash,
+      anchorBoundaryMs: { five_hour: prior.windows.find(w => w.id === 'five_hour')?.resetBoundaryMs ?? null,
+        seven_day: prior.windows.find(w => w.id === 'seven_day')?.resetBoundaryMs ?? null },
+      stream, priorDenial: { observedAt: priorPermission.denialObservedAt, evidenceHash: priorPermission.denialEvidenceHash } });
+    return result;
+  };
+  if (!answer.ok) return finish(answer, 'answer');
+  if (signal.aborted || admissionClosed || !sameClaudeLaunchIdentity(identity) || !sameClaudeLaunchIdentity(fresh)) {
+    return finish(fail('account_identity_changed_or_cancelled'), 'identity');
+  }
   const current = cooldowns.resetState(seat, expected, requestHash);
-  if (!current.ok || current.replayed || blockedElsewhere()) return fail('observation_changed');
-  // Never feed a success over any intervening seat observation/denial. The
-  // following observation and CAS commit are synchronous with no await boundary.
-  const latest = subscriptionUsage.headroom(seat, { accountFingerprint: identity.identity.accountFingerprint });
-  if (latest.evidenceHash !== prior.evidenceHash || latest.observedAt !== prior.observedAt
-    || latest.ordinaryUsageAllowed !== prior.ordinaryUsageAllowed) return fail('native_observation_changed');
-  const event = answer.events[answer.events.length - 1];
+  if (!current.ok || current.replayed || blockedElsewhere()) return finish(fail('observation_changed'), 'cooldown');
+  // Permission-only evidence never refreshes capacity or replaces native anchors.
+  // Its synchronous exact snapshot guard also detects denials whose capacity hash
+  // and timestamp did not change. No await occurs between this guard and CAS.
   const observation = parseClaudeStreamRateLimit(event, { quotaSeat: seat,
     accountFingerprint: identity.identity.accountFingerprint, observedAt: answer.startedAt });
-  const observedWindows = observation?.buckets?.[0]?.windows;
-  if (!observation || observation.ordinaryUsageAllowed !== true || observedWindows?.length !== 2
-    || !['five_hour', 'seven_day'].every(id => observedWindows.some(w => w.id === id && !w.invalid
-      && w.percentRemaining > Math.max(subscriptionUsage.getSettings().reservePercent, 2) && w.resetsAt > Date.now()))) {
-    return fail('latch_not_released');
-  }
-  if (!subscriptionUsage.observe(observation)) return fail('latch_not_released');
+  let permissionAccepted;
+  try {
+    permissionAccepted = subscriptionUsage.observePermission(observation, priorPermission,
+      { status: stream.status, answerOutputHash: answer.proof.outputHash });
+  } catch { return finish(fail('latch_not_released'), 'permission_persistence'); }
+  if (!permissionAccepted) return finish(fail('latch_not_released'), 'permission_observation');
   const verdict = subscriptionUsage.verdict(seat, { accountFingerprint: identity.identity.accountFingerprint });
-  if (verdict.freshness !== 'fresh' || !verdict.admit || verdict.vendorBlocked || verdict.protected) return fail('latch_not_released');
-  return cooldowns.reconcileObservation(seat, expected, requestHash, reservation.attempt.receiptId, { ok: true,
+  if (verdict.freshness !== 'fresh' || !verdict.admit || verdict.vendorBlocked || verdict.protected) {
+    return finish(fail('latch_not_released'), 'permission_verdict');
+  }
+  const result = cooldowns.reconcileObservation(seat, expected, requestHash, reservation.attempt.receiptId, { ok: true,
     proof: { authority: 'server_owned_native_probe', identity: fresh.identity,
       sourceReceiptHash: source.sourceReceiptHash, capacity: capacity.proof, answer: answer.proof,
+      permission: { observedAt: observation.observedAt, evidenceHash: observation.evidenceHash },
       evidenceHash: verdict.evidenceHash, attemptReceiptId: reservation.attempt.receiptId } });
+  return finish(result, 'cooldown_reconciliation');
 }
 app.post('/api/cooldowns/reset-reconciliations', trackedHandler(async (req, res) => {
   if (!BRIDGE_BUILD_IDENTITY.ready || !RECEIPT_STORE_IDENTITY.ready
