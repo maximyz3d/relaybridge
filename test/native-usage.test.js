@@ -203,3 +203,12 @@ test('malformed null RPC frames fail without uncaught exceptions', async (t) => 
   const script = path.join(dir, 'bad.cjs'); fs.writeFileSync(script, "process.stdout.write('null\\n');setInterval(()=>{},1000)");
   await assert.rejects(readCodexRateLimits({ command: process.execPath, args: [script], timeoutMs: 200 }), /unavailable/);
 });
+
+test('Claude allowed_warning is explicit permission, unknown statuses remain unknown', () => {
+  for (const [status, expected] of [['allowed', true], ['allowed_warning', true], ['rejected', false], ['unknown', null]]) {
+    const result = parseClaudeStreamRateLimit({ type: 'rate_limit_event', rate_limit_info: { status,
+      unifiedWindows: { five_hour: { utilization: .2, resetsAt: reset }, seven_day: { utilization: .3, resetsAt: reset } } } },
+    { quotaSeat: 'claude', observedAt: T });
+    assert.equal(result.ordinaryUsageAllowed, expected);
+  }
+});

@@ -285,3 +285,40 @@ test('shorter failure and earlier in-flight success cannot rewrite newer quota a
   assert.equal(s.status('claude').cooling, false);
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+test('reset reconciliation keeps genuine offences, persists its audit, and is exact/idempotent', t => {
+  const nowRef = { t: Date.now() }, { s, file, dir } = store(nowRef);
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  for (let i = 0; i < 4; i++) { const o = s.noteFailure('claude', 'rate_limited'); s.attachReceipt(o, 'rcpt_real'); }
+  const expected = s.status('claude'), hash = 'request';
+  assert.equal(expected.until - nowRef.t, BACKOFF[3]);
+  for (const key of ['sourceReceiptId', 'sourceObservationId', 'until', 'lastOffenceAt', 'offences']) {
+    assert.equal(s.beginResetAttempt('claude', { ...expected, [key]: typeof expected[key] === 'number' ? expected[key] + 1 : 'bad' }, hash).code, 'observation_changed');
+  }
+  const attempt = s.beginResetAttempt('claude', expected, hash);
+  assert.equal(attempt.ok, true);
+  assert.equal(createCooldownStore({ file }).beginResetAttempt('claude', expected, hash).code, 'reset_attempt_throttled');
+  const result = s.reconcileObservation('claude', expected, hash, attempt.attempt.receiptId, { ok: true, proof: { bound: true } });
+  assert.equal(result.ok, true); assert.equal(result.after.offences, 4); assert.equal(result.after.lastOffenceAt, expected.lastOffenceAt);
+  const reopened = createCooldownStore({ file });
+  assert.equal(reopened.resetState('claude', expected, hash).replayed, true);
+  assert.equal(reopened._state().claude.reconciliation.receiptId, result.reconciliation.receiptId);
+  nowRef.t += 1; s.noteFailure('claude', 'overloaded');
+  assert.equal(s.resetState('claude', expected, hash).code, 'observation_changed');
+  assert.equal(createCooldownStore({ file })._state().claude.reconciliation.receiptId, result.reconciliation.receiptId);
+});
+test('reset CAS rejects newer shorter failure and disk failure leaves unknown blocking authority', t => {
+  const nowRef = { t: Date.now() }, { s, file, dir } = store(nowRef);
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  for (let i = 0; i < 4; i++) s.noteFailure('claude', 'rate_limited');
+  const expected = s.status('claude'), attempt = s.beginResetAttempt('claude', expected, 'hash');
+  nowRef.t += 1; s.noteFailure('claude', 'overloaded');
+  assert.equal(s.status('claude').until, expected.until);
+  assert.equal(s.reconcileObservation('claude', expected, 'hash', attempt.attempt.receiptId, { ok: true }).code, 'observation_changed');
+  const next = s.status('claude'), before = fs.readFileSync(file, 'utf8'), rename = fs.renameSync;
+  fs.renameSync = (from, to) => { if (to === file) throw new Error('fixture write failure'); return rename(from, to); };
+  try {
+    assert.equal(s.reconcileObservation('claude', next, 'hash', attempt.attempt.receiptId, { ok: true }).code, 'persistence_failed');
+    assert.equal(s.status('claude').authority, 'unknown'); assert.equal(fs.readFileSync(file, 'utf8'), before);
+  } finally { fs.renameSync = rename; }
+});
