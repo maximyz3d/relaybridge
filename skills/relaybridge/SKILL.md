@@ -1,6 +1,6 @@
 ---
 name: relaybridge
-description: Use RelayBridge to delegate work to other AI CLIs (Claude, Codex, Cursor, Copilot, Gemini, Grok, Perplexity, local Ollama) on subscription seats the user already pays for. Use when a task should be handed to a different model, when work should be matched to a cheap/local vs frontier model, when running many independent subtasks, or when the user mentions RelayBridge, the bridge, delegating, or routing to another AI. Covers the HTTP API, provider selection by task difficulty, run supervision, and reading receipts.
+description: Use RelayBridge to delegate work to other AI CLIs (Claude, Codex, Cursor, Copilot, Gemini, Grok, Perplexity, local Ollama) on subscription seats the user already pays for. Use when a task should be handed to a different model, when work should be matched to a cheap/local vs frontier model, when running many independent subtasks, or when the user mentions RelayBridge, the bridge, delegating, or routing to another AI. Also use when the user wants to switch between accounts on the same AI or across AIs without re-logging-in, run several accounts at once, or fan one brief out across every account. Covers the HTTP API, provider selection by task difficulty, multiple accounts per provider, run supervision, and reading receipts.
 ---
 
 # RelayBridge
@@ -263,14 +263,77 @@ CPU advancing means it is thinking), `suspect_loop` (repeating; watch it).
 ## Parallel work
 
 Independent read-only subtasks can run concurrently — the bridge caps
-concurrency at eight globally and four per provider by default. Two constraints: never create multiple writers to the same
-files, and give each provider a genuinely independent slice. Fan out for
-analysis, fan in for the decision.
+concurrency at eight globally and four per authenticated account by default, and
+every linked account widens the fleet by four more slots. Two constraints: never
+create multiple writers to the same files, and give each provider a genuinely
+independent slice. Fan out for analysis, fan in for the decision.
+
+## Several accounts on one provider
+
+A seat that declares `credential_env` can hold more than one subscription. Each
+linked account gets its own credential directory, its own quota seat, and its own
+concurrency slots, so two Claude plans are two allowances rather than one bar
+that empties twice as fast.
+
+| Want | Call |
+|---|---|
+| See every plan and its allowance | `list_accounts` |
+| See what unqualified work runs on | `active_seat` |
+| Link a plan (returns its sign-in command) | `link_account` |
+| Swap plan, AI, or both | `swap_account` |
+| Take a plan out of rotation | `set_account_enabled` |
+
+`swap_account` is the verb to reach for whenever the user says they are tired of
+switching accounts:
+
+- `{kind:"claude", accountId:"work"}` — another plan on the same AI
+- `{kind:"codex"}` — a different AI
+- `{kind:"codex", accountId:"personal"}` — both at once
+- `{kind:"claude", accountId:null}` — back to automatic least-drained selection
+
+The account pin is soft: it is preferred whenever that plan can take work, and
+dispatch falls back to the least-drained account when it cannot, reporting which
+happened in `readiness.pinHonored`. A pin never crosses a hard filter — a
+disabled, signed-out, quarantined, cooling or quota-blocked plan is not
+dispatched to. The provider pin only fills a blank: naming a provider on a
+request always wins.
+
+Linking a plan needs one interactive sign-in the bridge cannot perform. Hand the
+user the exact command `link_account` returns and let them run it.
+
+## Super fan-out
+
+`super_fan_out` spends providers x accounts x (variants or replicas) in one call.
+Where `broadcast` uses one account per provider, this uses every linked plan at
+once, each agent hard-pinned to its own account so the parallelism is real
+instead of serialised behind one allowance.
+
+```
+super_fan_out({
+  prompt: "Audit this module for unsafe concurrency.",
+  all: true, accounts: "all",
+  variants: ["Cover the read path.", "Cover the write path."]
+})
+```
+
+`accounts` takes `all` (default), `active` (only the pinned plan), `auto` (one
+agent per provider), or `{claude:["work","personal"]}`. `replicas` (1-8) gives
+independent samples of the same brief.
+
+This is the most expensive call on the bridge — it spends many accounts
+simultaneously, so scope it deliberately. It is read-only: many unleased writers
+in one tree is the overlap the delegation contract forbids, so fan out discovery
+and authoring, then apply the result through a single leased writer. Accounts
+that cannot take work come back in `skipped` with a reason rather than failing
+the call, and a 64-agent ceiling refuses an unbounded fleet before anything
+spawns.
 
 ## More detail
 
 - `reference.md` — full endpoint list, request/response fields, provider table,
   supervision tuning.
+- `docs/MULTI-ACCOUNT.md` in the repo — linking, swapping, per-account
+  concurrency and the fan-out cross product in full.
 - Config lives in `cli-config.json` (providers, supervision) and
   `config/routing-policy.json` (tiers, priorities).
 - Every call writes a receipt to `data/receipts/YYYY-MM-DD.jsonl` with hashes,

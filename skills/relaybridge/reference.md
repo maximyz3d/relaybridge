@@ -138,6 +138,37 @@ Body `{ "task": "..." }`. Returns the classification (`tier`, tags), the primary
 task tag, and a ranked, readiness-filtered provider list. Prefer this over
 hand-picking a provider.
 
+### Accounts and fan-out
+
+| Route | Purpose |
+|---|---|
+| `GET /api/accounts` | Every linked account per provider: own quota seat, remaining allowance, `provisioned`, `enabled`, `implicit`, `active`, `cooling`, `authUnavailable`, in-flight runs. Plus fleet `capacity`. |
+| `GET /api/accounts/active` | Which AI and account a request naming no provider runs on, and whether each seat is `pinned` or `automatic`. |
+| `POST /api/accounts/swap` | `{kind, accountId?, setProvider?}`. One atomic write. `accountId:null` returns the seat to automatic selection; `setProvider:false` pins the account only. Response `readiness.pinHonored` is `false` when the pinned plan cannot take work. |
+| `POST /api/accounts/:kind` | `{id, label?}` links a plan and returns `signInCommand` — the exact command that signs it in. |
+| `POST /api/accounts/:kind/:id/enabled` | `{enabled}` only. Disabling releases any pin naming that account. |
+| `POST /api/accounts/:kind/:id/auth/retry` | `{retry:true}` after signing in again; the next live dispatch revalidates. |
+| `DELETE /api/accounts/:kind/:id` | Unlinks and signs out. `?keepCredentials=1` keeps the directory. |
+| `POST /api/fanout` | Super fan-out. `{prompt, providers?/tag?/all?, accounts?, variants?, replicas?}` plus the usual one-shot execution fields. |
+
+`/api/fanout` expands to providers x accounts x (variants or replicas), capped at
+64 members, each hard-pinned to its own account with `expectedAccountId`. It
+returns `expansion`, `seatsUsed`, `skipped` (accounts that could not take work,
+with reasons), `fleet` (width and how many members queued behind it), and one
+`results` row per agent carrying `accountId`, `quotaSeat`, `replica`,
+`assignment` and a normal provider receipt id. `dangerous:true` is refused.
+
+Pinning an account is a preference; asserting one is not. `expectedAccountId` on
+`/api/oneshot` and `/api/tasks` is a hard pin that fails rather than falling back,
+and `expectedQuotaSeat` rejects with `account_identity_changed` if the resolved
+account moved between admission and dispatch.
+
+Concurrency is keyed by `(provider, account)`: `maxActivePerAccount` (4) runs per
+login, a per-provider ceiling of 4 x usable accounts, and a fleet width of 8 plus
+4 per explicitly linked and signed-in account, hard-stopped at 32. Override with
+`RELAYBRIDGE_MAX_ACTIVE_PER_ACCOUNT`, `RELAYBRIDGE_MAX_ACTIVE_ONESHOTS`,
+`RELAYBRIDGE_ONESHOT_CAPACITY_CEILING`.
+
 ## Providers
 
 | Key | CLI | Cost | Best for |

@@ -20,7 +20,7 @@ const { createAttemptLifecycle } = require('./lib/attempt-lifecycle');
 const { readOllamaStream, readProviderBody, LIMITS: HTTP_PROVIDER_LIMITS } = require('./lib/http-provider-stream');
 const { parseHostedTerminal, classifyHttpTerminal } = require('./lib/http-provider-terminal');
 const { resolveAttemptTiming, renderCliDeadline, nativeTransportState } = require('./lib/cli-deadline');
-const { resolveConcurrencyPolicy } = require('./lib/concurrency-policy');
+const { resolveConcurrencyPolicy, scaleOneShotCapacity, providerCapacity } = require('./lib/concurrency-policy');
 const { createSubscriptionUsage } = require('./lib/subscription-usage');
 const { createContinuity } = require('./lib/continuity');
 const { createProgressAssessor } = require('./lib/progress-assessor');
@@ -2457,18 +2457,116 @@ const ownedDispatchIdentities = new Map();
 const ownedNativeAdmissions = new Map();
 let ownedExecutionBackend = null;
 const activeOneShots = new Map();
+// Keyed by provider AND account, because the rate limit a concurrent run
+// actually competes for belongs to one authenticated login. Two Claude plans are
+// two allowances; sharing one counter between them was the reason linked
+// accounts could be selected but never run in parallel.
+const activeOneShotsByAccount = new Map();
 const CONCURRENCY_POLICY = resolveConcurrencyPolicy();
 const MAX_ACTIVE_ONESHOTS = CONCURRENCY_POLICY.maxActiveOneShots;
 const MAX_ACTIVE_PER_PROVIDER = CONCURRENCY_POLICY.maxActivePerProvider;
+const MAX_ACTIVE_PER_ACCOUNT = CONCURRENCY_POLICY.maxActivePerAccount;
 let activeOneShotCount = 0;
+const accountSlotKey = (kind, accountId) => `${kind}\u0000${accountId}`;
 
-function acquireOneShot(kind) {
+// Usable-account counts drive both capacity limits. Cached on the same 2s window
+// as the registry itself: acquireOneShot runs on every dispatch, and each
+// provisioning check stats a credential file.
+let _accountCapacityCache = { at: 0, value: null };
+function accountCapacity() {
+  const now = Date.now();
+  if (_accountCapacityCache.value && now - _accountCapacityCache.at < 2000) return _accountCapacityCache.value;
+  const usableByProvider = Object.create(null);
+  let linkedAccountCount = 0;
+  try {
+    const registry = accountRegistry();
+    for (const [kind, entry] of Object.entries(loadConfig())) {
+      if (kind.startsWith('_') || !entry || typeof entry !== 'object') continue;
+      let usable = 0;
+      for (const account of providerAccounts.accountsFor(kind, entry, registry)) {
+        if (!account.enabled) continue;
+        if (!providerAccounts.accountIsProvisioned({ entry, account, dataDir: DATA_DIR, kind })) continue;
+        usable += 1;
+        // Only accounts the operator explicitly linked widen the fleet. A
+        // pristine install has none, so its width is exactly what it was.
+        if (!account.implicit) linkedAccountCount += 1;
+      }
+      usableByProvider[kind] = usable;
+    }
+  } catch {
+    // A malformed registry must neither widen nor narrow admission. Fall back to
+    // the configured single-account width and let dispatch report the real fault.
+    _accountCapacityCache = { at: 0, value: null };
+    return { usableByProvider: Object.create(null), linkedAccountCount: 0, fleet: MAX_ACTIVE_ONESHOTS };
+  }
+  const value = {
+    usableByProvider,
+    linkedAccountCount,
+    fleet: scaleOneShotCapacity({
+      base: MAX_ACTIVE_ONESHOTS,
+      perAccount: MAX_ACTIVE_PER_ACCOUNT,
+      ceiling: CONCURRENCY_POLICY.oneShotCapacityCeiling,
+      linkedAccountCount,
+    }),
+  };
+  _accountCapacityCache = { at: now, value };
+  return value;
+}
+
+// The seat a request that names no provider should run on. This is the other
+// half of a swap: pinning Codex is only useful if unqualified work then goes to
+// Codex. A caller that names a provider always wins, and a pin naming a seat
+// that is not an AI one-shot provider is ignored rather than allowed to break
+// dispatch.
+function pinnedProviderKind() {
+  try {
+    const pinned = providerAccounts.activeProviderOf(accountRegistry());
+    if (!pinned) return null;
+    return isAiProviderEntry(pinned, loadConfig()[pinned]) ? pinned : null;
+  } catch { return null; }
+}
+
+// Why one specific account cannot take work. Used wherever the operator is owed
+// a reason rather than a bare "unavailable": a refused fan-out member, and a swap
+// onto a plan that is pinned but not yet usable.
+function accountUnusableReason(kind, entry, account) {
+  if (!account) return 'unknown account';
+  if (!account.enabled) return 'disabled';
+  if (!providerAccounts.accountIsProvisioned({ entry, account, dataDir: DATA_DIR, kind })) return 'never signed in';
+  if (!providerAccounts.accountAuthAvailable({ entry, account, dataDir: DATA_DIR, kind })) {
+    return 'credentials quarantined after an authentication failure';
+  }
+  const cooling = coolingQuotaStates().some((state) => state.quotaSeat === account.quotaSeat);
+  if (cooling) return 'in cooldown after a rate limit';
+  return 'allowance exhausted or reserved';
+}
+
+function providerSlotLimit(kind, capacity = accountCapacity()) {
+  return providerCapacity({
+    perAccount: MAX_ACTIVE_PER_ACCOUNT,
+    usableAccountCount: capacity.usableByProvider[kind] || 1,
+    fleetCapacity: capacity.fleet,
+  });
+}
+
+function acquireOneShot(kind, accountId = providerAccounts.DEFAULT_ACCOUNT_ID) {
+  const account = typeof accountId === 'string' && accountId ? accountId : providerAccounts.DEFAULT_ACCOUNT_ID;
+  const slotKey = accountSlotKey(kind, account);
+  const capacity = accountCapacity();
+  const providerLimit = providerSlotLimit(kind, capacity);
   const providerCount = activeOneShots.get(kind) || 0;
+  const accountCount = activeOneShotsByAccount.get(slotKey) || 0;
   const restored = (ownedExecutionBackend?.reservationSnapshot() || []).filter(row => row.held && !liveOwnedAdmissions.has(row.ownerId));
-  if (activeOneShotCount + restored.length >= MAX_ACTIVE_ONESHOTS
-    || providerCount + restored.filter(row => row.provider === kind).length >= MAX_ACTIVE_PER_PROVIDER) return null;
+  // Restored reservations carry a provider but no account, so they are charged to
+  // the provider budget only. On a single-account seat providerLimit equals
+  // MAX_ACTIVE_PER_ACCOUNT, which makes this check identical to the one it
+  // replaced; on a pooled seat the provider ceiling still bounds the slack.
+  if (activeOneShotCount + restored.length >= capacity.fleet
+    || providerCount + restored.filter(row => row.provider === kind).length >= providerLimit
+    || accountCount >= MAX_ACTIVE_PER_ACCOUNT) return null;
   activeOneShotCount++;
   activeOneShots.set(kind, providerCount + 1);
+  activeOneShotsByAccount.set(slotKey, accountCount + 1);
   let released = false;
   const release = () => {
     if (released) return;
@@ -2476,8 +2574,20 @@ function acquireOneShot(kind) {
     activeOneShotCount = Math.max(0, activeOneShotCount - 1);
     const next = Math.max(0, (activeOneShots.get(kind) || 1) - 1);
     if (next) activeOneShots.set(kind, next); else activeOneShots.delete(kind);
+    const nextAccount = Math.max(0, (activeOneShotsByAccount.get(slotKey) || 1) - 1);
+    if (nextAccount) activeOneShotsByAccount.set(slotKey, nextAccount); else activeOneShotsByAccount.delete(slotKey);
   };
   return release;
+}
+
+// Live per-account occupancy, for /api/health and the fuel gauge.
+function activeOneShotsByAccountReport() {
+  const out = {};
+  for (const [slotKey, count] of activeOneShotsByAccount) {
+    const [kind, accountId] = String(slotKey).split('\u0000');
+    out[`${kind}#${accountId}`] = count;
+  }
+  return out;
 }
 function trackChild(proc) {
   if (!proc) return proc;
@@ -3042,9 +3152,13 @@ app.get('/api/health', (req, res) => {
     sessionCount: sessions.size,
     activeTaskCount: activeChildren.size,
     activeOneShotCount,
-    maxActiveOneShots: MAX_ACTIVE_ONESHOTS,
+    maxActiveOneShots: accountCapacity().fleet,
     maxActivePerProvider: MAX_ACTIVE_PER_PROVIDER,
+    maxActivePerAccount: MAX_ACTIVE_PER_ACCOUNT,
+    configuredMaxActiveOneShots: MAX_ACTIVE_ONESHOTS,
+    linkedAccountCount: accountCapacity().linkedAccountCount,
     activeOneShotsByProvider: Object.fromEntries(activeOneShots),
+    activeOneShotsByAccount: activeOneShotsByAccountReport(),
     maxConcurrentTasks: CONCURRENCY_POLICY.maxConcurrentTasks,
     activeTaskQueueCount: taskQueue.stats().active,
     queuedTaskCount: taskQueue.stats().queued,
@@ -4935,7 +5049,7 @@ async function executeOneShot(body, res, privateContext = null) {
   if (admissionClosed) return rejectBeforeAdmission(503, 'bridge_shutting_down', {
     error:'bridge shutting down', retryable:false, model_invocation:false, physical_attempt_count:0,
   });
-  releaseAdmission = acquireOneShot(kind);
+  releaseAdmission = acquireOneShot(kind, dispatchAccount.account?.id || providerAccounts.DEFAULT_ACCOUNT_ID);
   if (!releaseAdmission) {
     return rejectBeforeAdmission(429, 'admission_limit', {
       error: 'provider concurrency limit reached; retry with backoff',
@@ -4943,9 +5057,12 @@ async function executeOneShot(body, res, privateContext = null) {
       retryable: true,
       failureClass: 'admission_limit',
       activeOneShotCount,
-      maxActiveOneShots: MAX_ACTIVE_ONESHOTS,
+      maxActiveOneShots: accountCapacity().fleet,
       activeForKind: activeOneShots.get(kind) || 0,
-      maxActivePerProvider: MAX_ACTIVE_PER_PROVIDER,
+      maxActivePerProvider: providerSlotLimit(kind),
+      maxActivePerAccount: MAX_ACTIVE_PER_ACCOUNT,
+      activeForAccount: activeOneShotsByAccount.get(accountSlotKey(kind, dispatchAccount.account?.id || providerAccounts.DEFAULT_ACCOUNT_ID)) || 0,
+      accountId: dispatchAccount.account?.id || null,
     });
   }
   let promptFileDir = null;
@@ -6070,6 +6187,8 @@ async function executeOneShot(body, res, privateContext = null) {
 
 app.post('/api/oneshot', trackedHandler((req, res) => executeOneShot({
   ...req.body,
+  // An explicit kind always wins; the pin only fills a blank.
+  ...(req.body?.kind ? {} : (() => { const pinned = pinnedProviderKind(); return pinned ? { kind: pinned } : {}; })()),
   _relayClient: req.get('X-RelayBridge-Client') || null,
   _relayClientDeadlineAt: req.get('X-RelayBridge-Client-Deadline-At') || null,
 }, res)));
@@ -6135,7 +6254,10 @@ app.post('/api/tasks', trackedHandler(async (req, res) => {
     const budgetTaskTier = typeof input.budgetTaskTier === 'string'
       ? input.budgetTaskTier
       : input.execution?.resolvedTaskTier || taskTier || classifiedTaskTier;
-    const prepared = { ...input, _relayClient: req.get('X-RelayBridge-Client') || null, dangerous: input.dangerous === true, providerBudget, budgetTaskTier, taskTier, modelTier };
+    // A swapped-to seat is the operator's standing answer to "which AI?", so it
+    // fills an absent kind here exactly as it does for a direct one-shot.
+    const pinnedKind = input.kind ? null : pinnedProviderKind();
+    const prepared = { ...input, ...(pinnedKind ? { kind: pinnedKind } : {}), _relayClient: req.get('X-RelayBridge-Client') || null, dangerous: input.dangerous === true, providerBudget, budgetTaskTier, taskTier, modelTier };
     const snapshot = captureAllowedCwdIdentity(prepared.cwd);
     const controls = validateProviderIntent(prepared, loadConfig(), snapshot);
     if (input.expectedCwdIdentityHash !== undefined && input.expectedCwdIdentityHash !== snapshot.cwdIdentityHash
@@ -6734,7 +6856,7 @@ app.get('/api/project-workspace/attached-calls/:id', (req, res) => {
 });
 const progressAssessor = createProgressAssessor({ dataDir: DATA_DIR, queue: taskQueue, controls: continuityControls,
   getSettings: () => subscriptionUsage.getSettings(),
-  hasCapacity: () => taskQueue.stats().active < taskQueue.stats().maxConcurrent && activeOneShotCount < MAX_ACTIVE_ONESHOTS,
+  hasCapacity: () => taskQueue.stats().active < taskQueue.stats().maxConcurrent && activeOneShotCount < accountCapacity().fleet,
   getContext: (run) => run.continuityId ? continuity.get(run.continuityId) : null,
   selectCandidate: (run, context) => (context?.allowedProviders || [run.kind])
     .map((kind) => continuityCandidate({ kind, cwd: run.cwd, modelTier: 'light', effort: 'low', workflowId: context?.workflowId }))
@@ -7090,6 +7212,10 @@ function resolveDispatchAccount(kind, entry, { unavailableAccountIds = new Set()
         reason: 'linked_account_isolation_unsupported', retryAt: null,
       };
     }
+    // The operator's swap. Ignored when the caller pinned an account outright
+    // (requiredAccountId), because an assertion about which login will be billed
+    // must never be quietly redirected by a stored preference.
+    const pinnedAccountId = requiredAccountId ? null : providerAccounts.activeAccountIdFor(kind, registry);
     const cooling = new Set(coolingQuotaStates()
       .filter((state) => state.scope !== 'model')
       .map((state) => state.quotaSeat).filter(Boolean));
@@ -7106,6 +7232,7 @@ function resolveDispatchAccount(kind, entry, { unavailableAccountIds = new Set()
       unavailableAccountIds: new Set([...unavailableAccountIds, ...accounts.filter((a) =>
         (requiredAccountId && a.id !== requiredAccountId || !ignoreNativeReserve && !subscriptionUsage.verdict(a.quotaSeat, { model, bucket: entry.native_usage_bucket }).admit)).map((a) => a.id)]),
       allowCoolingFallback: true,
+      preferredAccountId: pinnedAccountId,
     });
     if (!account) {
       const usable = accounts.filter((candidate) => candidate.enabled
@@ -7137,6 +7264,11 @@ function resolveDispatchAccount(kind, entry, { unavailableAccountIds = new Set()
       resolutionError: false,
       reason: null,
       retryAt: null,
+      activeAccountId: pinnedAccountId,
+      // null when nothing was pinned, false when the pinned plan was unusable and
+      // work fell through to another one. A silent fallback is the thing an
+      // operator most needs told about.
+      pinHonored: pinnedAccountId ? account.id === pinnedAccountId : null,
     };
   } catch (err) {
     // Never run on a different login than the receipt will attribute.
@@ -7197,6 +7329,9 @@ function invalidateAccountRegistry({ healthOnly = false } = {}) {
   authGeneration += 1;
   if (!healthOnly) answerHealthEpoch += 1;
   _accountRegistryCache = { at: 0, value: { providers: {} } };
+  // Linking, enabling or forgetting an account changes how wide the fleet may
+  // run, so the derived capacity must not outlive the registry it came from.
+  _accountCapacityCache = { at: 0, value: null };
 }
 
 function currentQuotaSeatGroups() {
@@ -7579,6 +7714,8 @@ app.get('/api/accounts', (req, res) => {
           note: 'Use only after signing in again. The next live dispatch revalidates the credentials and quarantines them again if authentication still fails.',
         } : null,
         cooling: cooling.has(a.quotaSeat),
+        active: a.active === true,
+        activeOneShots: activeOneShotsByAccount.get(accountSlotKey(kind, a.id)) || 0,
         percentRemaining: typeof gauges[a.quotaSeat]?.percentRemaining === 'number'
           && Number.isFinite(gauges[a.quotaSeat].percentRemaining)
           ? gauges[a.quotaSeat].percentRemaining : null,
@@ -7593,11 +7730,143 @@ app.get('/api/accounts', (req, res) => {
       supportsMultipleAccounts,
       linkedAccountsUnavailableReason: supportsMultipleAccounts
         ? null : (entry.linked_accounts_unavailable_reason || null),
+      activeAccountId: providerAccounts.activeAccountIdFor(kind, registry),
+      maxActivePerAccount: MAX_ACTIVE_PER_ACCOUNT,
+      maxActiveForProvider: providerSlotLimit(kind),
       accounts,
     };
   }
-  res.json({ providers: out, dataDir: path.join(DATA_DIR, 'accounts') });
+  const capacity = accountCapacity();
+  res.json({
+    providers: out,
+    dataDir: path.join(DATA_DIR, 'accounts'),
+    activeProvider: providerAccounts.activeProviderOf(registry),
+    capacity: {
+      fleet: capacity.fleet,
+      configuredFleet: MAX_ACTIVE_ONESHOTS,
+      linkedAccountCount: capacity.linkedAccountCount,
+      maxActivePerAccount: MAX_ACTIVE_PER_ACCOUNT,
+      activeOneShots: activeOneShotCount,
+      note: 'Each linked, signed-in account adds maxActivePerAccount slots to the fleet, up to the machine-wide ceiling.',
+    },
+  });
 });
+
+// ---- Swapping seats ------------------------------------------------------
+//
+// The whole point of pooling accounts is to stop re-logging-in. These two routes
+// are the switch: GET reports which plan work is currently running on, POST
+// moves it. One POST covers all three swaps the operator actually makes -- a
+// different plan on the same AI, a different AI, or both at once -- because they
+// are one atomic registry write, and a half-applied swap would spend one
+// vendor's allowance while the ledger attributed it to another's.
+app.get('/api/accounts/active', (req, res) => {
+  const cfg = loadConfig();
+  let registry;
+  try {
+    registry = providerAccounts.loadRegistry(DATA_DIR, { strict: true });
+  } catch (err) {
+    return res.status(500).json({
+      error: 'account registry is invalid; dispatch is disabled until it is repaired',
+      detail: err.message,
+    });
+  }
+  const activeProvider = providerAccounts.activeProviderOf(registry);
+  const seats = {};
+  for (const [kind, entry] of Object.entries(cfg)) {
+    if (kind.startsWith('_') || !entry || typeof entry !== 'object') continue;
+    let accounts = [];
+    try { accounts = providerAccounts.accountsFor(kind, entry, registry); } catch { continue; }
+    const pinned = providerAccounts.activeAccountIdFor(kind, registry);
+    seats[kind] = {
+      label: entry.label || kind,
+      activeAccountId: pinned,
+      selection: pinned ? 'pinned' : 'automatic',
+      accountIds: accounts.map((a) => a.id),
+      linkedAccountIds: accounts.filter((a) => !a.implicit).map((a) => a.id),
+    };
+  }
+  res.json({
+    ok: true,
+    activeProvider,
+    activeAccountId: activeProvider && seats[activeProvider] ? seats[activeProvider].activeAccountId : null,
+    unqualifiedWorkRunsOn: activeProvider
+      ? { kind: activeProvider, accountId: seats[activeProvider]?.activeAccountId || providerAccounts.DEFAULT_ACCOUNT_ID }
+      : null,
+    note: activeProvider
+      ? 'A request that names no provider runs on activeProvider. Naming one still wins.'
+      : 'No provider is pinned; the router chooses the seat for every request.',
+    seats,
+  });
+});
+
+app.post('/api/accounts/swap', accountMutationLimit, (req, res) => {
+  const body = req.body;
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return res.status(400).json({ error: 'body must be an object' });
+  }
+  const allowed = new Set(['kind', 'accountId', 'setProvider']);
+  const unknown = Object.keys(body).filter((key) => !allowed.has(key));
+  if (unknown.length) return res.status(400).json({ error: 'unknown field(s): ' + unknown.join(', ') });
+  const kind = String(body.kind || '');
+  const cfg = loadConfig();
+  const entry = cfg[kind];
+  if (!entry || kind.startsWith('_')) return res.status(404).json({ error: `unknown provider '${kind}'` });
+  if (body.accountId !== undefined && body.accountId !== null
+    && typeof body.accountId !== 'string') {
+    return res.status(400).json({ error: 'accountId must be a string, or null to return this seat to automatic selection' });
+  }
+  if (body.setProvider !== undefined && typeof body.setProvider !== 'boolean') {
+    return res.status(400).json({ error: 'setProvider must be a boolean' });
+  }
+  let result;
+  try {
+    result = providerAccounts.swapSeat(DATA_DIR, {
+      kind,
+      accountId: body.accountId,
+      entry,
+      setProvider: body.setProvider !== false,
+    });
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+  invalidateAccountRegistry();
+  // Say plainly whether the swapped-to plan can actually take work right now.
+  // A swap onto a signed-out or drained plan is legal and durable, but the
+  // operator needs to know their next dispatch will fall back.
+  let readiness = null;
+  try {
+    const probe = resolveDispatchAccount(kind, entry, {});
+    let reason = probe.reason || null;
+    // When resolution SUCCEEDED but landed somewhere else, probe.reason is null:
+    // the fault belongs to the pinned plan, not to the seat. Name it.
+    if (!reason && probe.pinHonored === false && result.accountId) {
+      try {
+        const pinned = providerAccounts.accountsFor(kind, entry, providerAccounts.loadRegistry(DATA_DIR))
+          .find((item) => item.id === result.accountId);
+        reason = accountUnusableReason(kind, entry, pinned);
+      } catch { /* fall through to the generic note */ }
+    }
+    readiness = {
+      dispatchable: !probe.exhausted,
+      willRunOnAccountId: probe.account?.id || null,
+      quotaSeat: probe.quotaSeat || null,
+      pinHonored: probe.pinHonored,
+      reason,
+      retryAt: probe.retryAt || null,
+    };
+  } catch { readiness = null; }
+  res.json({
+    ok: true,
+    ...result,
+    readiness,
+    note: readiness && readiness.pinHonored === false
+      ? `Pinned ${kind}/${result.accountId}, but it cannot take work right now (${readiness.reason || 'unavailable'}); dispatch falls back to ${readiness.willRunOnAccountId || 'no usable account'}.`
+      : `Unqualified work now runs on ${result.activeProvider}${result.accountId ? '/' + result.accountId : ''}.`,
+  });
+});
+
+
 
 app.post('/api/accounts/:kind', accountMutationLimit, (req, res) => {
   const kind = String(req.params.kind);
@@ -7766,8 +8035,9 @@ app.get('/api/fuel', (req, res) => {
       queueStats: taskQueue.stats(),
       activeByProvider: activeOneShots,
       concurrency: {
-        maxActiveOneShots: MAX_ACTIVE_ONESHOTS,
+        maxActiveOneShots: accountCapacity().fleet,
         maxActivePerProvider: MAX_ACTIVE_PER_PROVIDER,
+        maxActivePerAccount: MAX_ACTIVE_PER_ACCOUNT,
       },
       gauges,
       providerUsageCapabilities: providerUsageCapabilities(loadConfig(), runtimeVersions),
@@ -8163,6 +8433,323 @@ app.post('/api/broadcast', trackedHandler(async (req, res) => {
   if (res.writableEnded || res.destroyed) return;
   res.json({
     targets,
+    results,
+    runId: run.runId,
+    status: run.status,
+    timeoutMs: effectiveTimeoutMs,
+    deadlineAt: deadlineAt === null ? null : new Date(deadlineAt).toISOString(),
+  });
+}));
+
+
+// ---- Super fan-out: one brief, every AI, every plan ----------------------
+//
+// Broadcast spends one account per provider. This spends the cross product:
+//
+//     providers  x  accounts per provider  x  (variants or replicas)
+//
+// so three Claude plans and two Codex plans running two variants each is twenty
+// agents in flight, not five. Each member is HARD-pinned to its own account via
+// expectedAccountId, which is what makes the multiplication real: without the pin
+// every member would resolve to the same least-drained plan and quietly serialise
+// behind one allowance.
+//
+// Read-only by design. N unleased writers in one tree is the overlap the
+// delegation contract exists to forbid, so dangerous:true is refused here rather
+// than silently downgraded.
+const FANOUT_MAX_MEMBERS = 64;
+const FANOUT_MAX_REPLICAS = 8;
+const FANOUT_MAX_VARIANTS = 16;
+
+// Which accounts of one seat this fan-out should occupy.
+//   'all'    every signed-in, enabled, non-quarantined account (the default)
+//   'active' only the plan the operator swapped to
+//   'auto'   one member, account chosen by the usual least-drained selection
+//   {kind:[ids]} exactly these
+function fanoutAccountsFor(kind, entry, registry, spec) {
+  const all = providerAccounts.accountsFor(kind, entry, registry);
+  const usable = all.filter((account) => account.enabled
+    && providerAccounts.accountIsProvisioned({ entry, account, dataDir: DATA_DIR, kind })
+    && providerAccounts.accountAuthAvailable({ entry, account, dataDir: DATA_DIR, kind }));
+  const skipped = [];
+  const unusable = (account) => accountUnusableReason(kind, entry, account);
+  if (spec === 'auto') return { ids: [null], skipped };
+  if (spec === 'active') {
+    const pinned = providerAccounts.activeAccountIdFor(kind, registry);
+    if (!pinned) return { ids: [null], skipped };
+    const account = usable.find((item) => item.id === pinned);
+    if (!account) {
+      skipped.push({ provider: kind, accountId: pinned, reason: 'the active account cannot take work: '
+        + (all.find((item) => item.id === pinned) ? unusable(all.find((item) => item.id === pinned)) : 'unknown account') });
+      return { ids: [], skipped };
+    }
+    return { ids: [account.id], skipped };
+  }
+  if (Array.isArray(spec)) {
+    const ids = [];
+    for (const raw of spec) {
+      const wanted = String(raw);
+      const account = usable.find((item) => item.id === wanted);
+      if (account) { ids.push(account.id); continue; }
+      const known = all.find((item) => item.id === wanted);
+      skipped.push({ provider: kind, accountId: wanted, reason: known ? unusable(known) : `unknown account '${wanted}'` });
+    }
+    return { ids, skipped };
+  }
+  for (const account of all) {
+    if (!usable.includes(account)) skipped.push({ provider: kind, accountId: account.id, reason: unusable(account) });
+  }
+  return { ids: usable.map((account) => account.id), skipped };
+}
+
+app.post('/api/fanout', trackedHandler(async (req, res) => {
+  const {
+    prompt, tag, providers, all, accounts, replicas, variants, dangerous,
+    timeoutMs = TIMEOUT_POLICY.oneShotDefaultMs, cwd,
+    providerBudget, effort, maxEffortOverride, model, execution, taskTier, modelTier,
+    requiresWorkspaceAccess, inlineEvidence, outputProfile,
+  } = req.body || {};
+  if (typeof prompt !== 'string' || !prompt.trim()) {
+    return res.status(400).json({ error: 'non-empty prompt required' });
+  }
+  if (dangerous === true) {
+    return res.status(400).json({
+      error: 'fan-out is read-only: many agents writing one tree with no writer lease is the overlap the delegation contract forbids',
+      hint: 'fan out discovery and authoring, then apply the results through a single leased writer (POST /api/delegate)',
+    });
+  }
+  const replicaCount = replicas === undefined ? 1 : Number(replicas);
+  if (!Number.isSafeInteger(replicaCount) || replicaCount < 1 || replicaCount > FANOUT_MAX_REPLICAS) {
+    return res.status(400).json({ error: `replicas must be an integer from 1 to ${FANOUT_MAX_REPLICAS}` });
+  }
+  // An empty array is refused rather than ignored: the caller plainly meant to
+  // fan out over assignments, and silently running one unassigned agent instead
+  // would spend quota on work nobody asked for.
+  if (variants !== undefined && (!Array.isArray(variants) || !variants.length || variants.length > FANOUT_MAX_VARIANTS
+    || variants.some((item) => typeof item !== 'string' || !item.trim() || item.length > 20000))) {
+    return res.status(400).json({ error: `variants must be an array of 1 to ${FANOUT_MAX_VARIANTS} non-empty assignment strings` });
+  }
+  const assignments = Array.isArray(variants) && variants.length ? variants.map(String) : [null];
+  let accountSpec = accounts === undefined ? 'all' : accounts;
+  if (typeof accountSpec === 'string') {
+    if (!['all', 'active', 'auto'].includes(accountSpec)) {
+      return res.status(400).json({ error: "accounts must be 'all', 'active', 'auto', or an object of provider -> account ids" });
+    }
+  } else if (accountSpec && typeof accountSpec === 'object' && !Array.isArray(accountSpec)) {
+    for (const [key, value] of Object.entries(accountSpec)) {
+      if (!providerAccounts.validProviderKey(key) || !Array.isArray(value)
+        || value.some((item) => typeof item !== 'string' || !providerAccounts.validAccountId(item))) {
+        return res.status(400).json({ error: `accounts.${key} must be an array of valid account ids` });
+      }
+    }
+  } else {
+    return res.status(400).json({ error: "accounts must be 'all', 'active', 'auto', or an object of provider -> account ids" });
+  }
+  let validatedProviderBudget;
+  try { validatedProviderBudget = validateProviderBudget(providerBudget); }
+  catch (err) { return rejectInvalidIntent(res, req.body || {}, err); }
+  const { classifyTask } = await ROUTER_MODULE_PROMISE;
+  const cfg = loadConfig();
+  let registry;
+  try { registry = providerAccounts.loadRegistry(DATA_DIR, { strict: true }); }
+  catch (err) {
+    return res.status(500).json({
+      error: 'account registry is invalid; dispatch is disabled until it is repaired',
+      detail: err.message,
+    });
+  }
+  let targets;
+  try { targets = resolveBroadcastTargets(cfg, { providers, tag, all, dangerous: false }); }
+  catch (err) { return res.status(400).json({ error: err.message }); }
+  // A named provider list is the operator being explicit; an empty resolution
+  // there is an error. With no selection at all, fall back to the pinned seat so
+  // "fan out" after a swap means "fan out on what I swapped to".
+  if (!targets.length) {
+    const pinnedProvider = providerAccounts.activeProviderOf(registry);
+    if (pinnedProvider && isAiProviderEntry(pinnedProvider, cfg[pinnedProvider])) targets = [pinnedProvider];
+  }
+  if (!targets.length) {
+    return res.status(400).json({
+      error: 'no matching fan-out targets; pass providers, a tag that AI providers carry, or all:true',
+      hint: 'POST /api/accounts/swap pins a default seat for calls that name none',
+    });
+  }
+  const skipped = [];
+  const expansion = [];
+  for (const kind of targets) {
+    const entry = cfg[kind];
+    let resolved;
+    try {
+      resolved = fanoutAccountsFor(kind, entry, registry,
+        typeof accountSpec === 'string' ? accountSpec
+          : Object.prototype.hasOwnProperty.call(accountSpec, kind) ? accountSpec[kind] : 'all');
+    } catch (err) {
+      skipped.push({ provider: kind, accountId: null, reason: err.message });
+      continue;
+    }
+    skipped.push(...resolved.skipped);
+    for (const accountId of resolved.ids) {
+      for (const [variantIndex, assignment] of assignments.entries()) {
+        for (let replica = 1; replica <= replicaCount; replica += 1) {
+          expansion.push({ kind, accountId, assignment, variantIndex, replica });
+        }
+      }
+    }
+  }
+  if (!expansion.length) {
+    return res.status(409).json({
+      error: 'every fan-out target resolved to zero usable accounts',
+      failureClass: 'account_unavailable',
+      skipped,
+      hint: 'POST /api/accounts/:kind returns the exact sign-in command for a linked account',
+    });
+  }
+  if (expansion.length > FANOUT_MAX_MEMBERS) {
+    return res.status(400).json({
+      error: `fan-out would start ${expansion.length} agents; the ceiling is ${FANOUT_MAX_MEMBERS}`,
+      hint: 'narrow providers, accounts, variants or replicas',
+      expansion: { providers: targets, members: expansion.length },
+    });
+  }
+  const effectiveTimeoutMs = TIMEOUT_POLICY.normalizeOneShotTimeoutMs(timeoutMs);
+  const resolvedTaskTier = taskTier !== undefined ? taskTier : execution != null ? undefined : classifyTask(prompt).tier;
+  const resolvedModelTier = modelTier !== undefined ? modelTier : execution != null ? undefined : modelTierForTaskTier(resolvedTaskTier);
+  const memberPrompt = (member) => member.assignment === null ? prompt
+    : `${prompt}\n\n--- Your assignment for this fan-out branch ---\n${member.assignment}`;
+  // Validate every member before the first one can consume quota. A planned
+  // tuple is provider-bound, so each provider needs its own validated intent.
+  const intents = new Map();
+  try {
+    for (const kind of new Set(expansion.map((member) => member.kind))) {
+      intents.set(kind, validateProviderIntent({
+        kind, prompt, cwd, requiresWorkspaceAccess, inlineEvidence, outputProfile,
+        providerBudget: validatedProviderBudget, model, execution,
+        taskTier: resolvedTaskTier, modelTier: resolvedModelTier, effort, maxEffortOverride,
+        dangerous: false,
+      }, cfg).execution);
+    }
+  } catch (err) { return rejectInvalidIntent(res, req.body || {}, err); }
+  const capacity = accountCapacity();
+  const startedAt = Date.now();
+  const budgetTaskTier = classifyTask(prompt).tier;
+  const deadlineAt = effectiveTimeoutMs === null ? null : startedAt + effectiveTimeoutMs;
+  const activeCaptured = new Set();
+  let clientGone = false;
+  // A disconnect detaches rather than cancels, exactly as broadcast does: each
+  // member persists its own terminal receipt. clientGone only stops this
+  // handler's admission-retry loop and its HTTP write.
+  res.once('close', () => { if (!res.writableEnded) clientGone = true; });
+  let run = writeBroadcastRun({
+    mode: 'fanout',
+    status: 'running',
+    promptHash: crypto.createHash('sha256').update(prompt).digest('hex'),
+    promptChars: prompt.length,
+    selection: {
+      tag: typeof tag === 'string' ? tag : null,
+      all: all === true,
+      explicitProviders: Array.isArray(providers) ? providers : [],
+      accounts: typeof accountSpec === 'string' ? accountSpec : accountSpec,
+      replicas: replicaCount,
+      variants: assignments.length,
+    },
+    targets,
+    members: [],
+    deadlineAt: deadlineAt === null ? null : new Date(deadlineAt).toISOString(),
+    timeoutMs: effectiveTimeoutMs,
+  });
+  const callOnce = async (member) => {
+    if (clientGone || res.destroyed) {
+      return { statusCode: 499, body: { error: 'fan-out client disconnected', dropped_out: true, cancelled: true } };
+    }
+    const remainingMs = deadlineAt === null ? null : deadlineAt - Date.now();
+    if (remainingMs !== null && remainingMs < TIMEOUT_POLICY.minimumMs) {
+      return { statusCode: 408, body: { error: 'fan-out deadline exceeded', dropped_out: true, timed_out: true } };
+    }
+    const captured = new CapturedOneShotResponse();
+    activeCaptured.add(captured);
+    executeOneShot({
+      kind: member.kind, prompt: memberPrompt(member), timeoutMs: remainingMs, cwd, dangerous: false,
+      requiresWorkspaceAccess, inlineEvidence, outputProfile,
+      providerBudget: validatedProviderBudget, budgetTaskTier,
+      taskTier: resolvedTaskTier, modelTier: resolvedModelTier, model,
+      execution: intents.get(member.kind), effort, maxEffortOverride,
+      // The pin is what makes the fan-out actually parallel across plans.
+      // Omitted for 'auto', where least-drained selection is the intent.
+      ...(member.accountId ? { expectedAccountId: member.accountId } : {}),
+    }, captured)
+      .catch((err) => captured.status(500).json({ error: err.message, dropped_out: true }));
+    try { return await captured.done; }
+    finally { activeCaptured.delete(captured); }
+  };
+  const results = await Promise.all(expansion.map(async (member) => {
+    const memberStartedAt = Date.now();
+    let response = await callOnce(member);
+    // A wide fan-out is expected to exceed the fleet width; members wait for a
+    // slot instead of failing, bounded by the same deadline as every other run.
+    while (
+      response.statusCode === 429
+      && response.body?.failureClass === 'admission_limit'
+      && (deadlineAt === null || Date.now() < deadlineAt)
+      && !clientGone && !res.destroyed
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 400 + Math.floor(Math.random() * 400)));
+      response = await callOnce(member);
+    }
+    const body = response.body || {};
+    const ok = response.statusCode === 200 && body.exitCode === 0 && !body.dropped_out;
+    return {
+      provider: member.kind,
+      label: cfg[member.kind]?.label || member.kind,
+      accountId: body.route?.account || member.accountId || providerAccounts.DEFAULT_ACCOUNT_ID,
+      quotaSeat: body.route?.quota_seat || null,
+      replica: member.replica,
+      variantIndex: member.assignment === null ? null : member.variantIndex,
+      assignment: member.assignment,
+      ok,
+      output: String(body.stdout || ''),
+      error: ok ? null : String(body.error || body.stderr || (body.timed_out ? 'timed out' : '')
+        || `provider dropped out (HTTP ${response.statusCode})`).slice(0, 4000),
+      durationMs: Date.now() - memberStartedAt,
+      exitCode: body.exitCode ?? null,
+      timedOut: !!body.timed_out,
+      receiptId: body.receiptId || null,
+    };
+  }));
+  run = writeBroadcastRun({
+    ...run,
+    status: clientGone ? 'cancelled'
+      : results.every((member) => member.ok) ? 'completed'
+        : results.some((member) => member.ok) ? 'partial'
+          : results.some((member) => member.timedOut) ? 'timed_out' : 'failed',
+    members: results.map((member) => ({
+      kind: member.provider, role: 'fanout', accountId: member.accountId, quotaSeat: member.quotaSeat,
+      replica: member.replica, exitCode: member.exitCode, droppedOut: !member.ok,
+      durationMs: member.durationMs, receiptId: member.receiptId,
+    })),
+    durationMs: Date.now() - startedAt,
+  });
+  if (res.writableEnded || res.destroyed) return;
+  const seatsUsed = [...new Set(results.map((member) => `${member.provider}#${member.accountId}`))];
+  res.json({
+    ok: results.some((member) => member.ok),
+    mode: 'fanout',
+    targets,
+    expansion: {
+      providers: targets.length,
+      accounts: seatsUsed.length,
+      variants: assignments.length,
+      replicas: replicaCount,
+      members: results.length,
+    },
+    seatsUsed,
+    skipped,
+    fleet: {
+      width: capacity.fleet,
+      configuredWidth: MAX_ACTIVE_ONESHOTS,
+      maxActivePerAccount: MAX_ACTIVE_PER_ACCOUNT,
+      linkedAccountCount: capacity.linkedAccountCount,
+      queuedBehindCapacity: Math.max(0, results.length - capacity.fleet),
+    },
     results,
     runId: run.runId,
     status: run.status,

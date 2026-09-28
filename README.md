@@ -266,6 +266,14 @@ with different accounts. Status output lists every alias in each quota seat.
 Vendor evidence marked `scope: "model"` remains model/provider scoped; generic
 429 and overload evidence is conservatively shared across the account group.
 
+One provider can hold several subscriptions. A seat that declares
+`credential_env` (Claude Code's `CLAUDE_CONFIG_DIR`, Codex's `CODEX_HOME`) can
+have extra accounts linked to it, each with its own credential directory and its
+own `quotaSeat` (`subscription:anthropic:default#work`), so three Claude plans
+drain as three seats rather than one. `POST /api/accounts/swap` moves work
+between plans, between AIs, or both at once, and `POST /api/fanout` spends every
+linked plan in parallel. See [Multiple accounts](docs/MULTI-ACCOUNT.md).
+
 When the account owner knows a seat is lower than its configured estimate, the
 Fuel panel can record an explicit quota-seat percentage with provenance and an
 expiry/reset time. The bridge stores only those bounded fields in
@@ -484,6 +492,19 @@ Every provider in `cli-config.json` carries a `tags` array (for example `coding`
 
 `POST /api/broadcast` sends one prompt through the same bounded one-shot path as `/api/oneshot` to every resolved target: an explicit `providers` list, every AI provider carrying `tag`, or `all:true`. Tag and all selection always skip opt-in `autoRoute:false` hosted seats (such as `groq_llama_fast`) unless they are named explicitly, the global one-shot concurrency cap still applies (extra members queue), and each member writes a normal provider receipt plus one broadcast run record. A broadcast deliberately spends several providers' quota or local compute at once — target it narrowly.
 
+`POST /api/fanout` goes one step further and spends the cross product of
+providers, accounts per provider, and per-branch assignments or replicas. Where a
+broadcast uses one account per provider, a fan-out uses every linked plan at
+once: three Claude plans and two Codex plans running two variants each is twenty
+agents in flight, not five. Each member is hard-pinned to its own account, so the
+parallelism is real rather than serialised behind one allowance; members beyond
+the fleet width wait for a slot; accounts that cannot take work are reported in
+`skipped` rather than failing the call; and a 64-member ceiling refuses an
+unbounded fleet before anything spawns. Fan-out is read-only by design —
+`dangerous: true` is refused, because N unleased writers in one tree is the
+overlap the delegation contract forbids. It is the most expensive call on the
+bridge. See [Multiple accounts](docs/MULTI-ACCOUNT.md).
+
 ## Browser UI
 
 The dashboard includes:
@@ -621,6 +642,13 @@ Core routes:
 | GET | `/api/agents` | AI providers with tags, autoRoute, and cached readiness |
 | POST | `/api/agents/:id/tags` | Replace one provider's routing tags in `cli-config.json` |
 | POST | `/api/broadcast` | Fan one prompt out to many providers (by `providers`, `tag`, or `all:true`) |
+| POST | `/api/fanout` | Super fan-out: providers x accounts x variants/replicas, each agent pinned to its own account |
+| GET | `/api/accounts` | Every linked account per provider with its own allowance, readiness, and in-flight runs |
+| GET | `/api/accounts/active` | Which AI and account a request naming no provider runs on |
+| POST | `/api/accounts/swap` | Swap plan, AI, or both in one atomic write |
+| POST | `/api/accounts/:kind` | Link another account and get its exact sign-in command |
+| POST | `/api/accounts/:kind/:id/enabled` | Take one plan out of rotation, or put it back |
+| DELETE | `/api/accounts/:kind/:id` | Unlink an account and sign it out |
 | GET/POST | `/api/workflows...` | List/resume and advance the phase-gated Codex-Claude pipeline; see the pipeline guide for the one-to-one MCP mapping |
 | POST | `/api/install` | Run a configured provider installer |
 | GET/POST/PUT/DELETE | `/api/collabs...` | Collaboration rooms |
@@ -688,6 +716,13 @@ When an AI client connects through MCP, it should start with `get_context_bundle
 Use `route_preview` before spending a hosted provider call. Use `route_and_ask` for one bounded answer with policy routing. Use `run_committee` when you need independent advisory views. Use `start_safe_session` and `send_session_input` only when host shell execution is actually required and approved.
 
 Agent management tools: `list_agents` lists AI providers with tags, autoRoute, and cached readiness without spawning probes; `set_agent_tags` replaces one provider's routing tags; `broadcast` fans one prompt out to many providers at once and can therefore spend multiple providers' quota in a single call — prefer a narrow tag or explicit provider list.
+
+Account tools: `list_accounts` shows every linked plan with its own allowance and
+readiness; `active_seat` reports which AI and account unqualified work runs on;
+`swap_account` moves between plans and AIs in one call; `link_account` registers
+a plan and returns the exact command that signs it in; `set_account_enabled`
+takes a plan out of rotation without signing it out; and `super_fan_out` spends
+every linked plan in parallel — the most expensive call on the bridge.
 
 Every provider call writes receipts where possible. Direct REST validation,
 configuration/auth, and admission-limit rejections also write a privacy-safe

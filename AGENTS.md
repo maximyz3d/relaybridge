@@ -175,6 +175,15 @@ $env:RELAYBRIDGE_URL = 'http://127.0.0.1:8787'
 npm run smoke:mcp -- --committee
 ```
 
+## Several accounts on one bridge
+
+One provider can hold several subscriptions: a seat declaring `credential_env`
+gives each linked account its own credential directory, quota seat and
+concurrency slots. `swap_account` moves work between plans, between AIs, or both
+in one atomic write, and `super_fan_out` spends every linked plan in parallel
+(providers x accounts x variants/replicas, each agent pinned to its own account,
+read-only by contract). See [Multiple accounts](docs/MULTI-ACCOUNT.md).
+
 ## Usage-aware coordination
 
 Use the [continuity protocol](docs/CONTINUITY.md) to checkpoint meaningful milestones and explicitly yield

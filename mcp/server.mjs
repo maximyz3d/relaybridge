@@ -2261,7 +2261,7 @@ function numericBoundsOf(field, depth = 0) {
 
 export function buildServer() {
   const server = new McpServer({ name: 'relaybridge', version: PACKAGE.version }, {
-    instructions: 'Read before acting: call get_context_bundle when taking over existing work, then use bridge_status, list_providers, list_pipelines, and route_preview as needed. For long projects, use list_coordinators/register_coordinator and checkpoint_coordinator after decisions or completed work. Honor early yield instructions before quota exhaustion. A registered permitted successor may take over coordination. For staged code work, Codex normally owns orchestration and primary implementation: create one workflow, submit a bounded research brief, follow nextActions, use reconcile_pipeline while provider phases are active, and never overlap writer leases. get_pipeline is status-only and never spends provider quota. AI provider one-shots (ask_provider, route_and_ask, run_committee) always force dangerous:false, so they consume subscription quotas or local compute in the provider CLI\'s own safe/headless mode. Terminals are different: start_safe_session only forces the vendor bypass flags off, and start_safe_session(kind="powershell") opens a real host PowerShell shell running with your account\'s full privileges. Anything sent through send_session_input executes on the host with no sandbox and no filesystem confinement, so it needs host approval and human review. The /api/exec route, provider installs, and the global full-permissions toggle are not exposed as tools. Routing scores are operator preferences, not universal model-quality claims; use receipts and preserve the human gate for high-stakes work.',
+    instructions: 'Read before acting: call get_context_bundle when taking over existing work, then use bridge_status, list_providers, list_pipelines, and route_preview as needed. For long projects, use list_coordinators/register_coordinator and checkpoint_coordinator after decisions or completed work. Honor early yield instructions before quota exhaustion. A registered permitted successor may take over coordination. For staged code work, Codex normally owns orchestration and primary implementation: create one workflow, submit a bounded research brief, follow nextActions, use reconcile_pipeline while provider phases are active, and never overlap writer leases. get_pipeline is status-only and never spends provider quota. AI provider one-shots (ask_provider, route_and_ask, run_committee) always force dangerous:false, so they consume subscription quotas or local compute in the provider CLI\'s own safe/headless mode. Terminals are different: start_safe_session only forces the vendor bypass flags off, and start_safe_session(kind="powershell") opens a real host PowerShell shell running with your account\'s full privileges. Anything sent through send_session_input executes on the host with no sandbox and no filesystem confinement, so it needs host approval and human review. The /api/exec route, provider installs, and the global full-permissions toggle are not exposed as tools. One provider may hold several accounts: list_accounts shows the pool, swap_account moves work between plans or between AIs, and super_fan_out spends providers x accounts x variants in one call, so scope it deliberately. Routing scores are operator preferences, not universal model-quality claims; use receipts and preserve the human gate for high-stakes work.',
     capabilities: { tools: {}, resources: {} },
     cacheHints: {
       'tools/list': { ttlMs: 60000, cacheScope: 'private' },
@@ -3328,6 +3328,140 @@ export function buildServer() {
       inputChars: prompt.length,
       status: response.status || 'unknown',
       succeededProviders: results.filter((member) => member.ok).map((member) => member.provider),
+    });
+    return result({ ...response, results, receiptId: receipt.receiptId });
+  }));
+
+  // ---- Multiple accounts on one bridge ------------------------------------
+  //
+  // A subscription CLI keeps its credentials in a config directory it reads from
+  // an environment variable, so pointing that variable somewhere else runs the
+  // same binary as a different account. The bridge owns one directory per linked
+  // account, gives each its own quota seat, and these tools are the whole
+  // operator surface: see the pool, link a plan, swap onto one, fan out over all
+  // of them at once.
+  const ACCOUNT_ID = z.string().regex(/^[a-z0-9][a-z0-9._-]{0,63}$/,
+    'lowercase letters, digits, dot, dash and underscore; 1-64 characters');
+
+  server.registerTool('list_accounts', {
+    title: 'List every linked account and which one is active',
+    description: 'The account pool for every provider: each linked plan, its own quota seat and remaining allowance, whether it is signed in, disabled, cooling or quarantined, how many runs it has in flight, and which account each seat is currently pinned to. Also reports the fleet width, which grows with every linked plan. Read this before swapping or fanning out — it is the only place that shows whether a second plan is actually usable.',
+    inputSchema: z.object({}),
+    annotations: READ_ONLY,
+  }, safeHandler(async (_args, context) => result(await bridgeRequest('/api/accounts', {
+    timeoutMs: 10000, signal: context?.mcpReq?.signal,
+  }))));
+
+  server.registerTool('active_seat', {
+    title: 'Report which AI and account unqualified work runs on',
+    description: 'What a request that names no provider will run on right now, and which account is pinned for every seat. Selection is "automatic" where nothing is pinned, meaning the least-drained usable account wins.',
+    inputSchema: z.object({}),
+    annotations: READ_ONLY,
+  }, safeHandler(async (_args, context) => result(await bridgeRequest('/api/accounts/active', {
+    timeoutMs: 10000, signal: context?.mcpReq?.signal,
+  }))));
+
+  server.registerTool('swap_account', {
+    title: 'Swap which AI and which account the work runs on',
+    description: 'One call for all three swaps: another plan on the same AI (kind:"claude", accountId:"work"), a different AI (kind:"codex"), or both at once. Both pins are one atomic write, so work is never attributed to one vendor while spending another. The pin is soft: it is preferred whenever that plan can take work, and dispatch falls back to the least-drained account (saying so in readiness.pinHonored) when it cannot. accountId:null returns that seat to automatic selection. setProvider:false pins the account without changing which AI unqualified work goes to. Naming a provider on a request always beats the pin.',
+    inputSchema: z.object({
+      kind: z.string().min(1).max(64),
+      accountId: ACCOUNT_ID.nullable().optional()
+        .describe('the plan to run on; null returns this seat to automatic least-drained selection'),
+      setProvider: z.boolean().optional()
+        .describe('default true: also make this the AI that requests naming no provider run on'),
+    }).strict(),
+    annotations: ACTION,
+  }, safeHandler(async (body, context) => result(await bridgeRequest('/api/accounts/swap', {
+    method: 'POST', body, actionIdentity: true, timeoutMs: 15000, signal: context?.mcpReq?.signal,
+  }))));
+
+  server.registerTool('link_account', {
+    title: 'Link a second account to a provider',
+    description: 'Register another plan on a seat that can relocate its credentials. Returns the EXACT shell command that signs this account in — the bridge cannot complete an interactive OAuth flow, so the operator runs that one command once and the account becomes selectable and fannable-out forever. The existing sign-in is preserved as the addressable "default" account. Adding a plan also widens the fleet by one account-worth of concurrent slots.',
+    inputSchema: z.object({
+      kind: z.string().min(1).max(64),
+      id: ACCOUNT_ID.describe('your name for this plan, e.g. "work" or "personal"; "default" is reserved for the existing sign-in'),
+      label: z.string().min(1).max(120).optional(),
+    }).strict(),
+    annotations: ACTION,
+  }, safeHandler(async ({ kind, ...body }, context) => result(await bridgeRequest(`/api/accounts/${encodeURIComponent(kind)}`, {
+    method: 'POST', body, actionIdentity: true, timeoutMs: 15000, signal: context?.mcpReq?.signal,
+  }))));
+
+  server.registerTool('set_account_enabled', {
+    title: 'Enable or disable one linked account',
+    description: 'Take a plan out of rotation without signing it out, or put it back. A disabled account is never selected, never fanned out to, and releases any pin that named it. Credentials are untouched.',
+    inputSchema: z.object({
+      kind: z.string().min(1).max(64),
+      id: ACCOUNT_ID,
+      enabled: z.boolean(),
+    }).strict(),
+    annotations: ACTION,
+  }, safeHandler(async ({ kind, id, enabled }, context) => result(await bridgeRequest(
+    `/api/accounts/${encodeURIComponent(kind)}/${encodeURIComponent(id)}/enabled`,
+    { method: 'POST', body: { enabled }, actionIdentity: true, timeoutMs: 15000, signal: context?.mcpReq?.signal },
+  ))));
+
+  server.registerTool('super_fan_out', {
+    title: 'Fan one brief across every AI and every account at once',
+    description: 'The multiplied fan-out: providers x accounts per provider x (variants or replicas). Where broadcast spends one account per provider, this spends every linked plan in parallel — three Claude plans and two Codex plans running two variants each is twenty agents in flight, not five. Each agent is hard-pinned to its own account, which is what makes the parallelism real instead of serialising behind one allowance. WARNING: this spends quota on MANY accounts simultaneously and is the most expensive call on the bridge. Pass variants to give each branch its own assignment, or replicas for independent samples of the same brief. Members beyond the fleet width wait for a slot rather than failing. Read-only by design: N unleased writers in one tree is the overlap the delegation contract forbids, so apply results through a single leased writer instead.',
+    inputSchema: z.object({
+      outputProfile: OUTPUT_PROFILE_SCHEMA.optional(),
+      ...GROUNDING_FIELDS,
+      prompt: z.string().min(1).max(100000).describe('the shared brief every agent receives'),
+      variants: z.array(z.string().min(1).max(20000)).max(16).optional()
+        .describe('one assignment per branch, appended to the shared brief; each becomes its own agent on every selected account'),
+      replicas: z.number().int().min(1).max(8).optional()
+        .describe('independent samples per account per variant; default 1'),
+      accounts: z.union([
+        z.enum(['all', 'active', 'auto']),
+        z.record(z.string(), z.array(ACCOUNT_ID).max(16)),
+      ]).optional().describe("'all' (default) uses every signed-in account, 'active' only the pinned one, 'auto' one agent per provider with the usual least-drained pick, or an object of provider -> account ids"),
+      tag: z.string().regex(/^[a-z][a-z0-9-]{0,23}$/).optional(),
+      providers: z.array(z.string()).max(16).default([]),
+      all: z.boolean().default(false).describe('every AI provider; opt-in autoRoute:false seats must still be named explicitly'),
+      cwd: z.string().max(1000).optional(),
+      timeoutMs: z.number().int().min(TIMEOUT_POLICY.minimumMs).optional().describe('check-in hint; never enforced'),
+      providerBudget: PROVIDER_BUDGET_SCHEMA.nullish(),
+      taskTier: z.enum(TASK_TIERS).optional(),
+      modelTier: z.enum(MODEL_TIERS).optional(),
+      model: z.string().min(1).max(160).optional(),
+      execution: EXECUTION_SCHEMA.optional(),
+      effort: z.enum(EFFORT_LEVELS).optional(),
+      maxEffortOverride: z.boolean().default(false),
+    }),
+    annotations: { ...ACTION, openWorldHint: true },
+  }, safeHandler(async ({
+    prompt, variants, replicas, accounts, tag, providers, all, cwd, timeoutMs, providerBudget,
+    effort, maxEffortOverride, taskTier, modelTier, model, execution,
+    requiresWorkspaceAccess, inlineEvidence, outputProfile,
+  }, context) => {
+    const response = await bridgeRequest('/api/fanout', {
+      method: 'POST',
+      body: {
+        prompt, variants, replicas, accounts, tag, providers, all, cwd, timeoutMs, providerBudget,
+        effort, requiresWorkspaceAccess, inlineEvidence, outputProfile,
+        maxEffortOverride, taskTier, modelTier, model, execution, dangerous: false,
+      },
+      timeoutMs: TIMEOUT_POLICY.transportTimeoutMs(timeoutMs),
+      signal: context?.mcpReq?.signal,
+      actionIdentity: true,
+    });
+    const results = (response.results || []).map((member) => {
+      const output = clip(member.output || '', 16000);
+      return { ...member, output: output.text, outputChars: output.originalChars, outputTruncated: output.truncated };
+    });
+    const receipt = appendReceipt({
+      event: 'super_fan_out',
+      providers: response.targets || [],
+      runId: response.runId || null,
+      inputHash: stableHash(prompt),
+      inputChars: prompt.length,
+      status: response.status || 'unknown',
+      succeededProviders: [...new Set(results.filter((member) => member.ok).map((member) => member.provider))],
+      seatsUsed: response.seatsUsed || [],
+      members: results.length,
     });
     return result({ ...response, results, receiptId: receipt.receiptId });
   }));

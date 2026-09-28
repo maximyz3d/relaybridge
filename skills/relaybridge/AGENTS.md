@@ -146,10 +146,32 @@ For a long-running call, `GET /api/runs/active` shows whether it is `streaming`,
 `quiet` (check `cpuMs` — CPU advancing means it is thinking, not stuck), or
 `suspect_loop`, plus which limit fires next.
 
+## Several accounts, and fanning out over all of them
+
+A provider that declares `credential_env` can hold more than one subscription.
+Each linked account has its own credential directory, its own quota seat, and its
+own concurrency slots.
+
+- `list_accounts` — every plan, its remaining allowance and whether it is usable.
+- `active_seat` — which AI and account a call naming no provider runs on.
+- `link_account` — registers a plan and returns the exact sign-in command. The
+  bridge cannot complete the OAuth flow; hand that command to the operator.
+- `swap_account` — `{kind, accountId}` for another plan on the same AI,
+  `{kind}` for a different AI, both together for both. `accountId:null` restores
+  automatic selection. The account pin is soft (it falls back to the
+  least-drained plan and says so in `readiness.pinHonored`); naming a provider on
+  a request always beats the provider pin.
+- `super_fan_out` — providers x accounts x (variants or replicas) in one call,
+  each agent pinned to its own account. The most expensive call on the bridge and
+  read-only by contract: fan out discovery, then apply through one leased writer.
+
+See `docs/MULTI-ACCOUNT.md`.
+
 ## Constraints
 
 - `dangerous: true` lets a CLI act on the filesystem. Default to `false`.
 - Never pass secrets or credentials in a prompt body.
-- Concurrency is capped at 4 in-flight calls.
+- Concurrency is capped at 4 in-flight calls per authenticated account, with a
+  fleet width of 8 that grows by 4 for every linked, signed-in account.
 - Parallelize only independent read-only subtasks; never create two writers to
   the same files.
