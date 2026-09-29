@@ -1,3 +1,6 @@
+## v2.5.4 - 2026-09-29
+- #140 fix(quota): preserve native capacity during Claude permission recovery
+
 ## v2.5.3 - 2026-09-28
 - #139 fix(quota): recover Claude after a verified native reset
 
