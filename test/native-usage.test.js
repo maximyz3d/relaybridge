@@ -212,3 +212,27 @@ test('Claude allowed_warning is explicit permission, unknown statuses remain unk
     assert.equal(result.ordinaryUsageAllowed, expected);
   }
 });
+test('linked Claude profile reads only the exact plain config dir and binds a distinct profile hash', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'rb-nu-'));
+  const dir = path.join(home, 'acct2');
+  fs.mkdirSync(dir);
+  fs.writeFileSync(path.join(dir, '.claude.json'), JSON.stringify(cachePayload()));
+  const env = { HOME: home, CLAUDE_CONFIG_DIR: dir };
+  const args = { defaultHome: home, quotaSeat: 'claude#acct2', now: T + 1000 };
+  const ok = readClaudeNativeUsage({ ...args, env, configDir: dir });
+  assert.ok(ok.identity); assert.ok(ok.observation);
+  fs.writeFileSync(path.join(home, '.claude.json'), JSON.stringify(cachePayload()));
+  const def = readClaudeNativeUsage({ ...args, env: { HOME: home } });
+  assert.equal(def.identity.accountFingerprint, ok.identity.accountFingerprint);
+  assert.notEqual(def.identity.profileHash, ok.identity.profileHash);
+  // Unchanged rule: without configDir an env CLAUDE_CONFIG_DIR is rejected.
+  assert.equal(readClaudeNativeUsage({ ...args, env }).identity, null);
+  // Mismatched env, relative dir, alt-auth env, symlink all refuse.
+  assert.equal(readClaudeNativeUsage({ ...args, env: { HOME: home }, configDir: dir }).identity, null);
+  assert.equal(readClaudeNativeUsage({ ...args, env: { ...env, CLAUDE_CONFIG_DIR: 'acct2' }, configDir: 'acct2' }).identity, null);
+  assert.equal(readClaudeNativeUsage({ ...args, env: { ...env, ANTHROPIC_API_KEY: 'x' }, configDir: dir }).identity, null);
+  const link = path.join(home, 'link'); fs.symlinkSync(dir, link);
+  assert.equal(readClaudeNativeUsage({ ...args, env: { HOME: home, CLAUDE_CONFIG_DIR: link }, configDir: link }).identity, null);
+  assert.equal(readClaudeNativeUsage({ ...args, env: { HOME: '/elsewhere', CLAUDE_CONFIG_DIR: dir }, configDir: dir }).identity, null);
+  fs.rmSync(home, { recursive: true, force: true });
+});

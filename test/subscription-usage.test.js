@@ -1287,3 +1287,18 @@ test('permission exact snapshot rejects denial hash change with unchanged timest
   assert.equal(f.store.observePermission(observation, afterDenial, f.proof), true,
     'matching exact snapshot accepts the same timestamp-valid evidence');
 });
+test('a linked account seat binds its own identity independently of the default seat', t => {
+  const f = fixture(t);
+  const seatObs = (accountUuid, quotaSeat, remaining) => parseClaudeNativeCache({ oauthAccount: { accountUuid }, cachedUsageUtilization: {
+    accountUuid, fetchedAtMs: f.at(), utilization: Object.fromEntries(['five_hour', 'seven_day'].map(name =>
+      [name, { utilization: 100 - remaining, resets_at: new Date(T + 86400000 - 437).toISOString() }])) } }, { quotaSeat, now: f.at() });
+  const a = seatObs(uuid, 'claude', 50), b = seatObs('99999999-8888-7777-6666-555555555555', 'claude#acct2', 40);
+  assert.equal(f.store.bindIdentity('claude', a.accountFingerprint), true);
+  assert.equal(f.store.bindIdentity('claude#acct2', b.accountFingerprint), true);
+  assert.equal(f.store.observeNativeCache(a), true);
+  assert.equal(f.store.observeNativeCache(b), true);
+  assert.equal(f.store.verdict('claude#acct2', { accountFingerprint: b.accountFingerprint }).admit, true);
+  // The default seat's login cannot be rebound onto the linked seat, nor the reverse.
+  assert.equal(f.store.observeNativeCache(seatObs(uuid, 'claude#acct2', 50)), false);
+  assert.equal(f.store.observeNativeCache(seatObs('99999999-8888-7777-6666-555555555555', 'claude', 50)), false);
+});

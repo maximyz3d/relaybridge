@@ -72,3 +72,15 @@ test('Claude usage PTY never types into a trust dialog', async () => {
   assert.deepEqual(result, { refreshed: false, reason: 'probe_interactive_gate' });
   assert.deepEqual(pty.state.writes, []);
 });
+
+test('Claude usage PTY spawns with exactly the caller-supplied account env and cwd', async () => {
+  const seen = [];
+  const inner = fakePty({ onWrite() {} });
+  const pty = { state: inner.state, spawn(command, args, options) { seen.push(options); return inner.spawn(); } };
+  const env = { HOME: '/h', CLAUDE_CONFIG_DIR: '/data/accounts/claude/acct2' };
+  await refreshClaudeUsageViaPty({ ptyImpl: pty, command: 'claude', readSample: () => ({ identity, observation: null }),
+    expectedIdentity: identity, baselineFetchedAt: 200, env, cwd: '/probe', timeoutMs: 100, pollMs: 10, startupDelayMs: 0, exitGraceMs: 10 });
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].env, env);
+  assert.equal(seen[0].cwd, '/probe');
+});

@@ -358,3 +358,27 @@ test('four live host commands reject a fifth and keep a disconnected child slot 
   for (const result of await Promise.all(others)) assert.equal(result.body.exitCode, 0);
   await waitFor(async () => (await bridge.request('/api/exec', { command, shell: 'sh' })).body.exitCode === 0);
 });
+
+test('preferred-account route validates its body, persists the switch, and shares the account mutation limiter', { timeout: 30000 }, async (t) => {
+  const bridge = await startTestBridge(t, () => ({ fixture: { label: 'fixture', credential_env: 'FIXTURE_CONFIG_DIR' } }));
+  assert.equal((await bridge.request('/api/accounts/fixture', { id: 'team' })).status, 200);
+  const registryPath = path.join(bridge.root, 'data', 'accounts.json');
+  const read = () => JSON.parse(fs.readFileSync(registryPath, 'utf8')).providers.fixture;
+  for (const bad of [{}, { id: 5 }, { id: 'team', extra: 1 }, [], { id: 'nope' }, { id: 'bad/id' }]) {
+    assert.equal((await bridge.request('/api/accounts/fixture/preferred', bad)).status, 400, JSON.stringify(bad));
+  }
+  assert.equal((await bridge.request('/api/accounts/missing/preferred', { id: 'team' })).status, 404);
+  assert.equal(read().preferred, undefined);
+  assert.equal((await bridge.request('/api/accounts/fixture/preferred', { id: 'team' })).status, 200);
+  assert.equal(read().preferred, 'team');
+  assert.equal((await bridge.request('/api/accounts')).body.providers.fixture.preferred, 'team');
+  assert.equal((await bridge.request('/api/accounts/fixture/preferred', { id: null })).status, 200);
+  assert.equal((await bridge.request('/api/accounts')).body.providers.fixture.preferred, null);
+  let limited = null;
+  for (let n = 0; n < 70 && !limited; n++) {
+    const r = await bridge.request('/api/accounts/fixture/preferred', { id: 'nope' });
+    if (r.status === 429) limited = r;
+  }
+  assert.ok(limited, 'preferred route must be rate limited with the other account mutations');
+  assert.equal(limited.body.validation.code, 'operation_rate_limit');
+});

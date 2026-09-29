@@ -365,3 +365,46 @@ test('provider paths and sign-in instructions are portable and safely quoted', (
   );
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+function seedClaude(dir, ids) {
+  for (const id of ids) {
+    fs.mkdirSync(path.join(dir, 'accounts', 'claude', id), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'accounts', 'claude', id, '.credentials.json'), '{}');
+  }
+}
+
+test('expectedEnvForAccount matches envForAccount without creating a directory', () => {
+  const dir = tmp();
+  A.addAccount(dir, 'claude', { id: 'acct2' });
+  const account = A.accountsFor('claude', CLAUDE, A.loadRegistry(dir)).find((a) => a.id === 'acct2');
+  const expected = A.expectedEnvForAccount({ entry: CLAUDE, account, dataDir: dir, kind: 'claude' });
+  assert.equal(fs.existsSync(path.join(dir, 'accounts', 'claude', 'acct2')), false);
+  assert.deepEqual(A.envForAccount({ entry: CLAUDE, account, dataDir: dir, kind: 'claude' }), expected);
+  assert.equal(fs.existsSync(path.join(dir, 'accounts', 'claude', 'acct2')), true);
+  const implicit = A.accountsFor('claude', CLAUDE, A.loadRegistry(dir)).find((a) => a.id === 'default');
+  assert.deepEqual(A.expectedEnvForAccount({ entry: CLAUDE, account: implicit, dataDir: dir, kind: 'claude' }), {});
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('preferred account wins selection, dangling preference is ignored, removal clears it', () => {
+  const dir = tmp();
+  A.addAccount(dir, 'claude', { id: 'acct2' });
+  seedClaude(dir, ['default', 'acct2']);
+  const gauges = { 'subscription:anthropic:default': { percentRemaining: 90 },
+    'subscription:anthropic:default#acct2': { percentRemaining: 5 } };
+  const pick = () => A.selectAccount({ kind: 'claude', entry: CLAUDE, registry: A.loadRegistry(dir), dataDir: dir, gauges }).id;
+  assert.equal(pick(), 'default');
+  A.setPreferredAccount(dir, 'claude', 'acct2');
+  assert.equal(pick(), 'acct2');
+  assert.throws(() => A.setPreferredAccount(dir, 'claude', 'nope'), /unknown account/);
+  A.setAccountEnabled(dir, 'claude', 'acct2', false);
+  assert.equal(pick(), 'default');
+  assert.throws(() => A.setPreferredAccount(dir, 'claude', 'acct2'), /disabled/);
+  A.setAccountEnabled(dir, 'claude', 'acct2', true);
+  A.removeAccount(dir, 'claude', 'acct2');
+  assert.equal(A.loadRegistry(dir).providers.claude.preferred, null);
+  A.setPreferredAccount(dir, 'claude', null);
+  assert.throws(() => A.validateRegistry({ providers: { claude: { accounts: [], preferred: 5 } } }), /preferred/);
+  A.validateRegistry({ providers: { claude: { accounts: [] } } });
+  fs.rmSync(dir, { recursive: true, force: true });
+});
