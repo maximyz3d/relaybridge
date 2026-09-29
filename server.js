@@ -6910,7 +6910,21 @@ function isNativeClaudeEntry(entry) {
 }
 function claudeGeneration(cfg, registry) {
   return crypto.createHash('sha256').update(JSON.stringify({ entries: Object.fromEntries(Object.entries(cfg)
-    .filter(([, entry]) => isNativeClaudeEntry(entry))), registry })).digest('hex');
+    .filter(([, entry]) => isNativeClaudeEntry(entry))), registry: claudeRegistryForGeneration(registry) })).digest('hex');
+}
+// The operator's active-account pin (providers[*].active, top-level activeProvider) only
+// reorders selection; it must not invalidate an in-flight launch identity or stop active runs.
+function claudeRegistryForGeneration(registry) { return providerAccounts.registryWithoutSelectionPins(registry); }
+// Exact env the CLI is launched with for this account: mirrors childEnv in the one-shot
+// path (buildEnv, then the account overlay applied last and never strippable).
+function claudeAccountEnv(entry, kind, account) {
+  return { ...buildEnv(normalizeEnvOverrides(entry.oneshot_env), entry.strip_env || []),
+    ...providerAccounts.expectedEnvForAccount({ entry, account, dataDir: DATA_DIR, kind }) };
+}
+function claudeReadConfigDir(entry, account, env) {
+  if (account.implicit) return null;
+  if (providerAccounts.credentialEnvFor(entry) !== 'CLAUDE_CONFIG_DIR') throw new Error('unsupported linked layout');
+  return env.CLAUDE_CONFIG_DIR;
 }
 function claudeEntryGeneration(entry) {
   return crypto.createHash('sha256').update(JSON.stringify(entry)).digest('hex');
@@ -6924,16 +6938,31 @@ function captureClaudeLaunchIdentity(kind, accountId, actualEnv = null, dispatch
       && claudeEntryGeneration(entry) !== dispatchSnapshot.entryGeneration)) return unavailable;
     const registry = providerAccounts.loadRegistry(DATA_DIR, { strict: true });
     const account = providerAccounts.accountsFor(kind, entry, registry).find((a) => a.id === accountId);
-    // Only the proven default layout is readable. No linked-account mkdir/probe.
-    if (entry.enabled === false || !account?.enabled || !account.implicit
+    // Linked accounts are read in place only (no mkdir, no ambient fallback).
+    if (entry.enabled === false || !account?.enabled
       || (dispatchSnapshot && account.quotaSeat !== dispatchSnapshot.quotaSeat)
       || !providerAccounts.accountIsProvisioned({ entry, account, dataDir: DATA_DIR, kind })
       || !providerAccounts.accountAuthAvailable({ entry, account, dataDir: DATA_DIR, kind })) return unavailable;
-    const expectedEnv = buildEnv(normalizeEnvOverrides(entry.oneshot_env), entry.strip_env || []);
+    const expectedEnv = claudeAccountEnv(entry, kind, account);
     const env = actualEnv || expectedEnv;
-    for (const key of ['HOME', 'USERPROFILE', 'CLAUDE_CONFIG_DIR']) if (env[key] !== expectedEnv[key]) return unavailable;
+    const guarded = new Set(['HOME', 'USERPROFILE', 'CLAUDE_CONFIG_DIR', providerAccounts.credentialEnvFor(entry),
+      ...providerAccounts.credentialAuxEnvsFor(entry)].filter(Boolean));
+    for (const key of guarded) if (env[key] !== expectedEnv[key]) return unavailable;
     const generation = claudeGeneration(cfg, registry);
-    const sample = readClaudeNativeUsage({ env, quotaSeat: account.quotaSeat });
+    const configDir = claudeReadConfigDir(entry, account, expectedEnv);
+    const sample = readClaudeNativeUsage({ env, quotaSeat: account.quotaSeat, ...(configDir ? { configDir } : {}) });
+    if (sample.identity && !account.implicit) {
+      // Two linked slots on one login would double-count a single plan.
+      for (const other of providerAccounts.accountsFor(kind, entry, registry)) {
+        if (other.id === account.id || !other.enabled) continue;
+        const otherEnv = claudeAccountEnv(entry, kind, other), otherDir = claudeReadConfigDir(entry, other, otherEnv);
+        const o = readClaudeNativeUsage({ env: otherEnv, quotaSeat: other.quotaSeat, ...(otherDir ? { configDir: otherDir } : {}) });
+        if (o.identity && o.identity.accountFingerprint === sample.identity.accountFingerprint) {
+          try { console.error(`[claude-account] same_plan_double_count account=${accountId} duplicates=${other.id}`); } catch {}
+          return unavailable;
+        }
+      }
+    }
     if (!sample.identity || generation !== claudeGeneration(loadConfig(), providerAccounts.loadRegistry(DATA_DIR, { strict: true }))) return unavailable;
     return { required: true, identity: Object.freeze({ kind, accountId, quotaSeat: account.quotaSeat,
       generation, ...sample.identity }), observation: sample.observation, cacheFetchedAt: sample.cacheFetchedAt };
@@ -6992,9 +7021,14 @@ async function probeClaudeNativeAdmission(captured, dispatchSnapshot = null) {
         const probeStat = fs.lstatSync(CLAUDE_USAGE_PROBE_DIR);
         if (!probeStat.isDirectory() || probeStat.isSymbolicLink()
           || path.resolve(fs.realpathSync(CLAUDE_USAGE_PROBE_DIR)) !== path.resolve(CLAUDE_USAGE_PROBE_DIR)) return fail('probe_dir_invalid');
-        const env = buildEnv(normalizeEnvOverrides(entry.oneshot_env), entry.strip_env || []);
+        const probeAccount = providerAccounts.accountsFor(captured.identity.kind, entry,
+          providerAccounts.loadRegistry(DATA_DIR, { strict: true })).find((a) => a.id === captured.identity.accountId);
+        if (!probeAccount) return fail('probe_identity_missing');
+        const env = claudeAccountEnv(entry, captured.identity.kind, probeAccount);
+        const configDir = claudeReadConfigDir(entry, probeAccount, env);
+        const configOpt = configDir ? { configDir } : {};
         const trusted = readClaudeNativeUsage({ env, quotaSeat: captured.identity.quotaSeat,
-          projectCwd: CLAUDE_USAGE_PROBE_DIR });
+          projectCwd: CLAUDE_USAGE_PROBE_DIR, ...configOpt });
         if (!trusted.identity || trusted.identity.accountFingerprint !== captured.identity.accountFingerprint
           || trusted.identity.profileHash !== captured.identity.profileHash) return fail('identity_mismatch_pre');
         // Same account and profile, but the probe directory has never been trusted in the
@@ -7006,7 +7040,7 @@ async function probeClaudeNativeAdmission(captured, dispatchSnapshot = null) {
         const timeoutMs = Number.isSafeInteger(settings.timeout_ms)
           ? Math.min(30000, Math.max(1000, settings.timeout_ms)) : 15000;
         const readSample = () => readClaudeNativeUsage({ env, quotaSeat: captured.identity.quotaSeat,
-          projectCwd: CLAUDE_USAGE_PROBE_DIR });
+          projectCwd: CLAUDE_USAGE_PROBE_DIR, ...configOpt });
         const result = await refreshClaudeUsageViaPty({ ptyImpl: pty, command, args, env, cwd: CLAUDE_USAGE_PROBE_DIR,
           readSample, expectedIdentity: captured.identity, baselineFetchedAt: captured.cacheFetchedAt, timeoutMs });
         if (!result.refreshed) return fail(`probe_not_refreshed:${result.reason || 'unknown'}`);
