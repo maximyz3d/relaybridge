@@ -20,10 +20,20 @@ const unsetBridgeEnv = Object.fromEntries(inheritedBridgeKeys.map((key) => [key,
 // overwrites the seed (matches continuity.integration.test.js's confirmed behavior that a
 // stale-at-boot profile never produces a store observation on its own).
 async function staleNativeFixture(t, { initialUtilization = 20, initialResetOffsetMs = 86400000,
-  probeMode = null, patchStoreSeat = null, primeStore = true, trustProbeDir = true, admitUnknownUsage = null } = {}) {
-  let profile, events, usageFile;
+  probeMode = null, patchStoreSeat = null, primeStore = true, trustProbeDir = true, admitUnknownUsage = null, linked = null, unreadableLinked = false, duplicateDefault = false } = {}) {
+  let profile, events, usageFile, linkedDir = null;
+  const seat = linked ? `claude#${linked}` : 'claude';
   const bridge = await startTestBridge(t, root => {
-    profile = path.join(root, 'native-home', '.claude.json'); events = path.join(root, 'native-events.jsonl');
+    if (linked) {
+      // Linked account: registry + credential marker + its own profile; the default
+      // account keeps a different login so the two never share a fingerprint.
+      linkedDir = path.join(root, 'data', 'accounts', 'claude', linked); fs.mkdirSync(linkedDir, { recursive: true });
+      fs.writeFileSync(path.join(linkedDir, '.credentials.json'), '{}');
+      fs.writeFileSync(path.join(root, 'data', 'accounts.json'), JSON.stringify({ providers: { claude: {
+        accounts: [{ id: 'default', enabled: true }, { id: linked, enabled: true }], active: linked } } }));
+      fs.writeFileSync(path.join(root, 'native-home', '.claude.json'), JSON.stringify({ oauthAccount: { accountUuid: duplicateDefault ? '11111111-2222-3333-4444-555555555555' : '99999999-0000-0000-0000-000000000000' } }));
+    }
+    profile = linked ? path.join(linkedDir, '.claude.json') : path.join(root, 'native-home', '.claude.json'); events = path.join(root, 'native-events.jsonl');
     usageFile = path.join(root, 'data', 'usage', 'native-usage.json');
     const probeCwd = path.join(root, 'data', 'claude-usage-probe'); fs.mkdirSync(probeCwd, { recursive: true });
     // Continuity settings are loaded once at boot (createSubscriptionUsage), so a pinned
@@ -45,21 +55,22 @@ async function staleNativeFixture(t, { initialUtilization = 20, initialResetOffs
     fs.writeFileSync(profile, JSON.stringify(initial));
     if (primeStore) {
       const nativeHome = path.join(root, 'native-home');
-      const { identity, observation } = readClaudeNativeUsage({ env: { HOME: nativeHome, USERPROFILE: nativeHome },
-        defaultHome: nativeHome, quotaSeat: 'claude' });
+      const { identity, observation } = readClaudeNativeUsage({ env: { HOME: nativeHome, USERPROFILE: nativeHome,
+        ...(linked ? { CLAUDE_CONFIG_DIR: linkedDir } : {}) }, defaultHome: nativeHome, quotaSeat: seat,
+        ...(linked ? { configDir: linkedDir } : {}) });
       const store = createSubscriptionUsage({ dataDir: path.join(root, 'data', 'usage') });
-      store.bindIdentity('claude', identity.accountFingerprint);
+      store.bindIdentity(seat, identity.accountFingerprint);
       store.observeNativeCache(observation);
       if (patchStoreSeat) {
         const raw = JSON.parse(fs.readFileSync(usageFile, 'utf8'));
-        raw.claude.observedAt -= 180001; raw.claude.seatObservedAt -= 180001;
-        for (const w of Object.values(raw.claude.buckets.account.windows)) w.observedAt -= 180001;
-        patchStoreSeat(raw.claude);
+        raw[seat].observedAt -= 180001; raw[seat].seatObservedAt -= 180001;
+        for (const w of Object.values(raw[seat].buckets.account.windows)) w.observedAt -= 180001;
+        patchStoreSeat(raw[seat]);
         fs.writeFileSync(usageFile, JSON.stringify(raw));
       } else {
         const raw = JSON.parse(fs.readFileSync(usageFile, 'utf8'));
-        raw.claude.observedAt -= 180001; raw.claude.seatObservedAt -= 180001;
-        for (const w of Object.values(raw.claude.buckets.account.windows)) w.observedAt -= 180001;
+        raw[seat].observedAt -= 180001; raw[seat].seatObservedAt -= 180001;
+        for (const w of Object.values(raw[seat].buckets.account.windows)) w.observedAt -= 180001;
         fs.writeFileSync(usageFile, JSON.stringify(raw));
       }
     }
@@ -68,8 +79,9 @@ async function staleNativeFixture(t, { initialUtilization = 20, initialResetOffs
     const stale = JSON.parse(fs.readFileSync(profile, 'utf8'));
     stale.cachedUsageUtilization.fetchedAtMs -= 180001;
     fs.writeFileSync(profile, JSON.stringify(stale));
+    if (unreadableLinked) fs.writeFileSync(profile, '{not json');
     const script = path.join(root, 'native-fixture.cjs');
-    fs.writeFileSync(script, `const fs=require('node:fs');let input='';const event=type=>fs.appendFileSync(${JSON.stringify(events)},JSON.stringify({type,at:Date.now()})+'\\n');
+    fs.writeFileSync(script, `const fs=require('node:fs');let input='';const event=type=>fs.appendFileSync(${JSON.stringify(events)},JSON.stringify({type,at:Date.now(),cfg:process.env.CLAUDE_CONFIG_DIR||null})+'\\n');
       const usage=()=>console.log(JSON.stringify({type:'rate_limit_event',rate_limit_info:{status:'allowed',unifiedWindows:{five_hour:{utilization:.2,resetsAt:${reset / 1000}},seven_day:{utilization:.2,resetsAt:${reset / 1000}}}}}));
       process.stdin.on('data',c=>input+=c);process.stdin.on('end',()=>{event('started');
         usage();console.log(JSON.stringify({type:'result',subtype:'success',is_error:false,result:'Synthetic native protocol completed.'}));event('finished');});`);
@@ -90,7 +102,7 @@ async function staleNativeFixture(t, { initialUtilization = 20, initialResetOffs
           value.oauthAccount.accountUuid=driftedUuid; value.cachedUsageUtilization.accountUuid=driftedUuid;
           value.cachedUsageUtilization.fetchedAtMs=Date.now();fs.writeFileSync(${JSON.stringify(profile)},JSON.stringify(value));}
         if(input.includes('/exit'))process.exit(0);});setInterval(()=>{},1000);`);
-    const entry = { label: 'Synthetic native Claude', npm_package: '@anthropic-ai/claude-code', credential_env: 'CLAUDE_CONFIG_DIR', quota_seat: 'claude',
+    const entry = { label: 'Synthetic native Claude', npm_package: '@anthropic-ai/claude-code', credential_env: 'CLAUDE_CONFIG_DIR', credential_markers: ['.credentials.json'], quota_seat: 'claude',
       safe: [process.execPath], probe: [process.execPath, '--version'], version_probe: [process.execPath, '--version'],
       model: 'fixture-model', model_tiers: { standard: { model: 'fixture-model', args: ['--model', 'fixture-model'] } },
       oneshot_safe: [process.execPath, script, '--model', 'fixture-model'], oneshot_output_parser: 'claude_json',
@@ -337,5 +349,46 @@ test('an account that drifts during the probe round-trip rejects with no spawn',
   assert.equal(reply.body.failureClass, 'quota_unknown', JSON.stringify(reply.body));
   assert.ok(reply.body.probe_reason, JSON.stringify(reply.body));
   assert.equal(reply.body.model_invocation, false);
+  assert.equal(completeJsonLines(bridge.events).filter(e => e.type === 'started').length, 0);
+});
+
+// Linked Claude accounts: acct2 dispatches through the same native admission path as the default.
+test('a pinned linked Claude account dispatches with its own launch env and admits on its own seat', async t => {
+  const bridge = await staleNativeFixture(t, { probeMode: 'fail', linked: 'acct2' });
+  const reply = await bridge.ask();
+  assert.equal(reply.status, 200, JSON.stringify(reply.body));
+  assert.equal(reply.body.model_invocation, true);
+  assert.equal(reply.body.route.account, 'acct2', JSON.stringify(reply.body.route));
+  assert.equal(reply.body.route.quota_seat, 'claude#acct2');
+  const started = completeJsonLines(bridge.events).filter(e => e.type === 'started');
+  assert.equal(started.length, 1);
+  assert.equal(started[0].cfg, path.join(bridge.root, 'data', 'accounts', 'claude', 'acct2'));
+  assert.equal(completeJsonLines(bridge.events).filter(e => e.type === 'usage_probe').length, 1);
+});
+
+test('a linked Claude account with an unreadable identity still refuses with 409 and never spawns', async t => {
+  const bridge = await staleNativeFixture(t, { probeMode: 'fail', linked: 'acct2', unreadableLinked: true, primeStore: false });
+  const reply = await bridge.ask();
+  assert.equal(reply.status, 409, JSON.stringify(reply.body));
+  assert.equal(reply.body.failureClass, 'account_identity_unavailable', JSON.stringify(reply.body));
+  assert.equal(reply.body.model_invocation, false);
+  assert.equal(completeJsonLines(bridge.events).filter(e => e.type === 'started').length, 0);
+});
+
+test('a linked Claude account without probe-dir trust rejects as probe_dir_untrusted and never stale-admits', async t => {
+  const bridge = await staleNativeFixture(t, { probeMode: 'fail', linked: 'acct2', trustProbeDir: false, primeStore: false, admitUnknownUsage: false });
+  const reply = await bridge.ask();
+  assert.equal(reply.status, 409, JSON.stringify(reply.body));
+  assert.equal(reply.body.failureClass, 'quota_unknown', JSON.stringify(reply.body));
+  assert.equal(reply.body.probe_reason, 'probe_dir_untrusted', JSON.stringify(reply.body));
+  assert.equal(reply.body.model_invocation, false);
+  assert.equal(completeJsonLines(bridge.events).filter(e => e.type === 'started').length, 0);
+});
+
+test('a linked Claude account on the same login as another enabled account is refused as a double-counted plan', async t => {
+  const bridge = await staleNativeFixture(t, { probeMode: 'fail', linked: 'acct2', duplicateDefault: true });
+  const reply = await bridge.ask();
+  assert.equal(reply.status, 409, JSON.stringify(reply.body));
+  assert.equal(reply.body.failureClass, 'account_identity_unavailable', JSON.stringify(reply.body));
   assert.equal(completeJsonLines(bridge.events).filter(e => e.type === 'started').length, 0);
 });

@@ -365,3 +365,41 @@ test('provider paths and sign-in instructions are portable and safely quoted', (
   );
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+function seedClaude(dir, ids) {
+  for (const id of ids) {
+    fs.mkdirSync(path.join(dir, 'accounts', 'claude', id), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'accounts', 'claude', id, '.credentials.json'), '{}');
+  }
+}
+
+test('expectedEnvForAccount matches envForAccount without creating a directory', () => {
+  const dir = tmp();
+  A.addAccount(dir, 'claude', { id: 'acct2' });
+  const account = A.accountsFor('claude', CLAUDE, A.loadRegistry(dir)).find((a) => a.id === 'acct2');
+  const expected = A.expectedEnvForAccount({ entry: CLAUDE, account, dataDir: dir, kind: 'claude' });
+  assert.equal(fs.existsSync(path.join(dir, 'accounts', 'claude', 'acct2')), false);
+  assert.deepEqual(A.envForAccount({ entry: CLAUDE, account, dataDir: dir, kind: 'claude' }), expected);
+  assert.equal(fs.existsSync(path.join(dir, 'accounts', 'claude', 'acct2')), true);
+  const implicit = A.accountsFor('claude', CLAUDE, A.loadRegistry(dir)).find((a) => a.id === 'default');
+  assert.deepEqual(A.expectedEnvForAccount({ entry: CLAUDE, account: implicit, dataDir: dir, kind: 'claude' }), {});
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('a swap (account and provider pins) does not change the registry hashed for Claude run identity', () => {
+  const dir = tmp();
+  A.addAccount(dir, 'claude', { id: 'acct2' });
+  const hashed = () => JSON.stringify(A.registryWithoutSelectionPins(A.loadRegistry(dir)));
+  const before = hashed();
+  A.swapSeat(dir, { kind: 'claude', accountId: 'acct2', entry: CLAUDE });
+  const pinned = A.loadRegistry(dir);
+  assert.equal(pinned.providers.claude.active, 'acct2');
+  assert.equal(pinned.activeProvider, 'claude');
+  assert.equal(hashed(), before, 'pins are ignored');
+  A.swapSeat(dir, { kind: 'claude', accountId: 'default', entry: CLAUDE });
+  assert.equal(hashed(), before);
+  // A real identity change (disabling the account) still changes the hash.
+  A.setAccountEnabled(dir, 'claude', 'acct2', false);
+  assert.notEqual(hashed(), before);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
