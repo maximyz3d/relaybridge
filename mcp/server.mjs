@@ -3556,6 +3556,21 @@ export function buildServer() {
     },
   ))));
 
+  server.registerTool('start_pipeline_implementation', {
+    title: 'Start the managed Claude implementation writer',
+    description: 'From an accepted plan in a full-permission workflow, queue one Claude initial writer under the exclusive workspace lease. Complex/critical writers request heavy/high; other writers request standard/medium. This is not per-file filesystem confinement. Fable is never a writer.',
+    inputSchema: z.object({
+      runId: workflowIdSchema,
+      leaseMs: z.number().int().min(60000).max(86400000).optional(),
+    }).strict(),
+    annotations: DESTRUCTIVE,
+  }, safeHandler(async ({ runId, leaseMs }, context) => result(await bridgeRequest(
+    `/api/workflows/${encodeURIComponent(runId)}/implementation/start`, {
+      method: 'POST', body: { ...(leaseMs === undefined ? {} : { leaseMs }) },
+      signal: context?.mcpReq?.signal, actionIdentity: true,
+    },
+  ))));
+
   server.registerTool('complete_pipeline_implementation', {
     title: 'Complete Codex implementation and dispatch review',
     description: 'Release Codex\'s writer lease, store exact changed-file and verification evidence, and queue one fresh read-only review using the persisted profile.',
@@ -3575,7 +3590,7 @@ export function buildServer() {
 
   server.registerTool('start_pipeline_revision', {
     title: 'Transfer the writer lease to Claude revision',
-    description: 'For accepted review findings in a full-permission workflow, queue one bounded Sonnet revision as the exclusive writer. Fable is never a writer.',
+    description: 'For accepted review findings in a full-permission workflow, queue one Claude revision as the exclusive writer. Complex/critical writers request heavy/high; other writers request standard/medium. Fable is never a writer.',
     inputSchema: z.object({
       runId: workflowIdSchema,
       leaseMs: z.number().int().min(60000).max(86400000).optional(),

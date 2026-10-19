@@ -258,7 +258,9 @@ test('MCP missing-exit diagnostic is bounded and names the failing shape', () =>
 });
 
 test('MCP stdio exposes resources, safe tools, routing, and provider receipts', {
-  timeout: process.platform === 'win32' ? 120000 : 30000,
+  // This aggregate now includes durable managed-workflow admission fixtures.
+  // Use the existing Windows allowance on POSIX too; no provider budget changes.
+  timeout: 120000,
 }, async (t) => {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ps-bridge-mcp-test-'));
   const tokenPath = path.join(tempRoot, 'capability.token');
@@ -537,7 +539,7 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
     'ask_provider', 'route_and_ask', 'run_committee', 'get_receipt',
     'restart_bridge', 'list_agents', 'set_agent_tags', 'broadcast',
     'start_codex_claude_pipeline', 'list_pipelines', 'get_pipeline', 'reconcile_pipeline',
-    'submit_pipeline_research', 'claim_pipeline_implementation',
+    'submit_pipeline_research', 'claim_pipeline_implementation', 'start_pipeline_implementation',
     'complete_pipeline_implementation', 'start_pipeline_revision',
     'claim_pipeline_revision', 'complete_pipeline_revision',
     'start_pipeline_final_review', 'retry_failed_pipeline_provider',
@@ -761,6 +763,81 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
 
   const capability = await (await fetch(`${baseUrl}/api/capability`)).json();
   const collabHeaders = { 'X-PS-Bridge-Token': capability.token, 'Content-Type': 'application/json' };
+  // Isolated protocol fixtures: these plans are test data, not live Claude authority.
+  const managedTool = listedTools.tools.find((tool) => tool.name === 'start_pipeline_implementation');
+  assert.equal(managedTool.annotations.destructiveHint, true);
+  assert.equal(managedTool.inputSchema.additionalProperties, false);
+  assert.deepEqual(Object.keys(managedTool.inputSchema.properties).sort(), ['leaseMs', 'runId']);
+  const managedHeaders = { ...collabHeaders, 'X-RelayBridge-Client': 'mcp',
+    'X-RelayBridge-Expected-Build-Id': healthPayload.buildId,
+    'X-RelayBridge-Expected-Receipt-Store-Id': healthPayload.receiptStoreId };
+  function managedFixture(extra = {}) {
+    const run = durablePipeline.createWorkflow({ cwd: allowedRootB, objective: 'Managed initial protocol fixture.',
+      acceptance: 'Exact admission, never live qualification.', permissionMode: 'full', ...extra });
+    durablePipeline.completeResearch(run.runId, { markdown: 'Fixture research.' });
+    durablePipeline.startPlanning(run.runId);
+    durablePipeline.completePlanning(run.runId, { markdown: 'Fixture plan.' });
+    return run;
+  }
+  async function managedPost(runId, body, headers = managedHeaders) {
+    return fetch(`${baseUrl}/api/workflows/${runId}/implementation/start`, {
+      method: 'POST', headers, body: JSON.stringify(body) });
+  }
+  const managedRun = managedFixture();
+  for (const [extra, body, code, status] of [
+    [{ permissionMode: 'safe' }, {}, 'FULL_PERMISSION_REQUIRED', 409],
+    [{ profile: 'codex-astra-ultra' }, {}, 'INVALID_WRITER_MODE', 400],
+    [{}, { actor: 'codex' }, 'PROVIDER_RESTRICTION', 409],
+    [{}, { ownedLease: true }, 'INVALID_ARGUMENT', 400],
+    [{}, { model: 'opus' }, 'INVALID_ARGUMENT', 400],
+    [{}, { allowedWritePaths: ['lib/example.js'] }, 'filesystem_contract_unsupported', 409],
+    [{}, { allowedWritePaths: ['../escape'] }, 'invalid_write_contract', 400],
+  ]) {
+    const run = Object.keys(extra).length ? managedFixture(extra) : managedRun;
+    const before = durablePipeline.get(run.runId);
+    const response = await managedPost(run.runId, body);
+    assert.equal(response.status, status);
+    assert.equal((await response.json()).code, code);
+    assert.deepEqual(durablePipeline.get(run.runId), before);
+    if (Object.keys(body).length === 0) {
+      const denied = await client.callTool({ name: 'start_pipeline_implementation', arguments: { runId: run.runId } });
+      assert.equal(denied.isError, true);
+      assert.ok(JSON.stringify(denied).includes(code));
+    }
+    if (run !== managedRun) durablePipeline.cancel(run.runId, { reason: 'Protocol negative fixture complete.' });
+  }
+  const noIdentity = await managedPost(managedRun.runId, {}, { ...collabHeaders, 'X-RelayBridge-Client': 'mcp' });
+  assert.equal(noIdentity.status, 409);
+  assert.equal((await noIdentity.json()).failureClass, 'bridge_identity_mismatch');
+  for (const extra of [{ allowedWritePaths: ['lib/example.js'] }, { unknown: true }]) {
+    const before = durablePipeline.get(managedRun.runId);
+    const refused = await client.callTool({ name: 'start_pipeline_implementation', arguments: { runId: managedRun.runId, ...extra } });
+    assert.equal(refused.isError, true, 'strict MCP schema rejects before REST dispatch');
+    assert.deepEqual(durablePipeline.get(managedRun.runId), before);
+  }
+  // The existing fake CLI exits 9; admission is positive, completion must refuse.
+  const managedResponse = await managedPost(managedRun.runId, { leaseMs: 60000 });
+  assert.equal(managedResponse.status, 202);
+  const managedStarted = await managedResponse.json();
+  assert.equal(managedStarted.workflow.phase, 'implementing');
+  assert.equal(managedStarted.workflow.writerLease.mode, 'provider');
+  assert.equal(managedStarted.task.user, 'claude-implementer');
+  assert.ok(!JSON.stringify(managedStarted).includes('"leaseToken":'));
+  let managedTerminal;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    managedTerminal = await client.callTool({ name: 'get_task', arguments: { id: managedStarted.task.id } });
+    if (['done', 'failed', 'cancelled', 'interrupted'].includes(managedTerminal.structuredContent?.task?.status
+      || managedTerminal.structuredContent?.status)) break;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  const managedReconciled = await client.callTool({ name: 'reconcile_pipeline', arguments: { runId: managedRun.runId } });
+  assert.equal(managedReconciled.structuredContent.workflow.phase, 'failed');
+  assert.equal(managedReconciled.structuredContent.workflow.writerLease, null);
+  const externalRun = managedFixture();
+  const externalClaim = await client.callTool({ name: 'claim_pipeline_implementation', arguments: { runId: externalRun.runId } });
+  assert.equal(externalClaim.structuredContent.workflow.providerTask, null);
+  assert.match(externalClaim.structuredContent.lease.leaseToken, /^[a-f0-9]{64}$/);
+  durablePipeline.cancel(externalRun.runId, { leaseToken: externalClaim.structuredContent.lease.leaseToken, reason: 'External fixture complete.' });
   const oldMcpResponse = await fetch(`${baseUrl}/api/oneshot`, {
     method: 'POST',
     headers: {
@@ -1639,7 +1716,8 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   const cancelledOuterReceipt = receipts.structuredContent.receipts.find((receipt) =>
     receipt.receiptId === cancelledTransportReceipt.outerReceiptId);
   assert.ok(cancelledOuterReceipt, 'late transport receipt must reconcile into one linked outer receipt');
-  assert.equal(cancelledOuterReceipt.transportReceiptId, cancelledTransportReceipt.receiptId);
+  assert.equal(cancelledOuterReceipt.transportReceiptId, cancelledTransportReceipt.receiptId,
+    `cancelled receipt join: ${JSON.stringify({ outer: cancelledOuterReceipt, transport: cancelledTransportReceipt })}`);
   assert.equal(cancelledOuterReceipt.failureClass, 'client_cancelled');
   assert.equal(cancelledOuterReceipt.stopReason, 'client_cancelled');
   assert.equal(cancelledOuterReceipt.modelInvocation, true);

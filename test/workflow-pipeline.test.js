@@ -143,6 +143,7 @@ test('exports the closed phase graph and validates review/revision gates through
     'revision_ready', 'final_reviewing', 'complete',
   ]);
   assert.ok(TRANSITIONS.review_ready.includes('final_reviewing'));
+  assert.equal(PROVIDER_TASK_PHASES.implementing, 'implementation');
   assert.equal(created.taskTier, 'complex');
   assert.equal(created.permissionMode, 'full');
   assert.deepEqual(created.providerPreferences.planning, ['claude_fable', 'claude']);
@@ -656,3 +657,98 @@ test('strict IDs, routing values, missing gets, and symlink storage escapes fail
   throwsCode(() => pipeline.get(evilId), 'PATH_ESCAPE');
   assert.equal(pipeline.list().some((row) => row.runId === evilId), false);
 });
+
+for (const historical of [false, true]) {
+  test(`initial ${historical ? 'modeless historical' : 'external'} lease rejects provider binding and orphan release`, (t) => {
+    const { pipeline, restart, cwd, dataDir } = fixture(t);
+    const id = 'wf_initial_123456789abc';
+    advanceToPlanReady(pipeline, cwd, id);
+    pipeline.startImplementation(id);
+    const file = path.join(dataDir, 'workflows', id, 'state.json');
+    if (historical) {
+      const state = JSON.parse(fs.readFileSync(file, 'utf8'));
+      state.schemaVersion = 1; delete state.profile; delete state.phasePolicy; delete state.writerLease.mode;
+      fs.writeFileSync(file, JSON.stringify(state));
+    }
+    const restored = restart(), before = fs.readFileSync(file);
+    throwsCode(() => restored.bindProviderTask(id, { actor: 'codex', provider: 'claude', taskId: 't_initial', purpose: 'implementation' }), 'INVALID_WRITER_MODE');
+    for (const action of ['failOrphanedImplementation', 'cancelOrphanedImplementation']) {
+      throwsCode(() => restored[action](id, { actor: 'codex' }), 'WRITER_EXECUTION_UNCERTAIN');
+    }
+    assert.deepEqual(fs.readFileSync(file), before);
+  });
+}
+
+test('initial bound writer verifies actor, task, token, expiry and exact lock ownership after restart', (t) => {
+  const { pipeline, restart, cwd, clock, dataDir } = fixture(t);
+  const id = 'wf_initial_223456789abc', actor = 'claude-implementer', taskId = 't_initial';
+  advanceToPlanReady(pipeline, cwd, id);
+  const started = pipeline.startImplementation(id, { actor, mode: 'provider', leaseMs: 1000 });
+  throwsCode(() => pipeline.bindProviderTask(id, { actor: 'intruder', provider: 'claude', taskId, purpose: 'implementation' }), 'PROVIDER_TASK_MISMATCH');
+  pipeline.bindProviderTask(id, { actor, provider: 'claude', taskId, purpose: 'implementation' });
+  const restored = restart();
+  throwsCode(() => restored.completeBoundImplementation(id, { actor, taskId: 't_wrong', markdown: 'No.' }), 'PROVIDER_TASK_MISMATCH');
+  throwsCode(() => restored.completeImplementation(id, { actor, leaseToken: '0'.repeat(64), markdown: 'No.' }), 'LEASE_MISMATCH');
+  throwsCode(() => restored.failOrphanedImplementation(id, { actor }), 'PROVIDER_TASK_ACTIVE');
+  const locks = path.join(dataDir, 'writer-locks'), lock = path.join(locks, fs.readdirSync(locks)[0]);
+  const original = fs.readFileSync(lock);
+  const replacement = JSON.parse(original); replacement.leaseToken = 'f'.repeat(64);
+  fs.writeFileSync(lock, JSON.stringify(replacement));
+  const replacedBytes = fs.readFileSync(lock);
+  throwsCode(() => restored.completeBoundImplementation(id, { actor, taskId, markdown: 'No.' }), 'LEASE_MISMATCH');
+  throwsCode(() => restored.failBoundWriterTask(id, { actor, taskId }), 'LEASE_MISMATCH');
+  assert.deepEqual(fs.readFileSync(lock), replacedBytes);
+  fs.writeFileSync(lock, original);
+  const contender = 'wf_initial_323456789abc';
+  advanceToPlanReady(restored, cwd, contender);
+  throwsCode(() => restored.startImplementation(contender), 'WRITER_CONFLICT');
+  throwsCode(() => restored.startImplementation(contender, { actor, mode: 'provider' }), 'WRITER_CONFLICT');
+  clock.value += 500;
+  const renewal = restored.renewBoundWriterLease(id, { actor, taskId, leaseMs: 1000 });
+  assert.equal(renewal.lease.leaseToken, undefined);
+  assert.equal(renewal.workflow.writerLease.expiresAt, clock.value + 1000);
+  clock.value += 1001;
+  throwsCode(() => restored.completeBoundImplementation(id, { actor, taskId, markdown: 'Late.' }), 'LEASE_EXPIRED');
+  // Expired completion is forbidden; a proven terminal recovery may release it.
+  const failed = restored.failBoundWriterTask(id, { actor, taskId, reason: 'Fixture proved termination.' });
+  assert.equal(failed.phase, 'failed');
+  assert.equal(failed.providerTaskHistory.at(-1).outcome, 'failed');
+  assert.equal(failed.history.at(-1).event, 'bound_writer_task_failed');
+  assert.deepEqual(fs.readdirSync(locks), []);
+  assert.equal(started.workflow.writerLease.mode, 'provider');
+});
+
+test('bound initial completion archives its exact task and releases the matching lock', (t) => {
+  const { pipeline, restart, cwd, dataDir } = fixture(t);
+  const id = 'wf_initial_423456789abc', actor = 'claude-implementer', taskId = 't_initial';
+  advanceToPlanReady(pipeline, cwd, id);
+  pipeline.startImplementation(id, { actor, mode: 'provider' });
+  pipeline.bindProviderTask(id, { actor, taskId, provider: 'claude', purpose: 'implementation' });
+  const restored = restart();
+  const done = restored.completeBoundImplementation(id, { actor, taskId, markdown: 'Changed files; real fixture results.' });
+  assert.equal(done.phase, 'implementation_ready');
+  assert.equal(done.writerLease, null);
+  assert.equal(done.providerTask, null);
+  assert.equal(done.providerTaskHistory.at(-1).taskId, taskId);
+  assert.equal(done.providerTaskHistory.at(-1).outcome, 'completed');
+  assert.equal(restored.readArtifact(id, 'implementation').content, 'Changed files; real fixture results.');
+  assert.deepEqual(fs.readdirSync(path.join(dataDir, 'writer-locks')), []);
+});
+
+for (const status of ['failed', 'cancelled']) {
+  test(`orphaned initial ${status} recovery is phase-specific and idempotently terminal`, (t) => {
+    const { pipeline, restart, cwd } = fixture(t);
+    const id = 'wf_initial_523456789abc', actor = 'claude-implementer';
+    advanceToPlanReady(pipeline, cwd, id);
+    pipeline.startImplementation(id, { actor, mode: 'provider' });
+    const restored = restart();
+    throwsCode(() => restored.failOrphanedRevision(id, { actor }), 'INVALID_TRANSITION');
+    const action = status === 'failed' ? 'failOrphanedImplementation' : 'cancelOrphanedImplementation';
+    const done = restored[action](id, { actor, reason: 'No task ever bound.' });
+    assert.equal(done.phase, status);
+    assert.equal(done.writerLease, null);
+    assert.equal(done.history.at(-1).event, `orphaned_implementation_${status}`);
+    assert.deepEqual(restart().get(id), done);
+    throwsCode(() => restored[action](id, { actor }), 'INVALID_TRANSITION');
+  });
+}

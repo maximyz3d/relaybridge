@@ -37,8 +37,50 @@ controller recovery.
 
 The default `codex-claude` profile makes Codex the user-facing orchestrator and primary implementation
 writer. Claude contributes a fresh read-only plan, fresh initial and final
-read-only reviews, and a bounded Sonnet revision when a review requests changes,
+read-only reviews, and a bounded Claude revision when a review requests changes,
 after an explicit writer-lease transfer.
+
+An explicit alternative, `start_pipeline_implementation`, dispatches the initial
+Claude writer from a genuine `plan_ready` workflow. It does not claim that an
+implementation already exists. The default `claim_pipeline_implementation`
+remains an external claim: it returns a lease and launches no provider.
+Like the other workflow authority tools, `start_pipeline_implementation` is
+local-only: neither remote MCP profile advertises it or accepts a direct call.
+
+The managed action requires a workflow created with full permission and the
+existing filesystem-write acknowledgement, an intact plan and brief, an
+available Claude dangerous slot, the original implementation provider policy,
+and an exclusive canonical-workspace lease. MCP accepts only `runId` and optional
+integer `leaseMs` (60,000–86,400,000); REST accepts `leaseMs` and optional
+`actor:"claude"`. Unsupported selectors, owned execution and declared
+`allowedWritePaths` refuse before writer dispatch. The Codex-only profile
+continues to require its external writer.
+
+The managed actor is `claude-implementer`, with provider ownership persisted
+before the task is made runnable. The start response contains workflow, task
+and dispatch metadata, never the lease token. Reconcile the task rather than
+calling external completion or renewal. Its heartbeat renews the bound lease.
+Only a complete terminal result ending with `IMPLEMENTATION_STATUS: COMPLETE`
+can install implementation evidence and dispatch one fresh independent review.
+`BLOCKED`, incomplete evidence and failures give no approval and never retry a
+writer automatically. Missing or uncertain task termination keeps the workspace
+held; historical and external leases cannot be released by orphan recovery.
+
+`cancel_pipeline` is not a force-release operation for a bound managed writer.
+A missing or uncertain task refuses with `WRITER_EXECUTION_UNCERTAIN`; a task
+still marked running refuses with `WRITER_TASK_RUNNING`. Lease expiry and a
+bridge restart do not supply termination evidence or authorize a replacement
+writer. Settlement needs affirmative execution evidence for the exact bound
+task. The orphan-cancel route applies only to an explicitly provider-owned
+lease with no durable task binding, not a missing record for a bound task.
+Historically ambiguous ownership stays held; retained advisor and revision
+terminal records keep their existing compatibility handling.
+
+This is a cooperative managed workspace lease and full-permission execution,
+not per-file filesystem confinement or a qualified owned-process backend. The
+declared file scope remains the writer's instruction, not an OS write sandbox.
+Existing owned-execution and write-contract refusals and uncertain reservations
+remain in effect. This change neither clears legacy holds nor installs a runtime.
 
 ## Install
 
@@ -185,10 +227,12 @@ Use the MCP workflow in this order:
    failure still fail closed.
 4. After accepting the Claude plan, call `claim_pipeline_implementation`.
    Codex is now the only writer. Use `renew_pipeline_writer_lease` before an
-   active lease expires.
+   active lease expires. Alternatively, explicitly dispatch the managed Claude
+   initial writer with `start_pipeline_implementation`, then reconcile its task.
 5. Call `complete_pipeline_implementation` with the resulting revision, exact
    changed-file list, and verification evidence. The lease must be released
-   before review starts.
+   before review starts. A managed initial writer reaches review through its
+   terminal completion marker and reconciliation, not external completion.
 6. Review in a fresh Sonnet read-only session. If it requests changes, call
    `start_pipeline_revision`; only the `pipeline-reviser` may hold that writer
    lease, and only for those accepted findings.
@@ -231,7 +275,8 @@ status client cannot spend provider quota.
 | `start_codex_claude_pipeline` | `POST /api/workflows` | Create one `scoping` workflow after the duplicate check. |
 | `submit_pipeline_research` | `POST /api/workflows/:runId/research` | `scoping` → queued `planning` through the internal `research_ready` gate. |
 | `claim_pipeline_implementation` | `POST /api/workflows/:runId/implementation/claim` | `plan_ready` → `implementing`; return the exclusive lease token. |
-| `renew_pipeline_writer_lease` | `POST /api/workflows/:runId/lease/renew` | Extend the live Codex implementation lease; ownership does not change. |
+| `start_pipeline_implementation` | `POST /api/workflows/:runId/implementation/start` | Full+ack `plan_ready` → exclusive managed Claude `implementing`; return 202 workflow/task/dispatch, no lease token. |
+| `renew_pipeline_writer_lease` | `POST /api/workflows/:runId/lease/renew` | Extend a live external writer lease; managed providers renew through their bound task. |
 | `complete_pipeline_implementation` | `POST /api/workflows/:runId/implementation/complete` | Valid lease: release it and queue `reviewing` through `implementation_ready`. |
 | `start_pipeline_revision` | `POST /api/workflows/:runId/revision/start` | `review_ready` with requested changes and a full+ack workflow → exclusive Claude `revising`. |
 | `start_pipeline_final_review` | `POST /api/workflows/:runId/final-review/start` | Approved `review_ready`, or `revision_ready`, → fresh `final_reviewing`; result is `complete` or returns to `review_ready`. |
@@ -284,14 +329,18 @@ confirmed the former provider process is gone. Writer tasks are never retried.
 | Complex plan | Claude planner | Opus / high | read-only |
 | Hardest plan | Claude planner | Fable heavy tier / high | read-only |
 | Implementation | primary Codex | routed Codex tier | single writer lease |
+| Explicit managed initial implementation | Claude implementer | complex/critical: heavy/high; otherwise standard/medium | single writer lease, full permission |
 | Initial review | Claude reviewer | Sonnet / high | read-only, fresh session |
-| Accepted revision | Claude reviser | Sonnet / medium | single writer lease |
+| Accepted revision | Claude reviser | complex/critical: heavy/high; otherwise standard/medium | single writer lease |
 | Final review | Claude final reviewer | Sonnet / high | read-only, fresh session |
 | Supplementary verification | Codex verifier | Terra / high | read-only |
 
 Fable intentionally has no dangerous provider slot. All Claude writes use
-`kind=claude`, whose baseline writer is Sonnet/medium, so the receipt and route
-metadata identify the model family actually invoked. Model tiers remain
+`kind=claude`. Initial and revision writers request heavy/high for complex or
+critical work and standard/medium for utility, deterministic and standard work.
+The configured Claude tier maps heavy to Opus and standard to Sonnet. A fixture
+assertion proves the requested tuple; only a real provider receipt can establish
+the observed model identity. Model tiers remain
 operator-selectable for safe work. Claude aliases float; pin a full model ID in
 CI when reproducibility is more important than automatic upgrades. See
 [Claude model configuration](https://code.claude.com/docs/en/model-config) and
@@ -336,9 +385,13 @@ The Claude writer deliberately omits `--restricted`, exposes only
 --model sonnet --effort medium --dangerously-skip-permissions
 ```
 
+The baseline slot above is rewritten by the selected model tier and effort.
 It can modify the checkout and execute Bash, so it is eligible only after an
-explicit full+ack workflow creation, an accepted review finding, and
-writer-lease transfer. Run it in an isolated trusted environment.
+explicit full+ack workflow creation and writer-lease transfer: an accepted plan
+for initial implementation, or accepted review findings for revision. Run it
+in an isolated trusted environment. Root must deploy client and server together
+at an idle boundary and assess rollback against persisted managed states;
+fixture success does not prove an installed runtime or live writer result.
 
 Safe Codex one-shots use:
 

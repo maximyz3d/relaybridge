@@ -6335,7 +6335,7 @@ const WORKFLOW_CONFLICT_CODES = new Set([
   'LEASE_EXPIRED', 'LEASE_NOT_REQUIRED', 'REVISION_NOT_REQUESTED',
   'REVISION_REQUIRED', 'PROVIDER_TASK_ACTIVE', 'PROVIDER_TASK_MISMATCH',
   'PROVIDER_TASK_REUSED', 'PROVIDER_RETRY_MISMATCH', 'PROVIDER_RETRY_EXHAUSTED',
-  'PROVIDER_RETRY_NOT_ALLOWED', 'FULL_PERMISSION_REQUIRED',
+  'PROVIDER_RETRY_NOT_ALLOWED', 'FULL_PERMISSION_REQUIRED', 'PROVIDER_RESTRICTION', 'filesystem_contract_unsupported',
   'WRITER_EXECUTION_UNCERTAIN', 'EXECUTION_TERMINATION_REQUIRED',
 ]);
 
@@ -6345,8 +6345,8 @@ function sendWorkflowError(res, error) {
     : WORKFLOW_CONFLICT_CODES.has(code) ? 409
       : code === 'ARTIFACT_TOO_LARGE' ? 413
         : code === 'ARTIFACT_TRUNCATED' ? 409
-      : code === 'PROVIDER_UNAVAILABLE' ? 503
-        : code.startsWith('INVALID_') || code === 'PATH_ESCAPE' ? 400 : 500;
+      : code === 'PROVIDER_UNAVAILABLE' || code === 'OWNER_BACKEND_UNAVAILABLE' ? 503
+        : code.startsWith('INVALID_') || code === 'invalid_write_contract' || code === 'PATH_ESCAPE' ? 400 : 500;
   return res.status(status).json({
     ok: false,
     code,
@@ -6450,6 +6450,14 @@ app.post('/api/workflows/:runId/research', (req, res) => {
 app.post('/api/workflows/:runId/implementation/claim', (req, res) => {
   try { res.json(workflowController.startImplementation(req.params.runId, req.body || {})); }
   catch (error) { sendWorkflowError(res, error); }
+});
+
+app.post('/api/workflows/:runId/implementation/start', (req, res) => {
+  try {
+    const body = req.body || {};
+    validateWorkspaceWriteContract(body);
+    res.status(202).json(workflowController.startManagedImplementation(req.params.runId, body));
+  } catch (error) { sendWorkflowError(res, error); }
 });
 
 app.post('/api/workflows/:runId/implementation/complete', (req, res) => {

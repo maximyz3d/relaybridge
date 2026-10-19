@@ -149,7 +149,7 @@ test(`the ${profile} endpoint authenticates MCP and excludes local workflow auth
 
   // Name these independently of the denylist: iterating the policy itself
   // cannot catch a newly registered tool that was accidentally omitted.
-  for (const name of ['claim_pipeline_revision', 'complete_pipeline_revision']) {
+  for (const name of ['start_pipeline_implementation', 'claim_pipeline_revision', 'complete_pipeline_revision']) {
     assert.equal(names.has(name), false, `${name} must NOT be advertised in ${profile}`);
     const called = await fetch(url, { method: 'POST', headers: H2,
       body: JSON.stringify({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name, arguments: {} } }) });
