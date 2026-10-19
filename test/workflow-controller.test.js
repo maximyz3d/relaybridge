@@ -1143,3 +1143,405 @@ test('initial bound-before-submit crash remains held and a restarted running tas
   f.clock.value += 30000; t.mock.timers.tick(30000);
   assert.ok(f.pipeline.get(run.runId).writerLease.expiresAt > original);
 });
+
+function canonicalEvidenceJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalEvidenceJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalEvidenceJson(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function modelUnavailableEvidence(task) {
+  return {
+    kind: 'bridge_claude_model_unavailable', version: 1, source: 'claude_json_stream', provider: 'claude_fable',
+    selectedModel: 'fable', selectedModelSource: 'bridge_dispatch', vendorModelEcho: null,
+    requestId: task.id, invocationId: task.id, attemptId: `${task.id}:attempt:1`,
+    retryEvents: [{ line: 2, eventIdHash: 'b'.repeat(64), attempt: 1, errorStatus: 404, error: 'model_not_found' }],
+    terminal: { line: 3, hash: 'c'.repeat(64), subtype: 'error_during_execution', apiErrorStatus: 404, terminalReason: 'model_error' },
+    streamHash: 'd'.repeat(64), streamLines: 3,
+  };
+}
+
+// Mirrors the queue's settled shape for a launched Fable CLI that ended with
+// Bridge-owned model_unavailable evidence. `mutate` breaks one join at a time.
+function settleModelUnavailable(f, task, mutate = () => {}) {
+  const receiptId = `rcpt_test_${task.id.replace(/[^a-z0-9]/gi, '')}`;
+  f.finish(task, '', 'failed', {
+    error: 'provider returned no successful result (model_unavailable)',
+    failureClass: 'model_unavailable',
+    receiptId,
+    execution: { state: 'settled', settledAt: f.clock.value, receiptId },
+    stopReason: null,
+    partialCheckpoint: '',
+    route: {
+      provider: 'claude_fable', requested_model: 'fable', resolved_outgoing_model: 'fable', model_flag_sent: true,
+      observed_model: null, request_id: task.id, invocation_id: task.id, attempt_id: `${task.id}:attempt:1`,
+    },
+    flags: {
+      cancelled: false, rate_limited: false, budget_exceeded: false, auth_failed: false, timed_out: false,
+      dropped_out: true, permission_denied: false, partial_result: false,
+    },
+    providerMetadata: {
+      receiptPersisted: true, model_invocation: true, physical_attempt_count: 1,
+      provider_api_error_status: 404, provider_terminal_reason: 'model_error',
+      provider_action_required: modelUnavailableEvidence(task),
+      provider_permission_denials: { retained: [], count: 0, observed: 0, invalid: 0, truncated: false, byTool: {} },
+    },
+    retryAt: null,
+    retryAfterSec: null,
+  });
+  mutate(f.tasks.get(task.id));
+  return f.tasks.get(task.id);
+}
+
+function startFablePlanning(f, input) {
+  const created = f.controller.create(input);
+  const planning = f.controller.submitResearch(created.runId, { markdown: 'Research evidence.' });
+  assert.equal(planning.task.kind, 'claude_fable');
+  return { created, planning };
+}
+
+function restartedController(t, f) {
+  const controller = createWorkflowController({
+    pipeline: createWorkflowPipeline({ dataDir: f.dataDir, now: () => f.clock.value }),
+    taskQueue: f.taskQueue, loadConfig: () => f.config, now: () => f.clock.value,
+  });
+  t.after(() => controller.shutdown());
+  return controller;
+}
+
+const claudeTasks = (f) => [...f.tasks.values()].filter((task) => task.kind === 'claude');
+
+for (const [label, input, modelTier, effort] of [
+  ['complex with Fable preferred', (cwd) => ({ ...createInput(cwd, 'complex'), providerPreferences: { planning: ['claude_fable'] } }), 'heavy', 'high'],
+  ['critical default', (cwd) => createInput(cwd, 'critical'), 'heavy', 'high'],
+  ['standard with Fable preferred', (cwd) => ({ ...createInput(cwd, 'standard'), providerPreferences: { planning: ['claude_fable'] } }), 'standard', 'medium'],
+]) {
+  test(`${label}: Fable model_unavailable continues once on Claude in the same reconcile`, (t) => {
+    const f = fixture(t);
+    const { created, planning } = startFablePlanning(f, input(f.cwd));
+    const fable = settleModelUnavailable(f, planning.task);
+    const fableBefore = structuredClone(fable);
+    const evidence = modelUnavailableEvidence(fable);
+
+    const continued = f.controller.reconcile(created.runId);
+    assert.equal(continued.workflow.phase, 'planning');
+    assert.deepEqual(continued.nextActions, ['reconcile_pipeline']);
+    assert.equal(f.tasks.size, 2);
+    assert.deepEqual(f.tasks.get(fable.id), fableBefore, 'the failed Fable task and its accounting stay unmodified');
+    const replacement = claudeTasks(f)[0];
+    assert.equal(replacement.modelTier, modelTier);
+    assert.equal(replacement.effort, effort);
+    assert.equal(replacement.model, null);
+    assert.equal(replacement.maxEffortOverride, false);
+    assert.equal(replacement.dangerous, false);
+    assert.match(replacement.intent, /planning_replacement_after_model_unavailable/);
+    assert.equal(replacement.correlation.attemptId, `${replacement.id}:attempt:1`);
+    assert.deepEqual(continued.workflow.providerTask && {
+      taskId: continued.workflow.providerTask.taskId, provider: continued.workflow.providerTask.provider,
+      attempt: continued.workflow.providerTask.attempt,
+    }, { taskId: replacement.id, provider: 'claude', attempt: 1 });
+    assert.deepEqual(continued.workflow.planningReplacement, {
+      version: 1,
+      failed: {
+        taskId: fable.id, provider: 'claude_fable', model: 'fable', attemptId: `${fable.id}:attempt:1`,
+        receiptId: fable.receiptId,
+        evidenceHash: require('node:crypto').createHash('sha256').update(canonicalEvidenceJson(evidence)).digest('hex'),
+        failureClass: 'model_unavailable',
+      },
+      replacementProvider: 'claude',
+      excludedProviders: ['claude_fable'],
+      scheduledAt: f.clock.value,
+      firstReplacementTaskId: replacement.id,
+      currentTaskId: replacement.id,
+    });
+    const archived = continued.workflow.providerTaskHistory.at(-1);
+    assert.equal(archived.taskId, fable.id);
+    assert.equal(archived.outcome, 'replacement_scheduled');
+
+    f.finish(replacement, 'Plan details.\nPLAN_STATUS: READY');
+    const ready = f.controller.reconcile(created.runId).workflow;
+    assert.equal(ready.phase, 'plan_ready');
+    assert.equal(ready.planningReplacement.failed.taskId, fable.id);
+    assert.equal(f.tasks.size, 2, 'no implementation, writer or plan adoption is started');
+    assert.equal(f.controller.reconcile(created.runId).workflow.phase, 'plan_ready');
+    assert.equal(f.tasks.size, 2);
+  });
+}
+
+test('every broken model_unavailable join keeps the ordinary Fable failure path', (t) => {
+  const f = fixture(t);
+  const metadata = (change) => (task) => { change(task.providerMetadata); };
+  const evidence = (change) => (task) => { change(task.providerMetadata.provider_action_required); };
+  const cases = [
+    ['other failure class', (task) => { task.failureClass = 'provider_exit'; }],
+    ...['cancelled', 'rate_limited', 'budget_exceeded', 'auth_failed', 'timed_out', 'permission_denied', 'partial_result']
+      .map((flag) => [`flag ${flag}`, (task) => { task.flags[flag] = true; }]),
+    ['not dropped', (task) => { task.flags.dropped_out = false; }],
+    ['missing flag', (task) => { delete task.flags.partial_result; }],
+    ['cooldown', metadata((m) => { m.cooldown = { until: 2000000 }; })],
+    ['quota evidence', metadata((m) => { m.quota_evidence = { kind: 'weekly' }; })],
+    ['vendor quota', metadata((m) => { m.vendor_quota = { remaining: 0 }; })],
+    ['metadata retry_after', metadata((m) => { m.retry_after = 30; })],
+    ['task retryAt', (task) => { task.retryAt = 2000000; }],
+    ['task retryAfterSec', (task) => { task.retryAfterSec = 30; }],
+    ['stop reason', (task) => { task.stopReason = 'token_budget'; }],
+    ['partial checkpoint', (task) => { task.partialCheckpoint = 'partial'; }],
+    ['partial diagnostic', metadata((m) => { m.partial_diagnostic = 'partial'; })],
+    ['supervisor stop', metadata((m) => { m.supervisor_stop_reason = 'token_budget'; })],
+    ['permission denial', metadata((m) => { m.provider_permission_denials.count = 1; })],
+    ['retained denial', metadata((m) => { m.provider_permission_denials.retained = [{ tool: 'Bash' }]; })],
+    ['no denial record', metadata((m) => { delete m.provider_permission_denials; })],
+    ['incomplete authority', (task) => { task.resultIntegrity = { truncated: true }; }],
+    ['uncertain execution', (task) => { task.execution = { state: 'uncertain' }; }],
+    ['not invoked', (task) => { task.execution = { state: 'not_invoked' }; task.providerMetadata.model_invocation = false; }],
+    ['owned execution', (task) => { task.execution = { state: 'owned_held', owner: { ownerId: 'o' } }; }],
+    ['no receipt', (task) => { task.receiptId = null; task.execution.receiptId = null; }],
+    ['receipt mismatch', (task) => { task.execution.receiptId = 'rcpt_other'; }],
+    ['receipt not persisted', metadata((m) => { m.receiptPersisted = false; })],
+    ['model not invoked', metadata((m) => { m.model_invocation = false; })],
+    ['second physical attempt', metadata((m) => { m.physical_attempt_count = 2; })],
+    ['wrong run', (task) => { task.correlation.runId = 'wf_other_000000000000'; }],
+    ['stale attempt', (task) => { task.correlation.attemptId = `${task.id}:attempt:2`; }],
+    ['wrong request', (task) => { task.correlation.requestId = 't_other'; }],
+    ['body model', (task) => { task.body.model = 'opus'; }],
+    ['body effort override', (task) => { task.body.maxEffortOverride = true; }],
+    ['body tier', (task) => { task.body.modelTier = 'light'; }],
+    ['body cwd', (task) => { task.body.cwd = '/elsewhere'; }],
+    ['source', (task) => { task.source = 'api'; }],
+    ['route provider', (task) => { task.route.provider = 'claude'; }],
+    ['route requested model', (task) => { task.route.requested_model = 'opus'; }],
+    ['route resolved model', (task) => { task.route.resolved_outgoing_model = 'opus'; }],
+    ['route flag unsent', (task) => { task.route.model_flag_sent = false; }],
+    ['vendor echo', (task) => { task.route.observed_model = 'claude-opus'; }],
+    ['route attempt', (task) => { task.route.attempt_id = `${task.id}:attempt:2`; }],
+    ['no evidence', metadata((m) => { delete m.provider_action_required; })],
+    ['evidence kind', evidence((e) => { e.kind = 'vendor_model_unavailable'; })],
+    ['evidence version', evidence((e) => { e.version = 2; })],
+    ['evidence source', evidence((e) => { e.source = 'stderr'; })],
+    ['evidence model', evidence((e) => { e.selectedModel = 'opus'; })],
+    ['evidence vendor echo', evidence((e) => { e.vendorModelEcho = 'fable'; })],
+    ['evidence invented field', evidence((e) => { e.vendorModelId = 'fable-1'; })],
+    ['evidence request', evidence((e) => { e.requestId = 't_other'; })],
+    ['evidence attempt', evidence((e) => { e.attemptId = 't_other:attempt:1'; })],
+    ['evidence no retries', evidence((e) => { e.retryEvents = []; })],
+    ['evidence retry error', evidence((e) => { e.retryEvents[0].error = 'rate_limit'; })],
+    ['evidence retry status', evidence((e) => { e.retryEvents[0].errorStatus = 429; })],
+    ['evidence first attempt', evidence((e) => { e.retryEvents[0].attempt = 2; })],
+    ['evidence non-monotonic', evidence((e) => { e.retryEvents.push({ ...e.retryEvents[0] }); })],
+    ['evidence terminal status', evidence((e) => { e.terminal.apiErrorStatus = 401; })],
+    ['evidence terminal reason', evidence((e) => { e.terminal.terminalReason = 'rate_limit'; })],
+    ['evidence hash', evidence((e) => { e.streamHash = 'not-a-hash'; })],
+    ['evidence one line', evidence((e) => { e.streamLines = 1; })],
+  ];
+  for (const [label, mutate] of cases) {
+    const { created, planning } = startFablePlanning(f, {
+      ...createInput(f.cwd), objective: `Exclusion ${label}.`, providerPreferences: { planning: ['claude_fable'] },
+    });
+    settleModelUnavailable(f, planning.task, mutate);
+    const before = claudeTasks(f).length;
+    const after = f.controller.reconcile(created.runId).workflow;
+    assert.equal(after.planningReplacement, null, label);
+    assert.equal(claudeTasks(f).length, before, label);
+    assert.notEqual(after.providerTask?.provider, 'claude', label);
+  }
+});
+
+test('a sync identity mismatch fails closed with the observed ID and never replaces', (t) => {
+  const f = fixture(t);
+  for (const [index, [label, mutate]] of [
+    ['substituted id', (task) => { task.id = 't_substituted'; }],
+    ['wrong kind', (task) => { task.kind = 'claude'; }],
+    ['wrong user', (task) => { task.user = 'codex'; }],
+  ].entries()) {
+    const { created, planning } = startFablePlanning(f, { ...createInput(f.cwd, 'critical'), objective: `Mismatch ${label}.` });
+    const stored = settleModelUnavailable(f, planning.task);
+    mutate(stored);
+    const failed = f.controller.reconcile(created.runId).workflow;
+    assert.equal(failed.phase, 'failed', label);
+    assert.equal(failed.planningReplacement, null, label);
+    assert.match(failed.terminal.reason, new RegExp(`provider task ${stored.id} failed`), label);
+    assert.equal(f.tasks.size, index + 1, label);
+    assert.deepEqual(f.controller.nextActions(failed), [], label);
+  }
+});
+
+test('a same-ID identity mismatch with a typed transient failure never retries Fable or its replacement', (t) => {
+  const f = fixture(t);
+  const limited = () => ({ failureClass: 'rate_limit', flags: { rate_limited: true, timed_out: false }, retryAt: f.clock.value + 1000 });
+  for (const [label, mutate] of [
+    ['wrong kind', (task) => { task.kind = 'codex'; }],
+    ['wrong user', (task) => { task.user = 'codex'; }],
+  ]) {
+    const fable = startFablePlanning(f, { ...createInput(f.cwd, 'critical'), objective: `Fable transient ${label}.` });
+    f.finish(fable.planning.task, 'provider 429', 'failed', limited());
+    mutate(f.tasks.get(fable.planning.task.id));
+    const fableBefore = f.tasks.size;
+    const fableFailed = f.controller.reconcile(fable.created.runId).workflow;
+    assert.equal(fableFailed.phase, 'failed', label);
+    assert.equal(fableFailed.providerRetry, null, label);
+    assert.equal(fableFailed.planningReplacement, null, label);
+    assert.deepEqual(f.controller.nextActions(fableFailed), [], label);
+    assert.throws(() => f.controller.retryFailedProvider(fable.created.runId, { actor: 'operator' }),
+      { code: 'PROVIDER_RETRY_NOT_ALLOWED' }, label);
+    assert.equal(f.tasks.size, fableBefore, label);
+
+    const replaced = startFablePlanning(f, { ...createInput(f.cwd, 'critical'), objective: `Replacement transient ${label}.` });
+    settleModelUnavailable(f, replaced.planning.task);
+    const bound = f.controller.reconcile(replaced.created.runId).workflow;
+    const replacement = f.tasks.get(bound.providerTask.taskId);
+    assert.equal(replacement.kind, 'claude', label);
+    f.finish(replacement, 'provider 429', 'failed', limited());
+    mutate(replacement);
+    const before = f.tasks.size;
+    const failed = f.controller.reconcile(replaced.created.runId).workflow;
+    assert.equal(failed.phase, 'failed', label);
+    assert.equal(failed.providerRetry, null, label);
+    assert.equal(failed.planningReplacement.currentTaskId, replacement.id, label);
+    assert.deepEqual(f.controller.nextActions(failed), [], label);
+    assert.throws(() => f.controller.retryFailedProvider(replaced.created.runId, { actor: 'operator' }),
+      { code: 'PROVIDER_RETRY_NOT_ALLOWED' }, label);
+    assert.equal(f.tasks.size, before, label);
+  }
+});
+
+test('replacement survives repeated reconcile and restart at every boundary with one submit', (t) => {
+  const f = fixture(t);
+  // After settle, before any reconcile: a fresh controller schedules and dispatches once.
+  const settled = startFablePlanning(f, createInput(f.cwd, 'critical'));
+  settleModelUnavailable(f, settled.planning.task);
+  const second = restartedController(t, f);
+  second.reconcile(settled.created.runId);
+  second.reconcile(settled.created.runId);
+  f.controller.reconcile(settled.created.runId);
+  restartedController(t, f).reconcile(settled.created.runId);
+  assert.equal(claudeTasks(f).length, 1);
+
+  // After the durable schedule, before the bind: the next reconcile dispatches exactly once.
+  const scheduled = startFablePlanning(f, { ...createInput(f.cwd, 'critical'), objective: 'Scheduled boundary.' });
+  const fable = settleModelUnavailable(f, scheduled.planning.task);
+  f.pipeline.schedulePlanningReplacement(scheduled.created.runId, {
+    actor: 'claude-planner', failedTaskId: fable.id, replacementProvider: 'claude',
+    failed: { model: 'fable', attemptId: `${fable.id}:attempt:1`, receiptId: fable.receiptId,
+      evidenceHash: 'e'.repeat(64), failureClass: 'model_unavailable' },
+  });
+  const resumed = restartedController(t, f);
+  const dispatched = resumed.reconcile(scheduled.created.runId).workflow;
+  resumed.reconcile(scheduled.created.runId);
+  f.controller.reconcile(scheduled.created.runId);
+  assert.equal(claudeTasks(f).length, 2);
+  assert.equal(dispatched.providerTask.provider, 'claude');
+  assert.equal(dispatched.planningReplacement.firstReplacementTaskId, dispatched.providerTask.taskId);
+
+  // After the bind, before queue submission: the missing task fails closed.
+  const bound = startFablePlanning(f, { ...createInput(f.cwd, 'critical'), objective: 'Bound boundary.' });
+  const boundFable = settleModelUnavailable(f, bound.planning.task);
+  f.pipeline.schedulePlanningReplacement(bound.created.runId, {
+    actor: 'claude-planner', failedTaskId: boundFable.id, replacementProvider: 'claude',
+    failed: { model: 'fable', attemptId: `${boundFable.id}:attempt:1`, receiptId: boundFable.receiptId,
+      evidenceHash: 'e'.repeat(64), failureClass: 'model_unavailable' },
+  });
+  f.pipeline.bindProviderTask(bound.created.runId, {
+    actor: 'claude-planner', taskId: 't_lost_replacement', provider: 'claude', purpose: 'planning',
+    modelTier: 'heavy', effort: 'high', attempt: 1,
+  });
+  const lost = restartedController(t, f).reconcile(bound.created.runId);
+  assert.equal(lost.workflow.phase, 'failed');
+  assert.match(lost.workflow.terminal.reason, /provider task t_lost_replacement failed/);
+  assert.deepEqual(lost.nextActions, []);
+  assert.equal(claudeTasks(f).length, 2);
+  assert.equal(f.tasks.has('t_lost_replacement'), false);
+});
+
+test('a replacement 429 retries on Claude only and explicit recovery stays on Claude', (t) => {
+  const f = fixture(t);
+  const { created, planning } = startFablePlanning(f, createInput(f.cwd, 'critical'));
+  settleModelUnavailable(f, planning.task);
+  const first = f.controller.reconcile(created.runId).workflow;
+  const firstTask = f.tasks.get(first.providerTask.taskId);
+  f.finish(firstTask, 'provider 429', 'failed', {
+    failureClass: 'rate_limit', flags: { rate_limited: true, timed_out: false }, retryAt: f.clock.value + 1000,
+  });
+  const scheduled = f.controller.reconcile(created.runId).workflow;
+  assert.equal(scheduled.providerRetry.failedProvider, 'claude');
+  assert.equal(scheduled.providerRetry.nextAttempt, 2);
+  f.clock.value += 1000;
+  const retried = f.controller.reconcile(created.runId).workflow;
+  const secondTask = f.tasks.get(retried.providerTask.taskId);
+  assert.equal(secondTask.kind, 'claude');
+  assert.equal(retried.providerTask.attempt, 2);
+  assert.equal(retried.planningReplacement.firstReplacementTaskId, firstTask.id);
+  assert.equal(retried.planningReplacement.currentTaskId, secondTask.id);
+
+  f.finish(secondTask, 'bridge restarted', 'interrupted', { execution: { state: 'uncertain' } });
+  const failed = f.controller.reconcile(created.runId).workflow;
+  assert.equal(failed.phase, 'failed');
+  f.tasks.get(secondTask.id).execution = { state: 'fenced', proof: { evidenceId: 'fence_2' } };
+  const recovered = f.controller.retryFailedProvider(created.runId, { actor: 'operator' });
+  assert.equal(recovered.workflow.phase, 'planning');
+  assert.equal(recovered.workflow.providerTask.provider, 'claude');
+  assert.equal(recovered.workflow.providerTask.attempt, 3);
+  assert.equal(f.tasks.get(recovered.workflow.providerTask.taskId).kind, 'claude');
+  assert.equal(recovered.workflow.planningReplacement.currentTaskId, recovered.workflow.providerTask.taskId);
+  assert.equal([...f.tasks.values()].filter((task) => task.kind === 'claude_fable').length, 1, 'never returns to Fable');
+});
+
+test('a replacement dispatch refusal fails without a third provider', (t) => {
+  const f = fixture(t);
+  f.config.codex = { oneshot_safe: ['codex-safe'] };
+  const { created, planning } = startFablePlanning(f, {
+    ...createInput(f.cwd), providerPreferences: { planning: ['claude_fable', 'codex'] },
+  });
+  const fable = settleModelUnavailable(f, planning.task);
+  f.pipeline.schedulePlanningReplacement(created.runId, {
+    actor: 'claude-planner', failedTaskId: fable.id, replacementProvider: 'claude',
+    failed: { model: 'fable', attemptId: `${fable.id}:attempt:1`, receiptId: fable.receiptId,
+      evidenceHash: 'e'.repeat(64), failureClass: 'model_unavailable' },
+  });
+  delete f.config.claude;
+  assert.throws(() => f.controller.reconcile(created.runId), { code: 'PROVIDER_UNAVAILABLE' });
+  const failed = f.pipeline.get(created.runId);
+  assert.equal(failed.phase, 'failed');
+  assert.match(failed.terminal.reason, /planning dispatch failed/);
+  assert.equal(f.tasks.size, 1, 'neither Codex nor Fable is selected');
+});
+
+test('no replacement for unconfigured Claude, phase policy or review phases', (t) => {
+  const f = fixture(t);
+  const claude = f.config.claude;
+  delete f.config.claude;
+  const unconfigured = startFablePlanning(f, createInput(f.cwd, 'critical'));
+  settleModelUnavailable(f, unconfigured.planning.task);
+  const failed = f.controller.reconcile(unconfigured.created.runId).workflow;
+  assert.equal(failed.phase, 'failed');
+  assert.equal(failed.planningReplacement, null);
+  assert.equal(f.tasks.size, 1);
+  f.config.claude = claude;
+
+  f.config.codex = { oneshot_safe: ['codex-safe'] };
+  const policy = f.controller.create({ ...createInput(f.cwd), objective: 'Policy run.', profile: 'codex-astra-ultra' });
+  const codexPlanning = f.controller.submitResearch(policy.runId, { markdown: 'Research evidence.' });
+  assert.equal(codexPlanning.task.kind, 'codex');
+  settleModelUnavailable(f, codexPlanning.task);
+  const policyFailed = f.controller.reconcile(policy.runId).workflow;
+  assert.equal(policyFailed.phase, 'failed');
+  assert.equal(policyFailed.planningReplacement, null);
+  assert.equal(f.tasks.size, 2);
+
+  const review = f.controller.create({ ...createInput(f.cwd), objective: 'Review run.', providerPreferences: { review: ['claude_fable'] } });
+  const plan = f.controller.submitResearch(review.runId, { markdown: 'Research evidence.' });
+  f.finish(plan.task, 'Plan details.\nPLAN_STATUS: READY');
+  f.controller.reconcile(review.runId);
+  const implementation = f.controller.startImplementation(review.runId);
+  const reviewing = f.controller.completeImplementation(review.runId, {
+    leaseToken: implementation.lease.leaseToken, markdown: 'Implementation evidence.',
+  });
+  assert.equal(reviewing.task.kind, 'claude_fable');
+  const count = f.tasks.size;
+  settleModelUnavailable(f, reviewing.task);
+  const reviewFailed = f.controller.reconcile(review.runId).workflow;
+  assert.equal(reviewFailed.phase, 'failed');
+  assert.equal(reviewFailed.planningReplacement, null);
+  assert.equal(f.tasks.size, count);
+});

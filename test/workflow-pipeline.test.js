@@ -752,3 +752,192 @@ for (const status of ['failed', 'cancelled']) {
     throwsCode(() => restored[action](id, { actor }), 'INVALID_TRANSITION');
   });
 }
+
+function bindFablePlanning(pipeline, cwd, runId, taskId = 't_fable_plan_1', extra = {}) {
+  create(pipeline, cwd, runId, { taskTier: 'complex', ...extra });
+  pipeline.completeResearch(runId, { markdown: 'research' });
+  pipeline.startPlanning(runId);
+  return pipeline.bindProviderTask(runId, {
+    actor: 'claude-planner', taskId, provider: 'claude_fable', purpose: 'planning',
+    modelTier: 'heavy', effort: 'high', attempt: 1,
+  });
+}
+
+function replacementInput(taskId = 't_fable_plan_1', changes = {}) {
+  return {
+    actor: 'claude-planner',
+    failedTaskId: taskId,
+    replacementProvider: 'claude',
+    failed: {
+      model: 'fable',
+      attemptId: `${taskId}:attempt:1`,
+      receiptId: 'rcpt_abc123_0123abcd',
+      evidenceHash: 'a'.repeat(64),
+      failureClass: 'model_unavailable',
+      ...changes,
+    },
+  };
+}
+
+test('planning replacement is durable, idempotent, pinned to claude and survives restart', (t) => {
+  const { pipeline, restart, cwd, clock } = fixture(t, { pipeline: { maxHistoryEntries: 1 } });
+  const runId = 'wf_replace_111111111111';
+  bindFablePlanning(pipeline, cwd, runId);
+  clock.value += 7;
+  const scheduled = pipeline.schedulePlanningReplacement(runId, replacementInput());
+  assert.equal(scheduled.phase, 'planning');
+  assert.equal(scheduled.providerTask, null);
+  assert.equal(scheduled.providerRetry, null);
+  assert.equal(scheduled.terminal, null);
+  assert.deepEqual(scheduled.planningReplacement, {
+    version: 1,
+    failed: {
+      taskId: 't_fable_plan_1', provider: 'claude_fable', model: 'fable',
+      attemptId: 't_fable_plan_1:attempt:1', receiptId: 'rcpt_abc123_0123abcd',
+      evidenceHash: 'a'.repeat(64), failureClass: 'model_unavailable',
+    },
+    replacementProvider: 'claude',
+    excludedProviders: ['claude_fable'],
+    scheduledAt: clock.value,
+    firstReplacementTaskId: null,
+    currentTaskId: null,
+  });
+  assert.equal(scheduled.providerTaskHistory.at(-1).taskId, 't_fable_plan_1');
+  assert.equal(scheduled.providerTaskHistory.at(-1).outcome, 'replacement_scheduled');
+  assert.equal(scheduled.history.at(-1).event, 'planning_replacement_scheduled');
+  assert.deepEqual(restart().get(runId), scheduled);
+
+  const restored = restart();
+  assert.deepEqual(restored.schedulePlanningReplacement(runId, replacementInput()), scheduled);
+  throwsCode(() => restored.schedulePlanningReplacement(runId, replacementInput('t_other_fable')), 'PROVIDER_TASK_MISMATCH');
+  for (const provider of ['claude_fable', 'codex']) {
+    throwsCode(() => restored.bindProviderTask(runId, {
+      actor: 'claude-planner', taskId: 't_third_provider', provider, purpose: 'planning',
+    }), 'PROVIDER_RESTRICTION');
+  }
+  throwsCode(() => restored.bindProviderTask(runId, {
+    actor: 'claude-planner', taskId: 't_fable_plan_1', provider: 'claude', purpose: 'planning',
+  }), 'PROVIDER_TASK_REUSED');
+
+  restored.bindProviderTask(runId, {
+    actor: 'claude-planner', taskId: 't_claude_plan_1', provider: 'claude', purpose: 'planning',
+    modelTier: 'heavy', effort: 'high', attempt: 1,
+  });
+  let state = restart().get(runId);
+  assert.equal(state.planningReplacement.firstReplacementTaskId, 't_claude_plan_1');
+  assert.equal(state.planningReplacement.currentTaskId, 't_claude_plan_1');
+  restored.scheduleProviderRetry(runId, {
+    actor: 'claude-planner', taskId: 't_claude_plan_1', failureClass: 'rate_limit',
+    reason: 'typed HTTP 429', delayMs: 0, maxAttempts: 3,
+  });
+  restored.bindProviderTask(runId, {
+    actor: 'claude-planner', taskId: 't_claude_plan_2', provider: 'claude', purpose: 'planning',
+    modelTier: 'heavy', effort: 'high', attempt: 2,
+  });
+  state = restart().get(runId);
+  assert.equal(state.planningReplacement.firstReplacementTaskId, 't_claude_plan_1');
+  assert.equal(state.planningReplacement.currentTaskId, 't_claude_plan_2');
+  assert.equal(state.providerTaskHistory.length, 1);
+  const done = restored.completePlanning(runId, { actor: 'claude-planner', markdown: 'PLAN_STATUS: READY' });
+  assert.equal(done.phase, 'plan_ready');
+  assert.equal(done.planningReplacement.failed.taskId, 't_fable_plan_1');
+  assert.deepEqual(restart().get(runId), done);
+});
+
+test('planning replacement keeps its record through terminal failure', (t) => {
+  const { pipeline, restart, cwd } = fixture(t);
+  const runId = 'wf_replace_222222222222';
+  bindFablePlanning(pipeline, cwd, runId);
+  pipeline.schedulePlanningReplacement(runId, replacementInput());
+  const failed = pipeline.fail(runId, { reason: 'replacement failed' });
+  assert.equal(failed.phase, 'failed');
+  assert.equal(failed.planningReplacement.replacementProvider, 'claude');
+  assert.deepEqual(restart().get(runId), failed);
+});
+
+test('planning replacement refuses wrong phase, provider, task, attempt, writer and phase policy', (t) => {
+  const { pipeline, cwd } = fixture(t);
+  const claudeRun = 'wf_replace_333333333331';
+  create(pipeline, cwd, claudeRun);
+  throwsCode(() => pipeline.schedulePlanningReplacement(claudeRun, replacementInput()), 'INVALID_TRANSITION');
+  pipeline.completeResearch(claudeRun, { markdown: 'research' });
+  pipeline.startPlanning(claudeRun);
+  throwsCode(() => pipeline.schedulePlanningReplacement(claudeRun, replacementInput()), 'PROVIDER_TASK_MISMATCH');
+  pipeline.bindProviderTask(claudeRun, {
+    actor: 'claude-planner', taskId: 't_fable_plan_1', provider: 'claude', purpose: 'planning',
+  });
+  throwsCode(() => pipeline.schedulePlanningReplacement(claudeRun, replacementInput()), 'PROVIDER_TASK_MISMATCH');
+
+  const retryRun = 'wf_replace_333333333332';
+  create(pipeline, cwd, retryRun);
+  pipeline.completeResearch(retryRun, { markdown: 'research' });
+  pipeline.startPlanning(retryRun);
+  pipeline.bindProviderTask(retryRun, {
+    actor: 'claude-planner', taskId: 't_fable_first', provider: 'claude_fable', purpose: 'planning', attempt: 1,
+  });
+  pipeline.scheduleProviderRetry(retryRun, {
+    actor: 'claude-planner', taskId: 't_fable_first', failureClass: 'timeout', delayMs: 0, maxAttempts: 3,
+  });
+  pipeline.bindProviderTask(retryRun, {
+    actor: 'claude-planner', taskId: 't_fable_plan_1', provider: 'claude_fable', purpose: 'planning', attempt: 2,
+  });
+  throwsCode(() => pipeline.schedulePlanningReplacement(retryRun, replacementInput()), 'PROVIDER_TASK_MISMATCH');
+
+  const wrongInputs = 'wf_replace_333333333333';
+  bindFablePlanning(pipeline, cwd, wrongInputs);
+  throwsCode(() => pipeline.schedulePlanningReplacement(wrongInputs, { ...replacementInput(), actor: 'other-planner' }), 'PROVIDER_TASK_MISMATCH');
+  throwsCode(() => pipeline.schedulePlanningReplacement(wrongInputs, { ...replacementInput(), replacementProvider: 'codex' }), 'PROVIDER_RESTRICTION');
+  for (const change of [
+    { model: 'opus' }, { attemptId: 't_fable_plan_1:attempt:2' }, { receiptId: '../receipt' },
+    { evidenceHash: 'A'.repeat(64) }, { failureClass: 'rate_limit' },
+  ]) {
+    throwsCode(() => pipeline.schedulePlanningReplacement(wrongInputs, replacementInput('t_fable_plan_1', change)), 'INVALID_ARGUMENT');
+  }
+  assert.equal(pipeline.get(wrongInputs).planningReplacement, null);
+  assert.equal(pipeline.get(wrongInputs).providerTask.taskId, 't_fable_plan_1');
+
+  const policyRun = 'wf_replace_333333333334';
+  create(pipeline, cwd, policyRun, { profile: 'codex-astra-ultra' });
+  pipeline.completeResearch(policyRun, { markdown: 'research' });
+  pipeline.startPlanning(policyRun);
+  throwsCode(() => pipeline.schedulePlanningReplacement(policyRun, replacementInput()), 'PROVIDER_RESTRICTION');
+
+  const writerRun = 'wf_replace_333333333335';
+  advanceToPlanReady(pipeline, cwd, writerRun);
+  pipeline.startImplementation(writerRun, { actor: 'claude-implementer', mode: 'provider' });
+  throwsCode(() => pipeline.schedulePlanningReplacement(writerRun, replacementInput()), 'INVALID_TRANSITION');
+});
+
+test('malformed or contradictory planning replacement state fails closed on load', (t) => {
+  const { pipeline, restart, cwd, dataDir } = fixture(t);
+  const runId = 'wf_replace_444444444444';
+  bindFablePlanning(pipeline, cwd, runId);
+  pipeline.schedulePlanningReplacement(runId, replacementInput());
+  const file = path.join(dataDir, 'workflows', runId, 'state.json');
+  const original = fs.readFileSync(file, 'utf8');
+  const state = JSON.parse(original);
+  for (const change of [
+    (s) => { s.planningReplacement.version = 2; },
+    (s) => { s.planningReplacement.replacementProvider = 'codex'; },
+    (s) => { s.planningReplacement.excludedProviders = []; },
+    (s) => { s.planningReplacement.failed.provider = 'claude'; },
+    (s) => { s.planningReplacement.failed.model = 'opus'; },
+    (s) => { s.planningReplacement.failed.failureClass = 'rate_limit'; },
+    (s) => { s.planningReplacement.failed.vendorField = 'invented'; },
+    (s) => { s.planningReplacement.extra = true; },
+    (s) => { s.planningReplacement.firstReplacementTaskId = 't_claude_plan_1'; },
+    (s) => { s.planningReplacement.currentTaskId = s.planningReplacement.failed.taskId;
+      s.planningReplacement.firstReplacementTaskId = s.planningReplacement.failed.taskId; },
+    (s) => { s.planningReplacement = 'claude'; },
+    (s) => { s.providerTask = { ...s.providerTaskHistory.at(-1), provider: 'claude_fable', outcome: undefined }; },
+    (s) => { s.providerRetry = {
+      phase: 'planning', purpose: 'planning', failedProvider: 'claude_fable', failureClass: 'timeout',
+      previousAttempt: 1, nextAttempt: 2, maxAttempts: 3, scheduledAt: 0, retryAt: 0, failedTaskId: 't_fable_plan_1',
+    }; },
+  ]) {
+    const corrupted = structuredClone(state); change(corrupted); fs.writeFileSync(file, JSON.stringify(corrupted));
+    throwsCode(() => restart().get(runId), 'STATE_CORRUPT');
+  }
+  fs.writeFileSync(file, original);
+  assert.equal(restart().get(runId).planningReplacement.replacementProvider, 'claude');
+});

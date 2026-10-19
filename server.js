@@ -2154,6 +2154,115 @@ function acceptedTerminalQuotaEvidence(parsed, provider) {
     errorDiagnosticHash: crypto.createHash('sha256').update(parsed.diagnostic || '').digest('hex') };
 }
 
+// Bridge-owned evidence that the explicitly selected Fable model was refused
+// before producing anything. This is a deliberately narrow controlled
+// contract over the complete accepted stream, not a vendor field: retry
+// events carry no model ID, so the record never claims a vendor model echo.
+// Any stronger, ambiguous, partial or malformed signal returns null and the
+// run keeps its ordinary classification.
+const CLAUDE_MODEL_UNAVAILABLE_EVIDENCE_KIND = 'bridge_claude_model_unavailable';
+const CLAUDE_MODEL_UNAVAILABLE_MAX_RETRY_EVENTS = 256;
+
+function claudeModelUnavailableEvidence({ kind, entry, rawStdout, parsed, route, model, code, exclusions }) {
+  const plainObject = (value) => !!value && typeof value === 'object' && !Array.isArray(value);
+  const emptyArrayOrAbsent = (value) => value === undefined || (Array.isArray(value) && value.length === 0);
+  const sha = (value) => crypto.createHash('sha256').update(value).digest('hex');
+  const onlyCount = (counts, key, count) => plainObject(counts)
+    && Object.keys(counts).length === 1 && counts[key] === count;
+  if (entry?.oneshot_output_parser !== 'claude_json' || kind !== 'claude_fable' || model !== 'fable') return null;
+  if (!plainObject(route) || route.provider !== 'claude_fable' || route.requested_model !== 'fable'
+    || route.resolved_outgoing_model !== 'fable' || !route.model_flag_sent || route.observed_model != null) return null;
+  const ids = [route.request_id, route.invocation_id, route.attempt_id];
+  if (ids.some((id) => typeof id !== 'string' || !id)) return null;
+  if (!Number.isInteger(code) || !plainObject(exclusions) || Object.values(exclusions).some(Boolean)) return null;
+  if (!plainObject(parsed) || parsed.parseError || parsed.resultSchemaDisagreement !== false
+    || parsed.terminalEnvelopePresent !== true || parsed.isError !== true) return null;
+  if (parsed.resultSubtype !== 'error_during_execution' || parsed.apiErrorStatus !== 404
+    || parsed.terminalReason !== 'model_error') return null;
+  if (parsed.errorCount !== 0 || parsed.errorObserved !== 0 || parsed.errorInvalid !== 0
+    || parsed.errorDiagnosticTruncated !== false || parsed.diagnostic) return null;
+  const denials = parsed.permissionDenials;
+  if (!plainObject(denials) || denials.count !== 0 || denials.observed !== 0 || denials.invalid !== 0
+    || denials.truncated !== false || (Array.isArray(denials.retained) && denials.retained.length)) return null;
+  // A refusal or any other provider stop reason is a stronger signal.
+  if (parsed.providerStopReason != null) return null;
+  if (parsed.usage != null && (!plainObject(parsed.usage) || parsed.usage.output_tokens !== 0
+    || !Array.isArray(parsed.usage.model_usage) || parsed.usage.model_usage.length)) return null;
+
+  const text = typeof rawStdout === 'string' ? rawStdout : '';
+  if (!text.endsWith('\n')) return null;
+  // The parser accepts a single whole document; this contract requires the
+  // ordered retry stream, so a document that parses whole is not eligible.
+  try { JSON.parse(text.trim()); return null; } catch {}
+  const rawLines = text.slice(0, -1).split('\n');
+  const lines = [];
+  for (let index = 0; index < rawLines.length; index += 1) {
+    const raw = rawLines[index].endsWith('\r') ? rawLines[index].slice(0, -1) : rawLines[index];
+    if (!raw.trim()) continue;
+    let value;
+    try { value = JSON.parse(raw); } catch { return null; }
+    if (!plainObject(value)) return null;
+    if (value.parent_tool_use_id !== undefined && value.parent_tool_use_id !== null) return null;
+    lines.push({ line: index + 1, raw, value });
+  }
+  if (lines.length < 2) return null;
+  let cursor = 0;
+  if (lines[0].value.type === 'system' && lines[0].value.subtype === 'init') cursor = 1;
+  const retryEvents = [];
+  const seen = new Set();
+  for (; cursor < lines.length - 1; cursor += 1) {
+    const { line, value } = lines[cursor];
+    if (value.type !== 'system' || value.subtype !== 'api_retry') return null;
+    if (value.error !== 'model_not_found' || typeof value.error_status !== 'number' || value.error_status !== 404) return null;
+    if (typeof value.uuid !== 'string' || !value.uuid || value.uuid !== value.uuid.trim()
+      || value.uuid.length > 200 || seen.has(value.uuid)) return null;
+    seen.add(value.uuid);
+    const previous = retryEvents.at(-1)?.attempt ?? 0;
+    if (!Number.isSafeInteger(value.attempt) || value.attempt <= previous || (!previous && value.attempt !== 1)) return null;
+    retryEvents.push({ line, eventIdHash: sha(value.uuid), attempt: value.attempt, errorStatus: 404, error: 'model_not_found' });
+  }
+  if (!retryEvents.length || retryEvents.length > CLAUDE_MODEL_UNAVAILABLE_MAX_RETRY_EVENTS) return null;
+  const terminalLine = lines.at(-1);
+  const terminal = terminalLine.value;
+  if (terminal.type !== 'result' || terminal.subtype !== 'error_during_execution' || terminal.is_error !== true
+    || typeof terminal.api_error_status !== 'number' || terminal.api_error_status !== 404
+    || terminal.terminal_reason !== 'model_error') return null;
+  if (!emptyArrayOrAbsent(terminal.errors) || !emptyArrayOrAbsent(terminal.permission_denials)) return null;
+  if (terminal.modelUsage !== undefined && (!plainObject(terminal.modelUsage) || Object.keys(terminal.modelUsage).length)) return null;
+  if (terminal.stop_reason !== undefined && terminal.stop_reason !== null) return null;
+  // Reported usage must be complete and valid with zero output. The
+  // normalizer turns an invalid count into null usage, so check the raw
+  // counts and require the normalized totals to agree with them.
+  if (terminal.usage !== undefined) {
+    const usage = terminal.usage;
+    const counts = ['input_tokens', 'output_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens'];
+    if (!plainObject(usage) || !plainObject(parsed.usage) || nonnegativeUsageNumber(usage.input_tokens) === null
+      || usage.output_tokens !== 0
+      || counts.slice(2).some((key) => usage[key] !== undefined && nonnegativeUsageNumber(usage[key]) === null)
+      || counts.some((key) => parsed.usage[key] !== (usage[key] ?? 0))) return null;
+  }
+
+  const retries = parsed.retries;
+  if (!plainObject(retries) || retries.count !== retryEvents.length || retries.observed_events !== retryEvents.length
+    || retries.invalid_events !== 0 || retries.duplicate_events !== 0 || retries.truncated !== false
+    || !Array.isArray(retries.events) || retries.events.length !== retryEvents.length
+    || !onlyCount(retries.by_error, 'model_not_found', retryEvents.length)
+    || !onlyCount(retries.by_status, '404', retryEvents.length)
+    || retries.events.some((event, index) => event.event_id_hash !== retryEvents[index].eventIdHash
+      || event.attempt !== retryEvents[index].attempt || event.error_status !== 404 || event.error !== 'model_not_found')) return null;
+
+  return {
+    kind: CLAUDE_MODEL_UNAVAILABLE_EVIDENCE_KIND, version: 1, source: 'claude_json_stream',
+    provider: 'claude_fable', selectedModel: 'fable', selectedModelSource: 'bridge_dispatch', vendorModelEcho: null,
+    requestId: route.request_id, invocationId: route.invocation_id, attemptId: route.attempt_id,
+    retryEvents,
+    terminal: { line: terminalLine.line, hash: sha(terminalLine.raw), subtype: 'error_during_execution',
+      apiErrorStatus: 404, terminalReason: 'model_error' },
+    streamHash: sha(text),
+    streamLines: rawLines.length,
+  };
+}
+
 function claudeStreamUserMessage(text) {
   return `${JSON.stringify({
     type: 'user',
@@ -5837,6 +5946,18 @@ async function executeOneShot(body, res, privateContext = null) {
     const providerTimedOut = timedOut || authoritativeApiFailure === 'timeout' || providerInternalTimedOut;
     const retainedPartial = !!stopReason && !!parsedOutput.partialDiagnostic;
     const checkpoint = retainedPartial ? parsedOutput.partialCheckpoint : null;
+    const modelUnavailableEvidence = claudeModelUnavailableEvidence({
+      kind, entry, rawStdout: semanticStdout, parsed: parsedOutput, route, model: execution.model, code,
+      exclusions: {
+        stopReason, isolationFailed: !isolationCleanup.ok, tokenBudgetExceeded, terminalQuotaEvidence,
+        copilotQuotaEvidence, runQuotaEvidence: runClassification.quotaEvidence, cursorActionRequired,
+        rate_limited, budget_exceeded, auth_failed, permission_denied, providerTimedOut, timedOut, retainedPartial,
+        planRestriction: runClassification.kind === 'plan_restriction',
+        // Spilled output keeps only a tail in memory; that tail cannot prove
+        // the complete stream had no earlier assistant, tool or subagent line.
+        outputSpilled: !!outputSpillPath,
+      },
+    });
     const finalFailureClass = !isolationCleanup.ok ? 'isolation_cleanup'
       : ['owner_proof_unconfirmed', 'owner_permit_failed'].includes(stopReason) ? stopReason
       : stopReason === 'operator_cancelled' ? 'operator_cancelled'
@@ -5849,6 +5970,7 @@ async function executeOneShot(body, res, privateContext = null) {
       : parsedOutput.resultSubtype === 'error_max_budget_usd' ? 'budget'
       : cursorUsageQuotaExhausted ? 'budget'
       : runClassification.kind === 'plan_restriction' ? 'plan_restriction'
+      : modelUnavailableEvidence ? 'model_unavailable'
       : authoritativeApiFailure || (rate_limited ? 'rate_limit'
         : budget_exceeded ? 'budget'
           : auth_failed ? 'auth'
@@ -5917,7 +6039,7 @@ async function executeOneShot(body, res, privateContext = null) {
       graceful_finalization: tokenBudgetExceeded || gracefulFinalization.requested
         ? { ...gracefulFinalization } : null,
       quota_evidence: terminalQuotaEvidence || copilotQuotaEvidence || runClassification.quotaEvidence || null,
-      provider_action_required: cursorActionRequired,
+      provider_action_required: cursorActionRequired || modelUnavailableEvidence,
       transport_output_chars: String(transportStdout).length,
       transport_output_hash: crypto.createHash('sha256').update(String(transportStdout)).digest('hex'),
       rate_limited,
