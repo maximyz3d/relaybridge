@@ -1132,7 +1132,9 @@ test('initial bound-before-submit crash remains held and a restarted running tas
   t.after(() => restored.shutdown());
   assert.throws(() => restored.reconcile(run.runId), { code: 'WRITER_EXECUTION_UNCERTAIN' });
   assert.equal(f.tasks.size, 1, 'restart does not invent a replacement writer');
-  f.taskQueue.submitReserved(taskId, { kind: 'claude', user: actor, cwd: f.cwd, dangerous: true,
+  // The real submitter uses the workflow's canonical identity, including
+  // lowercased Windows paths, rather than the caller's original spelling.
+  f.taskQueue.submitReserved(taskId, { kind: 'claude', user: actor, cwd: f.pipeline.get(run.runId).cwd, dangerous: true,
     modelTier: 'standard', model: null, effort: 'medium', requestId: taskId,
     correlation: { runId: run.runId, requestId: taskId, invocationId: taskId, attemptId: `${taskId}:attempt:1` } });
   f.tasks.get(taskId).status = 'running';

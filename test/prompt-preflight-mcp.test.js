@@ -68,10 +68,12 @@ test('MCP preserves typed prompt gates, null budgets, all-member admission and u
   assert.equal(laterMemberRejected.physicalAttemptCount, 0);
   assert.equal(fs.existsSync(marker), false, 'a valid earlier seat must not start before a later seat fails preflight');
   fs.writeFileSync(bridge.configPath, originalConfig);
+  // Exercise the completed prompt/chair admission contract through the direct
+  // path. Default durable collection may legitimately return a pending handle.
   const committee = await call('run_committee', { task, cwd: bridge.root, providers: ['claude', 'codex'],
     maxProviders: 2, mode: 'consensus', acknowledgeHumanGate: true, acknowledgeTruncatedEvidence: true,
-    useCache: false, providerBudget: null });
-  assert.equal(committee.status, 'partial', committee.error);
+    useCache: false, providerBudget: null, timeoutMs: 20000 });
+  assert.equal(committee.status, 'partial', JSON.stringify(committee));
   assert.equal(committee.members.length, 2);
   assert.equal(committee.synthesis.validation.code, 'prompt_too_large');
   assert.equal(committee.synthesis.modelInvocation, false);
@@ -85,7 +87,8 @@ test('MCP preserves typed prompt gates, null budgets, all-member admission and u
   const inlineEvidence = { content, sha256: crypto.createHash('sha256').update(content).digest('hex'), cwdIdentityHash };
   const groundedCommittee = await call('run_committee', { task, cwd: bridge.root, providers: ['claude', 'codex'],
     requiresWorkspaceAccess: true, inlineEvidence, maxProviders: 2, mode: 'consensus',
-    acknowledgeHumanGate: true, useCache: false });
+    acknowledgeHumanGate: true, useCache: false, timeoutMs: 20000 });
+  assert.equal(groundedCommittee.status, 'partial', JSON.stringify(groundedCommittee));
   assert.equal(groundedCommittee.members.length, 2, JSON.stringify(groundedCommittee));
   assert.equal(groundedCommittee.synthesis.validation.code, 'prompt_too_large');
   assert.equal(groundedCommittee.synthesis.modelInvocation, false);

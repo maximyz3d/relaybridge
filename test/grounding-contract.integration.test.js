@@ -206,8 +206,10 @@ test('grounding is a zero-spend gate across plans, REST, CLI, queue, broadcast a
   assert.equal(oversizedCommittee.blocked, true); assert.equal(oversizedCommittee.members.length, 0);
   assert.equal(oversizedCommittee.errorCode, 'prompt_too_large');
   assert.equal(completeJsonLines(cliMarker).length, callsBefore, 'tier/member semantic caps include the complete inline bundle');
+  // Inspect a completed provider prompt through the direct path; durable
+  // collection can return a valid pending handle before the result is ready.
   const filesystemCommittee = (await client.callTool({ name: 'run_committee', arguments: { task: 'Review src/a.js.', cwd: bridge.root,
-    requiresWorkspaceAccess: true, providers: ['claude'], maxProviders: 1, useCache: false } })).structuredContent;
+    requiresWorkspaceAccess: true, providers: ['claude'], maxProviders: 1, useCache: false, timeoutMs: 20000 } })).structuredContent;
   assert.equal(filesystemCommittee.members[0].modelInvocation, true, JSON.stringify(filesystemCommittee));
   const memberPrompt = completeJsonLines(cliMarker).at(-1).prompt;
   assert.match(memberPrompt, /permitted read-only inspection tools/); assert.match(memberPrompt, /Do not edit files/);
