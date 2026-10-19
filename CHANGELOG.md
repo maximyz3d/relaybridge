@@ -1,3 +1,6 @@
+## v2.5.5 - 2026-10-19
+- #145 feat(workflow): run managed Claude implementations with durable fencing
+
 ## v2.5.4 - 2026-09-29
 - #140 fix(quota): preserve native capacity during Claude permission recovery
 
