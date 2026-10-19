@@ -5,11 +5,13 @@ const assert = require('node:assert/strict');
 const {
   TOTAL_PROMPT_CHARS,
   buildPlanningPrompt,
+  buildImplementationPrompt,
   buildReviewPrompt,
   buildRevisionPrompt,
   parsePlanStatus,
   parseReviewVerdict,
   parseRevisionStatus,
+  parseImplementationStatus,
 } = require('../lib/workflow-prompts');
 
 const brief = {
@@ -69,6 +71,7 @@ test('marker parsers use the last valid standalone marker and fail closed', () =
 
 const phases = [
   ['planning', buildPlanningPrompt, 'PLAN_STATUS: BLOCKED', true],
+  ['implementation', buildImplementationPrompt, 'IMPLEMENTATION_STATUS: BLOCKED', false],
   ['review', buildReviewPrompt, 'REVIEW_VERDICT: BLOCK', true],
   ['final review', (input) => buildReviewPrompt(input, { final: true }), 'REVIEW_VERDICT: BLOCK', true],
   ['revision', buildRevisionPrompt, 'REVISION_STATUS: BLOCKED', false],
@@ -104,7 +107,7 @@ for (const [name, build, blockingMarker, readOnly] of phases) {
 
 test('terminal postscripts cannot substitute for a final artifact marker', () => {
   const postscript = 'The plan above is the complete deliverable. Write and ExitPlanMode are disabled.';
-  for (const parse of [parsePlanStatus, parseReviewVerdict, parseRevisionStatus]) {
+  for (const parse of [parsePlanStatus, parseReviewVerdict, parseRevisionStatus, parseImplementationStatus]) {
     assert.equal(parse(postscript), 'UNKNOWN');
     assert.equal(parse(''), 'UNKNOWN');
   }
@@ -112,6 +115,23 @@ test('terminal postscripts cannot substitute for a final artifact marker', () =>
   const earlierAssistant = 'Inspected the code.\nREVIEW_VERDICT: APPROVE';
   assert.equal(parseReviewVerdict(earlierAssistant), 'APPROVE');
   assert.equal(parseReviewVerdict('See my earlier review.'), 'UNKNOWN');
+});
+
+test('initial writer prompt uses the plan and truthful executor attribution without review instructions', () => {
+  const prompt = buildImplementationPrompt(brief);
+  assert.ok(prompt.includes(brief.plan));
+  assert.match(prompt, /## File scope\n\n- lib\/adapter\.js/);
+  assert.ok(!prompt.includes(brief.review));
+  assert.ok(!prompt.includes(brief.finalReview));
+  assert.match(prompt, /Completion is not approval/);
+  for (const build of [buildReviewPrompt, buildRevisionPrompt]) {
+    assert.match(build(brief), /(?:evidence from Codex|Codex implementation evidence)/);
+    assert.match(build({ ...brief, implementationExecutor: 'claude' }), /Implementation evidence from the managed Claude writer/);
+  }
+  assert.equal(parseImplementationStatus('IMPLEMENTATION_STATUS: COMPLETE'), 'COMPLETE');
+  assert.equal(parseImplementationStatus('IMPLEMENTATION_STATUS: COMPLETE\nblocked\nIMPLEMENTATION_STATUS: BLOCKED'), 'BLOCKED');
+  assert.equal(parseImplementationStatus('earlier IMPLEMENTATION_STATUS: COMPLETE'), 'UNKNOWN');
+  assert.equal(parseImplementationStatus('IMPLEMENTATION_STATUS: COMPLETE extra'), 'UNKNOWN');
 });
 
 test('explicit missing-evidence blocks preserve existing last-marker semantics', () => {

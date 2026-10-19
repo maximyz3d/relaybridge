@@ -9,6 +9,7 @@ const { createWorkflowPipeline } = require('../lib/workflow-pipeline');
 const { createWorkflowController, WorkflowControllerError } = require('../lib/workflow-controller');
 const { createIncidentLog } = require('../lib/incident-log');
 const { createRequestLedger } = require('../lib/request-ledger');
+const { createTaskQueue } = require('../lib/task-queue');
 
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rb-controller-'));
@@ -25,7 +26,7 @@ function fixture(t) {
     submit(input) { return this.submitReserved(this.newTaskId(), input); },
     submitReserved(id, input) {
       if (tasks.has(id)) throw new Error('task id already exists');
-      const task = { id, status: 'queued', ...input, body: { ...input } };
+      const task = { id, status: 'queued', startedAt: null, execution: { state: 'never_started' }, ...input, body: { ...input } };
       tasks.set(task.id, task);
       return task;
     },
@@ -301,8 +302,8 @@ test('controller drives the complete Codex-Claude handoff without overlapping wr
   const revision = f.controller.startRevision(created.runId);
   assert.equal(revision.workflow.phase, 'revising');
   assert.equal(revision.task.kind, 'claude');
-  assert.equal(revision.task.modelTier, 'standard');
-  assert.equal(revision.task.effort, 'medium');
+  assert.equal(revision.task.modelTier, 'heavy');
+  assert.equal(revision.task.effort, 'high');
   assert.equal(revision.task.dangerous, true);
   assert.equal(revision.workflow.writerLease.actor, 'claude-reviser');
 
@@ -418,7 +419,7 @@ test('bridge-interrupted tasks require explicit recovery instead of automatic re
   const f = fixture(t);
   const created = f.controller.create(createInput(f.cwd));
   const planning = f.controller.submitResearch(created.runId, { markdown: 'research' });
-  f.finish(planning.task, 'bridge restarted', 'interrupted');
+  f.finish(planning.task, 'bridge restarted', 'interrupted', { execution: { state: 'uncertain' } });
 
   const stopped = f.controller.reconcile(created.runId);
   assert.equal(stopped.workflow.phase, 'failed');
@@ -686,4 +687,457 @@ test('incomplete instruction or verdict authority fails durably before automatic
     assert.match(stored.terminal.reason, /artifact_truncated/);
     assert.equal(f.tasks.size, 1);
   }
+});
+
+// Managed-writer tests use the real durable pipeline and a fake queue, never a provider.
+function reachPlanReady(f, extra = {}) {
+  const run = f.controller.create({ ...createInput(f.cwd), ...extra });
+  const planning = f.controller.submitResearch(run.runId, { markdown: 'Research evidence.' });
+  f.finish(planning.task, 'Accepted plan.\nPLAN_STATUS: READY');
+  return f.controller.reconcile(run.runId).workflow;
+}
+
+function writerFiles(f, runId) {
+  return [fs.readFileSync(path.join(f.dataDir, 'workflows', runId, 'state.json'), 'utf8'),
+    fs.readdirSync(path.join(f.dataDir, 'writer-locks')).map((name) =>
+      [name, fs.readFileSync(path.join(f.dataDir, 'writer-locks', name), 'utf8')])];
+}
+
+test('managed initial writer binds before queue admission, completes once, and requests fresh review', (t) => {
+  const f = fixture(t), run = reachPlanReady(f);
+  assert.deepEqual(f.controller.view(run.runId).nextActions, ['claim_pipeline_implementation', 'start_pipeline_implementation']);
+  const submit = f.taskQueue.submitReserved.bind(f.taskQueue);
+  f.taskQueue.submitReserved = (id, input) => {
+    const state = f.pipeline.get(run.runId);
+    assert.equal(state.phase, 'implementing');
+    assert.equal(state.providerTask.taskId, id);
+    assert.equal(state.writerLease.mode, 'provider');
+    assert.ok(!state.history.some((row) => row.event === 'implementation_completed'));
+    return submit(id, input);
+  };
+  const started = f.controller.startManagedImplementation(run.runId);
+  f.taskQueue.submitReserved = submit;
+  assert.equal(f.tasks.size, 2);
+  assert.equal(started.task.kind, 'claude');
+  assert.equal(started.task.user, 'claude-implementer');
+  assert.equal(started.task.dangerous, true);
+  assert.deepEqual(started.task.correlation, { runId: run.runId, requestId: started.task.id,
+    invocationId: started.task.id, attemptId: `${started.task.id}:attempt:1` });
+  assert.ok(!JSON.stringify(started).includes('"leaseToken":'));
+  assert.deepEqual(f.controller.view(run.runId).nextActions, ['reconcile_pipeline']);
+  assert.throws(() => f.controller.completeImplementation(run.runId, { markdown: 'forged' }), { code: 'INVALID_WRITER_MODE' });
+  assert.throws(() => f.controller.renewWriterLease(run.runId, {}), { code: 'INVALID_WRITER_MODE' });
+  f.finish(started.task, 'Changed the scoped files; fixture checks passed.\nIMPLEMENTATION_STATUS: COMPLETE',
+    'done', { execution: { state: 'settled' } });
+  const reviewed = f.controller.reconcile(run.runId).workflow;
+  assert.equal(reviewed.phase, 'reviewing');
+  assert.equal(reviewed.writerLease, null);
+  assert.equal(reviewed.providerTaskHistory.at(-1).purpose, 'implementation');
+  assert.equal(reviewed.providerTaskHistory.at(-1).outcome, 'completed');
+  assert.match(f.tasks.get(reviewed.providerTask.taskId).prompt, /Implementation evidence from the managed Claude writer/);
+  assert.equal(f.tasks.get(reviewed.providerTask.taskId).modelTier, 'standard');
+  assert.equal(f.tasks.get(reviewed.providerTask.taskId).effort, 'high');
+  assert.match(f.pipeline.readArtifact(run.runId, 'implementation').content, /IMPLEMENTATION_STATUS: COMPLETE/);
+  f.controller.reconcile(run.runId);
+  assert.equal(f.tasks.size, 3, 'repeat reconciliation does not dispatch a second review');
+});
+
+test('managed admission refusals leave durable state, cwd locks and queue unchanged', (t) => {
+  const cases = [
+    ['safe', { permissionMode: 'safe' }, {}, 'FULL_PERMISSION_REQUIRED'],
+    ['profile', { profile: 'codex-astra-ultra' }, {}, 'INVALID_WRITER_MODE'],
+    ['preference', { providerPreferences: { implementation: ['claude_fable'] } }, {}, 'PROVIDER_RESTRICTION'],
+    ['actor', {}, { actor: 'codex' }, 'PROVIDER_RESTRICTION'],
+    ['owned', {}, { ownedLease: false }, 'INVALID_ARGUMENT'],
+    ['scope', {}, { allowedWritePaths: ['lib/target.js'] }, 'INVALID_ARGUMENT'],
+    ['model', {}, { model: 'opus' }, 'INVALID_ARGUMENT'],
+    ['null lease', {}, { leaseMs: null }, 'INVALID_ARGUMENT'],
+    ['small lease', {}, { leaseMs: 59999 }, 'INVALID_ARGUMENT'],
+    ['large lease', {}, { leaseMs: 86400001 }, 'INVALID_ARGUMENT'],
+    ['missing slot', {}, {}, 'PROVIDER_UNAVAILABLE'],
+    ['conflict', {}, {}, 'WRITER_CONFLICT'],
+  ];
+  for (const [name, extra, input, code] of cases) {
+    const f = fixture(t);
+    f.config.codex = { oneshot_safe: ['codex-safe'] };
+    const run = reachPlanReady(f, extra);
+    if (name === 'missing slot') f.config.claude.oneshot_dangerous = [];
+    if (name === 'conflict') {
+      const other = reachPlanReady(f);
+      f.controller.startImplementation(other.runId);
+    }
+    const before = writerFiles(f, run.runId), count = f.tasks.size;
+    assert.throws(() => f.controller.startManagedImplementation(run.runId, input), { code }, name);
+    assert.deepEqual(writerFiles(f, run.runId), before, name);
+    assert.equal(f.tasks.size, count, name);
+    if (name === 'safe' || name === 'profile') {
+      assert.deepEqual(f.controller.view(run.runId).nextActions, ['claim_pipeline_implementation']);
+    }
+  }
+});
+
+test('wrong-phase managed admission never reconciles or dispatches a pending handoff', (t) => {
+  for (const phase of ['research_ready', 'implementation_ready']) {
+    const f = fixture(t);
+    let run;
+    if (phase === 'research_ready') {
+      run = f.controller.create(createInput(f.cwd));
+      f.pipeline.completeResearch(run.runId, { markdown: 'Research.' });
+    } else {
+      run = reachPlanReady(f);
+      const count = f.tasks.size;
+      const claimed = f.controller.startImplementation(run.runId);
+      assert.equal(f.tasks.size, count, 'external claim dispatches nothing');
+      f.pipeline.completeImplementation(run.runId, { leaseToken: claimed.lease.leaseToken, markdown: 'Real external evidence.' });
+    }
+    const before = writerFiles(f, run.runId), count = f.tasks.size;
+    assert.throws(() => f.controller.startManagedImplementation(run.runId), { code: 'INVALID_TRANSITION' });
+    assert.deepEqual(writerFiles(f, run.runId), before);
+    assert.equal(f.tasks.size, count);
+  }
+});
+
+test('unbound provider crash releases only its own reservation', (t) => {
+  for (const mode of ['orphan reconcile', 'orphan cancel']) {
+    const f = fixture(t), run = reachPlanReady(f);
+    f.pipeline.startImplementation(run.runId, { actor: 'claude-implementer', mode: 'provider' });
+    const restarted = createWorkflowController({ pipeline: createWorkflowPipeline({ dataDir: f.dataDir }),
+      taskQueue: f.taskQueue, loadConfig: () => f.config });
+    t.after(() => restarted.shutdown());
+    if (mode === 'orphan cancel') restarted.cancel(run.runId);
+    else { restarted.reconcile(run.runId); restarted.reconcile(run.runId); }
+    assert.equal(f.pipeline.get(run.runId).phase, mode === 'orphan cancel' ? 'cancelled' : 'failed');
+    assert.equal(f.pipeline.get(run.runId).writerLease, null);
+    assert.deepEqual(fs.readdirSync(path.join(f.dataDir, 'writer-locks')), []);
+    assert.equal(f.tasks.size, 1);
+  }
+});
+
+for (const phase of ['implementation', 'revision']) {
+  test(`${phase} submission directory-fsync failure cancels the published task before releasing the writer`,
+    { skip: process.platform === 'win32' ? 'directory fsync is a POSIX queue durability barrier' : false }, (t) => {
+    const f = fixture(t), run = phase === 'implementation' ? reachPlanReady(f) : reachReviewReady(f);
+    const dir = path.join(f.dataDir, 'durable-tasks');
+    const queue = createTaskQueue({ dataDir: dir, autoStart: false, now: () => f.clock.value,
+      executeOneShot() { assert.fail('no provider should be invoked'); } });
+    t.after(() => queue.shutdown());
+    const controller = createWorkflowController({ pipeline: f.pipeline, taskQueue: queue,
+      loadConfig: () => f.config, now: () => f.clock.value });
+    t.after(() => controller.shutdown());
+    const originalSync = fs.fsyncSync;
+    const originalOpen = fs.openSync;
+    let queueDirectoryFd = null;
+    let published = null;
+    t.mock.method(fs, 'openSync', (file, ...args) => {
+      const fd = originalOpen(file, ...args);
+      if (file === dir) queueDirectoryFd = fd;
+      return fd;
+    });
+    t.mock.method(fs, 'fsyncSync', (fd) => {
+      // Inject exactly the post-rename directory barrier failure, not a
+      // fabricated submission result or a workflow-store failure.
+      if (!published && fd === queueDirectoryFd && fs.fstatSync(fd).isDirectory()) {
+        const name = fs.readdirSync(dir).find((entry) => /^t_.*\.json$/.test(entry));
+        published = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8'));
+        throw Object.assign(new Error('fixture queue directory fsync EIO'), { code: 'EIO' });
+      }
+      return originalSync(fd);
+    });
+    const start = () => phase === 'implementation' ? controller.startManagedImplementation(run.runId) : controller.startRevision(run.runId);
+    assert.throws(start, /fixture queue directory fsync EIO/);
+    assert.equal(published.status, 'queued');
+    assert.equal(published.execution.state, 'never_started');
+    const cancelled = queue.get(published.id);
+    assert.equal(cancelled.status, 'cancelled');
+    assert.equal(cancelled.startedAt, null);
+    assert.equal(cancelled.execution.state, 'never_started');
+    assert.equal(f.pipeline.get(run.runId).phase, 'failed');
+    assert.equal(f.pipeline.get(run.runId).writerLease, null);
+    assert.deepEqual(fs.readdirSync(path.join(f.dataDir, 'writer-locks')), []);
+    queue.shutdown();
+    const restarted = createTaskQueue({ dataDir: dir, autoStart: false });
+    t.after(() => restarted.shutdown());
+    assert.equal(restarted.get(published.id).status, 'cancelled');
+    assert.equal(restarted.stats().queued, 0, 'published work cannot re-enter the queue on restart');
+  });
+}
+
+test('ambiguous submission outcomes retain the initial writer binding and fence', (t) => {
+  for (const outcome of ['missing', 'identity mismatch', 'running', 'no execution proof', 'cancel throws', 'cancel not durable']) {
+    const f = fixture(t), run = reachPlanReady(f);
+    const submit = f.taskQueue.submitReserved.bind(f.taskQueue);
+    let cancellations = 0;
+    const cancel = f.taskQueue.cancel.bind(f.taskQueue);
+    f.taskQueue.cancel = (id) => {
+      cancellations++;
+      if (outcome === 'cancel throws') throw new Error('fixture cancellation persistence failure');
+      if (outcome === 'cancel not durable') return { ...f.taskQueue.get(id), status: 'cancelled' };
+      return cancel(id);
+    };
+    f.taskQueue.submitReserved = (id, input) => {
+      if (outcome !== 'missing') {
+        const task = submit(id, input);
+        task.execution = { state: 'never_started' };
+        if (outcome === 'identity mismatch') task.body.cwd = path.join(f.cwd, 'other');
+        if (outcome === 'running') Object.assign(task, { status: 'running', startedAt: f.clock.value, execution: { state: 'in_flight' } });
+        if (outcome === 'no execution proof') delete task.execution;
+      }
+      throw new Error('fixture ambiguous submission failure');
+    };
+    assert.throws(() => f.controller.startManagedImplementation(run.runId), /fixture ambiguous submission failure/);
+    const current = f.pipeline.get(run.runId);
+    assert.equal(current.phase, 'implementing');
+    assert.equal(current.providerTask.purpose, 'implementation');
+    assert.equal(current.writerLease.mode, 'provider');
+    assert.equal(fs.readdirSync(path.join(f.dataDir, 'writer-locks')).length, 1);
+    assert.equal(cancellations, outcome.startsWith('cancel ') ? 1 : 0);
+    const held = writerFiles(f, run.runId);
+    if (['missing', 'identity mismatch'].includes(outcome)) {
+      assert.throws(() => f.controller.reconcile(run.runId), { code: 'WRITER_EXECUTION_UNCERTAIN' });
+    } else {
+      assert.equal(f.controller.reconcile(run.runId).workflow.phase, 'implementing');
+    }
+    assert.throws(() => f.controller.cancel(run.runId), outcome === 'cancel throws'
+      ? /fixture cancellation persistence failure/
+      : { code: outcome === 'running' ? 'WRITER_TASK_RUNNING' : 'WRITER_EXECUTION_UNCERTAIN' });
+    assert.deepEqual(writerFiles(f, run.runId), held, 'later reconcile/cancel cannot convert ambiguous admission into release');
+  }
+});
+
+test('revision submission with a missing outcome cannot fall through to token-based release', (t) => {
+  const f = fixture(t), run = reachReviewReady(f);
+  f.taskQueue.submitReserved = () => { throw new Error('fixture ambiguous revision submission'); };
+  assert.throws(() => f.controller.startRevision(run.runId), /fixture ambiguous revision submission/);
+  const current = f.pipeline.get(run.runId);
+  assert.equal(current.phase, 'revising');
+  assert.equal(current.providerTask.purpose, 'revision');
+  assert.equal(current.writerLease.mode, 'provider');
+  assert.equal(fs.readdirSync(path.join(f.dataDir, 'writer-locks')).length, 1);
+});
+
+test('managed queued cancellation rechecks durable settlement before releasing the fence', (t) => {
+  const f = fixture(t), run = reachPlanReady(f);
+  const started = f.controller.startManagedImplementation(run.runId);
+  const before = writerFiles(f, run.runId);
+  const cancel = f.taskQueue.cancel.bind(f.taskQueue);
+  f.taskQueue.cancel = (id) => ({ ...f.taskQueue.get(id), status: 'cancelled' });
+  assert.throws(() => f.controller.cancel(run.runId), { code: 'WRITER_EXECUTION_UNCERTAIN' });
+  assert.deepEqual(writerFiles(f, run.runId), before);
+  f.taskQueue.cancel = () => { throw new Error('fixture cancellation write failed'); };
+  assert.throws(() => f.controller.cancel(run.runId), /fixture cancellation write failed/);
+  assert.deepEqual(writerFiles(f, run.runId), before);
+  f.taskQueue.cancel = cancel;
+  f.tasks.get(started.task.id).kind = 'wrong';
+  assert.throws(() => f.controller.reconcile(run.runId), { code: 'WRITER_EXECUTION_UNCERTAIN' });
+  assert.equal(f.tasks.get(started.task.id).status, 'queued', 'mismatched identity is not cancelled');
+  assert.deepEqual(writerFiles(f, run.runId), before);
+  f.tasks.get(started.task.id).kind = 'claude';
+  assert.equal(f.controller.cancel(run.runId).phase, 'cancelled');
+});
+
+for (const mode of ['missing', 'interrupted', 'cancelled', 'malformed', 'running mismatch', 'running']) {
+  test(`restarted initial writer with ${mode} task keeps its reservation until authoritative settlement`, (t) => {
+    const f = fixture(t), run = reachPlanReady(f);
+    const started = f.controller.startManagedImplementation(run.runId, mode === 'running' ? { leaseMs: 60000 } : {});
+    f.controller.shutdown();
+    if (mode === 'missing') f.tasks.delete(started.task.id);
+    else Object.assign(f.tasks.get(started.task.id), mode.startsWith('running')
+      ? { status: 'running', ...(mode === 'running mismatch' ? { kind: 'wrong' } : {}) }
+      : { status: mode === 'malformed' ? 'failed' : mode, execution: mode === 'malformed' ? {} : { state: 'uncertain' } });
+    if (mode === 'running') {
+      assert.equal(started.workflow.writerLease.expiresAt - f.clock.value, 60000);
+      // A bridge outage can outlast its heartbeat lease while the writer lives.
+      f.clock.value = started.workflow.writerLease.expiresAt + 1;
+    }
+    const restored = createWorkflowController({ pipeline: createWorkflowPipeline({ dataDir: f.dataDir, now: () => f.clock.value }),
+      taskQueue: f.taskQueue, loadConfig: () => f.config, now: () => f.clock.value });
+    t.after(() => restored.shutdown());
+    const before = writerFiles(f, run.runId), count = f.tasks.size;
+    restored.view(run.runId);
+    if (mode === 'running') {
+      assert.ok(f.pipeline.get(run.runId).writerLease.expiresAt < f.clock.value);
+      assert.equal(restored.reconcile(run.runId).workflow.phase, 'implementing');
+      assert.equal(f.tasks.get(started.task.id).status, 'running');
+    } else assert.throws(() => restored.reconcile(run.runId), { code: mode === 'running mismatch' ? 'WRITER_TASK_RUNNING' : 'WRITER_EXECUTION_UNCERTAIN' });
+    assert.throws(() => restored.cancel(run.runId), { code: mode.startsWith('running') ? 'WRITER_TASK_RUNNING' : 'WRITER_EXECUTION_UNCERTAIN' });
+    assert.deepEqual(writerFiles(f, run.runId), before, 'restart, expiry and refused cancellation retain the exact fence');
+    assert.equal(f.tasks.size, count, 'no replacement writer or review is dispatched');
+    if (mode !== 'missing') {
+      Object.assign(f.tasks.get(started.task.id), { kind: 'claude', status: 'failed', execution: { state: 'fenced' } });
+      assert.equal(restored.cancel(run.runId).phase, 'cancelled');
+    }
+  });
+}
+
+for (const status of ['done', 'failed']) {
+  for (const evidence of ['omitted', 'null']) {
+    test(`initial ${status} task with ${evidence} execution evidence retains its fence across restart and cancel`, (t) => {
+      const f = fixture(t), run = reachPlanReady(f), contender = reachPlanReady(f);
+      const started = f.controller.startManagedImplementation(run.runId);
+      f.finish(started.task, 'Scoped implementation.\nIMPLEMENTATION_STATUS: COMPLETE', status, { execution: null });
+      if (evidence === 'omitted') delete started.task.execution;
+      f.controller.shutdown();
+      const restored = createWorkflowController({ pipeline: createWorkflowPipeline({ dataDir: f.dataDir, now: () => f.clock.value }),
+        taskQueue: f.taskQueue, loadConfig: () => f.config, now: () => f.clock.value });
+      t.after(() => restored.shutdown());
+      const before = writerFiles(f, run.runId), count = f.tasks.size;
+      assert.throws(() => restored.reconcile(run.runId), { code: 'WRITER_EXECUTION_UNCERTAIN' });
+      assert.throws(() => restored.cancel(run.runId), { code: 'WRITER_EXECUTION_UNCERTAIN' });
+      assert.throws(() => restored.startImplementation(contender.runId), { code: 'WRITER_CONFLICT' });
+      assert.deepEqual(writerFiles(f, run.runId), before, 'the exact lease and binding remain held');
+      assert.equal(f.tasks.size, count, 'no review or replacement writer is dispatched');
+      started.task.execution = { state: status === 'done' ? 'settled' : 'fenced' };
+      const settled = restored.reconcile(run.runId).workflow;
+      assert.equal(settled.phase, status === 'done' ? 'reviewing' : 'failed');
+      assert.equal(settled.writerLease, null, 'affirmative matching terminal evidence permits settlement');
+    });
+  }
+}
+
+for (const [field, status, mutate] of [
+  ['id', 'done', task => { task.id += '_other'; }],
+  ['actor', 'failed', task => { task.user = 'other-writer'; }],
+  ['provider', 'done', task => { task.kind = 'wrong-provider'; }],
+  ['cwd', 'failed', task => { task.body.cwd += '-other'; }],
+  ['request', 'done', task => { task.correlation.requestId += '_other'; }],
+  ['invocation', 'failed', task => { task.correlation.invocationId += '_other'; }],
+]) {
+  test(`initial terminal ${field} mismatch cannot settle or cancel the original bound writer`, (t) => {
+    const f = fixture(t), run = reachPlanReady(f), contender = reachPlanReady(f);
+    const started = f.controller.startManagedImplementation(run.runId);
+    f.finish(started.task, 'Scoped implementation.\nIMPLEMENTATION_STATUS: COMPLETE', status,
+      { execution: { state: 'settled' } });
+    const original = structuredClone(started.task);
+    mutate(started.task);
+    f.controller.shutdown();
+    const restored = createWorkflowController({ pipeline: createWorkflowPipeline({ dataDir: f.dataDir, now: () => f.clock.value }),
+      taskQueue: f.taskQueue, loadConfig: () => f.config, now: () => f.clock.value });
+    t.after(() => restored.shutdown());
+    const before = writerFiles(f, run.runId), count = f.tasks.size;
+    assert.throws(() => restored.reconcile(run.runId), { code: 'WRITER_EXECUTION_UNCERTAIN' });
+    assert.throws(() => restored.cancel(run.runId), { code: 'WRITER_EXECUTION_UNCERTAIN' });
+    assert.throws(() => restored.startImplementation(contender.runId), { code: 'WRITER_CONFLICT' });
+    assert.deepEqual(writerFiles(f, run.runId), before);
+    assert.equal(f.tasks.size, count, 'a mismatched terminal record cannot dispatch review or retry');
+    Object.assign(started.task, original, { status: 'failed', execution: { state: 'fenced' } });
+    assert.equal(restored.cancel(run.runId).phase, 'cancelled', 'the exact fenced task permits operator cancellation');
+  });
+}
+
+for (const evidence of ['uncertain', 'missing execution', 'terminal identity mismatch']) {
+  test(`initial writer heartbeat survives ${evidence} reconciliation and stops after phase change`, (t) => {
+    const f = fixture(t);
+    t.mock.timers.enable({ apis: ['setInterval'] });
+    const run = reachPlanReady(f), started = f.controller.startManagedImplementation(run.runId, { leaseMs: 60000 });
+    Object.assign(f.tasks.get(started.task.id), { status: 'cancelled', execution: { state: 'uncertain' } });
+    if (evidence === 'missing execution') {
+      started.task.status = 'done';
+      delete started.task.execution;
+    } else if (evidence === 'terminal identity mismatch') {
+      Object.assign(started.task, { status: 'done', execution: { state: 'settled' } });
+      started.task.correlation.invocationId = 'other-task';
+    }
+    const expiry = started.workflow.writerLease.expiresAt;
+    for (let i = 0; i < 25; i++) {
+      f.clock.value += 1000;
+      assert.throws(() => f.controller.reconcile(run.runId), { code: 'WRITER_EXECUTION_UNCERTAIN' });
+      t.mock.timers.tick(1000);
+    }
+    assert.ok(f.pipeline.get(run.runId).writerLease.expiresAt > expiry);
+    started.task.correlation.invocationId = started.task.id;
+    f.finish(started.task, 'Scoped implementation.\nIMPLEMENTATION_STATUS: COMPLETE', 'done', { execution: { state: 'settled' } });
+    f.controller.reconcile(run.runId);
+    const before = writerFiles(f, run.runId);
+    f.clock.value += 60000; t.mock.timers.tick(60000);
+    assert.deepEqual(writerFiles(f, run.runId), before);
+  });
+}
+
+test('initial writer terminal refusals never dispatch review or retry a writer', (t) => {
+  const cases = [
+    ['', {}], ['No marker.', {}], ['IMPLEMENTATION_STATUS: BLOCKED', {}],
+    ['text IMPLEMENTATION_STATUS: COMPLETE', {}],
+    ['IMPLEMENTATION_STATUS: COMPLETE', { resultIntegrity: { truncated: true } }],
+    ['IMPLEMENTATION_STATUS: COMPLETE', { flags: { timed_out: true } }],
+  ];
+  for (const [result, extra] of cases) {
+    const f = fixture(t), run = reachPlanReady(f), started = f.controller.startManagedImplementation(run.runId);
+    f.finish(started.task, result, 'done', { execution: { state: 'settled' }, ...extra });
+    const view = f.controller.reconcile(run.runId);
+    assert.equal(view.workflow.phase, 'failed');
+    assert.equal(view.workflow.writerLease, null);
+    assert.deepEqual(view.nextActions, []);
+    assert.equal(f.tasks.size, 2);
+  }
+});
+
+test('retained advisor and revision records without execution metadata keep their legacy settlement behavior', (t) => {
+  const f = fixture(t), run = f.controller.create(createInput(f.cwd));
+  const planning = f.controller.submitResearch(run.runId, { markdown: 'Research evidence.' });
+  delete planning.task.execution;
+  f.finish(planning.task, 'Accepted legacy plan.\nPLAN_STATUS: READY');
+  assert.equal(f.controller.reconcile(run.runId).workflow.phase, 'plan_ready');
+  const claimed = f.controller.startImplementation(run.runId);
+  const review = f.controller.completeImplementation(run.runId, { leaseToken: claimed.lease.leaseToken, markdown: 'External implementation.' });
+  delete review.task.execution;
+  f.finish(review.task, 'Legacy revision finding.\nREVIEW_VERDICT: REVISE');
+  f.controller.reconcile(run.runId);
+  const revision = f.controller.startRevision(run.runId);
+  delete revision.task.execution;
+  f.finish(revision.task, 'Legacy revision evidence.\nREVISION_STATUS: APPLIED');
+  assert.equal(f.controller.reconcile(run.runId).workflow.phase, 'revision_ready');
+  assert.equal(f.pipeline.get(run.runId).writerLease, null);
+});
+
+for (const taskTier of ['complex', 'critical', 'standard', 'utility', 'deterministic']) {
+  test(`both managed writer phases request the accepted ${taskTier} tier`, (t) => {
+    const expected = ['complex', 'critical'].includes(taskTier) ? ['heavy', 'high'] : ['standard', 'medium'];
+    const f = fixture(t), run = reachPlanReady(f, { taskTier });
+    const initial = f.controller.startManagedImplementation(run.runId);
+    assert.deepEqual([initial.task.modelTier, initial.task.effort], expected);
+    f.finish(initial.task, 'Implemented.\nIMPLEMENTATION_STATUS: COMPLETE');
+    const review = f.controller.reconcile(run.runId).workflow;
+    f.finish(f.tasks.get(review.providerTask.taskId), 'Finding.\nREVIEW_VERDICT: REVISE');
+    f.controller.reconcile(run.runId);
+    const revision = f.controller.startRevision(run.runId);
+    assert.deepEqual([revision.task.modelTier, revision.task.effort], expected);
+  });
+}
+
+for (const historical of [false, true]) {
+  test(`reconcile preserves ${historical ? 'historical' : 'external'} initial owner without queue activity`, (t) => {
+    const f = fixture(t), run = reachPlanReady(f);
+    f.controller.startImplementation(run.runId);
+    if (historical) {
+      const file = path.join(f.dataDir, 'workflows', run.runId, 'state.json');
+      const state = JSON.parse(fs.readFileSync(file, 'utf8'));
+      state.schemaVersion = 1; delete state.profile; delete state.phasePolicy; delete state.writerLease.mode;
+      fs.writeFileSync(file, JSON.stringify(state));
+    }
+    const before = writerFiles(f, run.runId), count = f.tasks.size;
+    f.controller.reconcile(run.runId); f.controller.reconcile(run.runId);
+    assert.deepEqual(writerFiles(f, run.runId), before);
+    assert.equal(f.tasks.size, count);
+    assert.deepEqual(f.controller.view(run.runId).nextActions, ['complete_pipeline_implementation', 'renew_pipeline_writer_lease']);
+  });
+}
+
+test('initial bound-before-submit crash remains held and a restarted running task renews', (t) => {
+  const f = fixture(t), run = reachPlanReady(f), actor = 'claude-implementer', taskId = 't_reserved_only';
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  f.pipeline.startImplementation(run.runId, { actor, mode: 'provider', leaseMs: 60000 });
+  f.pipeline.bindProviderTask(run.runId, { actor, taskId, provider: 'claude', purpose: 'implementation', modelTier: 'standard', effort: 'medium' });
+  const restored = createWorkflowController({ pipeline: createWorkflowPipeline({ dataDir: f.dataDir, now: () => f.clock.value }),
+    taskQueue: f.taskQueue, loadConfig: () => f.config, now: () => f.clock.value });
+  t.after(() => restored.shutdown());
+  assert.throws(() => restored.reconcile(run.runId), { code: 'WRITER_EXECUTION_UNCERTAIN' });
+  assert.equal(f.tasks.size, 1, 'restart does not invent a replacement writer');
+  f.taskQueue.submitReserved(taskId, { kind: 'claude', user: actor, cwd: f.cwd, dangerous: true,
+    modelTier: 'standard', model: null, effort: 'medium', requestId: taskId,
+    correlation: { runId: run.runId, requestId: taskId, invocationId: taskId, attemptId: `${taskId}:attempt:1` } });
+  f.tasks.get(taskId).status = 'running';
+  const original = f.pipeline.get(run.runId).writerLease.expiresAt;
+  restored.reconcile(run.runId);
+  f.clock.value += 30000; t.mock.timers.tick(30000);
+  assert.ok(f.pipeline.get(run.runId).writerLease.expiresAt > original);
 });
