@@ -160,6 +160,373 @@ test('expired external and legacy ambiguous revisions remain held across read an
   }
 });
 
+// NOT RUN until root executes: explicit acknowledged cancellation of expired external ownership.
+function expiredExternal(t, { phase = 'revising', legacy = false } = {}) {
+  const f = fixture(t);
+  let created;
+  let claimed;
+  if (phase === 'revising') {
+    created = reachReviewReady(f);
+    claimed = f.controller.claimRevision(created.runId, { leaseMs: 60000 });
+  } else {
+    created = f.controller.create(createInput(f.cwd));
+    const planning = f.controller.submitResearch(created.runId, { markdown: 'Research evidence.' });
+    f.finish(planning.task, 'Plan details.\nPLAN_STATUS: READY');
+    f.controller.reconcile(created.runId);
+    claimed = f.controller.startImplementation(created.runId, { leaseMs: 60000 });
+  }
+  const runId = created.runId;
+  const stateFile = path.join(f.dataDir, 'workflows', runId, 'state.json');
+  const edit = (change) => {
+    const state = JSON.parse(fs.readFileSync(stateFile));
+    change(state);
+    fs.writeFileSync(stateFile, JSON.stringify(state));
+  };
+  if (legacy) edit((state) => { state.schemaVersion = 1; delete state.profile; delete state.phasePolicy; delete state.writerLease.mode; });
+  f.clock.value += 60001;
+  const state = f.pipeline.get(runId);
+  const lockFile = path.join(f.dataDir, 'writer-locks', `${state.writerLease.cwdSha256}.json`);
+  const ack = {
+    acknowledged: true, revision: state.revision, mode: legacy ? 'legacy_absent' : 'external', actor: 'codex',
+    cwdSha256: state.writerLease.cwdSha256, leaseTokenSha256: state.writerLease.leaseTokenSha256,
+    acquiredAt: state.writerLease.acquiredAt, expiresAt: state.writerLease.expiresAt,
+  };
+  const snapshot = () => ({ state: fs.readFileSync(stateFile), lock: fs.existsSync(lockFile) ? fs.readFileSync(lockFile) : null });
+  return { f, runId, token: claimed.lease.leaseToken, stateFile, lockFile, ack, edit, snapshot };
+}
+
+test('expired external ownership is cancelled by exact acknowledgement without the lost token', (t) => {
+  for (const phase of ['implementing', 'revising']) {
+    for (const legacy of [false, true]) {
+      for (const lockPresent of [true, false]) {
+        const x = expiredExternal(t, { phase, legacy });
+        if (!lockPresent) fs.unlinkSync(x.lockFile);
+        const count = x.f.tasks.size;
+        const cancelled = x.f.controller.cancel(x.runId, { actor: 'operator', expiredExternalOwnership: x.ack });
+        assert.equal(cancelled.phase, 'cancelled');
+        assert.equal(cancelled.writerLease, null);
+        assert.equal(x.f.tasks.size, count, 'cancellation dispatches nothing');
+        assert.equal(fs.existsSync(x.lockFile), false);
+        const reopened = createWorkflowPipeline({ dataDir: x.f.dataDir, now: () => x.f.clock.value }).get(x.runId);
+        const event = reopened.history.at(-1);
+        assert.equal(event.event, 'expired_external_writer_cancelled');
+        assert.equal(event.detail.processTermination, 'not_attested');
+        assert.equal(event.detail.lockPresent, lockPresent);
+        assert.equal(event.detail.leaseTokenSha256, x.ack.leaseTokenSha256);
+        assert.equal(reopened.terminal.status, 'cancelled');
+        assert.match(reopened.terminal.reason, /process termination not attested/);
+        assert.ok(!fs.readFileSync(x.stateFile, 'utf8').includes(x.token), 'the token never reaches durable state');
+        assert.throws(() => x.f.controller.cancel(x.runId, { expiredExternalOwnership: x.ack }), { code: 'WORKFLOW_TERMINAL' });
+        assert.equal(x.f.tasks.size, count);
+      }
+    }
+  }
+});
+
+test('expired external cancellation refuses misuse without any mutation', (t) => {
+  const x = expiredExternal(t);
+  const otherRun = x.f.controller.create(createInput(x.f.cwd));
+  const otherBefore = JSON.stringify(x.f.pipeline.get(otherRun.runId));
+  const before = x.snapshot();
+  const count = x.f.tasks.size;
+  const refuse = (input, code) => {
+    assert.throws(() => x.f.controller.cancel(x.runId, input), { code });
+    assert.deepEqual(x.snapshot(), before);
+    assert.equal(x.f.tasks.size, count);
+  };
+  for (const bad of [null, [], 'yes', {}, { ...x.ack, acknowledged: false }, { ...x.ack, acknowledged: 'true' },
+    { ...x.ack, extra: 1 }, { ...x.ack, mode: 'provider' }, { ...x.ack, cwdSha256: 'A'.repeat(64) },
+    { ...x.ack, revision: 0 }, { ...x.ack, expiresAt: -1 }, { ...x.ack, acquiredAt: 1.5 }]) {
+    refuse({ expiredExternalOwnership: bad }, 'INVALID_EXPIRED_CANCEL');
+  }
+  const { expiresAt, ...missing } = x.ack;
+  refuse({ expiredExternalOwnership: missing }, 'INVALID_EXPIRED_CANCEL');
+  refuse({ expiredExternalOwnership: x.ack, leaseToken: x.token }, 'INVALID_EXPIRED_CANCEL');
+  for (const [field, value] of [['revision', x.ack.revision + 1], ['mode', 'legacy_absent'], ['actor', 'claude'],
+    ['cwdSha256', 'b'.repeat(64)], ['leaseTokenSha256', 'b'.repeat(64)], ['acquiredAt', x.ack.acquiredAt + 1],
+    ['expiresAt', x.ack.expiresAt + 1]]) {
+    refuse({ expiredExternalOwnership: { ...x.ack, [field]: value } }, 'LEASE_MISMATCH');
+  }
+  assert.throws(() => x.f.controller.cancel(otherRun.runId, { expiredExternalOwnership: x.ack }), { code: 'LEASE_NOT_REQUIRED' });
+  assert.throws(() => x.f.pipeline.cancelExpiredExternalWriter(x.runId, { acknowledgement: { ...x.ack, revision: x.ack.revision - 1 } }),
+    { code: 'LEASE_MISMATCH' });
+  assert.deepEqual(x.snapshot(), before);
+  assert.equal(JSON.stringify(x.f.pipeline.get(otherRun.runId)), otherBefore, 'unrelated workflows are untouched');
+  // Without the acknowledgement the default expired refusal is unchanged.
+  assert.throws(() => x.f.controller.cancel(x.runId, { leaseToken: x.token }), { code: 'LEASE_EXPIRED' });
+  assert.deepEqual(x.snapshot(), before);
+});
+
+test('unexpired ownership cannot be cancelled by acknowledgement', (t) => {
+  const x = expiredExternal(t);
+  x.f.clock.value = x.ack.expiresAt - 1;
+  const before = x.snapshot();
+  assert.throws(() => x.f.controller.cancel(x.runId, { expiredExternalOwnership: x.ack }), { code: 'INVALID_EXPIRED_CANCEL' });
+  assert.throws(() => x.f.pipeline.cancelExpiredExternalWriter(x.runId, { acknowledgement: x.ack }), { code: 'INVALID_EXPIRED_CANCEL' });
+  assert.deepEqual(x.snapshot(), before);
+});
+
+test('provider, bound-task and owned records are refused before any queue or owner side effect', (t) => {
+  for (const [name, change, code, pipelineCode] of [
+    ['provider', (state) => { state.writerLease.mode = 'provider'; }, 'INVALID_EXPIRED_CANCEL', 'INVALID_EXPIRED_CANCEL'],
+    ['owned', (state) => { state.writerLease.ownerProtocol = 'owned-writer'; }, 'INVALID_EXPIRED_CANCEL', 'OWNER_RELEASE_REQUIRED'],
+    ['bound', (state, id) => { state.providerTask = { taskId: id, provider: 'claude', actor: 'codex' }; }, 'INVALID_EXPIRED_CANCEL', 'INVALID_EXPIRED_CANCEL'],
+  ]) {
+    const x = expiredExternal(t, { legacy: true });
+    const task = x.f.taskQueue.submit({ kind: 'claude', prompt: 'bound' });
+    x.edit((state) => change(state, task.id));
+    const before = x.snapshot();
+    const spy = t.mock.method(x.f.taskQueue, 'cancel');
+    assert.throws(() => x.f.controller.cancel(x.runId, { expiredExternalOwnership: x.ack }), { code }, name);
+    assert.equal(spy.mock.callCount(), 0, `${name}: no queue cancellation`);
+    assert.equal(x.f.tasks.get(task.id).status, 'queued');
+    assert.deepEqual(x.snapshot(), before);
+    assert.throws(() => x.f.pipeline.cancelExpiredExternalWriter(x.runId, { acknowledgement: x.ack }), { code: pipelineCode }, name);
+    assert.deepEqual(x.snapshot(), before);
+  }
+});
+
+test('corrupt, symlink, directory and successor locks are preserved and refuse cancellation', (t) => {
+  const outside = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'rb-lock-target-')), 'target.json');
+  t.after(() => fs.rmSync(path.dirname(outside), { recursive: true, force: true }));
+  fs.writeFileSync(outside, '{}');
+  const cases = [
+    ['corrupt', (x) => fs.writeFileSync(x.lockFile, '{not json'), 'LOCK_CORRUPT'],
+    ['wrong-shape', (x) => fs.writeFileSync(x.lockFile, JSON.stringify({ schemaVersion: 1 })), 'LOCK_CORRUPT'],
+    ['symlink', (x) => { fs.unlinkSync(x.lockFile); fs.symlinkSync(outside, x.lockFile); }, 'LOCK_CORRUPT'],
+    ['dangling', (x) => { fs.unlinkSync(x.lockFile); fs.symlinkSync(`${outside}.missing`, x.lockFile); }, 'LOCK_CORRUPT'],
+    ['directory', (x) => { fs.unlinkSync(x.lockFile); fs.mkdirSync(x.lockFile); }, 'LOCK_CORRUPT'],
+    ['successor-token', (x) => { const lock = JSON.parse(fs.readFileSync(x.lockFile)); lock.leaseToken = 'c'.repeat(64); fs.writeFileSync(x.lockFile, JSON.stringify(lock)); }, 'LEASE_MISMATCH'],
+    ['successor-run', (x) => { const lock = JSON.parse(fs.readFileSync(x.lockFile)); lock.runId = 'wf_mzzzzzzz_000000000000'; fs.writeFileSync(x.lockFile, JSON.stringify(lock)); }, 'LEASE_MISMATCH'],
+  ];
+  for (const [name, mutate, code] of cases) {
+    const x = expiredExternal(t);
+    mutate(x);
+    const stateBefore = fs.readFileSync(x.stateFile);
+    const lockBefore = fs.lstatSync(x.lockFile);
+    const lockBytes = lockBefore.isFile() ? fs.readFileSync(x.lockFile) : null;
+    assert.throws(() => x.f.controller.cancel(x.runId, { expiredExternalOwnership: x.ack }), { code }, name);
+    assert.deepEqual(fs.readFileSync(x.stateFile), stateBefore, `${name}: state unchanged`);
+    const lockAfter = fs.lstatSync(x.lockFile);
+    assert.equal(lockAfter.ino, lockBefore.ino, `${name}: lock preserved`);
+    if (lockBytes) assert.deepEqual(fs.readFileSync(x.lockFile), lockBytes);
+    assert.equal(x.f.pipeline.get(x.runId).phase, 'revising');
+  }
+});
+
+test('a successor lock written after state terminalization is never unlinked', (t) => {
+  const x = expiredExternal(t);
+  const original = fs.renameSync;
+  const successor = { ...JSON.parse(fs.readFileSync(x.lockFile)), leaseToken: 'd'.repeat(64) };
+  t.mock.method(fs, 'renameSync', (from, to, ...rest) => {
+    original(from, to, ...rest);
+    if (String(to).endsWith('state.json')) fs.writeFileSync(x.lockFile, JSON.stringify(successor));
+  });
+  assert.throws(() => x.f.pipeline.cancelExpiredExternalWriter(x.runId, { acknowledgement: x.ack }), { code: 'LEASE_MISMATCH' });
+  assert.deepEqual(JSON.parse(fs.readFileSync(x.lockFile)), successor, 'successor lock preserved');
+  // State is already durable-cancelled; there is no cross-file transaction.
+  assert.equal(x.f.pipeline.get(x.runId).phase, 'cancelled');
+});
+
+// NOT RUN until root executes. Deterministic seam: wrap one fs read on one path so
+// the first (authoritative) read returns its real outcome, then `replace` runs once,
+// and every later read sees the replacement. `replace` must not read through fs.
+function afterFirstRead(t, method, matches, replace) {
+  const original = fs[method];
+  const probe = { calls: 0 };
+  const mocked = t.mock.method(fs, method, (file, ...rest) => {
+    if (!matches(String(file))) return original(file, ...rest);
+    probe.calls += 1;
+    if (probe.calls > 1) return original(file, ...rest);
+    let outcome;
+    try { outcome = { value: original(file, ...rest) }; } catch (error) { outcome = { error }; }
+    replace();
+    if (outcome.error) throw outcome.error;
+    return outcome.value;
+  });
+  probe.restore = () => mocked.mock.restore();
+  return probe;
+}
+
+const isStateFile = (x) => (file) => file.endsWith(path.join(x.runId, 'state.json'));
+const isLockFile = (x) => (file) => path.basename(file) === path.basename(x.lockFile);
+
+// Returns the probe's read count taken at refusal time, before any post-hoc reads.
+function assertPrePersistRefusal(t, x, run, probe, { stateBytes, lockBytes }, label) {
+  const spy = t.mock.method(x.f.taskQueue, 'cancel');
+  const count = x.f.tasks.size;
+  assert.throws(run, { code: 'LEASE_MISMATCH' }, label);
+  const reads = probe.calls;
+  probe.restore();
+  assert.deepEqual(fs.readFileSync(x.stateFile), stateBytes, `${label}: state bytes are exactly the replacement`);
+  assert.equal(x.f.pipeline.get(x.runId).phase, 'revising', `${label}: no cancelled overwrite`);
+  if (lockBytes === null) assert.equal(fs.existsSync(x.lockFile), false, `${label}: lock stays absent`);
+  else assert.deepEqual(fs.readFileSync(x.lockFile), lockBytes, `${label}: lock bytes preserved`);
+  assert.equal(x.f.tasks.size, count, `${label}: no queue dispatch`);
+  assert.equal(spy.mock.callCount(), 0, `${label}: no queue or owner action`);
+  return reads;
+}
+
+test('pre-persist state replacement after the authoritative read is refused and preserved', (t) => {
+  const variants = [
+    ['revision bump', (s) => { s.revision += 1; }],
+    ['same-revision full-lease replacement', (s) => { s.writerLease.leaseTokenSha256 = 'e'.repeat(64); }],
+    ['same-revision lease expiry replacement', (s) => { s.writerLease.expiresAt += 1000; }],
+    ['same-revision unrelated state change', (s) => { s.updatedAt += 1; }],
+  ];
+  for (const [label, change] of variants) {
+    const x = expiredExternal(t);
+    const before = x.snapshot();
+    const replacement = JSON.parse(before.state);
+    change(replacement);
+    const replacementBytes = Buffer.from(JSON.stringify(replacement));
+    const probe = afterFirstRead(t, 'readFileSync', isStateFile(x), () => fs.writeFileSync(x.stateFile, replacementBytes));
+    const reads = assertPrePersistRefusal(t, x, () => x.f.pipeline.cancelExpiredExternalWriter(x.runId, { acknowledgement: x.ack }),
+      probe, { stateBytes: replacementBytes, lockBytes: before.lock }, label);
+    assert.ok(reads >= 2, `${label}: authoritative state was reread before persistence`);
+  }
+});
+
+test('pre-persist lock replacement after the first lock read is refused without release', (t) => {
+  const variants = [
+    ['successor token', (lock) => JSON.stringify({ ...lock, leaseToken: 'c'.repeat(64) })],
+    ['successor run', (lock) => JSON.stringify({ ...lock, runId: 'wf_mzzzzzzz_000000000000' })],
+    ['vanished', () => null],
+  ];
+  for (const [label, successor] of variants) {
+    const x = expiredExternal(t);
+    const before = x.snapshot();
+    const replacement = successor(JSON.parse(before.lock));
+    const replacementBytes = replacement === null ? null : Buffer.from(replacement);
+    // A vanished lock makes the production reread throw ENOENT from lstat before any second
+    // file read, so that variant counts matching-path lstat probes (pass-through) instead.
+    const lstats = { calls: 0, atReplace: 0, atRefusal: 0 };
+    let lstatMock = null;
+    if (replacementBytes === null) {
+      const lstatOriginal = fs.lstatSync;
+      lstatMock = t.mock.method(fs, 'lstatSync', (file, ...rest) => {
+        if (isLockFile(x)(String(file))) lstats.calls += 1;
+        return lstatOriginal(file, ...rest);
+      });
+    }
+    const probe = afterFirstRead(t, 'readFileSync', isLockFile(x), () => {
+      lstats.atReplace = lstats.calls;
+      if (replacementBytes === null) fs.unlinkSync(x.lockFile); else fs.writeFileSync(x.lockFile, replacementBytes);
+    });
+    const run = () => {
+      try { return x.f.controller.cancel(x.runId, { expiredExternalOwnership: x.ack }); }
+      finally { lstats.atRefusal = lstats.calls; }
+    };
+    const reads = assertPrePersistRefusal(t, x, run,
+      probe, { stateBytes: before.state, lockBytes: replacementBytes }, label);
+    if (lstatMock) lstatMock.mock.restore();
+    if (replacementBytes === null) {
+      assert.ok(reads >= 1, `${label}: the first lock read returned its real bytes before the lock vanished`);
+      assert.ok(lstats.atReplace >= 1, `${label}: the first lock probe preceded the removal`);
+      assert.ok(lstats.atRefusal > lstats.atReplace, `${label}: lock path was probed again before persistence`);
+    } else {
+      assert.ok(reads >= 2, `${label}: lock was reread before persistence`);
+    }
+  }
+});
+
+test('an initially missing lock that becomes a successor before persistence is refused', (t) => {
+  const variants = [
+    ['different owner', (lock) => JSON.stringify({ ...lock, leaseToken: 'c'.repeat(64) })],
+    // Identical identity still refuses: the lock's presence changed after the first read.
+    ['identical identity reappears', (lock) => JSON.stringify(lock)],
+  ];
+  for (const [label, successor] of variants) {
+    const x = expiredExternal(t);
+    const successorBytes = Buffer.from(successor(JSON.parse(fs.readFileSync(x.lockFile))));
+    fs.unlinkSync(x.lockFile);
+    const stateBytes = fs.readFileSync(x.stateFile);
+    // The first lock probe still reports ENOENT; the successor is installed before the next one.
+    const probe = afterFirstRead(t, 'lstatSync', isLockFile(x), () => fs.writeFileSync(x.lockFile, successorBytes));
+    const reads = assertPrePersistRefusal(t, x, () => x.f.pipeline.cancelExpiredExternalWriter(x.runId, { acknowledgement: x.ack }),
+      probe, { stateBytes, lockBytes: successorBytes }, label);
+    assert.ok(reads >= 2, `${label}: the missing lock was reread before persistence`);
+  }
+});
+
+test('an unreadable regular lock file is refused and preserved', (t) => {
+  for (const code of ['EACCES', 'EIO']) {
+    const x = expiredExternal(t);
+    const lockStat = fs.lstatSync(x.lockFile);
+    assert.ok(lockStat.isFile() && !lockStat.isSymbolicLink(), 'the lock is a real regular file');
+    const before = x.snapshot();
+    const count = x.f.tasks.size;
+    const spy = t.mock.method(x.f.taskQueue, 'cancel');
+    const original = fs.readFileSync;
+    let thrown = 0;
+    const mocked = t.mock.method(fs, 'readFileSync', (file, ...rest) => {
+      if (!isLockFile(x)(String(file))) return original(file, ...rest);
+      thrown += 1;
+      throw Object.assign(new Error(`injected ${code}`), { code });
+    });
+    const attempts = [
+      () => x.f.controller.cancel(x.runId, { expiredExternalOwnership: x.ack }),
+      () => x.f.pipeline.cancelExpiredExternalWriter(x.runId, { acknowledgement: x.ack }),
+    ];
+    for (const attempt of attempts) {
+      const reached = thrown;
+      assert.throws(attempt, (error) => error.code === 'LOCK_CORRUPT' && new RegExp(`unreadable.*${code}`).test(error.message), code);
+      assert.equal(thrown, reached + 1, `${code}: the regular-file read branch was reached`);
+    }
+    mocked.mock.restore();
+    assert.deepEqual(x.snapshot(), before, `${code}: state and lock bytes unchanged`);
+    assert.equal(fs.lstatSync(x.lockFile).ino, lockStat.ino, `${code}: lock inode preserved`);
+    assert.equal(x.f.tasks.size, count);
+    assert.equal(spy.mock.callCount(), 0);
+    assert.equal(x.f.pipeline.get(x.runId).phase, 'revising');
+  }
+});
+
+test('a providerRetry record is refused before any queue, owner or pipeline action', (t) => {
+  const retry = { phase: 'revising', purpose: 'revision', failedProvider: 'claude', failureClass: 'transient',
+    previousAttempt: 1, nextAttempt: 2, maxAttempts: 3, scheduledAt: 1, retryAt: 2, failedTaskId: 't_fake_1' };
+  const x = expiredExternal(t, { legacy: true });
+  const spy = t.mock.method(x.f.taskQueue, 'cancel');
+  const count = x.f.tasks.size;
+  const before = x.snapshot();
+  const cleanWorkflow = x.f.pipeline.get(x.runId);
+  // Schema unchanged: a retry beside a writer phase is already STATE_CORRUPT.
+  x.edit((state) => { state.providerRetry = retry; });
+  const corrupt = x.snapshot();
+  assert.throws(() => x.f.controller.cancel(x.runId, { expiredExternalOwnership: x.ack }), { code: 'STATE_CORRUPT' });
+  assert.throws(() => x.f.pipeline.cancelExpiredExternalWriter(x.runId, { acknowledgement: x.ack }), { code: 'STATE_CORRUPT' });
+  assert.deepEqual(x.snapshot(), corrupt);
+  assert.deepEqual(corrupt.lock, before.lock);
+  assert.equal(x.f.tasks.size, count);
+  assert.equal(spy.mock.callCount(), 0);
+
+  // The pipeline is frozen, so exercise the controller guard through a wrapper that
+  // hands it a valid clone carrying providerRetry. This proves guard ordering only;
+  // it is not a reachable valid state.
+  const guarded = fixtureControllerWith(t, x, {
+    get: () => ({ ...cleanWorkflow, providerRetry: retry }),
+  });
+  assert.throws(() => guarded.controller.cancel(x.runId, { expiredExternalOwnership: x.ack }), { code: 'INVALID_EXPIRED_CANCEL' });
+  assert.equal(guarded.delegated(), 0, 'no pipeline cancellation was attempted');
+  assert.deepEqual(x.snapshot(), corrupt);
+  assert.equal(x.f.tasks.size, count);
+  assert.equal(spy.mock.callCount(), 0);
+});
+
+function fixtureControllerWith(t, x, overrides) {
+  let delegated = 0;
+  const pipeline = {
+    ...x.f.pipeline,
+    ...overrides,
+    cancelExpiredExternalWriter: (...args) => { delegated += 1; return x.f.pipeline.cancelExpiredExternalWriter(...args); },
+  };
+  const controller = createWorkflowController({
+    pipeline, taskQueue: x.f.taskQueue, incidents: x.f.incidents, loadConfig: () => x.f.config, now: () => x.f.clock.value,
+  });
+  t.after(() => controller.shutdown());
+  return { controller, delegated: () => delegated };
+}
+
 test('a persisted provider mode cannot override the Codex-only external ownership policy', (t) => {
   const f = fixture(t); f.config.codex = { oneshot_safe: ['codex-safe'] };
   const created = reachReviewReady(f, { ...createInput(f.cwd), profile: 'codex-astra-ultra', permissionMode: 'full' });

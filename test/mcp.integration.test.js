@@ -838,6 +838,71 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   assert.equal(externalClaim.structuredContent.workflow.providerTask, null);
   assert.match(externalClaim.structuredContent.lease.leaseToken, /^[a-f0-9]{64}$/);
   durablePipeline.cancel(externalRun.runId, { leaseToken: externalClaim.structuredContent.lease.leaseToken, reason: 'External fixture complete.' });
+  // NOT RUN until root executes: explicit acknowledged cancellation of an expired external writer.
+  const cancelTool = listedTools.tools.find((tool) => tool.name === 'cancel_pipeline');
+  assert.equal(cancelTool.inputSchema.properties.expiredExternalOwnership.additionalProperties, false);
+  const expiredRun = managedFixture();
+  const unrelatedRun = managedFixture();
+  const unrelatedBefore = durablePipeline.get(unrelatedRun.runId);
+  const expiredIssued = durablePipeline.startImplementation(expiredRun.runId, { leaseMs: 1 });
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  const expiredBefore = durablePipeline.get(expiredRun.runId);
+  const expiredLockFile = path.join(fs.realpathSync(dataDir), 'writer-locks', `${expiredBefore.writerLease.cwdSha256}.json`);
+  assert.equal(fs.existsSync(expiredLockFile), true);
+  const acknowledgement = {
+    acknowledged: true, revision: expiredBefore.revision, mode: 'external', actor: 'codex',
+    cwdSha256: expiredBefore.writerLease.cwdSha256, leaseTokenSha256: expiredBefore.writerLease.leaseTokenSha256,
+    acquiredAt: expiredBefore.writerLease.acquiredAt, expiresAt: expiredBefore.writerLease.expiresAt,
+  };
+  const expiredCancelPost = (body, headers = managedHeaders) => fetch(`${baseUrl}/api/workflows/${expiredRun.runId}/cancel`, {
+    method: 'POST', headers, body: JSON.stringify({ actor: 'codex', ...body }) });
+  const taskIds = async () => JSON.stringify(((await client.callTool({ name: 'list_tasks', arguments: {} }))
+    .structuredContent?.tasks || []).map((task) => task.id));
+  const tasksBeforeExpired = await taskIds();
+  for (const [body, status, code] of [
+    [{ expiredExternalOwnership: { ...acknowledgement, revision: acknowledgement.revision + 1 } }, 409, 'LEASE_MISMATCH'],
+    [{ expiredExternalOwnership: { ...acknowledgement, leaseTokenSha256: 'b'.repeat(64) } }, 409, 'LEASE_MISMATCH'],
+    [{ expiredExternalOwnership: { ...acknowledgement, acknowledged: false } }, 400, 'INVALID_EXPIRED_CANCEL'],
+    [{ expiredExternalOwnership: { ...acknowledgement, extra: true } }, 400, 'INVALID_EXPIRED_CANCEL'],
+    [{ expiredExternalOwnership: acknowledgement, leaseToken: expiredIssued.lease.leaseToken }, 400, 'INVALID_EXPIRED_CANCEL'],
+  ]) {
+    const refused = await expiredCancelPost(body);
+    assert.equal(refused.status, status);
+    assert.equal((await refused.json()).code, code);
+    assert.deepEqual(durablePipeline.get(expiredRun.runId), expiredBefore);
+  }
+  const expiredNoIdentity = await expiredCancelPost({ expiredExternalOwnership: acknowledgement },
+    { ...collabHeaders, 'X-RelayBridge-Client': 'mcp' });
+  assert.equal(expiredNoIdentity.status, 409);
+  assert.equal((await expiredNoIdentity.json()).failureClass, 'bridge_identity_mismatch');
+  for (const bad of [{ ...acknowledgement, acknowledged: false }, { ...acknowledgement, extra: true }]) {
+    const refused = await client.callTool({ name: 'cancel_pipeline',
+      arguments: { runId: expiredRun.runId, expiredExternalOwnership: bad } });
+    assert.equal(refused.isError, true, 'strict MCP schema rejects before REST dispatch');
+  }
+  const noAcknowledgement = await client.callTool({ name: 'cancel_pipeline', arguments: { runId: expiredRun.runId } });
+  assert.equal(noAcknowledgement.isError, true, 'default cancellation of expired ownership stays refused');
+  assert.deepEqual(durablePipeline.get(expiredRun.runId), expiredBefore);
+  assert.equal(fs.existsSync(expiredLockFile), true);
+  const expiredCancelled = await client.callTool({ name: 'cancel_pipeline',
+    arguments: { runId: expiredRun.runId, expiredExternalOwnership: acknowledgement } });
+  assert.equal(expiredCancelled.isError, undefined, JSON.stringify(expiredCancelled.structuredContent));
+  assert.ok(!JSON.stringify(expiredCancelled).includes(expiredIssued.lease.leaseToken));
+  const expiredAfter = durablePipeline.get(expiredRun.runId);
+  assert.equal(expiredAfter.phase, 'cancelled');
+  assert.equal(expiredAfter.writerLease, null);
+  const expiredEvent = expiredAfter.history.at(-1);
+  assert.equal(expiredEvent.event, 'expired_external_writer_cancelled');
+  assert.equal(expiredEvent.detail.processTermination, 'not_attested');
+  assert.equal(expiredEvent.detail.leaseTokenSha256, acknowledgement.leaseTokenSha256);
+  assert.ok(!JSON.stringify(expiredAfter).includes(expiredIssued.lease.leaseToken));
+  assert.equal(fs.existsSync(expiredLockFile), false);
+  assert.deepEqual(durablePipeline.get(unrelatedRun.runId), unrelatedBefore);
+  assert.equal(await taskIds(), tasksBeforeExpired, 'acknowledged cancellation dispatches no provider task');
+  const repeated = await client.callTool({ name: 'cancel_pipeline',
+    arguments: { runId: expiredRun.runId, expiredExternalOwnership: acknowledgement } });
+  assert.equal(repeated.isError, true);
+  durablePipeline.cancel(unrelatedRun.runId, { reason: 'Expired cancel fixture complete.' });
   const oldMcpResponse = await fetch(`${baseUrl}/api/oneshot`, {
     method: 'POST',
     headers: {
@@ -1956,6 +2021,47 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   const detachOuter = await client.callTool({
     name: 'get_receipt', arguments: { receiptId: detachTransportReceipt.outerReceiptId },
   });
+  // Diagnostic only: the original assertions below are unchanged. This fails on
+  // the same bad response (no structured receipt) but names its sanitized shape.
+  const describeDetachOuter = () => {
+    const prefix = 'detached outer receipt lookup returned no receipt: ';
+    try {
+      const own = (object, key) => !!object && typeof object === 'object'
+        && !Array.isArray(object) && Object.prototype.hasOwnProperty.call(object, key);
+      const kind = (value) => value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value;
+      const structured = detachOuter?.structuredContent;
+      const receipt = own(structured, 'receipt') ? structured.receipt : undefined;
+      const transport = detachTransportReceipt;
+      const knownMiss = 'receipt not found; it may predate retention or the ID may be malformed';
+      const summary = {
+        expectedReceiptId: exitDiagnosticScalar(transport.outerReceiptId),
+        isError: exitDiagnosticScalar(detachOuter?.isError),
+        structuredType: kind(structured),
+        receiptPresent: own(structured, 'receipt'),
+        receiptType: own(structured, 'receipt') ? kind(receipt) : 'absent',
+        errorPresent: own(structured, 'error'),
+        errorType: own(structured, 'error') ? kind(structured.error) : 'absent',
+        knownLookupMiss: own(structured, 'error') && structured.error === knownMiss,
+        transportReceiptId: exitDiagnosticScalar(transport.receiptId),
+        transportStatus: exitDiagnosticScalar(transport.status),
+        transportRequestId: exitDiagnosticScalar(transport.requestId),
+        transportTaskId: exitDiagnosticScalar(transport.taskId),
+        transportInvocationId: exitDiagnosticScalar(transport.invocationId),
+      };
+      if (knownMiss === structured?.error) summary.error = knownMiss;
+      for (const key of EXIT_DIAGNOSTIC_FIELDS) {
+        if (own(structured, key)) summary[`structured.${key}`] = exitDiagnosticScalar(structured[key]);
+        if (own(receipt, key)) summary[`receipt.${key}`] = exitDiagnosticScalar(receipt[key]);
+      }
+      if (own(receipt, 'cancelled')) summary['receipt.cancelled'] = exitDiagnosticScalar(receipt.cancelled);
+      for (const key of Object.keys(summary)) if (summary[key] === undefined) delete summary[key];
+      const text = JSON.stringify(summary);
+      return prefix + (text.length > 3000 ? text.slice(0, 3000) + '...truncated' : text);
+    } catch {
+      return prefix + '{"diagnosticUnavailable":true}';
+    }
+  };
+  assert.ok(detachOuter?.structuredContent?.receipt, describeDetachOuter());
   assert.equal(detachOuter.structuredContent.receipt.receiptId, detachTransportReceipt.outerReceiptId);
   assert.notEqual(detachOuter.structuredContent.receipt.cancelled, true,
     'the reconciled outer receipt must not be recorded as a cancellation either');

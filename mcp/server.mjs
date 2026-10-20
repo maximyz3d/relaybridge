@@ -3670,17 +3670,30 @@ export function buildServer() {
 
   server.registerTool('cancel_pipeline', {
     title: 'Cancel a Codex-Claude pipeline',
-    description: 'Cancel a workflow and its queued provider task. A running Claude writer is not cancelled until it exits because releasing its lease early would permit overlapping writers.',
+    description: 'Cancel a workflow and its queued provider task. A running Claude writer is not cancelled until it exits because releasing its lease early would permit overlapping writers. expiredExternalOwnership intentionally cancels an expired, unbound external Codex writer bound to its exact revision and lease fingerprint; it does not prove the writer process stopped.',
     inputSchema: z.object({
       runId: workflowIdSchema,
       reason: z.string().min(1).max(2000).optional(),
       leaseToken: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+      expiredExternalOwnership: z.object({
+        acknowledged: z.literal(true),
+        revision: z.number().int().min(1),
+        mode: z.enum(['external', 'legacy_absent']),
+        actor: z.literal('codex'),
+        cwdSha256: z.string().regex(/^[a-f0-9]{64}$/),
+        leaseTokenSha256: z.string().regex(/^[a-f0-9]{64}$/),
+        acquiredAt: z.number().int().min(0),
+        expiresAt: z.number().int().min(0),
+      }).strict().optional(),
     }),
     annotations: DESTRUCTIVE,
-  }, safeHandler(async ({ runId, reason, leaseToken }, context) => result(await bridgeRequest(
+  }, safeHandler(async ({ runId, reason, leaseToken, expiredExternalOwnership }, context) => result(await bridgeRequest(
     `/api/workflows/${encodeURIComponent(runId)}/cancel`, {
       method: 'POST',
-      body: { actor: 'codex', ...(reason ? { reason } : {}), ...(leaseToken ? { leaseToken } : {}) },
+      body: {
+        actor: 'codex', ...(reason ? { reason } : {}), ...(leaseToken ? { leaseToken } : {}),
+        ...(expiredExternalOwnership ? { expiredExternalOwnership } : {}),
+      },
       signal: context?.mcpReq?.signal,
       actionIdentity: true,
     },
