@@ -33,7 +33,7 @@
     "node": ">=20.3"
   },
   "devDependencies": {
-    "@modelcontextprotocol/client": "^2.0.0"
+    "@modelcontextprotocol/client": "^2.3.0"
   },
   "bin": {
     "relaybridge": "bin/relaybridge.js"
