@@ -1,3 +1,6 @@
+## v2.5.7 - 2026-10-20
+- #148 fix(workflows): acknowledge cancellation of expired external writers
+
 ## v2.5.6 - 2026-10-20
 - #147 fix(workflow): replace unavailable planners with eligible Claude tiers
 
