@@ -1,3 +1,6 @@
+## v2.5.6 - 2026-10-20
+- #147 fix(workflow): replace unavailable planners with eligible Claude tiers
+
 ## v2.5.5 - 2026-10-19
 - #145 feat(workflow): run managed Claude implementations with durable fencing
 
