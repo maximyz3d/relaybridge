@@ -70,23 +70,37 @@ test('the skill installer resolves its bundled source independently of caller cw
     const profile = path.join(tempRoot, 'profile');
     fs.mkdirSync(callerCwd, { recursive: true });
     fs.mkdirSync(profile, { recursive: true });
+    const promptDir = path.join(profile, '.codex', 'prompts');
+    fs.mkdirSync(promptDir, { recursive: true });
+    fs.writeFileSync(path.join(promptDir, 'relaybridge.md'), 'existing user prompt');
     const result = childProcess.spawnSync('powershell.exe', [
       '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass',
       '-File', path.join(ROOT, 'install-skill.ps1'),
     ], {
       cwd: callerCwd,
       encoding: 'utf8',
-      env: { ...process.env, USERPROFILE: profile },
+      env: { ...process.env, USERPROFILE: profile, CODEX_HOME: '' },
       timeout: 30_000,
     });
     assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
     for (const installed of [
       path.join(profile, '.claude', 'skills', 'relaybridge', 'SKILL.md'),
       path.join(profile, '.codex', 'relaybridge', 'SKILL.md'),
+      path.join(profile, '.codex', 'skills', 'relaybridge', 'SKILL.md'),
+      path.join(profile, '.agents', 'skills', 'relaybridge', 'SKILL.md'),
+      path.join(profile, '.codex', 'prompts', 'relaybridge.md'),
       path.join(profile, '.codex', 'AGENTS.md'),
     ]) {
       assert.ok(fs.existsSync(installed), `expected installed RelayBridge file ${installed}`);
     }
+    const backups = fs.readdirSync(promptDir).filter((name) => name.startsWith('relaybridge.md.backup.'));
+    assert.equal(backups.length, 1);
+    assert.equal(fs.readFileSync(path.join(promptDir, backups[0]), 'utf8'), 'existing user prompt');
+    const repeated = childProcess.spawnSync('powershell.exe', [
+      '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(ROOT, 'install-skill.ps1'),
+    ], { cwd: callerCwd, encoding: 'utf8', env: { ...process.env, USERPROFILE: profile, CODEX_HOME: '' }, timeout: 30_000 });
+    assert.equal(repeated.status, 0, `${repeated.stdout}\n${repeated.stderr}`);
+    assert.deepEqual(fs.readdirSync(promptDir).filter((name) => name.startsWith('relaybridge.md.backup.')), backups);
   } finally {
     fs.rmSync(tempRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }

@@ -1,5 +1,10 @@
 # RelayBridge is available on this machine
 
+**Options:** `relaybridge options`; Codex `/prompts:relaybridge` or `/skills` →
+relaybridge. Auto is the default credit preference, with Off/Manual choices.
+Automatic switching remains unavailable; show preference and effective route
+separately. Never buy/reload credits or spend purchased/invoiced funds.
+
 This block is loaded into every session on purpose. It is deliberately short:
 always-loaded context costs tokens on every turn, so it carries only what must
 never be forgotten and points at the full reference for everything else.

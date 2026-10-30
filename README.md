@@ -108,7 +108,7 @@ under the Linux home filesystem (for example `~/src/relaybridge`) and run:
 ./start-chrome-debug.sh
 ```
 
-The first command links the pipeline skill and roles, registers this exact
+The first command links the RelayBridge options, pipeline skill and roles, registers this exact
 checkout's RelayBridge MCP server, and registers the pinned Chrome DevTools MCP
 in slim mode. The second starts a dedicated Chrome debugging profile. Restart
 open Codex and Claude clients after registration. On plain Linux or macOS, omit
@@ -682,6 +682,13 @@ npm run smoke:mcp -- --committee
 The test suite validates configuration, safety boundaries, transport cleanup, routing, cancellation, MCP tools/resources, browser script parsing, transactional update/rollback, config and runtime preservation, exact-build health, and MCP name migration with fake providers and fake client CLIs. It does not install or call providers, and it does not prove provider authentication, quota, model quality, or benchmark performance.
 
 ## For AI Agents
+
+Install the RelayBridge skill and Codex options with `./install-skill.sh`
+(Windows: `./install-skill.ps1`), then start a fresh session. In Codex use
+`/prompts:relaybridge` or `/skills` → relaybridge. `relaybridge options` shows
+the same controls in a terminal. Included-credit preferences default to Auto,
+with Off and Manual choices; **automatic switching remains unavailable** until
+grant-only funding can be enforced. See [credit preferences and setup](docs/ALLOCATED-CREDIT.md).
 
 When an AI client connects through MCP, it should start with `get_context_bundle`. That returns a bounded snapshot with health, providers, active work, terminal tails, collaboration history, projects, recent runs, receipts, registry fingerprints, and the exact detail tools needed for anything omitted.
 

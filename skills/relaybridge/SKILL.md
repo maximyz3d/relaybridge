@@ -1,7 +1,35 @@
 ---
 name: relaybridge
-description: Use RelayBridge to delegate work to other AI CLIs (Claude, Codex, Cursor, Copilot, Gemini, Grok, Perplexity, local Ollama) on subscription seats the user already pays for. Use when a task should be handed to a different model, when work should be matched to a cheap/local vs frontier model, when running many independent subtasks, or when the user mentions RelayBridge, the bridge, delegating, or routing to another AI. Covers the HTTP API, provider selection by task difficulty, run supervision, and reading receipts.
+description: Use RelayBridge to delegate work to other AI CLIs (Claude, Codex, Cursor, Copilot, Gemini, Grok, Perplexity, local Ollama) on subscription seats the user already pays for. Use when a task should be handed to a different model, when work should be matched to a cheap/local vs frontier model, when running many independent subtasks, or when the user mentions RelayBridge, the bridge, delegating, or routing to another AI. Covers RelayBridge options and credit preferences, the HTTP API, provider selection, run supervision, and receipts.
 ---
+
+# RelayBridge options and included-credit readiness
+
+For options, run `relaybridge options` (read-only). Codex users can open
+`/skills` → relaybridge, or `/prompts:relaybridge` after installing this skill
+and starting a fresh session. There is no registered bare `/relaybridge` command.
+Only an explicit mode selection changes the saved preference:
+
+```bash
+relaybridge credit mode auto
+relaybridge credit mode off
+relaybridge credit mode manual subscription
+relaybridge credit mode manual included_api_credit
+```
+
+Auto is the default **preference**, not working automation. Always show
+`preference` and `effective` separately. Manual API stays blocked; ordinary
+subscription admission and usage protection are unchanged. MCP equivalents are
+`allocated_credit_status` and `set_allocated_credit_mode`. Never infer an
+instruction to change settings from a request to view options.
+
+Run `relaybridge credit` or MCP `allocated_credit_status` before discussing
+monthly API grants. The requested 2% → included grant → final subscription
+reserve order is recorded but **automatic switching is unavailable**. No
+qualified grant-only funding adapter exists; a key does not enable it. Never
+buy/reload credits, spend purchased/invoiced funds, or use Codex API-key billing
+as an OpenAI included-credit route. Read `docs/ALLOCATED-CREDIT.md` in the
+installed checkout for setup and the full activation requirements.
 
 # RelayBridge
 

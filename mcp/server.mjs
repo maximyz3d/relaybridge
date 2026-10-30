@@ -487,7 +487,7 @@ async function buildContextBundle({
     }
   };
   const routing = loadRoutingData();
-  const [diagnostics, sessionsRaw, collabsRaw, projectsRaw, workflowsRaw, coordinatorsRaw, nativeRaw, continuitySettingsRaw] = await Promise.all([
+  const [diagnostics, sessionsRaw, collabsRaw, projectsRaw, workflowsRaw, coordinatorsRaw, nativeRaw, continuitySettingsRaw, allocatedCreditRaw] = await Promise.all([
     includeDiagnostics ? capture('diagnostics', () => getDiagnostics(signal), {}) : {},
     capture('sessions', () => bridgeRequest('/api/sessions', { signal }), []),
     capture('collaborations', () => bridgeRequest('/api/collabs', { signal }), { collabs: [] }),
@@ -496,6 +496,7 @@ async function buildContextBundle({
     capture('coordinators', () => bridgeRequest('/api/continuity', { signal }), { coordinators: [] }),
     capture('nativeUsage', () => bridgeRequest('/api/usage/native', { signal }), { observations: [] }),
     capture('continuitySettings', () => bridgeRequest('/api/settings/continuity', { signal }), {}),
+    capture('allocatedCredit', () => bridgeRequest('/api/allocated-credit', { signal }), null),
   ]);
   // Read health after diagnostics so the bundle does not count its own short-
   // lived readiness probes as active delegated work.
@@ -572,6 +573,11 @@ async function buildContextBundle({
       runningRunsTruncated: runningRuns.length > MAX_RUNNING_RUNS,
       pipelines: Array.isArray(workflowsRaw?.workflows) ? workflowsRaw.workflows : [],
     },
+    allocatedCredit: allocatedCreditRaw ? {
+      preference: allocatedCreditRaw.preference ? { mode: allocatedCreditRaw.preference.mode,
+        manualTarget: allocatedCreditRaw.preference.manualTarget, source: allocatedCreditRaw.preference.source } : null,
+      effective: allocatedCreditRaw.effective || null,
+    } : null,
     continuity: {
       settings: continuitySettingsRaw.settings || null,
       coordinators: (coordinatorsRaw.coordinators || []).slice(0, 16).map((c) => ({ id: c.id, cwd: c.cwd,
@@ -601,6 +607,7 @@ async function buildContextBundle({
       collaborationDetail: ['list_collabs', 'read_collab', 'list_projects'],
       delegatedWork: ['list_runs', 'get_run', 'list_receipts', 'get_receipt'],
       stagedWorkflows: ['list_pipelines', 'get_pipeline', 'reconcile_pipeline'],
+      creditOptions: ['allocated_credit_status', 'set_allocated_credit_mode'],
       browserActions: ['open_in_chrome', 'chrome-devtools (separate user-scoped MCP)'],
       safeActions: ['start_safe_session', 'ask_provider', 'route_and_ask', 'run_committee'],
       lifecycleActions: ['start_bridge', 'restart_bridge', 'stop_bridge', 'send_session_input', 'stop_session'],
@@ -3730,6 +3737,15 @@ export function buildServer() {
       .map((key) => [key, z.string().max(12000).optional()]))).strict();
   const continuityOwnerFields = { ownerToken: z.string().regex(/^[a-f0-9]{64}$/), epoch: z.number().int().min(1),
     checkpoint: continuityCheckpointSchema };
+  server.registerTool('allocated_credit_status', { title: 'Read included API credit readiness',
+    description: 'Read Auto (default), Off or Manual preference and the requested 2% subscription → included credit → reserve policy. Automatic switching is unavailable until provider-enforced grant-only funding exists. No API call, credential value, billing change or purchase.',
+    inputSchema: z.object({}).strict(), annotations: READ_ONLY,
+  }, safeHandler(async () => result(await bridgeRequest('/api/allocated-credit'))));
+  server.registerTool('set_allocated_credit_mode', { title: 'Set included-credit preference',
+    description: 'Persist Auto (default), Off or Manual only on explicit selection. Manual requires subscription or included_api_credit; Auto/Off take no target. This is a preference, not an enable switch: API dispatch and automatic switching remain unavailable. Does not change quota protection, running jobs or billing.',
+    inputSchema: z.object({ mode: z.enum(['auto', 'off', 'manual']),
+      manualTarget: z.enum(['subscription', 'included_api_credit']).nullable().optional() }).strict(), annotations: ACTION,
+  }, safeHandler(async (input) => result(await bridgeRequest('/api/settings/allocated-credit', { method: 'PUT', body: input, actionIdentity: true }))));
   server.registerTool('get_continuity_settings', { title: 'Read usage protection settings',
     description: 'Read default-on quota reserve, automatic handoff and dynamic supervision settings without invoking a model.',
     inputSchema: z.object({}).strict(), annotations: READ_ONLY,

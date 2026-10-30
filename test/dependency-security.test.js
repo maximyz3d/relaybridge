@@ -6,7 +6,7 @@ const qs = require('qs');
 const qsPackage = require('qs/package.json');
 
 test('qs override keeps the patched parser and serializer behavior', () => {
-  assert.equal(qsPackage.version, '6.16.0');
+  assert.equal(qsPackage.version, '6.16.1');
 
   assert.throws(() => qs.parse('a[]=1,2,3,4', {
     comma: true,
@@ -19,4 +19,6 @@ test('qs override keeps the patched parser and serializer behavior', () => {
     { plainObjects: true },
   );
   assert.doesNotThrow(() => qs.stringify(attackerControlled));
+  const nonCallableToString = Object.assign(Object.create(null), { toString: 'attacker', value: 'safe' });
+  assert.doesNotThrow(() => qs.stringify({ list: [nonCallableToString] }, { arrayFormat: 'comma' }));
 });

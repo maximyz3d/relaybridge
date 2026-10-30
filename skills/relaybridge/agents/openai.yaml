@@ -1,0 +1,4 @@
+interface:
+  display_name: "RelayBridge"
+  short_description: "Delegate work and manage RelayBridge options"
+  default_prompt: "Use $relaybridge to show the current options, credit preference and effective route without changing settings."

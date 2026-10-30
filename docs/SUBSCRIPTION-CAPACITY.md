@@ -1,5 +1,10 @@
 # Subscription capacity is not a local token budget
 
+For the requested subscription → included API grant at 2% → final reserve
+order, see [included API credits](ALLOCATED-CREDIT.md). That policy is recorded
+but automatic dispatch is blocked until grant-only funding can be enforced.
+Auto/Off/Manual credit preferences do not change `usageProtection`.
+
 The usage ledger measures RelayBridge runs, not every conversation on an
 account. Cached context tokens are usage evidence, not a published subscription
 allowance. Exhausting `config/usage-budgets.json` therefore does not establish
