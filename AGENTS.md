@@ -177,6 +177,18 @@ npm run smoke:mcp -- --committee
 
 ## Usage-aware coordination
 
+Read [included API credits](docs/ALLOCATED-CREDIT.md) before using monthly
+grants. The requested order is subscription above 2%, included grant, final
+subscription reserve, then stop. This build exposes readiness only: automatic
+switching is blocked until grant-only funding can be enforced. Keys and local
+assertions do not activate it. Codex API-key usage is excluded from OpenAI's
+linked-plan grant. Never purchase/reload credits or bypass this boundary.
+
+Use `relaybridge options` or Codex `/prompts:relaybridge` (`/skills` → relaybridge)
+for controls. Auto is the default saved preference; Off and Manual are available.
+Read `preference` separately from `effective`: selecting Auto does not activate
+switching, and Manual API remains blocked. Only explicit selections change settings.
+
 Use the [continuity protocol](docs/CONTINUITY.md) to checkpoint meaningful milestones and explicitly yield
 an unfinished project before native allowance runs out. A coordinator transfer
 preserves provider restrictions, writer exclusivity and fresh review gates.

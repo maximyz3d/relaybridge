@@ -36,10 +36,15 @@ if { [ -n "${WSL_DISTRO_NAME:-}" ] || grep -qi microsoft /proc/version 2>/dev/nu
   case "$script_dir" in /mnt|/mnt/*) fail 'move RelayBridge under the WSL Linux home filesystem before installing global links' ;; esac
 fi
 skill_source=$script_dir/skills/codex-claude-pipeline
+relay_skill_source=$script_dir/skills/relaybridge
+relay_prompt_source=$relay_skill_source/codex-prompts/relaybridge.md
+codex_dir=${CODEX_HOME:-$HOME/.codex}
 codex_agents_source=$script_dir/.codex/agents
 claude_agents_source=$script_dir/.claude/agents
 
 [ -f "$skill_source/SKILL.md" ] || fail "pipeline skill not found: $skill_source"
+[ -f "$relay_skill_source/SKILL.md" ] || fail 'RelayBridge skill is missing'
+[ -f "$relay_prompt_source" ] || fail 'RelayBridge Codex prompt is missing'
 [ -f "$skill_source/agents/openai.yaml" ] || fail 'pipeline skill UI metadata is missing'
 [ -d "$codex_agents_source" ] || fail 'Codex role directory is missing'
 [ -d "$claude_agents_source" ] || fail 'Claude role directory is missing'
@@ -82,12 +87,16 @@ install_link() {
 # source into the legacy/current-host ~/.codex/skills location for compatibility.
 # Claude Code uses its own ~/.claude/skills directory.
 install_link "$skill_source" "$HOME/.agents/skills/codex-claude-pipeline"
-install_link "$skill_source" "$HOME/.codex/skills/codex-claude-pipeline"
+install_link "$skill_source" "$codex_dir/skills/codex-claude-pipeline"
 install_link "$skill_source" "$HOME/.claude/skills/codex-claude-pipeline"
+install_link "$relay_skill_source" "$HOME/.agents/skills/relaybridge"
+install_link "$relay_skill_source" "$codex_dir/skills/relaybridge"
+install_link "$relay_skill_source" "$HOME/.claude/skills/relaybridge"
+install_link "$relay_prompt_source" "$codex_dir/prompts/relaybridge.md"
 
 for source_path in "$codex_agents_source"/*.toml; do
   [ -f "$source_path" ] || continue
-  install_link "$source_path" "$HOME/.codex/agents/$(basename "$source_path")"
+  install_link "$source_path" "$codex_dir/agents/$(basename "$source_path")"
 done
 
 for source_path in "$claude_agents_source"/*.md; do
@@ -111,4 +120,4 @@ if [ "$register_chrome" -eq 1 ]; then
   fi
 fi
 
-printf '%s\n' '[RelayBridge] Pipeline skill and roles verified. Start fresh Codex and Claude sessions to load them.'
+printf '%s\n' '[RelayBridge] Skills, roles and options verified. Start fresh Codex and Claude sessions. Codex: /prompts:relaybridge or /skills → relaybridge.'

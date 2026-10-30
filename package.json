@@ -14,26 +14,26 @@
     "test": "node --test --test-concurrency=1 test/*.test.js test/*.test.mjs"
   },
   "dependencies": {
-    "@modelcontextprotocol/node": "^2.0.0",
-    "@modelcontextprotocol/server": "^2.0.0",
+    "@modelcontextprotocol/node": "^2.1.2",
+    "@modelcontextprotocol/server": "^2.4.0",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
     "express": "^5.2.1",
     "express-rate-limit": "8.7.0",
     "ws": "^8.21.3",
-    "zod": "^4.5.4"
+    "zod": "^4.6.7"
   },
   "optionalDependencies": {
     "node-pty": "^1.1.0"
   },
   "overrides": {
-    "qs": "6.16.0"
+    "qs": "6.16.1"
   },
   "engines": {
     "node": ">=20.3"
   },
   "devDependencies": {
-    "@modelcontextprotocol/client": "^2.0.0"
+    "@modelcontextprotocol/client": "^2.4.0"
   },
   "bin": {
     "relaybridge": "bin/relaybridge.js"

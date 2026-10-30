@@ -82,6 +82,24 @@ if (-not $ClaudeOnly) {
   Copy-Item -Path (Join-Path $SourceDir '*') -Destination $codexDir -Recurse -Force
   Write-Host "[RelayBridge] Codex guide installed to $codexDir" -ForegroundColor Green
 
+  $codexHomeDir = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
+  foreach ($skillTarget in @((Join-Path $env:USERPROFILE '.agents\skills\relaybridge'), (Join-Path $codexHomeDir 'skills\relaybridge'))) {
+    New-Item -ItemType Directory -Path $skillTarget -Force | Out-Null
+    Copy-Item -Path (Join-Path $SourceDir '*') -Destination $skillTarget -Recurse -Force
+  }
+  $promptSource = Join-Path $SourceDir 'codex-prompts\relaybridge.md'
+  if (-not (Test-Path -LiteralPath $promptSource -PathType Leaf)) { throw 'RelayBridge Codex prompt is missing.' }
+  $promptTarget = Join-Path $codexHomeDir 'prompts\relaybridge.md'
+  New-Item -ItemType Directory -Path (Split-Path -Parent $promptTarget) -Force | Out-Null
+  if (Test-Path -LiteralPath $promptTarget) {
+    if ((Get-FileHash -LiteralPath $promptTarget).Hash -ne (Get-FileHash -LiteralPath $promptSource).Hash) {
+      $backup = $promptTarget + '.backup.' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffffffZ')
+      Copy-Item -LiteralPath $promptTarget -Destination $backup -ErrorAction Stop
+    }
+  }
+  Copy-Item -LiteralPath $promptSource -Destination $promptTarget -Force
+  Write-Host '[RelayBridge] Start a fresh Codex session: /prompts:relaybridge or /skills -> relaybridge.' -ForegroundColor Green
+
   if (-not $NoMemory) {
     $body = $primer + "`r`n`r`nFull guide: $codexDir\AGENTS.md"
     Write-MemoryBlock -File (Join-Path $env:USERPROFILE '.codex\AGENTS.md') -Body $body -Label 'Codex global instructions'

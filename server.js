@@ -22,6 +22,7 @@ const { parseHostedTerminal, classifyHttpTerminal } = require('./lib/http-provid
 const { resolveAttemptTiming, renderCliDeadline, nativeTransportState } = require('./lib/cli-deadline');
 const { resolveConcurrencyPolicy } = require('./lib/concurrency-policy');
 const { createSubscriptionUsage } = require('./lib/subscription-usage');
+const { allocatedCreditStatus, createCreditPreferences, assertNoAllocatedCreditDispatch } = require('./lib/allocated-credit');
 const { createContinuity } = require('./lib/continuity');
 const { createProgressAssessor } = require('./lib/progress-assessor');
 const { parseCodexRateLimits, parseClaudeStreamRateLimit, parseClaudeStatuslineUsage, readCodexRateLimits, readClaudeNativeUsage } = require('./lib/native-usage');
@@ -1330,7 +1331,9 @@ function resolveSlot(slot) {
 
 function buildEnv(extras = {}, stripNames = []) {
   const env = { ...process.env, ...extras };
-  const stripped = new Set((stripNames || []).map((name) => String(name).toUpperCase()));
+  const stripped = new Set([...(stripNames || []),
+    'RELAYBRIDGE_ANTHROPIC_CREDIT_API_KEY', 'RELAYBRIDGE_OPENAI_CREDIT_API_KEY',
+  ].map((name) => String(name).toUpperCase()));
   for (const key of Object.keys(env)) {
     if (stripped.has(key.toUpperCase())) delete env[key];
   }
@@ -2336,6 +2339,7 @@ function hostedChatUrl(entry) {
 }
 
 function hostedApiKey(entry) {
+  assertNoAllocatedCreditDispatch(null, entry);
   const names = [
     entry.api_key_env,
     ...(Array.isArray(entry.api_key_env_aliases) ? entry.api_key_env_aliases : []),
@@ -2900,6 +2904,7 @@ class Session {
 function createSessionFromKind(kind, opts = {}) {
   const cfg = loadConfig();
   let entry = cfg[kind];
+  assertNoAllocatedCreditDispatch(kind, entry, opts);
   // The terminal kind is platform-resolved: on Windows it is PowerShell as
   // configured; on WSL/Linux/macOS the same request opens the platform shell.
   // Aliasing here (not in config) keeps one cli-config.json valid everywhere
@@ -3316,6 +3321,7 @@ function prepareProfiledGrounding(body, snapshot, entry, dangerous) {
 
 function validateProviderIntent(body, cfg = loadConfig(), snapshot = captureAllowedCwdIdentity(body.cwd), phase = 'execute') {
   validateWorkspaceWriteContract(body);
+  assertNoAllocatedCreditDispatch(body.kind, cfg[body.kind], body);
   if (!providerAccounts.validProviderKey(body.kind) || !Object.prototype.hasOwnProperty.call(cfg, body.kind)) {
     throw validationError('unknown_provider', 'kind', 'Provider is not configured.');
   }
@@ -4502,6 +4508,7 @@ app.get('/api/sessions', (req, res) => {
 
 app.post('/api/sessions', (req, res) => {
   try {
+    assertNoAllocatedCreditDispatch(req.body?.kind, undefined, req.body);
     const { kind, label, cwd, dangerous, mode } = req.body || {};
     if (!kind) return res.status(400).json({ error: 'kind required' });
     const s = createSessionFromKind(kind, { label, cwd, dangerous, mode });
@@ -4680,6 +4687,9 @@ async function executeOneShot(body, res, privateContext = null) {
   }
   const entry = cfg[kind];
   if (!entry) return rejectBeforeAdmission(400, 'validation', { error: 'unknown kind: ' + kind });
+  try { assertNoAllocatedCreditDispatch(kind, entry, body); }
+  catch (error) { return rejectBeforeAdmission(409, error.code, { error: error.message,
+    model_invocation: false, physical_attempt_count: 0 }); }
   // Keep native admission tied to the entry that supplies the launch argv.
   // A later config read must never downgrade an already-selected native launch.
   const nativeDispatchConfig = Object.freeze({ required: isNativeClaudeEntry(entry),
@@ -6710,6 +6720,7 @@ function filterCandidatesByQuotaCooldown(candidates = [], explicit = null, cooli
   return { usable, skipped, allCooling: usable.length === 0 && skipped.length > 0 };
 }
 const subscriptionUsage = createSubscriptionUsage({ dataDir: path.join(DATA_DIR, 'usage') });
+const creditPreferences = createCreditPreferences({ dataDir: path.join(DATA_DIR, 'allocated-credit') });
 const usageLedger = createUsageLedger({
   nativeHeadroom: (seat, options) => subscriptionUsage.headroom(seat, options),
   dataDir: path.join(DATA_DIR, 'usage'),
@@ -7055,6 +7066,11 @@ async function refreshNativeUsage() {
 setInterval(() => { if (!admissionClosed) refreshNativeUsage().catch(() => {}); }, 60000).unref();
 setImmediate(() => refreshNativeUsage().catch(() => {}));
 
+app.get('/api/allocated-credit', (_req, res) => res.json(allocatedCreditStatus(process.env, creditPreferences.get())));
+app.put('/api/settings/allocated-credit', (req, res) => {
+  try { res.json(allocatedCreditStatus(process.env, creditPreferences.set(req.body))); }
+  catch (error) { res.status(error.code === 'invalid_credit_preference' ? 400 : 500).json({ error: error.message, errorCode: error.code }); }
+});
 app.get('/api/settings/continuity', (_req, res) => res.json({ settings: subscriptionUsage.getSettings() }));
 app.put('/api/settings/continuity', (req, res) => {
   try {

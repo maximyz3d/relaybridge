@@ -1,5 +1,10 @@
 # Usage-aware handoff and adaptive supervision
 
+Included monthly API credits are separate from native quota. See
+[the 2% policy and activation blockers](ALLOCATED-CREDIT.md). Automatic credit
+switching is not active; continuity does not authorize paid fallback.
+Auto/Off/Manual credit preferences do not change `usageProtection`.
+
 Usage protection, automatic handoff, dynamic supervision and bounded progress
 assessment are on by default. Open **Fuel → Usage protection** to change them.
 The default subscription reserve is **5%**, configurable from **2% to 5%**.

@@ -17,6 +17,7 @@ const os = require('os');
 const path = require('path');
 const { TextDecoder } = require('util');
 const { validateProviderBudget } = require('../lib/provider-budget');
+const { creditSetup, validateCreditPreference } = require('../lib/allocated-credit');
 
 const DEFAULT_PORT = process.env.RELAYBRIDGE_PORT || process.env.PS_BRIDGE_PORT || '8787';
 const DEFAULT_HOST = process.env.RELAYBRIDGE_HOST || '127.0.0.1';
@@ -291,6 +292,28 @@ function requireCorrelationTuple(result, expectedRequestId) {
   return tuple;
 }
 
+function printCredit(data) {
+  console.log(`preference ${data.preference.mode}${data.preference.manualTarget ? ` / ${data.preference.manualTarget}` : ''} (${data.preference.source})`);
+  console.log(`effective  ${data.effective.route}: ${data.effective.detail}`);
+  console.log(`policy     subscription → included API credits at ${data.policy.thresholdPercent}% → final subscription reserve → stop`);
+  console.log(`state      ${data.detail}`);
+  for (const [provider, info] of Object.entries(data.providers)) {
+    console.log(`${provider.padEnd(11)}blocked: ${info.blockedReason}; reserved API key ${info.apiKeyPresent ? 'present' : 'absent'}`);
+  }
+}
+
+function creditFlags(flags) {
+  if (Object.keys(flags).some((key) => key !== 'json') || flags.json !== undefined && flags.json !== true) {
+    throw new InputError('Credit/options commands accept only the boolean --json flag.');
+  }
+}
+
+const CREDIT_OPTIONS = [
+  'relaybridge credit mode auto', 'relaybridge credit mode off',
+  'relaybridge credit mode manual subscription', 'relaybridge credit mode manual included_api_credit',
+  'relaybridge credit setup claude', 'relaybridge credit setup openai',
+];
+
 const USAGE = `relaybridge — delegate work to AI CLIs on seats you already pay for
 
   relaybridge plan "<task>"            what to run this on: company, model, effort
@@ -299,6 +322,11 @@ const USAGE = `relaybridge — delegate work to AI CLIs on seats you already pay
   relaybridge ask "<task>"             plan it, then actually run it
   relaybridge ask --kind claude "..."  run on a specific provider
   relaybridge status                   bridge health and provider readiness
+  relaybridge options [--json]         current preferences and available controls (read-only)
+  relaybridge credit [--json]          included-credit policy and readiness (no API call)
+  relaybridge credit mode auto|off     save preference; automatic switching remains unavailable
+  relaybridge credit mode manual <subscription|included_api_credit>
+  relaybridge credit setup <claude|openai>  print private setup guidance; does not activate billing
   relaybridge models [--refresh]       models each provider can run, by tier
   relaybridge runs                     live runs: streaming, quiet, or looping
   relaybridge activity [--limit N]     recent calls from every client
@@ -370,11 +398,45 @@ async function main() {
         return result.exitCode === 0 && !result.dropped_out ? 0 : 1;
       }
 
+      case 'credit': {
+        creditFlags(flags);
+        if (rest[0] === 'setup') {
+          if (rest.length !== 2) throw new InputError('Use credit setup <claude|openai>. No credential arguments are accepted.');
+          const setup = creditSetup(rest[1]);
+          if (json) console.log(JSON.stringify(setup, null, 2));
+          else console.log(setup.steps.join('\n\n'));
+          return 0;
+        }
+        let preference;
+        if (rest[0] === 'mode') {
+          if (rest.length !== (rest[1] === 'manual' ? 3 : 2)) throw new InputError('Use credit mode auto|off or credit mode manual <subscription|included_api_credit>.');
+          preference = validateCreditPreference({ mode: rest[1], ...(rest.length === 3 ? { manualTarget: rest[2] } : {}) });
+        } else if (rest.length) throw new InputError('Use credit, credit mode, or credit setup. Run relaybridge options for commands.');
+        const data = preference ? await call('/api/settings/allocated-credit', { method: 'PUT', body: preference }) : await call('/api/allocated-credit');
+        if (json) console.log(JSON.stringify(data, null, 2));
+        else printCredit(data);
+        return 0;
+      }
+
+      case 'options': {
+        creditFlags(flags);
+        if (rest.length) throw new InputError('Use relaybridge options [--json].');
+        const [allocatedCredit, continuity] = await Promise.all([call('/api/allocated-credit'), call('/api/settings/continuity')]);
+        if (json) console.log(JSON.stringify({ allocatedCredit, continuitySettings: continuity.settings, commands: CREDIT_OPTIONS }, null, 2));
+        else {
+          printCredit(allocatedCredit);
+          console.log(`usage protection ${continuity.settings.usageProtection ? 'on' : 'off'} (independent of credit preference)`);
+          console.log('\nCredit options (preferences only; included API dispatch remains blocked):\n' + CREDIT_OPTIONS.join('\n'));
+          console.log('\nCodex: /prompts:relaybridge or /skills → relaybridge (start a fresh session after installation).');
+        }
+        return 0;
+      }
+
       case 'status': {
-        const [health, diag, operatorQuota] = await Promise.all([
-          call('/api/health'), call('/api/diag'), call('/api/usage/operator-quota'),
+        const [health, diag, operatorQuota, allocatedCredit] = await Promise.all([
+          call('/api/health'), call('/api/diag'), call('/api/usage/operator-quota'), call('/api/allocated-credit'),
         ]);
-        if (json) { console.log(JSON.stringify({ health, diag, operatorQuota }, null, 2)); return 0; }
+        if (json) { console.log(JSON.stringify({ health, diag, operatorQuota, allocatedCredit }, null, 2)); return 0; }
         console.log(`bridge    v${health.version}  pid ${health.pid}  ${health.sessionCount} session(s)`);
         const results = diag.results || {};
         const ready = Object.entries(results).filter(([, v]) => v && v.ready).map(([k]) => k);
@@ -383,6 +445,7 @@ async function main() {
         console.log(`ready     ${ready.join(', ') || '(none)'}`);
         if (signedOut.length) console.log(`signedOut ${signedOut.join(', ')}  → relaybridge login <kind>`);
         if (missing.length) console.log(`missing   ${missing.join(', ')}`);
+        console.log(`credits   ${allocatedCredit.preference.mode} selected; ${allocatedCredit.effective.route}; automatic switching unavailable. Run: relaybridge options`);
         for (const observation of Object.values(operatorQuota.observations || {})) {
           console.log(`quota     ${observation.quotaSeat}  ${observation.percentRemaining}% remaining  operator observed (${observation.provenance})  expires ${observation.expiresAt}`);
         }

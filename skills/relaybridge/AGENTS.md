@@ -7,6 +7,13 @@ match the model to the difficulty of the task.
 
 Full detail: `SKILL.md` and `reference.md` in this directory.
 
+Options: `relaybridge options`, Codex `/prompts:relaybridge`, or `/skills` →
+relaybridge. Auto is the default saved credit preference, with Off and Manual
+choices. Always report preference separately from effective route: automatic
+switching is unavailable, and Manual API remains blocked until grant-only
+funding is qualified. Settings never buy/reload credits or authorize purchased
+or invoiced funds. View options without changing settings unless explicitly asked.
+
 ## Auth
 
 Every request needs `X-RelayBridge-Token`, read from `.bridge-token` in the
