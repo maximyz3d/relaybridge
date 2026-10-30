@@ -113,6 +113,7 @@ jobs:
         run: npm ci
 
       - name: Test
+        shell: powershell
         run: npm test
 
       - name: Verify Windows PowerShell installer environment
