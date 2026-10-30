@@ -1,3 +1,6 @@
+## v2.6.0 - 2026-10-30
+- #153 feat(credits): add mode controls and Codex RelayBridge options
+
 ## v2.5.7 - 2026-10-20
 - #148 fix(workflows): acknowledge cancellation of expired external writers
 
