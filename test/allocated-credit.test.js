@@ -20,6 +20,18 @@ test('a key never enables unverified funding; policy preserves the final 2% afte
     assert.equal(info.dispatchAllowed, false);
   }
   assert.equal(JSON.stringify(status).includes('private-fixture-secret'), false);
+  for (const [provider, name] of [['claude', CREDIT_SECRET_NAMES[0]], ['openai', CREDIT_SECRET_NAMES[1]]]) {
+    const setup = creditSetup(provider);
+    assert.equal(setup.environmentVariableName, name);
+    assert.equal(status.providers[provider].environmentVariableName, name);
+    assert.equal(Object.hasOwn(setup, 'apiKeyVariable'), false);
+    assert.equal(Object.hasOwn(status.providers[provider], 'apiKeyVariable'), false);
+    const printed = execFileSync(process.execPath, [path.join(__dirname, '../bin/relaybridge.js'), 'credit', 'setup', provider, '--json'], {
+      encoding: 'utf8', env: { ...process.env, ...env },
+    });
+    assert.equal(JSON.parse(printed).environmentVariableName, name);
+    assert.equal(printed.includes('private-fixture-secret'), false);
+  }
   assert.equal(allocatedCreditStatus({}).providers.claude.apiKeyPresent, false);
   assert.match(creditSetup('openai').limitation, /Codex API-key usage is excluded/);
   assert.throws(() => creditSetup('toString'));
