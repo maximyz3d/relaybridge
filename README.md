@@ -1,5 +1,11 @@
 # RelayBridge
 
+Organization/project selection and explicit subscription fallback are documented in
+[ACCOUNT-ROUTING.md](docs/ACCOUNT-ROUTING.md). Use `relaybridge profiles` or MCP profile tools.
+Included API execution remains blocked until grant-only spending is enforceable;
+no keys, purchased funds, billing changes, or automatic 2% switching are enabled.
+
+
 RelayBridge is a local Windows control plane for PowerShell and AI CLIs. It gives a human browser UI, a local REST API, and an MCP server so tools such as Codex and Claude can inspect work, open safe terminal sessions, delegate bounded prompts to configured providers, run small committees, and retrieve receipts.
 
 RelayBridge binds to `127.0.0.1` only. Browser, REST, WebSocket, and MCP control use a generated local capability token. Provider CLIs can still make outbound requests to their own vendors.

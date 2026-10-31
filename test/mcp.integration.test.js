@@ -767,7 +767,8 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   const managedTool = listedTools.tools.find((tool) => tool.name === 'start_pipeline_implementation');
   assert.equal(managedTool.annotations.destructiveHint, true);
   assert.equal(managedTool.inputSchema.additionalProperties, false);
-  assert.deepEqual(Object.keys(managedTool.inputSchema.properties).sort(), ['leaseMs', 'runId']);
+  assert.deepEqual(Object.keys(managedTool.inputSchema.properties).sort(),
+    ['leaseMs', 'runId', 'funding', 'funding_route', 'fundingRoute', 'billing_mode', 'billingMode'].sort());
   const managedHeaders = { ...collabHeaders, 'X-RelayBridge-Client': 'mcp',
     'X-RelayBridge-Expected-Build-Id': healthPayload.buildId,
     'X-RelayBridge-Expected-Receipt-Store-Id': healthPayload.receiptStoreId };
@@ -784,6 +785,18 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
       method: 'POST', headers, body: JSON.stringify(body) });
   }
   const managedRun = managedFixture();
+  for (const [key, value, code] of [
+    ['funding', { route: 'included_api_credit', fallback: 'subscription' }, 'funding_envelope_unsupported'],
+    ...['funding_route', 'fundingRoute', 'billing_mode', 'billingMode'].map(key => [key, 'included_api_credit', 'funding_alias_unsupported']),
+    ['funding_route', 'allocated_api_credit', 'allocated_credit_unavailable'],
+  ]) {
+    const before = durablePipeline.get(managedRun.runId);
+    const refused = await client.callTool({ name: 'start_pipeline_implementation',
+      arguments: { runId: managedRun.runId, [key]: value } });
+    assert.equal(refused.isError, true, JSON.stringify(refused));
+    assert.ok(JSON.stringify(refused).includes(code), JSON.stringify(refused));
+    assert.deepEqual(durablePipeline.get(managedRun.runId), before, 'rejection cannot acquire a writer or dispatch a task');
+  }
   for (const [extra, body, code, status] of [
     [{ permissionMode: 'safe' }, {}, 'FULL_PERMISSION_REQUIRED', 409],
     [{ profile: 'codex-astra-ultra' }, {}, 'INVALID_WRITER_MODE', 400],

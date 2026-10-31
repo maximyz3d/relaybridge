@@ -1,5 +1,11 @@
 # Included API credits and the 2% reserve
 
+Organization/project selection and explicit subscription fallback are documented in
+[ACCOUNT-ROUTING.md](ACCOUNT-ROUTING.md). Use `relaybridge profiles` or MCP profile tools.
+Included API execution remains blocked until grant-only spending is enforceable;
+no keys, purchased funds, billing changes, or automatic 2% switching are enabled.
+
+
 **Automatic switching is not active in this build.** The bridge records the
 requested policy, exposes readiness, and rejects unqualified credit routes.
 There is no qualified provider-enforced grant-only funding adapter. Saving an

@@ -1,5 +1,11 @@
 # RelayBridge Agent Guide
 
+Organization/project selection and explicit subscription fallback are documented in
+[ACCOUNT-ROUTING.md](docs/ACCOUNT-ROUTING.md). Use `relaybridge profiles` or MCP profile tools.
+Included API execution remains blocked until grant-only spending is enforceable;
+no keys, purchased funds, billing changes, or automatic 2% switching are enabled.
+
+
 This repository contains RelayBridge, a local Windows PowerShell and AI CLI control plane with browser, REST, and MCP interfaces.
 
 ## First Call

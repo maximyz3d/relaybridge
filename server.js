@@ -23,6 +23,8 @@ const { resolveAttemptTiming, renderCliDeadline, nativeTransportState } = requir
 const { resolveConcurrencyPolicy } = require('./lib/concurrency-policy');
 const { createSubscriptionUsage } = require('./lib/subscription-usage');
 const { allocatedCreditStatus, createCreditPreferences, assertNoAllocatedCreditDispatch } = require('./lib/allocated-credit');
+const { createFundingProfiles } = require('./lib/funding-profiles');
+const { assertCanonicalFunding, resolveFundingRoute, assertFundingSubscriptionAdmission } = require('./lib/funding-routing');
 const { createContinuity } = require('./lib/continuity');
 const { createProgressAssessor } = require('./lib/progress-assessor');
 const { parseCodexRateLimits, parseClaudeStreamRateLimit, parseClaudeStatuslineUsage, readCodexRateLimits, readClaudeNativeUsage } = require('./lib/native-usage');
@@ -3285,6 +3287,23 @@ app.use('/api', (req, res, next) => {
   });
 });
 
+// Every mutating /api request is screened at the top level: only the paths listed
+// below accept a canonical `funding` envelope, and the legacy aliases are refused
+// everywhere. A future endpoint that legitimately needs one of these top-level
+// names must be added here explicitly, or it will be rejected.
+app.use('/api', (req, res, next) => {
+  if (!['POST', 'PUT', 'PATCH'].includes(req.method)) return next();
+  try {
+    if (!Object.hasOwn(req.body || {}, 'funding') && ['/oneshot', '/tasks', '/workspace/validate', '/sessions'].includes(req.path)
+      && (req.body?.funding_route === 'allocated_api_credit' || req.body?.billing_mode === 'allocated_credit_only')) return next();
+    assertCanonicalFunding(req.body, ['/oneshot', '/tasks', '/workspace/validate', '/funding-route/preview'].includes(req.path));
+    next();
+  } catch (error) {
+    if (req.path === '/funding-route/preview') return rejectFundingPreview(res, error);
+    rejectInvalidIntent(res, req.body || {}, error);
+  }
+});
+
 app.get('/api/config', (req, res) => {
   res.json(loadConfig());
 });
@@ -3319,8 +3338,19 @@ function prepareProfiledGrounding(body, snapshot, entry, dangerous) {
   return { compiled, grounded:prepareGroundedPrompt({ ...base, prompt:compiled.prompt }) };
 }
 
+function fundingForRequest(body, cfg = loadConfig()) {
+  assertCanonicalFunding(body);
+  if (!Object.hasOwn(body, 'funding')) return null;
+  const decision = resolveFundingRoute({ envelope: body.funding, snapshot: fundingProfiles.snapshot(),
+    kind: body.kind, entry: cfg[body.kind], expectedAccountId: body.expectedAccountId, preference: creditPreferences.get() });
+  if (decision.actual === 'none') throw Object.assign(new Error(decision.blockedReason), { code: decision.blockedReason, fundingDecision: decision });
+  body.funding = decision.requested;
+  body.expectedAccountId = decision.expectedAccountId;
+  return decision;
+}
 function validateProviderIntent(body, cfg = loadConfig(), snapshot = captureAllowedCwdIdentity(body.cwd), phase = 'execute') {
   validateWorkspaceWriteContract(body);
+  const fundingDecision = fundingForRequest(body, cfg);
   assertNoAllocatedCreditDispatch(body.kind, cfg[body.kind], body);
   if (!providerAccounts.validProviderKey(body.kind) || !Object.prototype.hasOwnProperty.call(cfg, body.kind)) {
     throw validationError('unknown_provider', 'kind', 'Provider is not configured.');
@@ -3344,14 +3374,20 @@ function validateProviderIntent(body, cfg = loadConfig(), snapshot = captureAllo
     policyPrefix: !useDanger && typeof entry.oneshot_safe_prompt_prefix === 'string' ? entry.oneshot_safe_prompt_prefix.trim() : '',
   }) : null;
   revalidateAllowedCwdIdentity(snapshot);
-  return { ...controls, grounding: grounded.grounding, promptEvidence: prepared?.evidence,
+  return { ...controls, funding: fundingDecision?.requested, fundingDecision, grounding: grounded.grounding, promptEvidence: prepared?.evidence,
     ...(compiled.profile ? { outputProfile:compiled.profile, preparedPrompt:compiled.prompt, promptEvidence:prepared.evidence } : {}) };
+}
+// Preview is a dry run: a refused preview answers 400 without writing a receipt.
+function rejectFundingPreview(res, error) {
+  return res.status(400).json({ error: error.code || 'invalid_funding_envelope', errorCode: error.code || null,
+    model_invocation: false, physical_attempt_count: 0, receiptPersisted: false });
 }
 function rejectInvalidIntent(res, body, error) {
   return sendOneShotPreAdmissionRejection(res, { statusCode: 400,
     payload: { error: error.validation?.reason || error.message, errorCode: error.code || null, validation: error.validation || null },
     kind: typeof body.kind === 'string' ? body.kind : null,
     prompt: typeof body.prompt === 'string' ? body.prompt : '',
+    route: error.fundingDecision ? { funding: error.fundingDecision } : null,
     requestId: normalizeOneShotRequestId(body), failureClass: error.code === 'workspace_grounding' ? 'workspace_grounding' : 'validation', startedAt: Date.now() });
 }
 app.post('/api/workspace/validate', (req, res) => {
@@ -3361,15 +3397,16 @@ app.post('/api/workspace/validate', (req, res) => {
   try {
     const snapshot = captureAllowedCwdIdentity(body.cwd);
     revalidateAllowedCwdIdentity(snapshot);
-    let execution = null, grounding = null, outputProfile = null, preparedPrompt = null, promptEvidence = null;
+    let execution = null, grounding = null, outputProfile = null, preparedPrompt = null, promptEvidence = null, funding, fundingDecision;
     if (body.kind !== undefined) {
-      ({ execution, grounding, outputProfile, preparedPrompt, promptEvidence } = validateProviderIntent(body, loadConfig(), snapshot));
+      ({ execution, grounding, outputProfile, preparedPrompt, promptEvidence, funding, fundingDecision } = validateProviderIntent(body, loadConfig(), snapshot));
     }
     return res.json({
       ok: true,
       execution,
       grounding,
       ...(outputProfile ? { outputProfile, preparedPrompt, promptEvidence } : {}),
+      ...(funding ? { funding, fundingDecision } : {}),
       cwdIdentityHash: snapshot.cwdIdentityHash,
       cwdPolicyId: CWD_POLICY_IDENTITY,
       model_invocation: false,
@@ -3393,7 +3430,8 @@ app.post('/api/workspace/validate', (req, res) => {
       requestId,
       failureClass: err.code === 'workspace_grounding' ? 'workspace_grounding' : 'validation',
       startedAt,
-      route: { provider: typeof body.kind === 'string' ? body.kind : null, request_id: requestId },
+      route: { provider: typeof body.kind === 'string' ? body.kind : null, request_id: requestId,
+        ...(err.fundingDecision ? { funding: err.fundingDecision } : {}) },
     });
   }
 });
@@ -4634,6 +4672,7 @@ async function executeOneShot(body, res, privateContext = null) {
   const startedAt = Date.now();
   let releaseAdmission = null;
   const { kind, prompt, timeoutMs, cwd, dangerous } = body || {};
+  let fundingDecision = null;
 
   // Run association for the GitHub tracker: who did this, and any
   // explicit intent. Falls back to the OS account so checkpoint commits
@@ -4657,7 +4696,10 @@ async function executeOneShot(body, res, privateContext = null) {
       requestId,
       failureClass,
       startedAt,
-      route,
+      // decisionHash binds the original proposal; these fields describe its rejected admission.
+      route: fundingDecision ? { ...(route || {}), funding: { ...fundingDecision, actual: 'none',
+        fallbackAuthorized: fundingDecision.fallbackApplied === true, fallbackApplied: false,
+        admissionBlockedReason: failureClass, transport: { surface: 'none', kind } } } : route,
     });
   };
   if (admissionClosed) return rejectBeforeAdmission(503, 'bridge_shutting_down', {
@@ -4686,6 +4728,13 @@ async function executeOneShot(body, res, privateContext = null) {
     return rejectBeforeAdmission(500, 'configuration', { error: `could not load provider configuration: ${err.message}` });
   }
   const entry = cfg[kind];
+  try {
+    fundingDecision = fundingForRequest(body, cfg);
+    if (fundingDecision && privateContext?.requiresOwner) throw Object.assign(new Error('funding_owned_binding_unsupported'), { code: 'funding_owned_binding_unsupported' });
+  } catch (error) {
+    fundingDecision = error.fundingDecision || fundingDecision;
+    return rejectBeforeAdmission(409, error.code, { error: error.message, errorCode: error.code, model_invocation: false, physical_attempt_count: 0 });
+  }
   if (!entry) return rejectBeforeAdmission(400, 'validation', { error: 'unknown kind: ' + kind });
   try { assertNoAllocatedCreditDispatch(kind, entry, body); }
   catch (error) { return rejectBeforeAdmission(409, error.code, { error: error.message,
@@ -4994,6 +5043,8 @@ async function executeOneShot(body, res, privateContext = null) {
     });
   const reserveAdmission = subscriptionUsage.verdict(dispatchAccount.quotaSeat || quotaSeatForProvider(kind),
     { model: execution.model, bucket: entry.native_usage_bucket });
+  try { assertFundingSubscriptionAdmission(fundingDecision, reserveAdmission); }
+  catch (error) { return rejectBeforeAdmission(409, error.code, { error: error.message, errorCode: error.code, model_invocation: false, physical_attempt_count: 0 }); }
   if (body.expectedQuotaSeat !== undefined && body.expectedQuotaSeat !== dispatchAccount.quotaSeat) {
     return rejectBeforeAdmission(409, 'account_identity_changed', { error: 'Selected quota account changed after coordinator admission.', model_invocation: false, physical_attempt_count: 0 });
   }
@@ -5099,6 +5150,7 @@ async function executeOneShot(body, res, privateContext = null) {
   // committee callers prove which model/effort was requested instead of
   // guessing from a generic "Claude" label.
   const route = {
+    ...(fundingDecision ? { funding: fundingDecision } : {}),
     provider: kind,
     // Which of the provider's accounts paid for this run. Null for a seat with
     // a single sign-in, so existing receipts are unchanged. It rides on the
@@ -5287,6 +5339,16 @@ async function executeOneShot(body, res, privateContext = null) {
   const runId = `run_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 8)}`;
   route.run_id = runId;
   let writerWorkspaceBaseline = null;
+  if (fundingDecision) {
+    try {
+      const current = fundingForRequest(body, loadConfig());
+      assertFundingSubscriptionAdmission(current, subscriptionUsage.headroom(dispatchAccount.quotaSeat, { model: execution.model, bucket: entry.native_usage_bucket }));
+      if (current.decisionHash !== fundingDecision.decisionHash) throw Object.assign(new Error('funding_decision_changed'), { code: 'funding_decision_changed' });
+    } catch (error) {
+      cleanupPromptFile(); cleanupProviderHome();
+      return rejectBeforeAdmission(409, error.code, { error: error.message, errorCode: error.code, model_invocation: false, physical_attempt_count: 0 }, route);
+    }
+  }
   let providerInputWriteError = false;
   let gracefulFinalization = null;
   let providerExited = false;
@@ -6349,6 +6411,17 @@ app.post('/api/delegate', rateLimit(delegationRateLimitOptions), trackedHandler(
       || typeof (task.prompt || task.objective) !== 'string' || !(task.prompt || task.objective).trim())) {
       return res.status(400).json({ error: 'every task must be an object with a non-empty string prompt' });
     }
+    // Delegated invocations carry a fixed field list, so a per-task funding or
+    // account selector would be dropped and the task launched on the default
+    // route. Refuse the whole batch instead.
+    for (const task of tasks) {
+      try {
+        assertCanonicalFunding(task, false);
+        if (Object.hasOwn(task, 'expectedAccountId')) throw Object.assign(new Error('funding_envelope_unsupported'), { code: 'funding_envelope_unsupported' });
+      } catch (error) {
+        return res.status(400).json({ error: error.code, errorCode: error.code, model_invocation: false, physical_attempt_count: 0 });
+      }
+    }
     const selection = new Map();
     for (const task of tasks) {
       const prompt = (task.prompt || task.objective).trim();
@@ -6721,6 +6794,7 @@ function filterCandidatesByQuotaCooldown(candidates = [], explicit = null, cooli
 }
 const subscriptionUsage = createSubscriptionUsage({ dataDir: path.join(DATA_DIR, 'usage') });
 const creditPreferences = createCreditPreferences({ dataDir: path.join(DATA_DIR, 'allocated-credit') });
+const fundingProfiles = createFundingProfiles({ dataDir: DATA_DIR });
 const usageLedger = createUsageLedger({
   nativeHeadroom: (seat, options) => subscriptionUsage.headroom(seat, options),
   dataDir: path.join(DATA_DIR, 'usage'),
@@ -7066,9 +7140,32 @@ async function refreshNativeUsage() {
 setInterval(() => { if (!admissionClosed) refreshNativeUsage().catch(() => {}); }, 60000).unref();
 setImmediate(() => refreshNativeUsage().catch(() => {}));
 
-app.get('/api/allocated-credit', (_req, res) => res.json(allocatedCreditStatus(process.env, creditPreferences.get())));
+// References only: CRUD never loads keys, probes APIs, or changes billing.
+app.get('/api/funding-profiles', (_req, res) => res.json(fundingProfiles.snapshot()));
+function fundingMutation(res, action) {
+  try { res.json(action()); }
+  catch (error) { res.status(error.code === 'funding_store_revision_conflict' ? 409 : 400).json({ error: error.message, errorCode: error.code, model_invocation: false }); }
+}
+app.post('/api/funding-profiles', (req, res) => fundingMutation(res, () => fundingProfiles.set(req.body)));
+app.put('/api/funding-profiles/:id', (req, res) => fundingMutation(res, () => {
+  if (req.body?.profile?.id !== req.params.id) throw Object.assign(new Error('invalid_funding_profile'), { code: 'invalid_funding_profile' });
+  return fundingProfiles.set(req.body);
+}));
+app.delete('/api/funding-profiles/:id', (req, res) => fundingMutation(res, () => fundingProfiles.remove({ ...req.body, profileId: req.params.id })));
+app.put('/api/settings/funding-selection', (req, res) => fundingMutation(res, () => fundingProfiles.select(req.body)));
+app.post('/api/funding-route/preview', (req, res) => {
+  try {
+    const body = req.body || {};
+    if (Object.keys(body).some(k => !['kind', 'funding', 'expectedAccountId'].includes(k))) throw Object.assign(new Error('invalid_funding_envelope'), { code: 'invalid_funding_envelope' });
+    const decision = resolveFundingRoute({ envelope: body.funding, snapshot: fundingProfiles.snapshot(), kind: body.kind,
+      entry: loadConfig()[body.kind], expectedAccountId: body.expectedAccountId, preference: creditPreferences.get() });
+    res.json({ decision, model_invocation: false, physical_attempt_count: 0, subscriptionAdmissionChecked: false });
+  } catch (error) { rejectFundingPreview(res, error); }
+});
+
+app.get('/api/allocated-credit', (_req, res) => res.json(allocatedCreditStatus(process.env, creditPreferences.get(), fundingProfiles.snapshot())));
 app.put('/api/settings/allocated-credit', (req, res) => {
-  try { res.json(allocatedCreditStatus(process.env, creditPreferences.set(req.body))); }
+  try { res.json(allocatedCreditStatus(process.env, creditPreferences.set(req.body), fundingProfiles.snapshot())); }
   catch (error) { res.status(error.code === 'invalid_credit_preference' ? 400 : 500).json({ error: error.message, errorCode: error.code }); }
 });
 app.get('/api/settings/continuity', (_req, res) => res.json({ settings: subscriptionUsage.getSettings() }));
