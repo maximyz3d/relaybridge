@@ -356,8 +356,8 @@ test('a unified run uses opted-in prepaid only on proven exhaustion and returns 
     expectedRevision: (await bridge.request('/api/funding-profiles')).body.storeRevision });
   assert.equal(saved.status, 200, JSON.stringify(saved.body));
   const revision = (await bridge.request('/api/funding-profiles')).body.profiles.find(p => p.id === 'api_openai').revision;
-  const claudeUsage = async (used) => {
-    const reset = Math.floor(Date.now() / 1000) + 18000;
+  const claudeUsage = async (used, shift = 0) => {
+    const reset = Math.floor(Date.now() / 1000) + 18000 + shift;
     const r = await bridge.request('/api/usage/native', { kind: 'claude', accountId: 'default', rate_limits: {
       five_hour: { used_percentage: used, resets_at: reset }, seven_day: { used_percentage: used, resets_at: reset + 604800 } } });
     assert.equal(r.status, 200, JSON.stringify(r.body));
@@ -405,7 +405,9 @@ test('a unified run uses opted-in prepaid only on proven exhaustion and returns 
   const created = record(await create([claudeNative, codexNative, prepaid]));
   assert.equal(created.status, 202, JSON.stringify(created.body));
   await waitFor(() => fetches().length === 1, 60000);
-  await claudeUsage(20);
+  // A statusline reading cannot restore capacity within the same window, so
+  // the recovery reports a later reset even when it lands in the same second.
+  await claudeUsage(20, 60);
   fs.writeFileSync(gate, '');
   let last;
   const done = await waitFor(async () => { const v = last = record(await bridge.request(`/api/unified-runs/${created.body.id}`)).body;
