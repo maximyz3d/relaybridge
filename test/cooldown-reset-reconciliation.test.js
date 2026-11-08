@@ -9,7 +9,6 @@ const { receiptStoreIdentity } = require('../lib/receipt-store-identity.cjs');
 const recovery = require('../lib/cooldown-reset-reconciliation');
 const seat = 'subscription:anthropic:default', uuid = '11111111-2222-3333-4444-555555555555';
 const url = '/api/cooldowns/reset-reconciliations';
-const unsetEnv = Object.fromEntries(Object.keys(process.env).filter(k => /^(RELAYBRIDGE_|PS_BRIDGE_)/.test(k)).map(k => [k, undefined]));
 function sourceReceipt(current, storeId) {
   return { receiptId: current.sourceReceiptId, receiptStoreId: storeId, timestamp: new Date(current.lastOffenceAt + 1).toISOString(),
     event: 'bridge_provider_call', provider: 'claude', modelInvocation: true, status: 'dropped', failureClass: 'rate_limit',
@@ -121,7 +120,7 @@ async function fixture(t, mode = 'success') {
       oneshot_safe: [process.execPath, script, '-p'], oneshot_safe_filesystem_policy: 'read_only_enforced',
       oneshot_output_parser: 'claude_json', model: 'fixture-model',
       native_usage_probe: { enabled: true, command: [process.execPath, script], timeout_ms: 1000 } } };
-  }, { nodeArgs, env: { ...unsetEnv, RELAYBRIDGE_WARM_DIAG: '0', RELAYBRIDGE_REMOTE_MCP: '0', PTY_MODE: 'auto' } });
+  }, { nodeArgs, env: { RELAYBRIDGE_WARM_DIAG: '0', RELAYBRIDGE_REMOTE_MCP: '0', PTY_MODE: 'auto' } });
   const health = (await bridge.request('/api/health')).body;
   const headers = { ...bridge.headers, 'x-relaybridge-expected-build-id': health.buildId,
     'x-relaybridge-expected-receipt-store-id': health.receiptStoreId };

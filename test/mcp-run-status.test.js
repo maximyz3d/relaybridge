@@ -6,6 +6,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 const { execFileSync } = require('node:child_process');
+const { isolatedEnv } = require('./helpers/isolated-env');
 
 test('repeated MCP run listings preserve overdue and ambiguous execution records byte for byte', (t) => {
   const data = fs.mkdtempSync(path.join(os.tmpdir(), 'rb-inert-runs-'));
@@ -27,7 +28,7 @@ test('repeated MCP run listings preserve overdue and ambiguous execution records
     `const { listRuns, readRun } = await import(${JSON.stringify(moduleUrl)});
      const a = listRuns(); const b = listRuns();
      process.stdout.write(JSON.stringify({a,b,read:readRun('run_past')}));`], {
-    env: { ...process.env, RELAYBRIDGE_DATA_DIR: data }, encoding: 'utf8', timeout: 10000,
+    env: isolatedEnv({ RELAYBRIDGE_DATA_DIR: data }), encoding: 'utf8', timeout: 10000,
   });
   const result = JSON.parse(stdout); assert.deepEqual(result.a, result.b);
   for (const original of originals) {

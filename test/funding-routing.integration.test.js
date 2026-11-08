@@ -6,11 +6,14 @@ const path = require('node:path');
 const { execFileSync, spawnSync } = require('node:child_process');
 const http = require('node:http');
 const { startTestBridge, waitFor } = require('./helpers/temporary-bridge');
+const { CREDIT_SECRET_NAMES } = require('../lib/allocated-credit');
+const { isolatedEnv } = require('./helpers/isolated-env');
 const ROOT = path.resolve(__dirname, '..');
 const profile = (id = 'one', provider = 'claude') => ({ id, provider, label: id,
   subscription: { kind: provider === 'claude' ? 'claude' : 'codex', accountId: 'default' },
   organization: { ref: 'org_' + id, label: 'Fixture org' }, project: { ref: 'project_' + id, label: 'Fixture project' },
-  credentialRef: null, creditPeriod: null });
+  credentialRef: { type: 'reserved_env', name: CREDIT_SECRET_NAMES[provider === 'claude' ? 0 : 1] },
+  creditPeriod: { start: '2020-01-01T00:00:00.000Z', end: '2099-01-01T00:00:00.000Z' } });
 const envelope = (patch = {}) => ({ route: 'included_api_credit', fallback: 'none', ...patch });
 function assertRejectedFunding(body, authorized) {
   assert.equal(body.model_invocation, false);
@@ -140,9 +143,9 @@ test('funding selections, blocked API, explicit fallback, queues, CLI and MCP re
   }
   assert.equal(count(), 2);
 
-  const cliEnv = { ...process.env, RELAYBRIDGE_URL: bridge.base, RELAYBRIDGE_TOKEN: bridge.headers['X-RelayBridge-Token'],
+  const cliEnv = isolatedEnv({ RELAYBRIDGE_URL: bridge.base, RELAYBRIDGE_TOKEN: bridge.headers['X-RelayBridge-Token'],
     NODE_ENV: 'test', RELAYBRIDGE_TEST_BUILD_ID: 'security-integration-fixture', RELAYBRIDGE_DATA_DIR: path.join(bridge.root, 'data'),
-    RELAYBRIDGE_CONFIG_FILE: bridge.configPath, RELAYBRIDGE_TOKEN_FILE: path.join(bridge.root, 'token') };
+    RELAYBRIDGE_CONFIG_FILE: bridge.configPath, RELAYBRIDGE_TOKEN_FILE: path.join(bridge.root, 'token') });
   const cli = (...args) => execFileSync(process.execPath, [path.join(ROOT, 'bin/relaybridge.js'), ...args], { encoding: 'utf8', env: cliEnv, cwd: bridge.root });
   assert.equal(JSON.parse(cli('profiles', 'list', '--json')).selected.profileId, 'two');
   const preview = JSON.parse(cli('profiles', 'preview', '--kind', 'claude', '--route', 'included_api_credit'));

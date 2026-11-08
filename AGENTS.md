@@ -2,8 +2,13 @@
 
 Organization/project selection and explicit subscription fallback are documented in
 [ACCOUNT-ROUTING.md](docs/ACCOUNT-ROUTING.md). Use `relaybridge profiles` or MCP profile tools.
-Included API execution remains blocked until grant-only spending is enforceable;
-no keys, purchased funds, billing changes, or automatic 2% switching are enabled.
+A read-only API agent exists, but included API execution remains blocked until grant-only
+spending is enforceable; no funding, keys, purchased funds, billing changes, automatic 2%
+switching or write tools are enabled. Grant-only stays the default; the only exceptions are
+the owner's out-of-band prepaid permit for one OpenAI profile (`authorized_prepaid`)
+and promotional permit for one Claude profile (`authorized_promotional`, read-only
+one-shots only, never unified runs or writers, not grant-only). Both are supervised,
+at most 24h, and never release the reserve; see docs/ALLOCATED-CREDIT.md.
 
 
 This repository contains RelayBridge, a local Windows PowerShell and AI CLI control plane with browser, REST, and MCP interfaces.
@@ -189,6 +194,16 @@ subscription reserve, then stop. This build exposes readiness only: automatic
 switching is blocked until grant-only funding can be enforced. Keys and local
 assertions do not activate it. Codex API-key usage is excluded from OpenAI's
 linked-plan grant. Never purchase/reload credits or bypass this boundary.
+The `authorized_prepaid` route needs the owner's private permit file; agents
+never create, edit or renew it, and must not assume a funding guarantee: the
+provider cap can lag and overshoot.
+
+A read-only API agent for included credit is implemented but not activated
+(see [unified usage](docs/UNIFIED-USAGE.md)). Production has no qualified
+provider, so it never calls a provider API; no funding is enabled, nothing
+switches automatically and the agent has no write tools. Do not add qualification adapters,
+test hooks or activation flags reachable from env, HTTP, MCP or settings; do not
+re-send an `outcome_uncertain` turn. Tests use only the local fake provider.
 
 Use `relaybridge options` or Codex `/prompts:relaybridge` (`/skills` → relaybridge)
 for controls. Auto is the default saved preference; Off and Manual are available.

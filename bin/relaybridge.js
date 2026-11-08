@@ -85,18 +85,18 @@ async function call(pathname, { method = 'GET', body = null } = {}) {
     err.authRequired = payload;
     throw err;
   }
-  if (res.status === 404) {
+  if (res.status === 404 && !payload.errorCode) {
     throw new Error(`${pathname} is not available on the running bridge (v${await bridgeVersion()}). `
       + 'The process is older than this endpoint — restart RelayBridge after syncing the install directory.');
   }
-  if (!res.ok) throw new Error(payload.error || `${res.status} ${res.statusText}`);
+  if (!res.ok) throw Object.assign(new Error(payload.error || `${res.status} ${res.statusText}`), { status: res.status, payload });
   return payload;
 }
 
 function parseFlags(argv) {
   const flags = {};
   const rest = [];
-  const booleanFlags = new Set(['force', 'json', 'refresh', 'stdin', 'requires-workspace-access']);
+  const booleanFlags = new Set(['force', 'json', 'refresh', 'stdin', 'requires-workspace-access', 'confirm-duplicate-billing-risk']);
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg.startsWith('--')) {
@@ -342,6 +342,13 @@ const USAGE = `relaybridge — delegate work to AI CLIs on seats you already pay
   relaybridge credit setup <claude|openai>  print private setup guidance; does not activate billing
   relaybridge profiles list|set|select|remove|preview  organization/project references and route preview
   relaybridge ask --kind claude --funding-route included_api_credit --funding-fallback subscription "..."
+  relaybridge ask --kind codex --funding-route authorized_prepaid --funding-profile <id> "..."
+                                       read-only OpenAI API agent on owner-authorized prepaid credit (private permit
+                                       required and must list the model; not grant-only; no purchase, reload or renewal)
+  relaybridge unified run --file <request.json>   one objective across listed native segments
+  relaybridge unified status|resume <id>          read or continue a unified run (terminal: no new call)
+  relaybridge unified link <id> --digest <workspaceEffectsDigest> [--confirm-duplicate-billing-risk]
+  relaybridge unified cancel <id>                 cancel only when no segment can be running (never stops live work)
   relaybridge models [--refresh]       models each provider can run, by tier
   relaybridge runs                     live runs: streaming, quiet, or looping
   relaybridge activity [--limit N]     recent calls from every client
@@ -366,7 +373,8 @@ async function main() {
 
   try {
     for (const key of Object.keys(flags)) {
-      if (/funding|billing|api.?key|credential/i.test(key) && !['funding-route', 'funding-profile', 'funding-revision', 'funding-fallback'].includes(key)) throw new InputError('Unsupported funding or credential flag.');
+      if (/funding|billing|api.?key|credential/i.test(key) && !['funding-route', 'funding-profile', 'funding-revision', 'funding-fallback'].includes(key)
+        && !(command === 'unified' && key === 'confirm-duplicate-billing-risk')) throw new InputError('Unsupported funding or credential flag.');
       if (key.startsWith('funding-') && command !== 'ask') throw new InputError('Funding flags are supported only by ask; use profiles preview for a dry run.');
     }
     switch (command) {
@@ -438,7 +446,33 @@ async function main() {
           method: 'DELETE', body: { expectedRevision: Number(flags.revision) } });
         else if (action === 'preview' && rest.length <= 2) data = await call('/api/funding-route/preview', { method: 'POST', body: {
           kind: flags.kind, funding: validateFundingEnvelope({ route: flags.route, fallback: flags.fallback || 'none', ...(rest[1] ? { profileId: rest[1] } : {}) }) } });
-        else throw new InputError('Use profiles list|set --file <metadata.json> --revision N|select <id|none> --revision N|remove <id> --revision N|preview [id] --kind claude|codex --route subscription|included_api_credit [--fallback subscription].');
+        else throw new InputError('Use profiles list|set --file <metadata.json> --revision N|select <id|none> --revision N|remove <id> --revision N|preview [id] --kind claude|codex --route subscription|included_api_credit|authorized_prepaid [--fallback subscription].');
+        console.log(JSON.stringify(data, null, 2));
+        return 0;
+      }
+
+      case 'unified': {
+        // The request file is forwarded verbatim; the bridge owns validation, so
+        // CLI and MCP get the same result. File scope is advisory, not enforced.
+        if (Object.keys(flags).some(k => !['json', 'file', 'digest', 'confirm-duplicate-billing-risk'].includes(k))) throw new InputError('Unsupported unified flag.');
+        const [action, id] = rest;
+        const runId = (value) => { if (!/^ur_[a-f0-9]{24}$/.test(String(value || ''))) throw new InputError('A unified run id (ur_...) is required.'); return encodeURIComponent(value); };
+        const unified = (route, options) => call(route, options).catch((err) => {
+          if (err.payload?.errorCode) err.message = `${err.payload.errorCode}: ${err.message}`;
+          throw err;
+        });
+        let data;
+        if (action === 'run' && rest.length === 1 && typeof flags.file === 'string') {
+          let body;
+          try { body = JSON.parse(fs.readFileSync(flags.file, 'utf8')); } catch { throw new InputError('Invalid unified run request file.'); }
+          data = await unified('/api/unified-runs', { method: 'POST', body });
+        } else if (action === 'status' && rest.length === 2) data = await unified('/api/unified-runs/' + runId(id));
+        else if (action === 'resume' && rest.length === 2) data = await unified('/api/unified-runs/' + runId(id) + '/resume', { method: 'POST', body: {} });
+        else if (action === 'cancel' && rest.length === 2) data = await unified('/api/unified-runs/' + runId(id) + '/cancel', { method: 'POST', body: {} });
+        else if (action === 'link' && rest.length === 2) data = await unified('/api/unified-runs/' + runId(id) + '/link', { method: 'POST', body: {
+          ...(typeof flags.digest === 'string' ? { workspaceEffectsDigest: flags.digest } : {}),
+          ...(flags['confirm-duplicate-billing-risk'] === true ? { confirmDuplicateBillingRisk: true } : {}) } });
+        else throw new InputError('Use unified run --file <request.json>|status <id>|resume <id>|cancel <id>|link <id> --digest <d> [--confirm-duplicate-billing-risk].');
         console.log(JSON.stringify(data, null, 2));
         return 0;
       }

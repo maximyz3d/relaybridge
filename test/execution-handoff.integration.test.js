@@ -1,10 +1,12 @@
 'use strict';
+require('./helpers/isolated-env').scrubInheritedEnv();
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { startTestBridge, waitFor, completeJsonLines } = require('./helpers/temporary-bridge');
 const { buildAskBody } = require('../bin/relaybridge');
+const { isolatedEnv } = require('./helpers/isolated-env');
 const ROOT = path.resolve(__dirname, '..');
 
 test('output guidance survives REST, queued execution and MCP cache as frozen prompt text', { timeout:45000 }, async t => {
@@ -101,9 +103,9 @@ test('output guidance survives REST, queued execution and MCP cache as frozen pr
     import('@modelcontextprotocol/client'), import('@modelcontextprotocol/client/stdio'),
   ]);
   const transport = new StdioClientTransport({ command:process.execPath, args:[path.join(ROOT,'mcp/server.mjs')], cwd:ROOT,
-    env:{ ...process.env, NODE_ENV:'test', RELAYBRIDGE_TEST_BUILD_ID:'security-integration-fixture', RELAYBRIDGE_URL:`http://127.0.0.1:${proxy.address().port}`,
+    env:isolatedEnv({ NODE_ENV:'test', RELAYBRIDGE_TEST_BUILD_ID:'security-integration-fixture', RELAYBRIDGE_URL:`http://127.0.0.1:${proxy.address().port}`,
       RELAYBRIDGE_TOKEN_FILE:path.join(bridge.root,'token'), RELAYBRIDGE_DATA_DIR:path.join(bridge.root,'data'),
-      RELAYBRIDGE_CONFIG_FILE:bridge.configPath }, stderr:'pipe' });
+      RELAYBRIDGE_CONFIG_FILE:bridge.configPath }), stderr:'pipe' });
   const client = new Client({ name:'profile-handoff-test', version:'1.0.0' });
   t.after(async () => { await client.close(); await transport.close(); }); await client.connect(transport);
   const call = async (name,args) => (await client.callTool({ name, arguments:args })).structuredContent;
@@ -243,9 +245,9 @@ test('exact plan intent survives CLI, REST, MCP cache, queue and broadcast; drif
     import('@modelcontextprotocol/client'), import('@modelcontextprotocol/client/stdio'),
   ]);
   const transport = new StdioClientTransport({ command: process.execPath, args: [path.join(ROOT, 'mcp/server.mjs')], cwd: ROOT,
-    env: { ...process.env, NODE_ENV: 'test', RELAYBRIDGE_TEST_BUILD_ID: 'security-integration-fixture',
+    env: isolatedEnv({ NODE_ENV: 'test', RELAYBRIDGE_TEST_BUILD_ID: 'security-integration-fixture',
       RELAYBRIDGE_URL: bridge.base, RELAYBRIDGE_TOKEN_FILE: path.join(bridge.root, 'token'),
-      RELAYBRIDGE_DATA_DIR: path.join(bridge.root, 'data'), RELAYBRIDGE_CONFIG_FILE: bridge.configPath }, stderr: 'pipe' });
+      RELAYBRIDGE_DATA_DIR: path.join(bridge.root, 'data'), RELAYBRIDGE_CONFIG_FILE: bridge.configPath }), stderr: 'pipe' });
   const client = new Client({ name: 'execution-handoff-test', version: '1.0.0' });
   t.after(async () => { await client.close(); await transport.close(); });
   await client.connect(transport);

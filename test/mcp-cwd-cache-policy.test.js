@@ -7,6 +7,7 @@ const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
+const { isolatedEnv } = require('./helpers/isolated-env');
 
 const ROOT = path.resolve(__dirname, '..');
 
@@ -36,8 +37,7 @@ async function waitForHealth(baseUrl, proc) {
 
 async function startPair({ port, configPath, tokenPath, dataDir, allowedRoots }) {
   const baseUrl = `http://127.0.0.1:${port}`;
-  const commonEnv = {
-    ...process.env,
+  const commonEnv = isolatedEnv({
     NODE_ENV: 'test',
     PTY_MODE: 'none',
     PORT: String(port),
@@ -46,7 +46,7 @@ async function startPair({ port, configPath, tokenPath, dataDir, allowedRoots })
     RELAYBRIDGE_TOKEN_FILE: tokenPath,
     RELAYBRIDGE_DATA_DIR: dataDir,
     RELAYBRIDGE_ALLOWED_ROOTS: allowedRoots.join(';'),
-  };
+  });
   const bridge = spawn(process.execPath, [path.join(ROOT, 'server.js')], {
     cwd: ROOT, env: commonEnv, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
   });

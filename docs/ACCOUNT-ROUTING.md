@@ -9,9 +9,14 @@ at 2% and release of the final subscription reserve are not implemented.
 ## Funding boundary
 
 Included API execution is blocked with `grant_only_funding_unverified`.
-No production grant-only adapter is qualified; no API transport is implemented
-by this change. A balance, screenshot, key, local budget, or profile cannot
-override this gate. Off reports `credit_preference_off` for an API choice.
+No production grant-only adapter is qualified. A read-only API agent transport
+with no write tools exists ([unified usage](UNIFIED-USAGE.md)) but is never dispatched,
+no funding is enabled and nothing switches automatically: decisions report
+`apiTransportImplemented: true` with `qualification: null`. A profile needs a
+bound `credentialRef` and `creditPeriod` (else `api_credential_unbound`) and a
+current period (else `grant_expired`) before qualification is even consulted.
+A balance, screenshot, key, local budget, profile, environment variable or
+client-supplied `qualification` field cannot override this gate. Off reports `credit_preference_off` for an API choice.
 For OpenAI profiles `blockedReason` is still `grant_only_funding_unverified`;
 the Codex API-key exclusion is reported separately as
 `apiLimitation:"codex_api_key_excluded"` with
@@ -27,6 +32,20 @@ apply to eligible API usage, but other organization funds can be used after
 the grant. Messages/Agent SDK is the planned eligible surface here.
 For the current accounts, grant-only enforcement has not been verified.
 Never buy credits, enable reload, or consume purchased or invoiced funds.
+
+| Route | Who decides | Runs |
+| --- | --- | --- |
+| `subscription` | Subscription admission | The existing CLI seat |
+| `included_api_credit` | Grant-only qualification (none in production) | Nothing: `grant_only_funding_unverified` |
+| `authorized_prepaid` | The owner's private prepaid permit, one OpenAI profile | The read-only Responses agent, one-shots only |
+
+`authorized_prepaid` is the only exception to the grant-only rule. It reports
+`fundingPolicy: "owner_authorized_prepaid"` and `grantOnly: false`, never
+releases the subscription reserve, and is never used by unified runs. It
+needs a valid permit; see
+[owner-authorized prepaid](ALLOCATED-CREDIT.md#owner-authorized-prepaid-openai-only)
+for the permit, its block reasons and its limitations. A grant decision never
+reads the permit, so it is unchanged when a permit exists.
 
 An explicitly authorized subscription fallback may run **before admission**:
 it invokes the existing CLI once with the same provider/model/effort and exact
@@ -104,7 +123,7 @@ workspace, and execution controls:
 }
 ```
 
-`route` is `subscription` or `included_api_credit`; `fallback` is required and
+`route` is `subscription`, `included_api_credit` or `authorized_prepaid`; `fallback` is required and
 is `none` or `subscription`. Default to `none` when spending authorization is
 unclear. Omitted profile/revision resolve at admission and are persisted before
 queueing. Integrators should send the exact displayed profile and revision.
@@ -163,7 +182,9 @@ single-writer ownership and the existing independent review gates.
 
 Before future API execution can ship, qualify a provider-enforced grant-only
 mechanism bound to organization/project/credential generation and grant period,
-then implement and verify the separate eligible transport, exhaustion evidence,
-writer transfer and receipt accounting. Never weaken the closed gate to make a
+and add a reviewed adapter for that provider. The read-only transport,
+checkpoints, exhaustion classification and receipts exist and are tested only
+against a local fake; writer transfer and owned-workflow API execution are
+still not implemented. Never weaken the closed gate to make a
 smoke test pass. This branch requires a separately scheduled deployment; the
 current live v2.6.0 process has not been restarted by this work.

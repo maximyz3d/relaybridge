@@ -7,6 +7,7 @@ const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const { providerVersion, classifyAnswer, readPerplexityState } = require('../lib/perplexity-diagnostics');
 const { answerHealth } = require('../lib/answer-health');
+const { isolatedEnv } = require('./helpers/isolated-env');
 
 test('answer diagnostics preserve unknown causes and omit private version banners', () => {
   assert.equal(providerVersion('pwm, version 1.2.3\nprivate@example.test'), '1.2.3');
@@ -32,8 +33,8 @@ if(process.argv[2]==='--version'){console.log('pwm, version 1.2.3');process.exit
 if(process.argv[2]==='login'){process.exit(0)}
 console.log('No answer received');`;
   fs.writeFileSync(path.join(dir, 'pwm'), fake, { mode: 0o700 });
-  const env = { ...process.env, PATH: dir + path.delimiter + process.env.PATH, FIXTURE_CALLS: marker,
-    PPLX_ALLOW_PAID_API_FALLBACK: '0', PERPLEXITY_API_KEY: '', PPLX_API_KEY: '' };
+  const env = isolatedEnv({ PATH: dir + path.delimiter + process.env.PATH, FIXTURE_CALLS: marker,
+    PPLX_ALLOW_PAID_API_FALLBACK: '0', PERPLEXITY_API_KEY: '', PPLX_API_KEY: '' });
   const wrapper = path.resolve(__dirname, '../tools/pplx.js');
   const check = spawnSync(process.execPath, [wrapper, '--check'], { env, encoding: 'utf8', timeout: 15000 });
   assert.equal(check.status, 0);

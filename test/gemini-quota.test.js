@@ -1,4 +1,5 @@
 'use strict';
+require('./helpers/isolated-env').scrubInheritedEnv();
 const test = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
 const { parseGeminiQuotaExhaustion: parse, normalizeQualitativeQuotaExhaustion: normalize } = require('../lib/vendor-quota');

@@ -7,6 +7,7 @@ const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
+const { isolatedEnv } = require('./helpers/isolated-env');
 
 const ROOT = path.resolve(__dirname, '..');
 
@@ -54,8 +55,7 @@ async function exerciseInvalidAllowedRoots(t, allowedRootsValue) {
   const baseUrl = `http://127.0.0.1:${port}`;
   const proc = spawn(process.execPath, [path.join(ROOT, 'server.js')], {
     cwd: ROOT,
-    env: {
-      ...process.env,
+    env: isolatedEnv({
       PORT: String(port),
       PTY_MODE: 'none',
       NODE_ENV: 'test',
@@ -63,7 +63,7 @@ async function exerciseInvalidAllowedRoots(t, allowedRootsValue) {
       RELAYBRIDGE_TOKEN_FILE: path.join(tempRoot, 'token'),
       RELAYBRIDGE_DATA_DIR: path.join(tempRoot, 'data'),
       RELAYBRIDGE_ALLOWED_ROOTS: allowedRootsValue,
-    },
+    }),
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'],
   });

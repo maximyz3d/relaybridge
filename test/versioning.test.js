@@ -8,6 +8,7 @@ const path = require('node:path');
 const { execFileSync, spawnSync } = require('node:child_process');
 
 const versioning = require('../templates/github-automations/compute-version.cjs');
+const { isolatedEnv } = require('./helpers/isolated-env');
 
 test('release write mode synchronizes existing npm roots and preserves dependencies without lifecycle execution', t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(),'rb-release-write-'));
@@ -17,7 +18,7 @@ test('release write mode synchronizes existing npm roots and preserves dependenc
   fs.writeFileSync(path.join(dir,'package.json'),JSON.stringify(pkg));
   fs.writeFileSync(path.join(dir,'package-lock.json'),JSON.stringify(lock));
   const script = path.resolve(__dirname,'../.github/scripts/compute-version.cjs');
-  const result = spawnSync(process.execPath,[script,'--write-release','2.3.1'],{cwd:dir,encoding:'utf8'});
+  const result = spawnSync(process.execPath,[script,'--write-release','2.3.1'],{ env: isolatedEnv(), cwd:dir,encoding:'utf8'});
   assert.equal(result.status,0,result.stderr); assert.equal(result.stdout,'');
   assert.equal(fs.readFileSync(path.join(dir,'VERSION'),'utf8'),'2.3.1\n');
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir,'package.json'))),{...pkg,version:'2.3.1'});
@@ -115,12 +116,12 @@ test('installed CLI reads repository state and emits safe GitHub outputs', () =>
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rb-version-'));
   const script = path.resolve(__dirname, '..', '.github', 'scripts', 'compute-version.cjs');
   try {
-    execFileSync('git', ['init', '-q'], { cwd: dir });
+    execFileSync('git', ['init', '-q'], { env: isolatedEnv(), cwd: dir });
     fs.writeFileSync(path.join(dir, 'package.json'), '{"version":"2.0.1"}\n');
     const success = spawnSync(process.execPath, [script], {
       cwd: dir,
       encoding: 'utf8',
-      env: { ...process.env, BUMP: 'patch', SET_VERSION_PRESENT: 'false' },
+      env: isolatedEnv({ BUMP: 'patch', SET_VERSION_PRESENT: 'false' }),
     });
     assert.equal(success.status, 0, success.stderr);
     assert.equal(success.stdout, 'current=2.0.1\nnext=2.0.2\nsource=package.json\n');
@@ -128,12 +129,11 @@ test('installed CLI reads repository state and emits safe GitHub outputs', () =>
     const rejected = spawnSync(process.execPath, [script], {
       cwd: dir,
       encoding: 'utf8',
-      env: {
-        ...process.env,
+      env: isolatedEnv({
         BUMP: 'patch',
         SET_VERSION_PRESENT: 'true',
         SET_VERSION: '2.0.1',
-      },
+      }),
     });
     assert.notEqual(rejected.status, 0);
     assert.match(rejected.stderr, /must be strictly greater/);

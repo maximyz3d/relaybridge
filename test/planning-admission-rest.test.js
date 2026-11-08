@@ -5,6 +5,7 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const { startTestBridge, waitFor } = require('./helpers/temporary-bridge');
+const { isolatedEnv } = require('./helpers/isolated-env');
 
 test('explicit opt-in planning respects hard ceilings and routed fallback cannot restore weak seats', { timeout: 30000 }, async (t) => {
   let marker;
@@ -31,8 +32,8 @@ test('explicit opt-in planning respects hard ceilings and routed fallback cannot
   const [{ Client }, { StdioClientTransport }] = await Promise.all([import('@modelcontextprotocol/client'), import('@modelcontextprotocol/client/stdio')]);
   const root = path.resolve(__dirname, '..');
   const transport = new StdioClientTransport({ command: process.execPath, args: [path.join(root, 'mcp/server.mjs')], cwd: root,
-    env: { ...process.env, NODE_ENV: 'test', RELAYBRIDGE_TEST_BUILD_ID: 'security-integration-fixture', RELAYBRIDGE_URL: bridge.base,
-      RELAYBRIDGE_TOKEN_FILE: path.join(bridge.root, 'token'), RELAYBRIDGE_DATA_DIR: path.join(bridge.root, 'data'), RELAYBRIDGE_CONFIG_FILE: bridge.configPath }, stderr: 'pipe' });
+    env: isolatedEnv({ NODE_ENV: 'test', RELAYBRIDGE_TEST_BUILD_ID: 'security-integration-fixture', RELAYBRIDGE_URL: bridge.base,
+      RELAYBRIDGE_TOKEN_FILE: path.join(bridge.root, 'token'), RELAYBRIDGE_DATA_DIR: path.join(bridge.root, 'data'), RELAYBRIDGE_CONFIG_FILE: bridge.configPath }), stderr: 'pipe' });
   const client = new Client({ name: 'hard-routing-test', version: '1' });
   t.after(async () => { await client.close(); await transport.close(); });
   await client.connect(transport);

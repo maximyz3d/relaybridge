@@ -14,6 +14,7 @@ const ROOT = path.resolve(__dirname, '..');
 const CONFIG = path.join(ROOT, 'cli-config.json');
 const TEST_BUILD_ID = 'relaybridge-source-test';
 const TIMEOUT_POLICY = require('../timeout-policy.cjs');
+const { isolatedEnv } = require('./helpers/isolated-env');
 
 function readConfig() {
   return JSON.parse(fs.readFileSync(CONFIG, 'utf8'));
@@ -313,7 +314,7 @@ test('server, MCP adapter, Perplexity wrapper, and inline browser script parse',
     path.join('mcp', 'receipts.mjs'),
     'timeout-policy.cjs',
   ]) {
-    const result = spawnSync(process.execPath, ['--check', path.join(ROOT, file)], { encoding: 'utf8' });
+    const result = spawnSync(process.execPath, ['--check', path.join(ROOT, file)], { env: isolatedEnv(), encoding: 'utf8' });
     assert.equal(result.status, 0, result.stderr || result.stdout);
   }
   const html = fs.readFileSync(path.join(ROOT, 'public', 'index.html'), 'utf8');
@@ -373,12 +374,11 @@ test('MCP bridge startup rejects a healthy same-version listener with a differen
   `;
   const child = spawn(process.execPath, ['--input-type=module', '--eval', childScript], {
     cwd: ROOT,
-    env: {
-      ...process.env,
+    env: isolatedEnv({
       NODE_ENV: 'test',
       RELAYBRIDGE_TEST_BUILD_ID: '2.0.1+bbbbbbbbbbbbbbbb',
       RELAYBRIDGE_URL: `http://127.0.0.1:${port}`,
-    },
+    }),
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -921,8 +921,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
   const baseUrl = `http://127.0.0.1:${port}`;
   const proc = spawn(process.execPath, [path.join(ROOT, 'server.js')], {
     cwd: ROOT,
-    env: {
-      ...process.env,
+    env: isolatedEnv({
       NODE_ENV: 'test',
       RELAYBRIDGE_TEST_BUILD_ID: TEST_BUILD_ID,
       RELAYBRIDGE_ALLOW_STICKY_DANGEROUS: '0',
@@ -946,7 +945,7 @@ test('prompt-file transport preserves long special-character prompts and cleans 
       USERPROFILE: realProviderHome,
       RELAYBRIDGE_ALLOWED_ROOTS: tempRoot,
       RELAYBRIDGE_MAX_ACTIVE_PER_PROVIDER: '1',
-    },
+    }),
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -1080,11 +1079,10 @@ test('prompt-file transport preserves long special-character prompts and cleans 
 
   const datasheetCli = spawnSync(process.execPath, [path.join(ROOT, 'bin', 'relaybridge.js'), 'plan', datasheetTask, '--json'], {
     cwd: tempRoot,
-    env: {
-      ...process.env,
+    env: isolatedEnv({
       RELAYBRIDGE_URL: baseUrl,
       RELAYBRIDGE_TOKEN: fs.readFileSync(tokenPath, 'utf8').trim(),
-    },
+    }),
     encoding: 'utf8',
     windowsHide: true,
   });
@@ -1877,10 +1875,10 @@ test('prompt-file transport preserves long special-character prompts and cleans 
     ['init', '-q'],
     ['config', 'user.email', 'test@example.invalid'],
     ['config', 'user.name', 'Relay Test'],
-  ]) assert.equal(spawnSync('git', args, { cwd: writerRepo }).status, 0);
+  ]) assert.equal(spawnSync('git', args, { env: isolatedEnv(), cwd: writerRepo }).status, 0);
   fs.writeFileSync(path.join(writerRepo, 'base.txt'), 'base\n');
-  assert.equal(spawnSync('git', ['add', 'base.txt'], { cwd: writerRepo }).status, 0);
-  assert.equal(spawnSync('git', ['commit', '-qm', 'base'], { cwd: writerRepo }).status, 0);
+  assert.equal(spawnSync('git', ['add', 'base.txt'], { env: isolatedEnv(), cwd: writerRepo }).status, 0);
+  assert.equal(spawnSync('git', ['commit', '-qm', 'base'], { env: isolatedEnv(), cwd: writerRepo }).status, 0);
   const writerBudgetResponse = await fetch(baseUrl + '/api/oneshot', {
     method: 'POST',
     headers: jsonAuth,
@@ -3169,8 +3167,7 @@ test('linked provider accounts fail closed, isolate cooldowns, and refresh mutat
   const baseUrl = `http://127.0.0.1:${port}`;
   const proc = spawn(process.execPath, [path.join(ROOT, 'server.js')], {
     cwd: ROOT,
-    env: {
-      ...process.env,
+    env: isolatedEnv({
       NODE_ENV: 'test',
       RELAYBRIDGE_TEST_BUILD_ID: TEST_BUILD_ID,
       PORT: String(port),
@@ -3180,7 +3177,7 @@ test('linked provider accounts fail closed, isolate cooldowns, and refresh mutat
       RELAYBRIDGE_DATA_DIR: dataDir,
       RELAYBRIDGE_ALLOWED_ROOTS: tempRoot,
       ...Object.fromEntries(copilotOverrideNames.map((name) => [name, 'must-not-override-the-selected-account'])),
-    },
+    }),
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -3835,8 +3832,7 @@ test('Copilot live signed-out evidence quarantines only the failing linked profi
   const baseUrl = `http://127.0.0.1:${port}`;
   const bridge = spawn(process.execPath, [path.join(ROOT, 'server.js')], {
     cwd: ROOT,
-    env: {
-      ...process.env,
+    env: isolatedEnv({
       NODE_ENV: 'test',
       RELAYBRIDGE_TEST_BUILD_ID: TEST_BUILD_ID,
       PORT: String(port),
@@ -3844,7 +3840,7 @@ test('Copilot live signed-out evidence quarantines only the failing linked profi
       RELAYBRIDGE_CONFIG_FILE: configPath,
       RELAYBRIDGE_TOKEN_FILE: tokenPath,
       RELAYBRIDGE_DATA_DIR: dataDir,
-    },
+    }),
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -3914,8 +3910,7 @@ test('readiness and version probes share one diagnostic wall-clock envelope', { 
   const baseUrl = `http://127.0.0.1:${port}`;
   const bridge = spawn(process.execPath, [path.join(ROOT, 'server.js')], {
     cwd: ROOT,
-    env: {
-      ...process.env,
+    env: isolatedEnv({
       NODE_ENV: 'test',
       RELAYBRIDGE_TEST_BUILD_ID: TEST_BUILD_ID,
       PORT: String(port),
@@ -3923,7 +3918,7 @@ test('readiness and version probes share one diagnostic wall-clock envelope', { 
       RELAYBRIDGE_CONFIG_FILE: configPath,
       RELAYBRIDGE_TOKEN_FILE: tokenPath,
       RELAYBRIDGE_DATA_DIR: path.join(tempRoot, 'data'),
-    },
+    }),
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -4010,8 +4005,7 @@ test('local Ollama adapter uses loopback HTTP, returns final-only text, and reco
   const baseUrl = `http://127.0.0.1:${bridgePort}`;
   const bridge = spawn(process.execPath, [path.join(ROOT, 'server.js')], {
     cwd: ROOT,
-    env: {
-      ...process.env,
+    env: isolatedEnv({
       NODE_ENV: 'test',
       RELAYBRIDGE_TEST_BUILD_ID: TEST_BUILD_ID,
       PORT: String(bridgePort),
@@ -4020,7 +4014,7 @@ test('local Ollama adapter uses loopback HTTP, returns final-only text, and reco
       PS_BRIDGE_TOKEN_FILE: tokenPath,
       PS_BRIDGE_DATA_DIR: path.join(tempRoot, 'data'),
       PS_BRIDGE_OLLAMA_URL: `http://127.0.0.1:${apiPort}`,
-    },
+    }),
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -4144,8 +4138,7 @@ test('hosted OpenAI-compatible adapter blocks China-hosted endpoints before netw
   const baseUrl = `http://127.0.0.1:${bridgePort}`;
   const bridge = spawn(process.execPath, [path.join(ROOT, 'server.js')], {
     cwd: ROOT,
-    env: {
-      ...process.env,
+    env: isolatedEnv({
       NODE_ENV: 'test',
       RELAYBRIDGE_TEST_BUILD_ID: TEST_BUILD_ID,
       PORT: String(bridgePort),
@@ -4154,7 +4147,7 @@ test('hosted OpenAI-compatible adapter blocks China-hosted endpoints before netw
       PS_BRIDGE_TOKEN_FILE: tokenPath,
       PS_BRIDGE_DATA_DIR: path.join(tempRoot, 'data'),
       TEST_BLOCKED_HOSTED_KEY: 'sk-test-not-real',
-    },
+    }),
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -4223,8 +4216,7 @@ test('agents listing, tag updates, and broadcast fan-out respect auth, autoRoute
   const baseUrl = `http://127.0.0.1:${port}`;
   const proc = spawn(process.execPath, [path.join(ROOT, 'server.js')], {
     cwd: ROOT,
-    env: {
-      ...process.env,
+    env: isolatedEnv({
       NODE_ENV: 'test',
       RELAYBRIDGE_TEST_BUILD_ID: TEST_BUILD_ID,
       PORT: String(port),
@@ -4233,7 +4225,7 @@ test('agents listing, tag updates, and broadcast fan-out respect auth, autoRoute
       RELAYBRIDGE_TOKEN_FILE: tokenPath,
       RELAYBRIDGE_DATA_DIR: path.join(tempRoot, 'data'),
       RELAYBRIDGE_MAX_ACTIVE_ONESHOTS: '2',
-    },
+    }),
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'],
   });

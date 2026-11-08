@@ -6,6 +6,8 @@ import os from 'node:os';
 import { PassThrough } from 'node:stream';
 import { pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
+import { scrubInheritedEnv } from './helpers/isolated-env.js';
+scrubInheritedEnv();
 const TARGET = path.resolve(import.meta.dirname, '../mcp/launcher.mjs');
 const { startLauncher } = await import(pathToFileURL(TARGET).href);
 const CHILD = path.join(import.meta.dirname, 'helpers/mcp-launcher/protocol-child.cjs');

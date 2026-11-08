@@ -3850,9 +3850,56 @@ export function buildServer() {
     inputSchema: z.object({ profileId: z.string().nullable(), expectedRevision: z.number().int().nonnegative() }), annotations: ACTION,
   }, safeHandler(async input => result(await bridgeRequest('/api/settings/funding-selection', { method: 'PUT', body: input, actionIdentity: true }))));
   server.registerTool('preview_funding_route', {
-    title: 'Preview API eligibility and explicit subscription fallback', description: 'No model call. Included API execution remains blocked without provider-enforced grant-only spending. Subscription fallback still needs normal admission.',
+    title: 'Preview API eligibility and explicit subscription fallback', description: 'No model call. Included API execution remains blocked without provider-enforced grant-only spending. route authorized_prepaid is allowed only with the owner\'s private prepaid permit for one OpenAI profile (read-only API agent, not grant-only, provider hard cap can lag; no purchase, reload or renewal). Subscription fallback still needs normal admission.',
     inputSchema: z.object({ kind: z.enum(['claude', 'codex']), funding: z.unknown(), expectedAccountId: z.string().optional() }), annotations: READ_ONLY,
   }, safeHandler(async input => result(await bridgeRequest('/api/funding-route/preview', { method: 'POST', body: input, actionIdentity: true }))));
+
+  // Unified runs: the request is forwarded unchanged (unknown keys included) so
+  // the bridge applies exactly the validation the CLI and HTTP API get.
+  // Server-internal fields such as unifiedRun or reserveRelease are refused there.
+  const UNIFIED_RUN_ID = z.string().regex(/^ur_[a-f0-9]{24}$/);
+  server.registerTool('unified_run_create', {
+    title: 'Start a unified run across listed native segments',
+    description: 'Carry one objective across the listed native accounts (each with accountId, model and effort; accountId "default" is the existing login). dangerous=true needs acknowledgeFilesystemWrites=true and edits the workspace. advisoryFileScope is shown to the provider but is NOT enforced (writeBoundary advisory_unenforced); exact allowedWritePaths contracts are refused. API segments are read-only and blocked unless grant-only funding is verified; owner-authorized prepaid never applies to unified runs.',
+    inputSchema: z.object({
+      objective: z.string().min(1).max(20000),
+      constraints: z.string().max(12000).optional(),
+      advisoryFileScope: z.array(z.string().min(1).max(500)).max(128).optional(),
+      cwd: z.string().max(1000).optional(),
+      title: z.string().max(120).optional(),
+      dangerous: z.boolean().optional(),
+      acknowledgeFilesystemWrites: z.boolean().optional(),
+      segments: z.array(z.unknown()).min(1).max(8),
+    }).passthrough(),
+    annotations: { ...DESTRUCTIVE, openWorldHint: true },
+  }, safeHandler(async (input, context) => result(await bridgeRequest('/api/unified-runs', {
+    method: 'POST', body: input, actionIdentity: true, signal: context?.mcpReq?.signal }))));
+  server.registerTool('unified_run_status', {
+    title: 'Read a unified run',
+    description: 'Read state, segments and writer_diff_summary. Reading may advance a run whose segment has settled. An uncertain writer segment reports workspaceReconciliation with a workspaceEffectsDigest for unified_run_link.',
+    inputSchema: z.object({ runId: UNIFIED_RUN_ID }).strict(), annotations: ACTION,
+  }, safeHandler(async ({ runId }, context) => result(await bridgeRequest(`/api/unified-runs/${encodeURIComponent(runId)}`, {
+    signal: context?.mcpReq?.signal }))));
+  server.registerTool('unified_run_resume', {
+    title: 'Resume a waiting unified run',
+    description: 'Retry a run waiting for quota or for a writer. A terminal run returns its record without any new submit or model call. An uncertain segment is refused; use unified_run_link.',
+    inputSchema: z.object({ runId: UNIFIED_RUN_ID }).passthrough(), annotations: { ...ACTION, openWorldHint: true },
+  }, safeHandler(async ({ runId, ...body }, context) => result(await bridgeRequest(`/api/unified-runs/${encodeURIComponent(runId)}/resume`, {
+    method: 'POST', body, actionIdentity: true, signal: context?.mcpReq?.signal }))));
+  server.registerTool('unified_run_link', {
+    title: 'Continue after an uncertain unified segment',
+    description: 'Start exactly one new segment after an uncertain one, only once it is physically settled. A writer run needs the current workspaceEffectsDigest from unified_run_status; confirmDuplicateBillingRisk=true is required when a call may have been sent.',
+    inputSchema: z.object({ runId: UNIFIED_RUN_ID, workspaceEffectsDigest: z.string().max(128).optional(),
+      confirmDuplicateBillingRisk: z.boolean().optional() }).passthrough(), annotations: { ...DESTRUCTIVE, openWorldHint: true },
+  }, safeHandler(async ({ runId, ...body }, context) => result(await bridgeRequest(`/api/unified-runs/${encodeURIComponent(runId)}/link`, {
+    method: 'POST', body, actionIdentity: true, signal: context?.mcpReq?.signal }))));
+
+  server.registerTool('unified_run_cancel', {
+    title: 'Cancel a unified run safely',
+    description: 'Cancel a unified run only when no segment can be running: a waiting run, a segment still queued and never started (verified by its exact intent), or a segment already physically settled. A running, uncertain or unrecorded segment is refused, never stopped or replayed. Cancelled runs never auto-start pending work.',
+    inputSchema: z.object({ runId: UNIFIED_RUN_ID }).strict(), annotations: { ...DESTRUCTIVE, openWorldHint: false },
+  }, safeHandler(async ({ runId }, context) => result(await bridgeRequest(`/api/unified-runs/${encodeURIComponent(runId)}/cancel`, {
+    method: 'POST', body: {}, actionIdentity: true, signal: context?.mcpReq?.signal }))));
 
   server.registerTool('submit_task', {
     title: 'Submit a background task',

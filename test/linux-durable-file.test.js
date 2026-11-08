@@ -7,6 +7,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { execFile } = require('node:child_process');
 const { promisify } = require('node:util');
+const { isolatedEnv } = require('./helpers/isolated-env');
 const { openLinuxDurableDirectory, DurableFileError, MAX_BYTES, MAX_WRITE_CALLS } = require('../lib/linux-durable-file');
 
 const native = process.platform === 'linux';
@@ -213,7 +214,7 @@ run('two native processes publishing one exclusive intent have exactly one compl
     try{h.createExclusive('intent.json',process.argv[3].repeat(4096));process.stdout.write('confirmed');}
     catch(e){process.stdout.write(e.details.publication);}finally{h.close();}`;
   const results = await Promise.all(['a', 'b'].map((value) => promisify(execFile)(process.execPath,
-    ['-e', script, require.resolve('../lib/linux-durable-file'), f.root, value], { timeout: 10000, maxBuffer: 1024 })));
+    ['-e', script, require.resolve('../lib/linux-durable-file'), f.root, value], { timeout: 10000, maxBuffer: 1024, env: isolatedEnv() })));
   assert.deepEqual(results.map((r) => r.stdout).sort(), ['confirmed', 'conflict']);
   assert.match(fs.readFileSync(path.join(f.root, 'intent.json'), 'utf8'), /^(?:a{4096}|b{4096})$/);
   assert.deepEqual(fs.readdirSync(f.root), ['intent.json']);
@@ -227,7 +228,7 @@ run('restrictive inherited umask cannot publish an unusable canonical file', asy
       process.stdout.write(JSON.stringify({mode:fs.statSync(process.argv[2]+'/intent.json').mode&0o777,bytes:fs.readFileSync(process.argv[2]+'/intent.json','utf8')}));}
     finally{h.close();}`;
   const result = await promisify(execFile)(process.execPath,
-    ['-e', script, require.resolve('../lib/linux-durable-file'), f.root], { timeout: 10000, maxBuffer: 1024 });
+    ['-e', script, require.resolve('../lib/linux-durable-file'), f.root], { timeout: 10000, maxBuffer: 1024, env: isolatedEnv() });
   assert.deepEqual(JSON.parse(result.stdout), { mode: 0o600, bytes: 'next' });
 });
 
@@ -241,7 +242,7 @@ run('restrictive inherited umask cannot leave a successfully initialized child u
         bytes:fs.readFileSync(process.argv[2]+'/child/intent.json','utf8')}));}
     finally{if(child)child.close();h.close();}`;
   const result = await promisify(execFile)(process.execPath,
-    ['-e', script, require.resolve('../lib/linux-durable-file'), f.root], { timeout: 10000, maxBuffer: 1024 });
+    ['-e', script, require.resolve('../lib/linux-durable-file'), f.root], { timeout: 10000, maxBuffer: 1024, env: isolatedEnv() });
   assert.deepEqual(JSON.parse(result.stdout), { mode: 0o700, bytes: 'next' });
 });
 
@@ -309,4 +310,28 @@ run('child cleanup close failure cannot mask failed parent durability', (t) => {
     errno: 'ENOSPC', cleanupPending: true, cleanupError: 'EIO',
   });
   assert.ok(fs.statSync(path.join(f.root, 'child')).isDirectory());
+});
+
+run('every pinned child directory, not only the root, must be on a qualified filesystem', (t) => {
+  const { openLinuxWorkspaceDirectory, WORKSPACE_FS_TYPES } = require('../lib/linux-durable-file');
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'rb-workspace-')));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(root, 'a', 'b'), { recursive: true });
+  const nested = path.join(root, 'a', 'b');
+  const opened = new Set();
+  const api = new Proxy(fs, { get(target, key) {
+    if (key === 'statfsSync') return (p, ...rest) => {
+      let real = null; try { real = fs.readlinkSync(p); } catch {}
+      return real === nested ? { type: 0x6969 } : target.statfsSync(p, ...rest);
+    };
+    if (key === 'openSync') return (...args) => { const fd = target.openSync(...args); opened.add(fd); return fd; };
+    if (key === 'closeSync') return (fd) => { opened.delete(fd); return target.closeSync(fd); };
+    return target[key];
+  } });
+  const ws = openLinuxWorkspaceDirectory({ directory: root, fsApi: api, allowedTypes: WORKSPACE_FS_TYPES });
+  t.after(() => ws.close());
+  const parent = ws.openDirectory(['a']);
+  parent.close();
+  assert.throws(() => ws.openDirectory(['a', 'b']), { code: 'api_write_unavailable' });
+  assert.equal(opened.size, 1, 'only the root descriptor stays open after the refusal');
 });

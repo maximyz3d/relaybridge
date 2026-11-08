@@ -89,3 +89,12 @@ test('corrupt, missing, permissive and symlinked stores fail closed across reade
   fs.rmSync(path.dirname(file), { recursive: true });
   assert.equal(createFundingProfiles({ dataDir }).snapshot().storeState, 'invalid');
 });
+
+test('profiles cannot carry a prepaid policy or permit fields', t => {
+  const { store } = fixture(t);
+  for (const patch of [{ fundingPolicy: 'owner_authorized_prepaid' }, { grantOnly: false }, { prepaid: { authorizationId: 'pa_x' } },
+    { prepaidAuthorization: 'pa_x' }, { authorizationId: 'pa_x' }, { hardLimitCents: 12000 }]) {
+    assert.throws(() => store.set({ profile: { ...profile(), ...patch }, expectedRevision: 0 }), { code: 'invalid_funding_profile' }, JSON.stringify(patch));
+    assert.equal(store.snapshot().storeRevision, 0);
+  }
+});

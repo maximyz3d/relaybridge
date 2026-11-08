@@ -7,6 +7,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const { createOwnerJournal, hash, canonical, MAX_JOURNAL_FILES, MAX_OWNER_EVENTS, PUBLICATION_HEADROOM } = require('../lib/execution-owner');
+const { isolatedEnv } = require('./helpers/isolated-env');
 const BASE = { requestId: 'request_one', invocationId: 'invoke_one', attemptId: 'attempt_one', runId: 'run_one', taskId: 'task_one',
   provider: 'fixture', accountId: 'default', executionHash: hash('execution'), cwdIdentityHash: hash('cwd'), cwdPolicyId: hash('policy'), reservationId: 'reservation_one' };
 const PIN = { hostPid: 12345, starttime: '100', nsIno: '99999', namespacePid: 1, bootId: '11111111-1111-1111-1111-111111111111' };
@@ -149,7 +150,7 @@ if (process.argv[2] === '--crash-child') {
 
   test('actual SIGKILL before/after decision publication preserves original recovery request', async t => {
     for (const position of ['before-publish', 'after-publish']) {
-      const f = fixture(t), crash = spawnSync(process.execPath, [__filename, '--crash-child', f.directory, position], { encoding: 'utf8', timeout: 10000, maxBuffer: 2048 });
+      const f = fixture(t), crash = spawnSync(process.execPath, [__filename, '--crash-child', f.directory, position], { env: isolatedEnv(), encoding: 'utf8', timeout: 10000, maxBuffer: 2048 });
       assert.equal(crash.signal, 'SIGKILL', crash.stderr); const { id, request } = JSON.parse(crash.stdout.trim());
       const restored = f.open(), decision = restored.recover(id, request);
       assert.equal(request.expectedRevision, 4); assert.equal(restored.inspect(id).revision, 5);

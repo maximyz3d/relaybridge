@@ -8,6 +8,7 @@ const path = require('node:path');
 const { execFileSync, spawnSync } = require('node:child_process');
 const { createCreditPreferences, validateCreditPreference, allocatedCreditStatus } = require('../lib/allocated-credit');
 const { startTestBridge, waitFor } = require('./helpers/temporary-bridge');
+const { isolatedEnv } = require('./helpers/isolated-env');
 const ROOT = path.resolve(__dirname, '..');
 const selections = [{ mode: 'auto' }, { mode: 'off' },
   { mode: 'manual', manualTarget: 'subscription' }, { mode: 'manual', manualTarget: 'included_api_credit' }];
@@ -28,6 +29,9 @@ test('default Auto and each explicit preference persist without enabling API dis
     assert.equal(status.effective.route, selection.manualTarget === 'included_api_credit' ? 'blocked' : 'subscription_only');
     assert.equal(status.automationAvailable, false); assert.equal(status.effective.dispatchAllowed, false);
     assert.ok(Object.values(status.providers).every((p) => !p.dispatchAllowed));
+    // No preference selects or reports the promotional route; only a permit summary does.
+    assert.equal(Object.hasOwn(status, 'promotionalTransport'), false);
+    assert.equal(allocatedCreditStatus({}, saved, null, null, { state: 'blocked', reason: 'promotional_authorization_missing' }).promotionalTransport, 'implemented_not_activated');
     saved.mode = 'off'; assert.deepEqual(store.get().mode, selection.mode);
   }
   if (process.platform !== 'win32') {
@@ -91,7 +95,7 @@ test('REST, CLI and MCP share persisted modes, preserve quota settings, and enfo
     const result = await put(selection); assert.equal(result.status, 200);
     assert.equal(result.body.preference.mode, selection.mode); assert.equal(result.body.automationAvailable, false);
   }
-  const cliEnv = { ...process.env, RELAYBRIDGE_URL: bridge.base, RELAYBRIDGE_TOKEN: bridge.headers['X-RelayBridge-Token'] };
+  const cliEnv = isolatedEnv({ RELAYBRIDGE_URL: bridge.base, RELAYBRIDGE_TOKEN: bridge.headers['X-RelayBridge-Token'] });
   const cli = (...args) => execFileSync(process.execPath, [path.join(ROOT, 'bin/relaybridge.js'), ...args], { encoding: 'utf8', env: cliEnv });
   assert.match(cli('credit', 'mode', 'manual', 'included_api_credit'), /effective\s+blocked/);
   assert.deepEqual(JSON.parse(cli('options', '--json')).allocatedCredit, (await bridge.request('/api/allocated-credit')).body);
@@ -127,7 +131,7 @@ test('CLI rejects ambiguous/trailing arguments and secret flags before any netwo
     ['credit', 'setup', 'openai', 'private-fixture'], ['credit', '--api-key', 'private-fixture'],
     ['credit', '--json=true'], ['options', 'off'], ['options', '--unexpected'], ['credit', 'mode', 'private-fixture']]) {
     const result = spawnSync(process.execPath, [path.join(ROOT, 'bin/relaybridge.js'), ...args], {
-      encoding: 'utf8', env: { ...process.env, RELAYBRIDGE_URL: 'http://127.0.0.1:1' } });
+      encoding: 'utf8', env: isolatedEnv({ RELAYBRIDGE_URL: 'http://127.0.0.1:1' }) });
     assert.notEqual(result.status, 0); assert.doesNotMatch(result.stderr, /cannot reach|no bridge token|private-fixture/);
   }
 });

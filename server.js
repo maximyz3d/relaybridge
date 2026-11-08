@@ -22,10 +22,19 @@ const { parseHostedTerminal, classifyHttpTerminal } = require('./lib/http-provid
 const { resolveAttemptTiming, renderCliDeadline, nativeTransportState } = require('./lib/cli-deadline');
 const { resolveConcurrencyPolicy } = require('./lib/concurrency-policy');
 const { createSubscriptionUsage } = require('./lib/subscription-usage');
-const { allocatedCreditStatus, createCreditPreferences, assertNoAllocatedCreditDispatch } = require('./lib/allocated-credit');
+const { allocatedCreditStatus, createCreditPreferences, assertNoAllocatedCreditDispatch, CREDIT_SECRET_NAMES } = require('./lib/allocated-credit');
 const { createFundingProfiles } = require('./lib/funding-profiles');
-const { assertCanonicalFunding, resolveFundingRoute, assertFundingSubscriptionAdmission } = require('./lib/funding-routing');
-const { createContinuity } = require('./lib/continuity');
+const { createQualificationAuthority } = require('./lib/api-agent-qualification');
+const { createPrepaidAuthority, summarize: summarizePrepaidAuthorization } = require('./lib/prepaid-authorization');
+const { createPromotionalAuthority, summarize: summarizePromotionalAuthorization } = require('./lib/promotional-authorization');
+const { createCheckpointStore } = require('./lib/api-agent-checkpoint');
+const { createApiAgentDispatcher } = require('./lib/api-agent-dispatch');
+const { createWorkspaceTools } = require('./lib/api-agent-tools');
+const { WRITE_BOUNDARY: API_WRITE_BOUNDARY, READ_ONLY_BOUNDARY: API_READ_ONLY_BOUNDARY } = require('./lib/api-agent-patch');
+const { assertCanonicalFunding, resolveFundingRoute, assertFundingSubscriptionAdmission, assertNoInternalFields, isApiDecision } = require('./lib/funding-routing');
+const { createContinuity, workspacesOverlap } = require('./lib/continuity');
+const { createUnifiedRuns } = require('./lib/unified-run');
+const { resolveApiModel } = require('./lib/api-agent-wire');
 const { createProgressAssessor } = require('./lib/progress-assessor');
 const { parseCodexRateLimits, parseClaudeStreamRateLimit, parseClaudeStatuslineUsage, readCodexRateLimits, readClaudeNativeUsage } = require('./lib/native-usage');
 const { refreshClaudeUsageViaPty } = require('./lib/claude-usage-probe');
@@ -49,7 +58,7 @@ const {
 const { buildTaskPlan, costClassFor } = require('./lib/task-plan');
 const { createWorkflowPipeline } = require('./lib/workflow-pipeline');
 const { createWorkflowController } = require('./lib/workflow-controller');
-const { createOwnedExecutionBackend } = require('./lib/owned-execution-backend');
+const { createOwnedExecutionBackend, physicalOwnerHolder } = require('./lib/owned-execution-backend');
 const { qualifyOwnedHost } = require('./lib/owned-host-qualification');
 const { registerOwnedWorkflowRoutes } = require('./lib/owned-workflow-routes');
 const { hash: ownerIdentityHash } = require('./lib/execution-owner');
@@ -2384,7 +2393,7 @@ async function runHttpProviderOneShot({ entry, prompt, effectivePrompt, res, rou
     registry: activeRuns, releaseAdmission, tickMs: 1000 });
   supervisor.progress.runId = runId; supervisor.progress.attemptId = route.attempt_id;
   const runControl = { runId, kind: route.provider, route, startedAt, supervisor, cwd, objective: prompt, quotaFingerprint: subscriptionUsage.fingerprint(route.quota_seat),
-    settled: false, finalizeSupported: false, stop: (reason) => lifecycle.requestStop({ reason, source: 'continuity' }) };
+    settled: false, finalizeSupported: false, dangerous: false, stop: (reason) => lifecycle.requestStop({ reason, source: 'continuity' }) };
   continuityControls.set(runId, runControl);
   lifecycle.physicalDone.then(() => { runControl.settled = true; continuity.saveRun(runControl); continuityControls.delete(runId); }).catch(() => {});
   res._relayLifecycle = lifecycle;
@@ -2631,6 +2640,9 @@ const WS_CLIENT_BUFFER_MAX = 4194304;
 // whether a quiet run is working or wedged instead of guessing.
 const activeRuns = new Map();
 const continuityControls = new Map();
+// Dangerous one-shots between their final holder check and live-control
+// registration. Fed to continuity as live controls so holders see them.
+const writerReservations = new Map();
 
 
 // What each provider can actually run, discovered at boot. Configured pins rot,
@@ -3342,7 +3354,8 @@ function fundingForRequest(body, cfg = loadConfig()) {
   assertCanonicalFunding(body);
   if (!Object.hasOwn(body, 'funding')) return null;
   const decision = resolveFundingRoute({ envelope: body.funding, snapshot: fundingProfiles.snapshot(),
-    kind: body.kind, entry: cfg[body.kind], expectedAccountId: body.expectedAccountId, preference: creditPreferences.get() });
+    kind: body.kind, entry: cfg[body.kind], expectedAccountId: body.expectedAccountId, preference: creditPreferences.get(),
+    qualificationAuthority: apiQualificationAuthority, credentialSourceFor: apiCredentialSourceFor, prepaidAuthority, promotionalAuthority, now: Date.now() });
   if (decision.actual === 'none') throw Object.assign(new Error(decision.blockedReason), { code: decision.blockedReason, fundingDecision: decision });
   body.funding = decision.requested;
   body.expectedAccountId = decision.expectedAccountId;
@@ -4899,8 +4912,122 @@ async function executeOneShot(body, res, privateContext = null) {
   // reservation after that wait so cancellation cannot launch late work.
   try { progressAssessor.assertDispatch(body); }
   catch (error) { return rejectBeforeAdmission(409, 'assessment_revoked', { error: error.message }); }
+  // Shared writer exclusion: registered coordinators, unified runs and workflow
+  // leases hold their workspace. Other plain dangerous one-shots do not, so
+  // today's broadcast behavior is unchanged.
+  if (useDanger) {
+    const holder = plainWriterHolder(resolvedCwd, { privateContext, continuityId: body.continuityId || null });
+    if (holder) return rejectBeforeAdmission(409, 'workspace_writer_busy', { error: 'Another writer holds an overlapping workspace.',
+      errorCode: 'workspace_writer_busy', holder, model_invocation: false, physical_attempt_count: 0 });
+  }
+  // An admitted API decision runs the API agent, never a subscription CLI or
+  // account. Included API credit is read-only unless this task is a
+  // unified-run API contract segment, whose private writer authority lets it
+  // edit exactly the run's allowed existing files; production never admits
+  // it, because its qualification authority has no adapters. Owner-authorized
+  // prepaid is admitted only with a valid private permit for one OpenAI
+  // profile, and is always read-only. A unified run selects it only for an
+  // explicitly opted-in entry after every listed native seat is positively
+  // exhausted, and its private prepaid authority re-proves that exhaustion
+  // here, before any provider request. Owner-authorized promotional credit is
+  // admitted only with a valid private permit for one Claude profile, only as
+  // an explicit read-only one-shot: never a writer, never a unified run.
+  if (isApiDecision(fundingDecision)) {
+    const refused = { model_invocation: false, physical_attempt_count: 0 };
+    const prepaidDecision = fundingDecision.actual === 'authorized_prepaid';
+    const promotionalDecision = fundingDecision.actual === 'authorized_promotional';
+    let apiWriter = null;
+    try { apiWriter = unifiedRuns.apiWriterAuthority(body, privateContext); }
+    catch (error) { return rejectBeforeAdmission(409, error.code || 'api_write_unauthorized', { ...refused, error: error.message, errorCode: error.code || null }); }
+    if (promotionalDecision) {
+      const message = 'Owner-authorized promotional credit runs only the read-only API agent.';
+      if (apiWriter) return rejectBeforeAdmission(409, 'api_write_unauthorized', { ...refused, error: message });
+      if (body.unifiedRun !== undefined) return rejectBeforeAdmission(409, 'promotional_unified_unsupported', { ...refused,
+        error: 'Owner-authorized promotional credit is not available to unified runs.', errorCode: 'promotional_unified_unsupported' });
+      if (useDanger) return rejectBeforeAdmission(409, 'api_agent_read_only', { ...refused, error: message });
+    }
+    if (prepaidDecision && apiWriter) return rejectBeforeAdmission(409, 'api_write_unauthorized', { ...refused, error: 'Owner-authorized prepaid runs only the read-only API agent.' });
+    if (useDanger && !apiWriter) return rejectBeforeAdmission(409, 'api_agent_read_only', { ...refused, error: prepaidDecision
+      ? 'Owner-authorized prepaid runs only the read-only API agent.' : 'Included API credit runs only the read-only API agent.' });
+    if (apiWriter && !useDanger) return rejectBeforeAdmission(409, 'api_write_unauthorized', { ...refused, error: 'API writer segments run only with dangerous=true.' });
+    if (prepaidDecision && body.unifiedRun !== undefined) {
+      // A recovered or unproven subscription seat refuses with failureClass
+      // quota_unknown, which hands the run to its next segment boundary.
+      try { unifiedRuns.prepaidAuthority(body, privateContext, { decision: fundingDecision }); }
+      catch (error) {
+        const code = error.code || 'prepaid_authorization_invalid';
+        return rejectBeforeAdmission(409, error.failureClass || code, { ...refused, error: error.message, errorCode: code });
+      }
+    }
+    if (admissionClosed) return rejectBeforeAdmission(503, 'bridge_shutting_down', { ...refused, error: 'bridge shutting down', retryable: false });
+    const apiProvider = fundingDecision.identity.provider;
+    releaseAdmission = acquireOneShot(`api:${apiProvider}`);
+    if (!releaseAdmission) {
+      return rejectBeforeAdmission(429, 'admission_limit', { ...refused, error: 'provider concurrency limit reached; retry with backoff',
+        kind, retryable: true, failureClass: 'admission_limit' });
+    }
+    const resolveApiDecision = () => fundingForRequest(body, loadConfig());
+    try {
+      if (resolveApiDecision().decisionHash !== fundingDecision.decisionHash) throw Object.assign(new Error('funding_decision_changed'), { code: 'funding_decision_changed' });
+    } catch (error) { return rejectBeforeAdmission(409, error.code, { ...refused, error: error.message, errorCode: error.code }); }
+    // The dispatcher now owns the admission and releases it exactly once.
+    const ownedRelease = releaseAdmission;
+    releaseAdmission = null;
+    const apiRoute = { provider: kind, transport: 'api_agent', request_id: requestId, invocation_id: invocationId, attempt_id: attemptId,
+      dangerous: !!apiWriter, read_only_enforced: !apiWriter, write_boundary: apiWriter ? { ...API_WRITE_BOUNDARY } : { ...API_READ_ONLY_BOUNDARY },
+      prompt_evidence: preparedPrompt.evidence, grounding: grounding || null,
+      caller_requested_model: typeof body?.model === 'string' ? body.model : null, requested_model: execution.model, requested_effort: requestedEffort ?? null };
+    // Before every patch: the run's private writer authority and every other
+    // writer holder are re-proven. Any failure stops further tools.
+    const writer = apiWriter ? { allowedWritePaths: [...apiWriter.allowedWritePaths], writePathsHash: apiWriter.writePathsHash,
+      execution: { unifiedRunId: apiWriter.runId, segment: apiWriter.segment, taskId: apiWriter.taskId },
+      assertHeld: () => {
+        let fresh = null;
+        try { fresh = unifiedRuns.apiWriterAuthority(body, privateContext); } catch {}
+        if (!fresh || fresh.checkpointRunId !== apiWriter.checkpointRunId || fresh.writePathsHash !== apiWriter.writePathsHash
+          || plainWriterHolder(resolvedCwd, { privateContext, continuityId: body.continuityId || null })) {
+          throw Object.assign(new Error('The workspace writer hold is no longer this segment\'s.'), { code: 'writer_hold_lost' });
+        }
+      } } : null;
+    const dispatcher = createApiAgentDispatcher({ fetchImpl: fetch, store: apiAgentStore, registry: activeRuns,
+      readCredential: readApiCredential, supervisorOptions,
+      createTools: ({ writer: toolWriter = null } = {}) => createWorkspaceTools({ cwd: resolvedCwd, deniedPaths: [DATA_DIR, CONFIG_FILE, TOKEN_FILE],
+        writer: toolWriter,
+        revalidateCwd: () => {
+          try { revalidateAllowedCwdIdentity(resolvedCwdIdentity); }
+          catch (error) { throw Object.assign(new Error('Workspace identity changed.'), { code: 'cwd_identity_changed', cause: error }); }
+        } }) });
+    try {
+      await dispatcher.runApiAgentOneShot({ kind, route: apiRoute, prompt: preparedPrompt.text, model: execution.model,
+        effort: requestedEffort ?? null, releaseAdmission: ownedRelease, ...(apiWriter ? { runId: apiWriter.checkpointRunId } : {}),
+        // Before every turn: any profile, account, credential, period or
+        // prepaid permit change (edit, deletion, revocation, expiry) stops the
+        // run with that turn recorded as not_sent.
+        reauthorize: () => { try { return resolveApiDecision().decisionHash === fundingDecision.decisionHash; } catch { return false; } },
+        admission: { resolveDecision: resolveApiDecision, expectedDecisionHash: fundingDecision.decisionHash,
+          cwd: resolvedCwd, cwdIdentityHash: resolvedCwdIdentity.cwdIdentityHash, ...(writer ? { writer } : {}) },
+        deliver: receipt => sendOneShotResult(res, receipt, { kind, prompt, route: receipt.route, startedAt, cwd: resolvedCwd, persistAfterDisconnect: true }) });
+    } catch (error) {
+      if (res.headersSent) { console.warn(`[api-agent] post-delivery error: ${error.code || 'unknown'}`); return; }
+      return rejectBeforeAdmission(409, error.code || 'api_dispatch_unavailable', { ...refused, error: error.message,
+        errorCode: error.code || null, ...(error.changedFields ? { changedFields: error.changedFields } : {}) });
+    }
+    return;
+  }
+  // Private unified-run reserve authority, recomputed at every gate below and
+  // during supervision from the queue's own running-task context. A request
+  // body alone never grants it, and an invalid claim never falls back to the
+  // ordinary or stale-admit rules.
+  let unifiedReserve = null;
+  try { unifiedReserve = unifiedRuns.reserveAuthority(body, privateContext); }
+  catch (error) { return rejectBeforeAdmission(409, error.code || 'reserve_release_unavailable', { error: error.message, model_invocation: false, physical_attempt_count: 0 }); }
+  const reserveRefusal = unifiedReserve ? (usage) => {
+    try { unifiedRuns.reserveAuthority(body, privateContext, { usage }); return null; }
+    catch (error) { return error.code || 'reserve_release_unavailable'; }
+  } : null;
+  const reserveCheck = reserveRefusal ? (usage) => reserveRefusal(usage) === null : null;
   const dispatchAccount = resolveDispatchAccount(kind, entry, {
-    model: execution.model, requiredAccountId: body.expectedAccountId,
+    model: execution.model, requiredAccountId: body.expectedAccountId, ignoreNativeReserve: !!unifiedReserve,
     unavailableAccountIds: defaultAccountSignedOut
       ? new Set([providerAccounts.DEFAULT_ACCOUNT_ID]) : new Set(),
   });
@@ -4990,7 +5117,7 @@ async function executeOneShot(body, res, privateContext = null) {
       try { progressAssessor.assertDispatch(body); }
       catch (error) { return rejectBeforeAdmission(409, 'assessment_revoked', { error: error.message }); }
     }
-    if (!validateClaudeLaunchAdmission(nativeLaunchIdentity)) {
+    if (!validateClaudeLaunchAdmission(nativeLaunchIdentity, null, reserveCheck)) {
       // The probe itself did not establish fresh admission (or was never attempted because
       // nativeUsage was already fresh at capture but drifted stale between here and now).
       // Fall back to the last same-identity observation rather than rejecting outright: admit
@@ -5018,7 +5145,7 @@ async function executeOneShot(body, res, privateContext = null) {
       const windowReset = !!bindingWindow && !priorSeat.vendorBlocked
         && subscriptionUsage.anchoredRolloverOccurred(bindingWindow);
       const headroomAboveReserve = hasPriorObservation && priorSeat.admit === true;
-      if (identityStillMatches && hasPriorObservation && (windowReset || headroomAboveReserve)) {
+      if (!unifiedReserve && identityStillMatches && hasPriorObservation && (windowReset || headroomAboveReserve)) {
         staleAdmittedNativeUsage = true;
         staleAdmitReason = windowReset ? 'window_reset' : 'headroom_above_reserve';
       } else {
@@ -5049,7 +5176,8 @@ async function executeOneShot(body, res, privateContext = null) {
     return rejectBeforeAdmission(409, 'account_identity_changed', { error: 'Selected quota account changed after coordinator admission.', model_invocation: false, physical_attempt_count: 0 });
   }
   if (body.requireFreshUsage === true && reserveAdmission.freshness !== 'fresh') return rejectBeforeAdmission(409, 'quota_unknown', { error: 'Automatic work requires fresh native quota at dispatch.', model_invocation: false, physical_attempt_count: 0 });
-  if (!reserveAdmission.admit) return rejectBeforeAdmission(409, 'quota_reserve', {
+  const reserveDenied = reserveRefusal ? reserveRefusal(reserveAdmission) : reserveAdmission.admit ? null : 'quota_reserve';
+  if (reserveDenied) return rejectBeforeAdmission(409, reserveDenied, {
     error: 'Subscription reserve protected; checkpoint and select a permitted provider with more headroom.',
     native_usage: reserveAdmission, model_invocation: false, physical_attempt_count: 0 });
   if (dispatchAccount.account && !dispatchAccount.account.implicit) {
@@ -5366,11 +5494,24 @@ async function executeOneShot(body, res, privateContext = null) {
     }
     resolvedCwd = spawnCwdIdentity.resolved;
     ownedExecutionBackend?.assertWorkspaceLaunchAllowed({ cwd: resolvedCwd, privateContext, dangerous: useDanger });
+    if (useDanger) {
+      // Recheck after every await above, and reserve in the same tick so a
+      // concurrent holder sees this writer before its control is registered.
+      const holder = plainWriterHolder(resolvedCwd, { privateContext, continuityId: body.continuityId || null });
+      if (holder) throw Object.assign(new Error('Another writer holds an overlapping workspace.'), { code: 'workspace_writer_busy', holder });
+      writerReservations.set(runId, { runId, cwd: resolvedCwd, settled: false, dangerous: true, route: { request_id: requestId } });
+    }
     if (useDanger) writerWorkspaceBaseline = captureWriterWorkspaceSnapshot(resolvedCwd);
     // B1: a stale admit still must verify account/identity against the actual spawn env;
     // only the freshness/headroom comparison is skipped for a stale admit.
     if (staleAdmittedNativeUsage ? !sameClaudeLaunchIdentity(nativeLaunchIdentity, launch.env)
-      : !validateClaudeLaunchAdmission(nativeLaunchIdentity, launch.env)) throw Object.assign(new Error('Native Claude launch identity or capacity changed.'), { code: 'NATIVE_LAUNCH_ADMISSION_CHANGED' });
+      : !validateClaudeLaunchAdmission(nativeLaunchIdentity, launch.env, reserveCheck)) throw Object.assign(new Error('Native Claude launch identity or capacity changed.'), { code: 'NATIVE_LAUNCH_ADMISSION_CHANGED' });
+    // The reserve claim is re-proven against current usage immediately before spawn.
+    if (reserveRefusal) {
+      const denied = reserveRefusal(subscriptionUsage.verdict(dispatchAccount.quotaSeat || quotaSeatForProvider(kind),
+        { model: execution.model, bucket: entry.native_usage_bucket }));
+      if (denied) throw Object.assign(new Error('Unified-run reserve authority changed before launch.'), { code: denied });
+    }
     const spawnOpts = {
       cwd: resolvedCwd,
       env: launch.env,
@@ -5390,7 +5531,7 @@ async function executeOneShot(body, res, privateContext = null) {
       const identity = { provider: kind, accountId: dispatchAccount.account?.id || 'default',
         executionHash: ownerIdentityHash(execution), cwdIdentityHash: spawnCwdIdentity.cwdIdentityHash, cwdPolicyId: CWD_POLICY_IDENTITY };
       ownedDispatchIdentities.set(privateContext.taskId, Object.freeze(identity));
-      ownedNativeAdmissions.set(privateContext.taskId, { runId, identity: nativeLaunchIdentity, env: launch.env });
+      ownedNativeAdmissions.set(privateContext.taskId, { runId, identity: nativeLaunchIdentity, env: launch.env, reserveCheck });
       ownedHandle = ownedExecutionBackend.prepareLaunch(privateContext, {
         binding: { requestId, invocationId, attemptId, runId, taskId: privateContext.taskId,
           reservationId: privateContext.reservationId, ...identity },
@@ -5405,7 +5546,7 @@ async function executeOneShot(body, res, privateContext = null) {
         releasePhysicalAdmission(); liveOwnedAdmissions.delete(ownedHandle.ownerId);
         ownedDispatchIdentities.delete(privateContext.taskId);
         ownedNativeAdmissions.delete(privateContext.taskId);
-        activeRuns.delete(runId); continuityControls.delete(runId);
+        activeRuns.delete(runId); continuityControls.delete(runId); writerReservations.delete(runId);
       });
       proc = await ownedHandle.start();
       if (!proc) throw Object.assign(new Error('Owned launch stopped before provider dispatch.'), { code: 'OWNER_START_CANCELLED' });
@@ -5413,7 +5554,7 @@ async function executeOneShot(body, res, privateContext = null) {
       route.execution_owner = { ownerId: ownedHandle.ownerId, bindingHash: ownedHandle.bindingHash };
     } else {
       if (staleAdmittedNativeUsage ? !sameClaudeLaunchIdentity(nativeLaunchIdentity, launch.env)
-        : !validateClaudeLaunchAdmission(nativeLaunchIdentity, launch.env)) throw Object.assign(new Error('Native Claude launch admission changed.'), { code: 'NATIVE_LAUNCH_ADMISSION_CHANGED' });
+        : !validateClaudeLaunchAdmission(nativeLaunchIdentity, launch.env, reserveCheck)) throw Object.assign(new Error('Native Claude launch admission changed.'), { code: 'NATIVE_LAUNCH_ADMISSION_CHANGED' });
       proc = trackChild(spawn(launch.file, launch.args, spawnOpts));
     }
     // ChildProcess stdin errors are emitted asynchronously and are not caught
@@ -5431,11 +5572,18 @@ async function executeOneShot(body, res, privateContext = null) {
     // that intentional deferred response from a handler that forgot to reply.
     res._relayDeferredResponse = true;
   } catch (err) {
+    if (!ownedHandle) writerReservations.delete(runId);
+    if (err.code === 'workspace_writer_busy') {
+      releaseAdmission();
+      return rejectBeforeAdmission(409, 'workspace_writer_busy', { error: err.message, errorCode: err.code, holder: err.holder,
+        model_invocation: false, physical_attempt_count: 0 });
+    }
     if (ownedHandle) {
       ownedHandle.stop();
       try { await ownedExecutionBackend.abortBeforePermit(ownedHandle.ownerId, 'Owned launch failed before permit.'); } catch {}
       // Keep resources until actual physical completion, even after a writer-only abort.
       ownedHandle.physicalDone.then(() => {
+        writerReservations.delete(runId);
         cleanupPromptFile(); cleanupProviderHome();
         if (res._relayIsolationReceiptDeferred) persistCancellationReceipt();
       }).catch(() => {});
@@ -5638,11 +5786,12 @@ async function executeOneShot(body, res, privateContext = null) {
   supervisor.progress.parser = entry.oneshot_output_parser || 'text';
   const continuityControl = { runId, kind, route, startedAt, supervisor, pid: proc.pid, cwd: resolvedCwd,
     objective: prompt, quotaFingerprint: subscriptionUsage.fingerprint(route.quota_seat), continuityId: body.continuityId || null, settled: false, reserve: null,
-    nativeLaunchIdentity,
+    nativeLaunchIdentity, dangerous: useDanger, reserveCheck,
     finalizeSupported: supportsClaudeStreamFinalization,
     finalize: requestGracefulFinalization };
   activeRuns.set(runId, continuityControl);
   continuityControls.set(runId, continuityControl);
+  if (!ownedHandle) writerReservations.delete(runId); // the live control now holds
   continuityControl.handoffPath = continuity.saveRun(continuityControl);
   let stopReason = null;
   let stopDetail = '';
@@ -6219,7 +6368,16 @@ async function executeOneShot(body, res, privateContext = null) {
   }
 }
 
-app.post('/api/oneshot', trackedHandler((req, res) => executeOneShot({
+// Internal unified-run, reserve and qualification fields are server-owned.
+function refuseInternalFields(req, res) {
+  try { assertNoInternalFields(req.body || {}); return false; }
+  catch (error) {
+    res.status(400).json({ ok: false, error: 'Request carries server-internal fields.', errorCode: error.code,
+      model_invocation: false, physical_attempt_count: 0 });
+    return true;
+  }
+}
+app.post('/api/oneshot', trackedHandler((req, res) => refuseInternalFields(req, res) ? undefined : executeOneShot({
   ...req.body,
   _relayClient: req.get('X-RelayBridge-Client') || null,
   _relayClientDeadlineAt: req.get('X-RelayBridge-Client-Deadline-At') || null,
@@ -6241,7 +6399,7 @@ ownedExecutionBackend = createOwnedExecutionBackend({
   readExecutionIdentity: task => ownedDispatchIdentities.get(task.id) || null,
   validateLaunchAdmission: binding => {
     const captured = ownedNativeAdmissions.get(binding.taskId);
-    return !!captured && captured.runId === binding.runId && validateClaudeLaunchAdmission(captured.identity, captured.env);
+    return !!captured && captured.runId === binding.runId && validateClaudeLaunchAdmission(captured.identity, captured.env, captured.reserveCheck);
   },
 });
 const taskQueue = createTaskQueue({
@@ -6261,6 +6419,7 @@ const taskQueue = createTaskQueue({
 });
 
 app.post('/api/tasks', trackedHandler(async (req, res) => {
+  if (refuseInternalFields(req, res)) return;
   try {
     const input = req.body || {};
     if (input.deliveryMode !== undefined && input.deliveryMode !== 'queued') {
@@ -6511,7 +6670,11 @@ app.post('/api/delegations/:id/escalation', (req, res) => {
 // the single canonical-workspace writer lease.  Provider tasks stay in the
 // existing queue so they survive client disconnects and retain normal receipt,
 // quota, timeout, and filesystem-policy handling.
-const workflowPipeline = createWorkflowPipeline({ dataDir: DATA_DIR, executionOwners: ownedExecutionBackend.writerAuthority });
+// Late-bound: the shared holder check needs continuity and unified runs, which
+// are created after the pipeline. Until then lease acquisition fails closed.
+let workflowWriterBusy = () => ({ holder: 'writer_holders_unavailable' });
+const workflowPipeline = createWorkflowPipeline({ dataDir: DATA_DIR, executionOwners: ownedExecutionBackend.writerAuthority,
+  externalWriterBusy: (cwd, options) => workflowWriterBusy(cwd, options) });
 const { createRequestLedger } = require('./lib/request-ledger');
 const requestLedger = createRequestLedger({ dataDir: path.join(DATA_DIR, 'requests') });
 const workflowController = createWorkflowController({
@@ -6795,6 +6958,35 @@ function filterCandidatesByQuotaCooldown(candidates = [], explicit = null, cooli
 const subscriptionUsage = createSubscriptionUsage({ dataDir: path.join(DATA_DIR, 'usage') });
 const creditPreferences = createCreditPreferences({ dataDir: path.join(DATA_DIR, 'allocated-credit') });
 const fundingProfiles = createFundingProfiles({ dataDir: DATA_DIR });
+// The only qualification authority. It has no adapters, so no provider is
+// qualified, the reserved API credential is never read for qualification and
+// included API credit is never admitted. Nothing in env, settings, HTTP or MCP
+// can add an adapter or supply a qualification.
+const apiQualificationAuthority = createQualificationAuthority({ adapters: Object.freeze({}) });
+// The only prepaid authority: the owner's private permit at a fixed path in
+// DATA_DIR, re-read on every resolve. Nothing here writes or renews it.
+const prepaidAuthority = createPrepaidAuthority({ dataDir: DATA_DIR });
+const promotionalAuthority = createPromotionalAuthority({ dataDir: DATA_DIR });
+const apiAgentStore = createCheckpointStore({ dataDir: DATA_DIR });
+// Exact provider-to-secret map. An unknown provider reads nothing and stays
+// unbound; it never falls through to another provider's key.
+const API_CREDENTIAL_NAMES = Object.freeze({ claude: CREDIT_SECRET_NAMES[0], openai: CREDIT_SECRET_NAMES[1] });
+const readApiCredential = provider => Object.hasOwn(API_CREDENTIAL_NAMES, provider) ? process.env[API_CREDENTIAL_NAMES[provider]] || '' : '';
+// Lazy: routing builds this for the profile's provider. The returned thunk is
+// called only by a qualification adapter or, after a prepaid permit's file,
+// scope and window check out, to compare its credential HMAC.
+const apiCredentialSourceFor = provider => () => {
+  const value = readApiCredential(provider);
+  return value ? { value, fingerprint: apiAgentStore.fingerprint(value) } : null;
+};
+// Reconcile only checkpoints whose owner is proven dead; live or unverifiable
+// owners are left alone. Nothing is created when no checkpoint store exists.
+if (fs.existsSync(path.join(DATA_DIR, 'api-agent'))) {
+  try {
+    const reconciled = apiAgentStore.reconcile().filter(r => !['unchanged', 'skipped'].includes(r.action));
+    if (reconciled.length) console.warn(`[api-agent] reconciled ${reconciled.length} checkpoint(s): ${reconciled.map(r => `${r.runId}=${r.action}`).join(', ')}`);
+  } catch (error) { console.warn(`[api-agent] checkpoint reconciliation skipped: ${error.code || error.message}`); }
+}
 const usageLedger = createUsageLedger({
   nativeHeadroom: (seat, options) => subscriptionUsage.headroom(seat, options),
   dataDir: path.join(DATA_DIR, 'usage'),
@@ -6828,7 +7020,145 @@ function continuityCandidate({ kind, cwd, modelTier, effort, model, accountId, w
   } catch { return null; }
 }
 const continuity = createContinuity({ dataDir: DATA_DIR, quota: subscriptionUsage, queue: taskQueue,
-  resolveCandidate: continuityCandidate, activeControls: () => [...continuityControls.values()] });
+  resolveCandidate: continuityCandidate, activeControls: () => [...continuityControls.values(), ...writerReservations.values()] });
+
+// ---- Shared writer holders (unified runs, workflows, coordinators) --------
+// A corrupt or unreadable workflow lock holds every workspace.
+function workflowLockHolder(cwd, { taskId = null, exceptRunId = null } = {}) {
+  let locks;
+  try { locks = workflowPipeline.listWriterLocks(); } catch { return { holder: 'workflow_writer_lock', id: null }; }
+  for (const lock of locks) {
+    if (!lock.corrupt && lock.runId && lock.runId === exceptRunId) continue;
+    if (!lock.corrupt && !workspacesOverlap(cwd, lock.cwd)) continue;
+    if (!lock.corrupt && taskId) {
+      try { if (workflowPipeline.get(lock.runId)?.providerTask?.taskId === taskId) continue; } catch { /* unknown state holds */ }
+    }
+    return { holder: 'workflow_writer_lock', id: lock.runId || null };
+  }
+  return null;
+}
+function unifiedRunHolder(cwd, { taskId = null, exceptRunId = null } = {}) {
+  const intent = taskId ? taskQueue.get(taskId)?.delivery?.intentHash || null : null;
+  try { return unifiedRuns.holderFor(cwd, { taskId, intentHash: intent, exceptRunId }); }
+  catch { return { holder: 'unified_run', id: null }; }
+}
+// Physical owner workspaces held by the private owner journal. An active or
+// uncertain owner holds regardless of which workflow or run started it. The
+// only exemption is the owner bound to this exact running task, reservation
+// and owner id, for that task's own idempotent launch check.
+function ownedWorkspaceHolder(cwd, { privateContext = null } = {}) {
+  const own = privateContext?.requiresOwner === true && ownedExecutionBackend?.isExecutionContext(privateContext)
+    ? taskQueue.get(privateContext.taskId)?.execution?.owner?.ownerId || null : null;
+  return physicalOwnerHolder(ownedExecutionBackend, cwd, { overlap: workspacesOverlap,
+    exempt: own ? { taskId: privateContext.taskId, reservationId: privateContext.reservationId, ownerId: own } : null });
+}
+// One-shot check: holders only. Other plain dangerous work is not a holder.
+function plainWriterHolder(cwd, { privateContext = null, continuityId = null } = {}) {
+  const taskId = privateContext?.taskId || null;
+  return continuity.writerHeld(cwd, { except: { continuityId } })
+    || unifiedRunHolder(cwd, { taskId }) || workflowLockHolder(cwd, { taskId })
+    || ownedWorkspaceHolder(cwd, { privateContext });
+}
+// Holder acquisition (unified run segment, workflow lease) also excludes live,
+// queued and unsettled dangerous work, and every physical owner.
+function exclusiveWriterHolder(cwd, { unifiedRunId = null, workflowRunId = null } = {}) {
+  return continuity.writerHeld(cwd, { includeLiveDangerous: true })
+    || unifiedRunHolder(cwd, { exceptRunId: unifiedRunId })
+    || workflowLockHolder(cwd, { exceptRunId: workflowRunId })
+    || ownedWorkspaceHolder(cwd);
+}
+workflowWriterBusy = (cwd, { runId }) => exclusiveWriterHolder(cwd, { workflowRunId: runId });
+
+function unifiedRunFailure(code, message, status = 409) { return Object.assign(new Error(message || code), { code, status }); }
+// Journal-only access for unified-run API writer segments: settlement proof and
+// effects recovery. It never sends a provider request or reads a credential.
+const apiEffectsJournal = createApiAgentDispatcher({ store: apiAgentStore, registry: activeRuns,
+  fetchImpl: async () => { throw unifiedRunFailure('api_dispatch_unavailable', 'Effects recovery never contacts a provider.'); },
+  readCredential: () => { throw unifiedRunFailure('api_dispatch_unavailable', 'Effects recovery never reads a credential.'); },
+  createTools: () => { throw unifiedRunFailure('api_dispatch_unavailable', 'Effects recovery runs no provider tools.'); } });
+const unifiedRuns = createUnifiedRuns({
+  dataDir: DATA_DIR, queue: taskQueue,
+  resolveCwd: (cwd) => captureAllowedCwdIdentity(cwd).resolved,
+  validateWriteContract: (input) => validateWorkspaceWriteContract({ ...input, dangerous: input.dangerous === true }),
+  validateNativeEntry: (entry, { dangerous, cwd }) => {
+    const cfg = loadConfig();
+    if (!cfg[entry.kind] || entry.kind.startsWith('_')) throw unifiedRunFailure('unknown_provider', 'Provider is not configured.', 400);
+    const controls = validateProviderIntent({ kind: entry.kind, cwd, dangerous, model: entry.model, effort: entry.effort,
+      requiresWorkspaceAccess: true }, cfg, captureAllowedCwdIdentity(cwd));
+    if (!controls.execution.model) throw unifiedRunFailure('invalid_unified_run', 'The listed model is unavailable for this transport.', 400);
+  },
+  // Exactly the listed account; resolution never substitutes another login.
+  bindSegment: (entry) => {
+    const providerEntry = loadConfig()[entry.kind];
+    if (!providerEntry) throw unifiedRunFailure('unknown_provider', 'Provider is not configured.', 400);
+    const account = resolveDispatchAccount(entry.kind, providerEntry, { model: entry.model, requiredAccountId: entry.accountId, ignoreNativeReserve: true });
+    if (account.exhausted || !account.account || account.account.id !== entry.accountId || !account.quotaSeat) {
+      throw unifiedRunFailure('account_binding_required', `Account ${entry.accountId} is not available for ${entry.kind}; no other account is substituted.`);
+    }
+    return { accountId: account.account.id, quotaSeat: account.quotaSeat };
+  },
+  headroom: (entry, binding) => subscriptionUsage.headroom(binding.quotaSeat, { model: entry.model, bucket: loadConfig()[entry.kind]?.native_usage_bucket }),
+  reservePercent: () => subscriptionUsage.getSettings().reservePercent ?? 0,
+  validateApiEntry: (entry) => {
+    const profile = fundingProfiles.snapshot().profiles.find((p) => p.id === entry.fundingProfileId);
+    if (!profile) throw unifiedRunFailure('funding_profile_missing', 'The listed funding profile does not exist.', 400);
+    try { resolveApiModel(profile.provider, entry.model, entry.effort); }
+    catch (error) { throw unifiedRunFailure(error.code || 'api_model_unmapped', error.message, 400); }
+  },
+  // Only an entry that explicitly opts into authorized_prepaid consults the
+  // owner's prepaid permit; every other API entry resolves the grant exactly
+  // as before.
+  apiDecision: (entry) => entry.fundingRoute === 'authorized_prepaid'
+    ? resolveFundingRoute({ envelope: { route: 'authorized_prepaid', profileId: entry.fundingProfileId,
+      expectedProfileRevision: entry.expectedProfileRevision, fallback: 'none' }, snapshot: fundingProfiles.snapshot(),
+    kind: entry.kind, entry: loadConfig()[entry.kind], expectedAccountId: entry.accountId, preference: creditPreferences.get(),
+    qualificationAuthority: apiQualificationAuthority, credentialSourceFor: apiCredentialSourceFor, prepaidAuthority, now: Date.now() })
+    : resolveFundingRoute({ envelope: { route: 'included_api_credit', profileId: entry.fundingProfileId,
+    expectedProfileRevision: entry.expectedProfileRevision, fallback: 'none' }, snapshot: fundingProfiles.snapshot(),
+  kind: entry.kind, entry: loadConfig()[entry.kind], expectedAccountId: entry.accountId, preference: creditPreferences.get(),
+  qualificationAuthority: apiQualificationAuthority, credentialSourceFor: apiCredentialSourceFor, now: Date.now() }),
+  nativeFunding: (entry) => {
+    const decision = resolveFundingRoute({ envelope: { route: 'subscription', profileId: entry.fundingProfileId,
+      expectedProfileRevision: entry.expectedProfileRevision, fallback: 'none' }, snapshot: fundingProfiles.snapshot(),
+    kind: entry.kind, entry: loadConfig()[entry.kind], expectedAccountId: entry.accountId, preference: creditPreferences.get(), now: Date.now() });
+    if (decision.actual !== 'subscription') throw unifiedRunFailure(decision.blockedReason || 'funding_decision_changed');
+  },
+  // The queue intent is admitted exactly like a queued /api/tasks submission.
+  prepareQueueInput: (input) => {
+    const cfg = loadConfig();
+    const snapshot = captureAllowedCwdIdentity(input.cwd);
+    const controls = validateProviderIntent({ ...input, requiresWorkspaceAccess: true }, cfg, snapshot);
+    if (controls.promptEvidence?.truncated) throw unifiedRunFailure('invalid_unified_run', 'The handoff exceeds the provider prompt limit.');
+    return { ...input, cwd: snapshot.resolved, requiresWorkspaceAccess: true, execution: controls.execution,
+      expectedCwdIdentityHash: snapshot.cwdIdentityHash, expectedCwdPolicyId: CWD_POLICY_IDENTITY,
+      expectedPromptHash: controls.promptEvidence.effectiveHash };
+  },
+  externalHolder: (cwd, { runId }) => exclusiveWriterHolder(cwd, { unifiedRunId: runId }),
+  // Fail closed: a queue record alone proves physical settlement only when no
+  // persisted continuity run record for it remains unsettled.
+  physicallySettled: (task) => {
+    const held = continuity.writerHeld(task.body?.cwd || '', { includeLiveDangerous: true });
+    return !held || held.holder === 'continuity';
+  },
+  snapshot: (cwd) => captureWriterWorkspaceSnapshot(cwd),
+  summarize: (before, after) => summarizeWriterWorkspaceDiff(before, after),
+  apiJournalSettled: ({ checkpointRunId, expect }) => apiEffectsJournal.apiEffectsSettled({ runId: checkpointRunId, expect }),
+  // The workspace must still be the one the checkpoint was bound to.
+  apiReconcileEffects: ({ checkpointRunId, expect, cwd, allowedWritePaths, assertHeld }) => {
+    let bound = null;
+    try { bound = apiAgentStore.load(checkpointRunId).manifest?.binding?.cwdIdentityHash ?? null; } catch {}
+    const revalidateCwd = () => {
+      let current = null;
+      try { current = captureAllowedCwdIdentity(cwd); } catch {}
+      if (bound !== null && current?.cwdIdentityHash !== bound) {
+        throw Object.assign(new Error('Workspace identity changed.'), { code: 'cwd_identity_changed' });
+      }
+    };
+    return apiEffectsJournal.reconcileApiEffects({ runId: checkpointRunId, expect, cwd, allowedWritePaths,
+      deniedPaths: [DATA_DIR, CONFIG_FILE, TOKEN_FILE], assertHeld, revalidateCwd });
+  },
+  log: (message) => console.log(`[RelayBridge] unified run: ${message}`),
+});
 const { createProjectWorkspace } = require('./lib/project-workspace');
 const projectWorkspace = createProjectWorkspace({ dataDir: DATA_DIR, queue: taskQueue, quota: subscriptionUsage,
   workflows: workflowController, receiptsDir: RECEIPTS_DIR,
@@ -6922,6 +7252,13 @@ function observeRunContinuity(run) {
   if (!run.lastCheckpointAt || at - run.lastCheckpointAt >= 10000) {
     run.handoffPath = continuity.saveRun(run); run.lastCheckpointAt = at;
   }
+  // A unified-run reserve segment is supervised only by its private reserve
+  // authority: once it cannot be re-proven the run stops, with no grace.
+  if (run.reserveCheck) {
+    if (!run.settled && !run.reserveCheck(usage)) { run.handoffPath = continuity.saveRun(run); run.stop?.('quota_reserve'); }
+    progressAssessor.observe(run);
+    return;
+  }
   if (!usage.admit && !run.settled) {
     if (!run.reserveRequestedAt) {
       run.handoffPath = continuity.saveRun(run); run.reserveRequestedAt = at;
@@ -6940,6 +7277,7 @@ async function tickContinuity() {
     progressAssessor.tick();
     for (const run of continuityControls.values()) observeRunContinuity(run);
     continuity.tick();
+    unifiedRuns.tick();
   } catch { /* preserve durable state; failure cannot authorize a replacement */ }
   finally {
     try { projectWorkspace.tick(); } catch { /* a workspace fault cannot stop continuity supervision */ }
@@ -6998,11 +7336,13 @@ function observeClaudeNativeSnapshot(captured) {
   if (!subscriptionUsage.bindIdentity(captured.identity.quotaSeat, captured.identity.accountFingerprint)) return false;
   return !!captured.observation && subscriptionUsage.observeNativeCache(captured.observation);
 }
-function validateClaudeLaunchAdmission(captured, actualEnv = null) {
+// reserveCheck, when present, is the private unified-run reserve authority and
+// replaces the ordinary reserve verdict; it is never combined with stale admits.
+function validateClaudeLaunchAdmission(captured, actualEnv = null, reserveCheck = null) {
   if (!captured?.required) return true;
   if (!sameClaudeLaunchIdentity(captured, actualEnv)) return false;
   const usage = subscriptionUsage.verdict(captured.identity.quotaSeat, { accountFingerprint: captured.identity.accountFingerprint });
-  return usage.freshness === 'fresh' && usage.admit;
+  return usage.freshness === 'fresh' && (reserveCheck ? reserveCheck(usage) === true : usage.admit);
 }
 const claudeUsageProbes = new Map(), claudeUsageProbeFailures = new Map();
 const CLAUDE_USAGE_PROBE_FAILURE_COOLDOWN_MS = 60000;
@@ -7158,14 +7498,30 @@ app.post('/api/funding-route/preview', (req, res) => {
     const body = req.body || {};
     if (Object.keys(body).some(k => !['kind', 'funding', 'expectedAccountId'].includes(k))) throw Object.assign(new Error('invalid_funding_envelope'), { code: 'invalid_funding_envelope' });
     const decision = resolveFundingRoute({ envelope: body.funding, snapshot: fundingProfiles.snapshot(), kind: body.kind,
-      entry: loadConfig()[body.kind], expectedAccountId: body.expectedAccountId, preference: creditPreferences.get() });
+      entry: loadConfig()[body.kind], expectedAccountId: body.expectedAccountId, preference: creditPreferences.get(),
+      qualificationAuthority: apiQualificationAuthority, credentialSourceFor: apiCredentialSourceFor, prepaidAuthority, promotionalAuthority, now: Date.now() });
     res.json({ decision, model_invocation: false, physical_attempt_count: 0, subscriptionAdmissionChecked: false });
   } catch (error) { rejectFundingPreview(res, error); }
 });
 
-app.get('/api/allocated-credit', (_req, res) => res.json(allocatedCreditStatus(process.env, creditPreferences.get(), fundingProfiles.snapshot())));
+// Read-only permit summary: no HMAC, credential or fingerprint.
+function prepaidAuthorizationStatus(profiles) {
+  try {
+    return summarizePrepaidAuthorization(prepaidAuthority.status({ profiles: profiles.profiles, credentialSourceFor: apiCredentialSourceFor, now: Date.now() }));
+  } catch { return summarizePrepaidAuthorization(null); }
+}
+function promotionalAuthorizationStatus(profiles) {
+  try {
+    return summarizePromotionalAuthorization(promotionalAuthority.status({ profiles: profiles.profiles, credentialSourceFor: apiCredentialSourceFor, now: Date.now() }));
+  } catch { return summarizePromotionalAuthorization(null); }
+}
+function creditStatus(preference) {
+  const profiles = fundingProfiles.snapshot();
+  return allocatedCreditStatus(process.env, preference, profiles, prepaidAuthorizationStatus(profiles), promotionalAuthorizationStatus(profiles));
+}
+app.get('/api/allocated-credit', (_req, res) => res.json(creditStatus(creditPreferences.get())));
 app.put('/api/settings/allocated-credit', (req, res) => {
-  try { res.json(allocatedCreditStatus(process.env, creditPreferences.set(req.body), fundingProfiles.snapshot())); }
+  try { res.json(creditStatus(creditPreferences.set(req.body))); }
   catch (error) { res.status(error.code === 'invalid_credit_preference' ? 400 : 500).json({ error: error.message, errorCode: error.code }); }
 });
 app.get('/api/settings/continuity', (_req, res) => res.json({ settings: subscriptionUsage.getSettings() }));
@@ -7238,6 +7594,35 @@ app.post('/api/continuity/:id/resume', (req, res) => {
 app.post('/api/continuity/:id/cancel', (req, res) => {
   try { res.json(continuity.cancel(req.params.id)); } catch (error) { res.status(409).json({ error: error.message }); }
 });
+
+// ---- Unified runs (lib/unified-run.js) -----------------------------------
+// One objective across listed native (and read-only API) segments. Every
+// response states that the file scope is advisory and not enforced.
+function sendUnifiedRunError(res, error) {
+  const code = error.code || 'invalid_unified_run';
+  const status = error.status || (code === 'filesystem_contract_unsupported' ? 409
+    : ['invalid_write_contract', 'validation', 'invalid_funding_envelope', 'funding_envelope_unsupported', 'funding_alias_unsupported',
+      'api_model_unmapped', 'api_effort_unsupported', 'unknown_provider', 'invalid_control', 'invalid_model', 'handoff_banned_content'].includes(code) ? 400 : 409);
+  return res.status(status).json({ ok: false, error: error.validation?.reason || error.message, errorCode: code,
+    ...(error.holder ? { holder: error.holder } : {}), ...(error.runId ? { runId: error.runId } : {}),
+    ...(error.publication ? { publication: error.publication } : {}), writeBoundary: 'advisory_unenforced', model_invocation: false });
+}
+app.post('/api/unified-runs', (req, res) => {
+  if (admissionClosed) return res.status(503).json({ ok: false, error: 'bridge shutting down', errorCode: 'bridge_shutting_down' });
+  try { res.status(202).json(unifiedRuns.create(req.body || {})); }
+  catch (error) { sendUnifiedRunError(res, error); }
+});
+app.get('/api/unified-runs/:id', (req, res) => {
+  try { res.setHeader('Cache-Control', 'no-store'); res.json(unifiedRuns.status(req.params.id)); }
+  catch (error) { sendUnifiedRunError(res, error); }
+});
+for (const action of ['resume', 'link', 'cancel']) {
+  app.post(`/api/unified-runs/:id/${action}`, (req, res) => {
+    if (admissionClosed) return res.status(503).json({ ok: false, error: 'bridge shutting down', errorCode: 'bridge_shutting_down' });
+    try { res.json(unifiedRuns[action](req.params.id, req.body || {})); }
+    catch (error) { sendUnifiedRunError(res, error); }
+  });
+}
 
 // Which account should this dispatch run on, and what env makes the CLI use it?
 //

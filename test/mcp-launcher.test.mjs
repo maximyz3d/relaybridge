@@ -6,6 +6,7 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import { spawn } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
+import { isolatedEnv } from './helpers/isolated-env.js';
 
 const REPO = path.resolve(import.meta.dirname, '..');
 const TARGET = path.join(REPO, 'mcp', 'launcher.mjs');
@@ -37,7 +38,9 @@ function decode(result) {
 }
 function fixtureEnv() {
   // No real provider/token configuration enters the fake child.
-  return Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(RELAYBRIDGE_|PS_BRIDGE_|OPENAI_|ANTHROPIC_|CLAUDE_|CODEX_)/.test(key)));
+  const env = isolatedEnv();
+  for (const key of Object.keys(env)) if (/^(OPENAI_|ANTHROPIC_|CLAUDE_|CODEX_)/i.test(key)) delete env[key];
+  return env;
 }
 function makeState(t, throughLauncher) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rb-mcp-regression-'));

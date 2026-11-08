@@ -1,4 +1,5 @@
 'use strict';
+require('./helpers/isolated-env').scrubInheritedEnv();
 
 const assert = require('node:assert/strict');
 const test = require('node:test');

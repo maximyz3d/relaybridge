@@ -1,4 +1,5 @@
 'use strict';
+require('./helpers/isolated-env').scrubInheritedEnv();
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -7,6 +8,7 @@ const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
+const { isolatedEnv } = require('./helpers/isolated-env');
 
 const {
   findToken,
@@ -270,11 +272,10 @@ function runCli(args, input, port) {
   const spawnArgs = [CLI, ...args];
   const child = spawn(process.execPath, spawnArgs, {
     cwd: ROOT,
-    env: {
-      ...process.env,
+    env: isolatedEnv({
       RELAYBRIDGE_URL: `http://127.0.0.1:${port}`,
       RELAYBRIDGE_TOKEN: 'test-token-not-a-secret',
-    },
+    }),
     windowsHide: true,
     stdio: ['pipe', 'pipe', 'pipe'],
   });

@@ -4,6 +4,12 @@ Organization/project selection and explicit subscription fallback are documented
 [ACCOUNT-ROUTING.md](ACCOUNT-ROUTING.md). Use `relaybridge profiles` or MCP profile tools.
 Included API execution remains blocked until grant-only spending is enforceable;
 no keys, purchased funds, billing changes, or automatic 2% switching are enabled.
+The one exception is the explicit, supervised
+[owner-authorized prepaid](#owner-authorized-prepaid-openai-only) route for a
+single OpenAI profile, and the separate supervised
+[owner-authorized promotional](#owner-authorized-promotional-claude-only) route
+for a single Claude profile. Neither changes `included_api_credit` or claims
+grant-only funding.
 
 
 **Automatic switching is not active in this build.** The bridge records the
@@ -160,7 +166,7 @@ Obtain provider-authoritative, fresh, organization-bound funding enforcement
 that cannot spill beyond the included grant, including concurrent organization
 usage. Verify account/key identity, credit period/expiry, included balance,
 absence of purchased funding, disabled auto-reload and no invoiced spillover.
-Do not accept a manually written JSON assertion as authority.
+Do not accept a manually written JSON assertion as grant-only authority.
 
 Then implement and independently review an eligible transport, exact identity
 and receipt binding, checkpoint transfer, single-writer settlement, and durable
@@ -171,6 +177,168 @@ native reserve. Preserve existing provider restrictions and review gates.
 
 No current status endpoint, CLI flag or config field satisfies these
 requirements. Do not silently enable an API route to finish a task.
+
+## Owner-authorized prepaid (OpenAI only)
+
+The owner may authorize prepaid OpenAI credit for **one** OpenAI funding
+profile, outside RelayBridge, with a short-lived private permit. It is a
+separate explicit route, `authorized_prepaid`; `included_api_credit` stays
+grant-only and blocked, and the permit never changes it. Claude profiles are
+refused with `prepaid_provider_unsupported`. Only the read-only Responses agent
+runs (`dangerous: true` is `api_agent_read_only`), only for one-shots;
+unified runs never select it and it never releases the 2% reserve.
+
+The permit is the file `prepaid-authorization.json` in the bridge data
+directory (`RELAYBRIDGE_DATA_DIR`). The path is fixed. No HTTP, MCP, CLI,
+setting or environment variable can write it, move it or renew it. It must be a
+regular file, mode `0600`, owned by the bridge user, not a symlink or hard
+link, and at most 16 KiB. Every request and every agent turn re-reads and
+re-verifies it.
+
+```json
+{ "schemaVersion": 1, "authorizationId": "pa_2026_11_10_a",
+  "policy": "owner_authorized_prepaid", "provider": "openai", "surface": "openai_responses_agent",
+  "supervised": true, "noPurchases": true,
+  "profileId": "<profile id>", "profileRevision": 1, "organization": "<org ref>", "project": "<project ref>",
+  "credentialHmac": "hmac-sha256:<64 hex>", "models": ["gpt-5"],
+  "issuedAt": "2026-11-10T09:00:00.000Z", "expiresAt": "2026-11-10T21:00:00.000Z", "revokedAt": null,
+  "providerControls": { "autoReload": "off", "hardLimitCents": 12000, "hardLimitScope": "organization",
+    "hardLimitEnforced": true, "observedAt": "2026-11-10T08:50:00.000Z" },
+  "balance": { "observedBalanceCents": 20100, "observedAt": "2026-11-10T08:50:00.000Z",
+    "earliestCreditExpiry": "2027-10-01" } }
+```
+
+Rules (any failure is `prepaid_authorization_invalid`): no extra or missing
+keys; `models` lists 1–16 OpenAI API models; the window is at most 24 hours,
+ends before the earliest credit expiry date and before the next UTC month (the
+monthly cap reset); both observations are at most 12 hours before `issuedAt`;
+auto-reload is off and the hard limit is enforced; and the hard limit is at
+most 80% of the observed balance. The profile id, revision, organization and
+project must match the selected profile (`prepaid_scope_mismatch`), the
+credential must match `credentialHmac` (`prepaid_credential_mismatch`), and a
+model outside `models` is `prepaid_model_not_permitted`.
+
+`credentialHmac` is HMAC-SHA256, keyed by `authorizationId`, over the key in
+`RELAYBRIDGE_OPENAI_CREDIT_API_KEY`. Compute it in the bridge environment
+without printing the key:
+
+```bash
+node -e 'console.log(require("./lib/prepaid-authorization").credentialHmac(process.argv[1], process.env.RELAYBRIDGE_OPENAI_CREDIT_API_KEY))' pa_2026_11_10_a
+```
+
+Write the file with `umask 077`, then `chmod 600`. Check it with
+`GET /api/allocated-credit`: `prepaidAuthorization.state` is `valid` or
+`blocked` with a reason, and `apiTransport` is
+`owner_authorized_prepaid_supervised` only while it is valid. Status output
+never contains the key, the HMAC or the credential fingerprint.
+
+Revoke by deleting the file or setting `revokedAt`; an edit, deletion, revocation
+or expiry stops a running agent before its next turn (`funding_decision_changed`,
+turn `not_sent`). Renewal is manual: a new file with a new `authorizationId`,
+fresh observations and a new HMAC. A resume needs the byte-identical permit, and
+a linked attempt never crosses to a new `authorizationId`.
+
+Limitations, recorded in every receipt as `route.funding.limitations`:
+
+- The provider hard cap is the only spending backstop. Provider cutoff can lag
+  and overshoot it. With a $201 balance and a $120 cap, the $81 difference is a
+  nominal cushion, not a guaranteed reserve, and there is no absolute bound on
+  the balance spent.
+- There is no local spend ledger or accounting; RelayBridge counts no dollars.
+- Spend by other clients, keys or projects in the organization is not seen.
+- Dashboard changes after `observedAt` (cap, auto-reload, balance) are not
+  monitored; the permit only records what the owner observed.
+- Use is supervised and short-lived (at most 24 hours). RelayBridge never
+  purchases, reloads, or changes billing.
+
+## Owner-authorized promotional (Claude only)
+
+The owner may authorize Anthropic promotional credit for **one** Claude
+funding profile, outside RelayBridge, with a short-lived private permit. It is
+a separate explicit route, `authorized_promotional` (policy
+`owner_authorized_promotional`, `grantOnly: false`). It never changes
+`included_api_credit` (still grant-only and blocked) or `authorized_prepaid`
+(still OpenAI only; Claude stays `prepaid_provider_unsupported`). OpenAI
+profiles are refused with `promotional_provider_unsupported`.
+
+Scope of this increment:
+
+- Only explicit read-only API one-shots (`POST /api/oneshot` with
+  `funding.route: "authorized_promotional"`). `dangerous: true` is
+  `api_agent_read_only`; an API writer is `api_write_unauthorized`.
+- Unified runs never select it: a segment cannot name the route, and a request
+  carrying `unifiedRun` is `promotional_unified_unsupported`. Existing prepaid
+  unified recovery is unchanged.
+- It never releases the 2% subscription reserve. Spend-limit and low-balance
+  errors (`spend_limit`, `account_credit_low`) are terminal and are not reserve
+  release evidence.
+
+The permit is the file `promotional-authorization.json` in the bridge data
+directory. It is read under the same rules as the prepaid permit: fixed path,
+regular file, mode `0600`, owned by the bridge user, not a symlink or hard
+link, at most 16 KiB, and nothing in RelayBridge writes, moves or renews it.
+The root operator creates it out of band. Every request and every agent turn
+re-reads and re-verifies it.
+
+```json
+{ "schemaVersion": 1, "authorizationId": "pp_2026_11_02_a",
+  "policy": "owner_authorized_promotional", "provider": "claude", "surface": "claude_messages_agent",
+  "supervised": true, "noPurchases": true,
+  "profileId": "<profile id>", "profileRevision": 1, "organization": "<org ref>", "workspace": "<workspace ref>",
+  "credentialHmac": "hmac-sha256:<64 hex>", "models": ["claude-sonnet-5-5"],
+  "issuedAt": "2026-11-02T09:00:00.000Z", "expiresAt": "2026-11-02T21:00:00.000Z", "revokedAt": null,
+  "providerControls": { "autoReload": "off", "billingMode": "pay_as_you_go",
+    "operatorSpendLimitCents": 12000, "operatorSpendLimitScope": "organization",
+    "operatorSpendLimitActive": true, "observedAt": "2026-11-02T08:50:00.000Z" },
+  "balance": { "observedPromotionalCents": 19999, "observedPurchasedCents": 370,
+    "observedMonthSpendCents": 0, "promotionalExpiry": "2026-11-05",
+    "observedAt": "2026-11-02T08:50:00.000Z" } }
+```
+
+Rules (any failure is `promotional_authorization_invalid`): no extra or
+missing keys; `models` lists 1–16 Claude API models; billing is pay-as-you-go
+with auto-reload off and an active organization spend limit; the window is at
+most 24 hours, ends at least 24 hours before `promotionalExpiry` and no later
+than the next UTC month (the monthly spend-limit reset); both observations are
+at most 12 hours before `issuedAt`; and the spend limit still available this
+month (`operatorSpendLimitCents - observedMonthSpendCents`) is positive and at
+most 80% of `observedPromotionalCents`. Purchased balance never counts toward
+that check. Anthropic counts promotional usage toward the monthly spend limit,
+which is why month spend is subtracted. The profile id, revision, organization
+and workspace (the profile's `project` reference, or `null` for none) must match
+the selected profile (`promotional_scope_mismatch`), the key in
+`RELAYBRIDGE_ANTHROPIC_CREDIT_API_KEY` must match `credentialHmac`
+(`promotional_credential_mismatch`), and a model outside `models` is
+`promotional_model_not_permitted`. A deleted, revoked or expired permit is
+`promotional_authorization_missing`, `_revoked` or `_expired`.
+
+`credentialHmac` uses the same HMAC as the prepaid permit, keyed by
+`authorizationId`:
+
+```bash
+node -e 'console.log(require("./lib/prepaid-authorization").credentialHmac(process.argv[1], process.env.RELAYBRIDGE_ANTHROPIC_CREDIT_API_KEY))' pp_2026_11_02_a
+```
+
+Check it with `GET /api/allocated-credit`: `promotionalAuthorization.state` is
+`valid` or `blocked` with a reason, and `promotionalTransport` is
+`owner_authorized_promotional_supervised` only while it is valid. `apiTransport`
+still describes only the prepaid route. Status never contains the key, the HMAC
+or the credential fingerprint. Revocation, edits, renewal, resume and linked
+attempts behave as for the prepaid permit: any change stops a running agent
+before its next turn (`not_sent`).
+
+This is supervised, short-lived authorization, not a grant-only guarantee.
+Limitations, recorded in every receipt as `route.funding.limitations`:
+
+- Anthropic spends promotional credit before purchased credit, but that order
+  is not billing isolation. The purchased balance is not authorized, yet an
+  overshoot can charge it.
+- The organization spend limit is the only backstop, and its enforcement can
+  lag. The 80% rule is a nominal cushion, not a guaranteed reserve.
+- There is no local spend ledger or accounting.
+- Spend by other clients, keys or workspaces is not seen, and dashboard changes
+  after `observedAt` are not monitored.
+- RelayBridge never purchases, reloads, or changes billing.
 
 ## Quick handoff for a new AI
 

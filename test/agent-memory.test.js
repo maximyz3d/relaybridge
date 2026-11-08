@@ -6,6 +6,7 @@ const childProcess = require('node:child_process');
 const fs = require('fs');
 const os = require('node:os');
 const path = require('path');
+const { isolatedEnv } = require('./helpers/isolated-env');
 
 const ROOT = path.resolve(__dirname, '..');
 const primer = fs.readFileSync(path.join(ROOT, 'skills', 'relaybridge', 'PRIMER.md'), 'utf8');
@@ -79,7 +80,7 @@ test('the skill installer resolves its bundled source independently of caller cw
     ], {
       cwd: callerCwd,
       encoding: 'utf8',
-      env: { ...process.env, USERPROFILE: profile, CODEX_HOME: '' },
+      env: isolatedEnv({ USERPROFILE: profile, CODEX_HOME: '' }),
       timeout: 30_000,
     });
     assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
@@ -98,7 +99,7 @@ test('the skill installer resolves its bundled source independently of caller cw
     assert.equal(fs.readFileSync(path.join(promptDir, backups[0]), 'utf8'), 'existing user prompt');
     const repeated = childProcess.spawnSync('powershell.exe', [
       '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(ROOT, 'install-skill.ps1'),
-    ], { cwd: callerCwd, encoding: 'utf8', env: { ...process.env, USERPROFILE: profile, CODEX_HOME: '' }, timeout: 30_000 });
+    ], { cwd: callerCwd, encoding: 'utf8', env: isolatedEnv({ USERPROFILE: profile, CODEX_HOME: '' }), timeout: 30_000 });
     assert.equal(repeated.status, 0, `${repeated.stdout}\n${repeated.stderr}`);
     assert.deepEqual(fs.readdirSync(promptDir).filter((name) => name.startsWith('relaybridge.md.backup.')), backups);
   } finally {

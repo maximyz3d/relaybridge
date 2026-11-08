@@ -6,6 +6,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
+const { isolatedEnv } = require('./helpers/isolated-env');
 
 const ROOT = path.resolve(__dirname, '..');
 const REAL_TIMEOUT_POLICY = path.join(ROOT, 'config', 'timeout-policy.json');
@@ -25,7 +26,7 @@ const SNIPPET = `
 `;
 
 function runSnippet(policyPath) {
-  return spawnSync(process.execPath, ['-e', SNIPPET, policyPath], { encoding: 'utf8' });
+  return spawnSync(process.execPath, ['-e', SNIPPET, policyPath], { env: isolatedEnv(), encoding: 'utf8' });
 }
 
 function writePolicy(dir, overrides) {
@@ -75,7 +76,7 @@ test('timeout-policy.cjs rejects a missing or non-positive mcpInlineWaitMs', (t)
   fs.writeFileSync(path.join(configDir, 'timeout-policy.json'), JSON.stringify(base));
   fs.copyFileSync(path.join(ROOT, 'timeout-policy.cjs'), path.join(dir, 'timeout-policy.cjs'));
 
-  const result = spawnSync(process.execPath, ['-e', `require(${JSON.stringify(path.join(dir, 'timeout-policy.cjs'))})`], {
+  const result = spawnSync(process.execPath, ['-e', `require(${JSON.stringify(path.join(dir, 'timeout-policy.cjs'))})`], { env: isolatedEnv(),
     encoding: 'utf8',
   });
   assert.notEqual(result.status, 0);

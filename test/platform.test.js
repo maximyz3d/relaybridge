@@ -1,4 +1,5 @@
 'use strict';
+require('./helpers/isolated-env').scrubInheritedEnv();
 
 // Platform abstraction for the WSL/Linux/macOS port. These tests run on the
 // TARGET platform (the CI sandbox is Linux), so the POSIX paths here are
@@ -12,11 +13,12 @@ const path = require('node:path');
 const { spawn } = require('child_process');
 
 const P = require('../lib/platform');
+const { isolatedEnv } = require('./helpers/isolated-env');
 
 const posixOnly = process.platform === 'win32' ? test.skip : test;
 
 function resolvePosixCommand(name) {
-  const result = spawn('/bin/sh', ['-c', 'command -v "$1"', 'sh', name], {
+  const result = spawn('/bin/sh', ['-c', 'command -v "$1"', 'sh', name], { env: isolatedEnv(),
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let stdout = '';
@@ -46,7 +48,7 @@ async function createStartRegistryFixture(t) {
   }
   fs.symlinkSync(process.execPath, path.join(binDir, 'node'));
 
-  const sentinel = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+  const sentinel = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { env: isolatedEnv(),
     stdio: 'ignore',
   });
   const port = 62000 + Math.floor(Math.random() * 2000);
@@ -61,15 +63,14 @@ async function createStartRegistryFixture(t) {
 async function runRejectedStart(t, registryFile, expected) {
   const fixture = await createStartRegistryFixture(t);
   const child = spawn('/bin/bash', [path.join(fixture.tempRoot, 'start.sh')], {
-    env: {
-      ...process.env,
+    env: isolatedEnv({
       PATH: fixture.binDir,
       PORT: String(fixture.port),
       RELAYBRIDGE_PORT: String(fixture.port),
       RELAYBRIDGE_GITHUB_REPOS: registryFile,
       RELAYBRIDGE_ALLOW_SLOW_WSL_FS: '0',
       WSL_DISTRO_NAME: 'RelayBridge-Test',
-    },
+    }),
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let output = '';
@@ -199,6 +200,7 @@ posixOnly('the command travels as a single argv element — no interpolation lay
 posixOnly('a real command with hostile quoting survives end to end', async () => {
   const built = P.buildExecSpawn(`printf '%s' "it's \\"fine\\""`, { shell: 'bash' });
   const out = await new Promise((resolve) => {
+    // env-isolation: options are the P.buildExecSpawn output under test; the command is a local printf.
     const c = spawn(built.exe, built.args, built.options);
     let s = '';
     c.stdout.on('data', (d) => { s += d; });
@@ -244,7 +246,7 @@ posixOnly('CPU time of a busy tree is measured, not null', async () => {
   // that is also how the supervisor consumes this signal: as a delta over
   // time, never a single absolute read.
   const child = spawn('bash', ['-c',
-    'end=$((SECONDS+6)); while [ $SECONDS -lt $end ]; do :; done'], { detached: true });
+    'end=$((SECONDS+6)); while [ $SECONDS -lt $end ]; do :; done'], { env: isolatedEnv(), detached: true });
   let ms = null;
   const deadline = Date.now() + 5000;
   while (Date.now() < deadline) {
@@ -266,7 +268,7 @@ posixOnly('CPU time of a vanished tree resolves null, never throws', async () =>
 posixOnly('killTree takes out grandchildren, not just the direct child', async () => {
   // The old POSIX path was proc.kill('SIGTERM') — the CLI died, its node
   // subprocess kept running and holding the port/file locks.
-  const root = spawn('bash', ['-c', 'sleep 30 & sleep 30 & wait'], { detached: true });
+  const root = spawn('bash', ['-c', 'sleep 30 & sleep 30 & wait'], { env: isolatedEnv(), detached: true });
   await new Promise((r) => setTimeout(r, 300));
   const before = P.collectTreePids(root.pid);
   assert.ok(before.length >= 3, `expected root+2 sleeps, saw ${before.length}`);
@@ -276,7 +278,7 @@ posixOnly('killTree takes out grandchildren, not just the direct child', async (
   // kill(pid, 0) succeeds on zombies — dead but unreaped — so ask ps for the
   // state and only count processes actually running.
   const { spawnSync } = require('child_process');
-  const ps = spawnSync('ps', ['-Ao', 'pid=,state='], { encoding: 'utf8' });
+  const ps = spawnSync('ps', ['-Ao', 'pid=,state='], { env: isolatedEnv(), encoding: 'utf8' });
   const running = new Set((ps.stdout || '').split('\n')
     .map((l) => l.trim().match(/^(\d+)\s+(\S+)/))
     .filter((m) => m && !m[2].startsWith('Z'))
@@ -302,7 +304,7 @@ posixOnly('start.sh never trusts the shared legacy pidfile without a port inspec
     fs.symlinkSync(await resolvePosixCommand(command), path.join(binDir, command));
   }
 
-  const sentinel = () => spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+  const sentinel = () => spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { env: isolatedEnv(),
     stdio: 'ignore',
   });
   const legacy = sentinel();
@@ -316,7 +318,7 @@ posixOnly('start.sh never trusts the shared legacy pidfile without a port inspec
 
   fs.writeFileSync(path.join(tempRoot, '.bridge.pid'), `${legacy.pid}\n`);
   let stopped = spawn('/bin/bash', [scriptPath, '--stop'], {
-    env: { ...process.env, PATH: binDir, PORT: String(port), RELAYBRIDGE_PORT: String(port) },
+    env: isolatedEnv({ PATH: binDir, PORT: String(port), RELAYBRIDGE_PORT: String(port) }),
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let output = '';
@@ -328,7 +330,7 @@ posixOnly('start.sh never trusts the shared legacy pidfile without a port inspec
 
   fs.writeFileSync(path.join(tempRoot, `.bridge.${port}.pid`), `${scoped.pid}\n`);
   stopped = spawn('/bin/bash', [scriptPath, '--stop'], {
-    env: { ...process.env, PATH: binDir, PORT: String(port), RELAYBRIDGE_PORT: String(port) },
+    env: isolatedEnv({ PATH: binDir, PORT: String(port), RELAYBRIDGE_PORT: String(port) }),
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   output = '';
