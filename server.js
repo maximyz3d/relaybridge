@@ -29,6 +29,7 @@ const { createPrepaidAuthority, summarize: summarizePrepaidAuthorization } = req
 const { createPromotionalAuthority, summarize: summarizePromotionalAuthorization } = require('./lib/promotional-authorization');
 const { createCheckpointStore } = require('./lib/api-agent-checkpoint');
 const { createApiAgentDispatcher } = require('./lib/api-agent-dispatch');
+const { createCreditLedger } = require('./lib/credit-ledger');
 const { createWorkspaceTools } = require('./lib/api-agent-tools');
 const { WRITE_BOUNDARY: API_WRITE_BOUNDARY, READ_ONLY_BOUNDARY: API_READ_ONLY_BOUNDARY } = require('./lib/api-agent-patch');
 const { assertCanonicalFunding, resolveFundingRoute, assertFundingSubscriptionAdmission, assertNoInternalFields, isApiDecision } = require('./lib/funding-routing');
@@ -4942,15 +4943,16 @@ async function executeOneShot(body, res, privateContext = null) {
     if (promotionalDecision) {
       const message = 'Owner-authorized promotional credit runs only the read-only API agent.';
       if (apiWriter) return rejectBeforeAdmission(409, 'api_write_unauthorized', { ...refused, error: message });
-      if (body.unifiedRun !== undefined) return rejectBeforeAdmission(409, 'promotional_unified_unsupported', { ...refused,
-        error: 'Owner-authorized promotional credit is not available to unified runs.', errorCode: 'promotional_unified_unsupported' });
+      // A unified run may use promotional credit only under a v2 (ledger) permit.
+      if (body.unifiedRun !== undefined && !fundingDecision.promotional?.ledger) return rejectBeforeAdmission(409, 'promotional_unified_unsupported', { ...refused,
+        error: 'Owner-authorized promotional credit is not available to unified runs without a v2 spend-ledger permit.', errorCode: 'promotional_unified_unsupported' });
       if (useDanger) return rejectBeforeAdmission(409, 'api_agent_read_only', { ...refused, error: message });
     }
     if (prepaidDecision && apiWriter) return rejectBeforeAdmission(409, 'api_write_unauthorized', { ...refused, error: 'Owner-authorized prepaid runs only the read-only API agent.' });
     if (useDanger && !apiWriter) return rejectBeforeAdmission(409, 'api_agent_read_only', { ...refused, error: prepaidDecision
       ? 'Owner-authorized prepaid runs only the read-only API agent.' : 'Included API credit runs only the read-only API agent.' });
     if (apiWriter && !useDanger) return rejectBeforeAdmission(409, 'api_write_unauthorized', { ...refused, error: 'API writer segments run only with dangerous=true.' });
-    if (prepaidDecision && body.unifiedRun !== undefined) {
+    if ((prepaidDecision || promotionalDecision) && body.unifiedRun !== undefined) {
       // A recovered or unproven subscription seat refuses with failureClass
       // quota_unknown, which hands the run to its next segment boundary.
       try { unifiedRuns.prepaidAuthority(body, privateContext, { decision: fundingDecision }); }
@@ -4990,7 +4992,7 @@ async function executeOneShot(body, res, privateContext = null) {
         }
       } } : null;
     const dispatcher = createApiAgentDispatcher({ fetchImpl: fetch, store: apiAgentStore, registry: activeRuns,
-      readCredential: readApiCredential, supervisorOptions,
+      readCredential: readApiCredential, supervisorOptions, creditLedger,
       createTools: ({ writer: toolWriter = null } = {}) => createWorkspaceTools({ cwd: resolvedCwd, deniedPaths: [DATA_DIR, CONFIG_FILE, TOKEN_FILE],
         writer: toolWriter,
         revalidateCwd: () => {
@@ -6968,6 +6970,7 @@ const apiQualificationAuthority = createQualificationAuthority({ adapters: Objec
 const prepaidAuthority = createPrepaidAuthority({ dataDir: DATA_DIR });
 const promotionalAuthority = createPromotionalAuthority({ dataDir: DATA_DIR });
 const apiAgentStore = createCheckpointStore({ dataDir: DATA_DIR });
+const creditLedger = createCreditLedger({ dataDir: DATA_DIR });
 // Exact provider-to-secret map. An unknown provider reads nothing and stays
 // unbound; it never falls through to another provider's key.
 const API_CREDENTIAL_NAMES = Object.freeze({ claude: CREDIT_SECRET_NAMES[0], openai: CREDIT_SECRET_NAMES[1] });
@@ -7108,11 +7111,11 @@ const unifiedRuns = createUnifiedRuns({
   // Only an entry that explicitly opts into authorized_prepaid consults the
   // owner's prepaid permit; every other API entry resolves the grant exactly
   // as before.
-  apiDecision: (entry) => entry.fundingRoute === 'authorized_prepaid'
-    ? resolveFundingRoute({ envelope: { route: 'authorized_prepaid', profileId: entry.fundingProfileId,
+  apiDecision: (entry) => (entry.fundingRoute === 'authorized_prepaid' || entry.fundingRoute === 'authorized_promotional')
+    ? resolveFundingRoute({ envelope: { route: entry.fundingRoute, profileId: entry.fundingProfileId,
       expectedProfileRevision: entry.expectedProfileRevision, fallback: 'none' }, snapshot: fundingProfiles.snapshot(),
     kind: entry.kind, entry: loadConfig()[entry.kind], expectedAccountId: entry.accountId, preference: creditPreferences.get(),
-    qualificationAuthority: apiQualificationAuthority, credentialSourceFor: apiCredentialSourceFor, prepaidAuthority, now: Date.now() })
+    qualificationAuthority: apiQualificationAuthority, credentialSourceFor: apiCredentialSourceFor, prepaidAuthority, promotionalAuthority, now: Date.now() })
     : resolveFundingRoute({ envelope: { route: 'included_api_credit', profileId: entry.fundingProfileId,
     expectedProfileRevision: entry.expectedProfileRevision, fallback: 'none' }, snapshot: fundingProfiles.snapshot(),
   kind: entry.kind, entry: loadConfig()[entry.kind], expectedAccountId: entry.accountId, preference: creditPreferences.get(),
@@ -7505,14 +7508,24 @@ app.post('/api/funding-route/preview', (req, res) => {
 });
 
 // Read-only permit summary: no HMAC, credential or fingerprint.
+// A v2 permit also reports local ledger spend (no receipts, no authorization hash).
+function withLedgerSpend(summary) {
+  if (!summary?.ledger || !summary.authorizationId) return summary;
+  try {
+    const spend = creditLedger.summary({ authorizationId: summary.authorizationId });
+    if (!spend) return { ...summary, ledgerSpend: { spentCents: 0, heldCents: 0, exhausted: false, turns: 0 } };
+    const { spentCents, heldCents, exhausted, turns } = spend;
+    return { ...summary, ledgerSpend: { spentCents, heldCents, exhausted, turns: turns.length } };
+  } catch { return { ...summary, ledgerSpend: { state: 'unreadable' } }; }
+}
 function prepaidAuthorizationStatus(profiles) {
   try {
-    return summarizePrepaidAuthorization(prepaidAuthority.status({ profiles: profiles.profiles, credentialSourceFor: apiCredentialSourceFor, now: Date.now() }));
+    return withLedgerSpend(summarizePrepaidAuthorization(prepaidAuthority.status({ profiles: profiles.profiles, credentialSourceFor: apiCredentialSourceFor, now: Date.now() })));
   } catch { return summarizePrepaidAuthorization(null); }
 }
 function promotionalAuthorizationStatus(profiles) {
   try {
-    return summarizePromotionalAuthorization(promotionalAuthority.status({ profiles: profiles.profiles, credentialSourceFor: apiCredentialSourceFor, now: Date.now() }));
+    return withLedgerSpend(summarizePromotionalAuthorization(promotionalAuthority.status({ profiles: profiles.profiles, credentialSourceFor: apiCredentialSourceFor, now: Date.now() })));
   } catch { return summarizePromotionalAuthorization(null); }
 }
 function creditStatus(preference) {
