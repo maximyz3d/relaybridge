@@ -407,8 +407,10 @@ test('a unified run uses opted-in prepaid only on proven exhaustion and returns 
   await waitFor(() => fetches().length === 1, 60000);
   await claudeUsage(20);
   fs.writeFileSync(gate, '');
-  const done = await waitFor(async () => { const v = record(await bridge.request(`/api/unified-runs/${created.body.id}`)).body;
-    return ['complete', 'failed', 'needs_attention', 'cancelled'].includes(v.state) && v; }, 90000);
+  let last;
+  const done = await waitFor(async () => { const v = last = record(await bridge.request(`/api/unified-runs/${created.body.id}`)).body;
+    return ['complete', 'failed', 'needs_attention', 'cancelled'].includes(v.state) && v; }, 90000)
+    .catch((error) => { throw new Error(`${error.message}; last view ${JSON.stringify(last).slice(0, 4000)}`); });
   assert.equal(done.state, 'complete', JSON.stringify(done));
   const m = manifest(created.body.id);
   assert.equal(m.segments.length, 2, JSON.stringify(m.segments));
@@ -639,7 +641,8 @@ test('the real server runs owner-authorized promotional credit read-only for one
   writePermit(permit());
   const unified = record(await bridge.request('/api/unified-runs', { objective: 'Read the readme', cwd: ws,
     segments: [{ kind: 'claude', accountId: 'default', transport: 'native' }, { kind: 'claude', accountId: 'default', transport: 'api', fundingRoute: 'authorized_promotional' }] }));
-  assert.equal(unified.status, 400, JSON.stringify(unified.body));
+  // win32 refuses every unified run before validating segments (409 unified_run_platform_unsupported).
+  assert.equal(unified.status, process.platform === 'win32' ? 409 : 400, JSON.stringify(unified.body));
   const before = fetches().length;
   const carried = record(await shot({ unifiedRun: { id: 'ur_forged', segment: 0 } }));
   assert.ok([400, 409].includes(carried.status), JSON.stringify(carried.body));
