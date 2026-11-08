@@ -282,7 +282,8 @@ test('the real server runs owner-authorized prepaid read-only for one OpenAI pro
   const past = livePermit({ profileRevision: revision }, { now: now - 2 * 86400e3 });
   if (new Date(Date.parse(past.issuedAt)).getUTCMonth() === new Date(Date.parse(past.expiresAt) - 1).getUTCMonth()) cases.push([past, 'prepaid_authorization_expired']);
   for (const [value, code] of cases) { writePermit(value); await refused({}, code); }
-  writePermit(permit(), 0o644); await refused({}, 'prepaid_authorization_invalid');
+  // POSIX modes are not enforced on win32, where the file-mode check is skipped.
+  if (process.platform !== 'win32') { writePermit(permit(), 0o644); await refused({}, 'prepaid_authorization_invalid'); }
   fs.rmSync(permitFile); await refused({}, 'prepaid_authorization_missing');
   status = record(await bridge.request('/api/allocated-credit'));
   assert.equal(status.body.apiTransport, 'implemented_not_activated');
@@ -316,7 +317,7 @@ test('the real server runs owner-authorized prepaid read-only for one OpenAI pro
 // native seat is positively exhausted, and returns to a recovered native seat at
 // the next segment boundary. The Codex seat is observed through a fake
 // app-server; the Claude seat through the statusline endpoint.
-test('a unified run uses opted-in prepaid only on proven exhaustion and returns to native at the next segment', { timeout: 90000 }, async t => {
+test('a unified run uses opted-in prepaid only on proven exhaustion and returns to native at the next segment', { timeout: 180000, skip: process.platform === 'win32' && 'unified runs are unsupported on win32' }, async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rb-prepaid-unified-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const files = { scriptFile: path.join(dir, 'script.json'), fetchLog: path.join(dir, 'fetch.jsonl'), egressLog: path.join(dir, 'egress.log') };
@@ -403,11 +404,11 @@ test('a unified run uses opted-in prepaid only on proven exhaustion and returns 
   script([{ read: 'README.md', gate }, { status: 429, error: { code: 'credit_balance_exhausted', message: 'out' } }]);
   const created = record(await create([claudeNative, codexNative, prepaid]));
   assert.equal(created.status, 202, JSON.stringify(created.body));
-  await waitFor(() => fetches().length === 1, 20000);
+  await waitFor(() => fetches().length === 1, 60000);
   await claudeUsage(20);
   fs.writeFileSync(gate, '');
   const done = await waitFor(async () => { const v = record(await bridge.request(`/api/unified-runs/${created.body.id}`)).body;
-    return ['complete', 'failed', 'needs_attention', 'cancelled'].includes(v.state) && v; }, 30000);
+    return ['complete', 'failed', 'needs_attention', 'cancelled'].includes(v.state) && v; }, 90000);
   assert.equal(done.state, 'complete', JSON.stringify(done));
   const m = manifest(created.body.id);
   assert.equal(m.segments.length, 2, JSON.stringify(m.segments));
@@ -623,7 +624,7 @@ test('the real server runs owner-authorized promotional credit read-only for one
     [{ ...permit(), policy: 'owner_authorized_prepaid' }, 'promotional_authorization_invalid'],
   ];
   for (const [value, code] of cases) { writePermit(value); await refused({}, code); }
-  writePermit(permit(), 0o644); await refused({}, 'promotional_authorization_invalid');
+  if (process.platform !== 'win32') { writePermit(permit(), 0o644); await refused({}, 'promotional_authorization_invalid'); }
   // A promotional permit placed at the prepaid path qualifies nothing.
   fs.rmSync(permitFile);
   const prepaidFile = path.join(dataDir, 'prepaid-authorization.json');

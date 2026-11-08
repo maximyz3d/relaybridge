@@ -35,7 +35,7 @@ test('issues a valid v2 OpenAI permit 0600 without printing or storing the key',
   const env = setup(t);
   const { permit, out } = await run('openai', OPENAI, env);
   const file = path.join(env.data, 'prepaid-authorization.json');
-  assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+  if (process.platform !== 'win32') assert.equal(fs.statSync(file).mode & 0o777, 0o600);
   const stored = JSON.parse(fs.readFileSync(file, 'utf8'));
   assert.equal(stored.schemaVersion, 2); assert.equal(stored.credentialHmac, prepaid.credentialHmac('pa_issue1', KEY));
   prepaid.validateAuthorization(stored);

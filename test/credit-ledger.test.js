@@ -34,12 +34,12 @@ test('ledger files are private, reserve then settle charge usage, and receipts c
   const r = ledger.reserve(base());
   assert.equal(r.heldCents, 10); assert.equal(r.remainingCents, 90);
   const dir = path.join(dataDir, 'credit-ledger');
-  assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
-  assert.equal(fs.statSync(path.join(dir, `${ID}.json`)).mode & 0o777, 0o600);
+  if (process.platform !== 'win32') assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
+  if (process.platform !== 'win32') assert.equal(fs.statSync(path.join(dir, `${ID}.json`)).mode & 0o777, 0o600);
   const s = ledger.settle({ authorizationId: ID, requestKey: 'run_a:1', disposition: 'settled', pricing: RATES,
     usage: { input_tokens: 10_000, output_tokens: 2000, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } });
   assert.equal(s.chargedCents, 6); assert.equal(s.spentCents, 6); assert.equal(s.heldCents, 0); assert.equal(s.remainingCents, 94);
-  assert.equal(fs.statSync(path.join(dir, 'receipts.jsonl')).mode & 0o777, 0o600);
+  if (process.platform !== 'win32') assert.equal(fs.statSync(path.join(dir, 'receipts.jsonl')).mode & 0o777, 0o600);
   const [row] = receipts(dataDir);
   for (const k of ['at', 'provider', 'organization', 'scope', 'policy', 'authorizationId', 'authorizationHash', 'evidence', 'requestKey', 'model',
     'reservedCents', 'usage', 'chargedCents', 'disposition', 'providerErrorClass', 'spentCentsAfter', 'remainingCentsAfter', 'exhausted']) assert.ok(Object.hasOwn(row, k), k);

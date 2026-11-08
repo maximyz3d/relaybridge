@@ -145,7 +145,7 @@ test('static (b): every child_process call passes env or carries an env-isolatio
   const offenders = [];
   for (const { rel, src } of testSources()) {
     // Fixture executables only ever run as children of an already isolated launch and inherit its environment.
-    if (rel === 'test/prompt-file-cli.js') continue;
+    if (rel.split(path.sep).join('/') === 'test/prompt-file-cli.js') continue;
     for (const call of childProcessCalls(src)) if (!call.hasEnv && !call.annotated) offenders.push(`${rel}:${call.line}: ${call.text.slice(0, 120)}`);
   }
   assert.deepEqual(offenders, []);

@@ -65,7 +65,7 @@ test('traversal, absolute, NUL, hidden and secret paths are refused', (t) => {
   const { root, outside } = workspace(t);
   const tools = createReadOnlyTools({ cwd: root });
   for (const [p, code] of [['../outside.txt', 'path_outside_workspace'], ['src/../../outside.txt', 'path_outside_workspace'],
-    [outside, 'path_outside_workspace'], ['C:/x', 'path_outside_workspace'], ['a\0b', 'invalid_path'], ['src\\a.js', 'invalid_path'],
+    [outside.split(path.sep).join('/'), 'path_outside_workspace'], ['C:/x', 'path_outside_workspace'], ['a\0b', 'invalid_path'], ['src\\a.js', 'invalid_path'],
     ['.env', 'path_denied'], ['.npmrc', 'path_denied'], ['.ssh/id_rsa', 'path_denied'], ['.git/config', 'path_denied'],
     ['server.pem', 'path_denied'], ['id_ed25519', 'path_denied'], ['missing.txt', 'not_found'], ['src', 'not_a_file']]) {
     const r = run(tools, 'read_file', { path: p, offset: null, length: null });

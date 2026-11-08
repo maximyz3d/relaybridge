@@ -60,7 +60,7 @@ test('a valid permit verifies to a branded, secret-free result with a stable has
   assert.equal(summarize({ ...result }).state, 'blocked');
   // The authority never rewrites or repairs the file.
   assert.equal(fs.readFileSync(env.file, 'utf8'), JSON.stringify(permit(), null, 2));
-  assert.equal(fs.statSync(env.file).mode & 0o777, 0o600);
+  if (process.platform !== 'win32') assert.equal(fs.statSync(env.file).mode & 0o777, 0o600);
 });
 
 test('every schema rule failure is prepaid_authorization_invalid and never reads the credential', (t) => {

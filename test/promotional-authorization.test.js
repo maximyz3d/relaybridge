@@ -79,7 +79,7 @@ test('a valid promotional permit verifies to a branded, secret-free result that 
   assert.equal(env.verify().reason, 'promotional_scope_mismatch');
   // The authority never rewrites or repairs the file.
   assert.equal(fs.readFileSync(env.file, 'utf8'), JSON.stringify(permit({ workspace: null }), null, 2));
-  assert.equal(fs.statSync(env.file).mode & 0o777, 0o600);
+  if (process.platform !== 'win32') assert.equal(fs.statSync(env.file).mode & 0o777, 0o600);
 });
 
 test('every schema rule failure is promotional_authorization_invalid and never reads the credential', (t) => {
