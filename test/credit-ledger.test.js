@@ -112,7 +112,7 @@ const l=createCreditLedger({dataDir:${JSON.stringify(dataDir)}});let ok=0;
 for(let i=0;i<10;i++){for(;;){try{l.reserve(Object.assign(${JSON.stringify(base())},{requestKey:process.argv[1]+':'+i}));ok++;}catch(e){if(e.code==='credit_ledger_locked')continue;if(e.code!=='funding_exhausted')throw e;}break;}}
 process.stdout.write(String(ok));`;
   const outs = await Promise.all(Array.from({ length: 6 }, (_, n) => new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, ['-e', code, `p${n}`]); let out = '', errs = '';
+    const child = spawn(process.execPath, ['-e', code, `p${n}`], { env: {} }); let out = '', errs = '';
     child.stdout.on('data', (d) => { out += d; }); child.stderr.on('data', (d) => { errs += d; });
     child.on('close', (c) => c === 0 ? resolve(Number(out)) : reject(new Error(errs)));
   })));
