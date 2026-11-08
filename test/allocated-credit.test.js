@@ -143,3 +143,15 @@ test('CLI setup works offline, never accepts credentials, and distinguishes Code
   assert.equal(result.activationAvailable, false);
   assert.match(result.limitation, /excluded/);
 });
+
+test('each provider reports that provider-confirmed grant evidence is unavailable and why', () => {
+  const { allocatedCreditStatus } = require('../lib/allocated-credit');
+  const status = allocatedCreditStatus({});
+  for (const provider of ['openai', 'claude']) {
+    const e = status.providers[provider].providerConfirmedGrantEvidence;
+    assert.equal(e.state, 'unavailable');
+    assert.ok(e.missing.length >= 2 && e.missing.every((m) => typeof m === 'string'), provider);
+    assert.ok(e.missing.some((m) => /per_request_funding_source/.test(m)), provider);
+    assert.equal(status.providers[provider].dispatchAllowed, false);
+  }
+});

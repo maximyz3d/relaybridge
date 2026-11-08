@@ -988,3 +988,43 @@ test('a prepaid manifest is corrupt with writer danger, missing or misplaced pre
   h.writeManifest(run.id, good); h.runs = h.make();
   assert.equal(h.runs.status(run.id).segments.length, 2);
 });
+
+// Unified Claude promotional fallback: same gate as prepaid, plus a v2 ledger permit.
+const { PROMOTIONAL_POLICY } = require('../lib/promotional-authorization');
+const promoApi = (patch = {}) => api({ kind: 'claude', model: 'claude-sonnet-4-5', fundingProfileId: 'api_claude', fundingRoute: 'authorized_promotional', ...patch });
+const promoDecision = ({ ledger = true } = {}) => ({ actual: 'authorized_promotional', apiDispatchAllowed: true, fundingPolicy: PROMOTIONAL_POLICY, grantOnly: false, blockedReason: null,
+  identity: { provider: 'anthropic', organization: 'org', project: null, creditPeriod: null, profileRevision: 1 },
+  qualification: { qualificationId: 'promo:pa_2', credentialFingerprint: 'f' },
+  promotional: { authorizationId: 'pa_2', authorizationHash: 'b'.repeat(64), models: ['claude-sonnet-4-5'], reserveRelease: 'never', ...(ledger ? { ledger: { budgetCents: 100 } } : {}) } });
+function promoRun(t, { ledger = true, exhaust = true } = {}) {
+  const h = harness(t);
+  h.decision = promoDecision({ ledger });
+  const run = h.runs.create({ objective: 'Review the change', cwd: h.cwd, segments: [native(), promoApi()] });
+  if (exhaust) for (const seat of Object.keys(h.headrooms)) h.headrooms[seat] = exhausted();
+  h.finish(run.segments[0].taskId, { status: 'failed', failureClass: 'quota_reserve', result: 'native progress' });
+  const after = h.runs.status(run.id);
+  return { h, run: after, segment: after.segments[after.segments.length - 1] };
+}
+
+test('unified Claude promotional fallback is planned only after positive native exhaustion and a v2 permit', linuxOnly, (t) => {
+  const { h, run, segment } = promoRun(t);
+  assert.equal(h.submits.length, 2); assert.equal(segment.phase, 'api');
+  const stored = h.manifest(run.id).segments[1];
+  assert.deepEqual(stored.prepaidBinding, { authorizationId: 'pa_2', authorizationHash: 'b'.repeat(64), profileRevision: 1, route: 'authorized_promotional' });
+  assert.equal(h.submits[1].input.funding.route, 'authorized_promotional');
+  assert.equal(h.submits[1].input.dangerous, false);
+  // Promotional exhaustion never releases the reserve.
+  h.finish(segment.taskId, { status: 'failed', failureClass: 'funding_exhausted',
+    route: { funding: { qualificationId: 'promo:pa_2' }, api_agent: { reserve_release_evidence: true } } });
+  assert.equal(h.manifest(run.id).reserveRelease ?? null, null);
+  assert.equal(h.submits.length, 2);
+});
+
+test('unified Claude promotional fallback never spends with a v1 permit or without exhaustion', linuxOnly, (t) => {
+  const v1 = promoRun(t, { ledger: false });
+  assert.equal(v1.h.submits.length, 1, 'v1 permit: no api segment submitted');
+  assert.notEqual(v1.segment.phase, 'api');
+  const live = promoRun(t, { exhaust: false });
+  assert.equal(live.h.submits.length, 1, 'native seat not exhausted: no spend');
+  assert.notEqual(live.segment?.phase, 'api');
+});

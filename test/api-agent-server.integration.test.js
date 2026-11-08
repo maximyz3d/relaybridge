@@ -442,14 +442,13 @@ test('production wiring constructs one promotional authority, used only by expli
   const server = fs.readFileSync(path.join(ROOT, 'server.js'), 'utf8');
   assert.equal(server.split('createPromotionalAuthority(').length - 1, 1);
   assert.match(server, /createPromotionalAuthority\(\{ dataDir: DATA_DIR \}\)/);
-  // fundingForRequest and the preview pass it; the unified-run API decision does not.
-  assert.equal(server.split('prepaidAuthority, promotionalAuthority, now: Date.now() })').length - 1, 2);
-  assert.equal(server.split('prepaidAuthority, now: Date.now() })').length - 1, 1);
-  assert.equal(/unifiedRuns\.[A-Za-z]+\([^)]*promotional/i.test(server), false);
+  // fundingForRequest, the preview and the unified-run API decision (v2 ledger permits only, enforced in selectSegment) pass it.
+  assert.equal(server.split('prepaidAuthority, promotionalAuthority, now: Date.now() })').length - 1, 3);
+  assert.equal(server.split('prepaidAuthority, now: Date.now() })').length - 1, 0);
   const lib = fs.readFileSync(path.join(ROOT, 'lib', 'promotional-authorization.js'), 'utf8');
   assert.equal(/process\.env/.test(lib), false);
   assert.equal(/write(File)?Sync|rename|unlink|rmSync|chmod|appendFile|createWriteStream/.test(lib), false);
-  for (const name of ['unified-run.js', 'prepaid-authorization.js']) {
+  for (const name of ['prepaid-authorization.js']) {
     assert.equal(/promotional/i.test(fs.readFileSync(path.join(ROOT, 'lib', name), 'utf8')), false, name);
   }
   for (const dir of ['server.js', 'mcp', 'lib', 'bin']) {
