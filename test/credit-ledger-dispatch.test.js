@@ -167,3 +167,37 @@ test('missing, expired and revoked permits never dispatch', async (t) => {
     assert.equal(expired.fake.requests.length, 0);
   }
 });
+
+function wrapLedger(real, overrides) {
+  return { reserve: (...a) => (overrides.reserve ?? real.reserve)(...a), settle: (...a) => (overrides.settle ?? real.settle)(...a),
+    markExhausted: (...a) => (overrides.markExhausted ?? real.markExhausted)(...a), summary: (...a) => real.summary(...a) };
+}
+
+test('openai: markExhausted failing after a funding error fails closed in-process and surfaces the ledger error', async (t) => {
+  const id = 'pa_disp_failclosed';
+  const permit = permitFor('openai', { authorizationId: id, credentialHmac: prepaid.credentialHmac(id, KEY) });
+  const env = await setup(t, 'openai', () => ({ status: 429, json: { error: { type: 'insufficient_quota', code: 'credit_balance_exhausted', message: 'out' } } }), { permit });
+  let calls = 0;
+  const bad = wrapLedger(env.ledger, { markExhausted: () => { calls++; throw Object.assign(new Error('x'), { code: 'credit_ledger_locked' }); } });
+  const dispatcher = createApiAgentDispatcher({ fetchImpl: env.fake.fetchImpl, store: env.store, registry: new Map(), creditLedger: bad,
+    readCredential: () => KEY, createTools: () => createReadOnlyTools({ cwd: env.common().admission.cwd }) });
+  const first = await dispatcher.runApiAgentOneShot({ ...env.common(), prompt: 'x' });
+  assert.equal(first.failureClass, 'funding_exhausted'); assert.equal(calls, 2);
+  assert.equal(first.route.funding.ledgerError, 'credit_ledger_locked');
+  assert.equal(env.fake.requests.length, 1);
+  const second = await dispatcher.runApiAgentOneShot({ ...env.common(), prompt: 'y' });
+  assert.equal(second.failureClass, 'funding_exhausted'); assert.equal(env.fake.requests.length, 1);
+});
+
+test('claude: a reservation is settled not_sent when markDispatched refuses after a successful reserve', async (t) => {
+  const env = await setup(t, 'claude', [ok('claude', { text: 'never' })]);
+  const ac = new AbortController();
+  const racing = wrapLedger(env.ledger, { reserve: (a) => { const r = env.ledger.reserve(a); ac.abort(); return r; } });
+  const dispatcher = createApiAgentDispatcher({ fetchImpl: env.fake.fetchImpl, store: env.store, registry: new Map(), creditLedger: racing,
+    readCredential: () => KEY, createTools: () => createReadOnlyTools({ cwd: env.common().admission.cwd }) });
+  await dispatcher.runApiAgentOneShot({ ...env.common(), prompt: 'x', signal: ac.signal });
+  assert.equal(env.fake.requests.length, 0);
+  const s = env.summary();
+  assert.equal(s.heldCents, 0); assert.equal(s.spentCents, 0);
+  assert.ok(s.turns.every((x) => x.disposition === 'not_sent'));
+});

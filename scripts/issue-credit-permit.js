@@ -62,12 +62,16 @@ function existingUnexpired(file, now) {
   } catch { return true; } // unreadable: do not overwrite blindly
 }
 
-function writeAtomic(file, permit) {
+function writeAtomic(file, permit, { replace = true } = {}) {
   const tmp = `${file}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
   const fd = fs.openSync(tmp, 'wx', 0o600);
   try { fs.writeSync(fd, JSON.stringify(permit, null, 2) + '\n'); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
   fs.chmodSync(tmp, 0o600);
-  fs.renameSync(tmp, file);
+  if (replace) { fs.renameSync(tmp, file); return; }
+  // Exclusive publish: link fails with EEXIST rather than overwrite a permit created meanwhile.
+  try { fs.linkSync(tmp, file); }
+  catch (e) { try { fs.unlinkSync(tmp); } catch {} if (e.code === 'EEXIST') fail(`a permit appeared at ${file}; pass --replace to overwrite`); throw e; }
+  try { fs.unlinkSync(tmp); } catch {}
 }
 
 function createAsker(input, output) {
@@ -128,13 +132,17 @@ async function main(argv = process.argv.slice(2), { input = process.stdin, outpu
   const file = path.join(dataDir, args.provider === 'openai' ? 'prepaid-authorization.json' : 'promotional-authorization.json');
   if (!fs.statSync(dataDir, { throwIfNoEntry: false })?.isDirectory()) fail('--data-dir must be an existing directory');
   if (existingUnexpired(file, now) && !args.replace) fail(`an unexpired permit exists at ${file}; pass --replace to overwrite`);
-  const credential = fs.readFileSync(args.keyFile, 'utf8').trim();
+  // The server compares the raw env value untrimmed, so the HMAC input must be the exact key:
+  // only one trailing newline is dropped; any other surrounding whitespace is refused.
+  let credential = fs.readFileSync(args.keyFile, 'utf8');
+  if (credential.endsWith('\n')) credential = credential.slice(0, -1);
+  if (credential !== credential.trim()) fail('key file has leading or trailing whitespace other than one trailing newline; fix the file');
   if (!credential) fail('key file is empty');
   const asker = createAsker(input, output);
   let values;
   try { values = await collect(args.provider, asker); } finally { asker.close(); }
   const permit = buildPermit(args.provider, values, { credential, now });
-  writeAtomic(file, permit);
+  writeAtomic(file, permit, { replace: !!args.replace });
   output.write(`\nwrote ${file} (mode 0600)\nauthorizationId ${permit.authorizationId}\nexpires ${permit.expiresAt}\n`);
   return permit;
 }

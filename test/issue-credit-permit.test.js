@@ -69,3 +69,29 @@ test('the issuer is not reachable from the server, CLI or MCP', () => {
   const root = path.join(__dirname, '..');
   for (const f of ['server.js', 'bin/relaybridge.js']) assert.ok(!fs.readFileSync(path.join(root, f), 'utf8').includes('issue-credit-permit'), f);
 });
+
+test('a key file with surrounding whitespace is refused; the key is not trimmed', async (t) => {
+  const env = setup(t);
+  fs.writeFileSync(env.keyFile, ` ${KEY}\n`);
+  await assert.rejects(run('openai', OPENAI, env), /whitespace/);
+  fs.writeFileSync(env.keyFile, `${KEY}\n\n`);
+  await assert.rejects(run('openai', OPENAI, env), /whitespace/);
+  assert.deepEqual(fs.readdirSync(env.data), []);
+  fs.writeFileSync(env.keyFile, KEY); // no newline is exact too
+  const { permit } = await run('openai', OPENAI, env);
+  assert.equal(permit.credentialHmac, prepaid.credentialHmac('pa_issue1', KEY));
+});
+
+test('without --replace the final write is exclusive and never overwrites a racing permit', async (t) => {
+  const env = setup(t);
+  const file = path.join(env.data, 'prepaid-authorization.json');
+  const input = new PassThrough(), output = new PassThrough();
+  input.write(OPENAI.slice(0, 1).join('\n') + '\n');
+  const p = main(['--provider', 'openai', '--data-dir', env.data, '--key-file', env.keyFile], { input, output, now: NOW });
+  await new Promise((r) => setTimeout(r, 50));
+  fs.writeFileSync(file, 'racer'); // appears after the unexpired check, before the write
+  input.end(OPENAI.slice(1).join('\n') + '\n');
+  await assert.rejects(p, /appeared|exists/);
+  assert.equal(fs.readFileSync(file, 'utf8'), 'racer');
+  assert.deepEqual(fs.readdirSync(env.data), ['prepaid-authorization.json']);
+});

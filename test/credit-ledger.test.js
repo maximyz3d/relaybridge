@@ -109,7 +109,7 @@ test('parallel processes never over-reserve the budget', async (t) => {
   const { dataDir } = setup(t);
   const code = `const {createCreditLedger}=require(${JSON.stringify(path.resolve(__dirname, '../lib/credit-ledger'))});
 const l=createCreditLedger({dataDir:${JSON.stringify(dataDir)}});let ok=0;
-for(let i=0;i<10;i++){try{l.reserve(Object.assign(${JSON.stringify(base())},{requestKey:process.argv[1]+':'+i}));ok++;}catch(e){if(e.code!=='funding_exhausted')throw e;}}
+for(let i=0;i<10;i++){for(;;){try{l.reserve(Object.assign(${JSON.stringify(base())},{requestKey:process.argv[1]+':'+i}));ok++;}catch(e){if(e.code==='credit_ledger_locked')continue;if(e.code!=='funding_exhausted')throw e;}break;}}
 process.stdout.write(String(ok));`;
   const outs = await Promise.all(Array.from({ length: 6 }, (_, n) => new Promise((resolve, reject) => {
     const child = spawn(process.execPath, ['-e', code, `p${n}`]); let out = '', errs = '';
@@ -127,4 +127,23 @@ test('in-process parallel reserves never exceed the budget', async (t) => {
     try { ledger.reserve(base({ requestKey: `r:${i}`, estimateCents: 7 })); return 1; } catch (e) { assert.equal(e.code, 'funding_exhausted'); return 0; }
   })));
   assert.equal(results.reduce((a, b) => a + b, 0), 14);
+});
+
+test('a held lock fails fast (bounded spin) instead of blocking for seconds', (t) => {
+  const { dataDir, ledger } = setup(t);
+  ledger.reserve(base());
+  const lock = path.join(dataDir, 'credit-ledger', `${ID}.lock`);
+  fs.writeFileSync(lock, '1', { mode: 0o600 });
+  const t0 = Date.now();
+  assert.throws(() => ledger.reserve(base({ requestKey: 'run_a:2' })), { code: 'credit_ledger_locked' });
+  assert.ok(Date.now() - t0 < 1500, 'lock wait must be short');
+  assert.ok(fs.existsSync(lock));
+});
+
+test('settle and markExhausted validate the authorizationId before any filesystem effect', (t) => {
+  const { dataDir, ledger } = setup(t);
+  const outside = path.join(dataDir, 'x.lock');
+  assert.throws(() => ledger.settle({ authorizationId: '../x', requestKey: 'run_a:1', disposition: 'not_sent' }), { code: 'credit_ledger_invalid' });
+  assert.throws(() => ledger.markExhausted({ authorizationId: '../x', cause: 'operator' }), { code: 'credit_ledger_invalid' });
+  assert.ok(!fs.existsSync(outside)); assert.ok(!fs.existsSync(path.join(dataDir, 'credit-ledger')));
 });
