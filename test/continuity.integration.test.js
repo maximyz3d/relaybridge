@@ -2,10 +2,9 @@
 const test = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs'), path = require('node:path');
 const { startTestBridge, waitFor, completeJsonLines } = require('./helpers/temporary-bridge');
+const { isolatedEnv } = require('./helpers/isolated-env');
 const ROOT = path.resolve(__dirname, '..');
-const inheritedBridgeKeys = Object.keys(process.env).filter((key) => /^(RELAYBRIDGE_|PS_BRIDGE_)/.test(key));
-const cleanEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !inheritedBridgeKeys.includes(key)));
-const unsetBridgeEnv = Object.fromEntries(inheritedBridgeKeys.map((key) => [key, undefined]));
+const cleanEnv = isolatedEnv();
 async function fixture(t) {
   let events;
   const bridge = await startTestBridge(t, (root) => {
@@ -34,7 +33,7 @@ async function fixture(t) {
       oneshot_capabilities: { safe: ['model_invocation', 'workspace_read', 'tool_use'] },
       ...(kind === 'codex' ? { npm_package: '@openai/codex', native_usage_command: [process.execPath, script, kind, root] } : {}),
     }])) };
-  }, { env: { ...unsetBridgeEnv, RELAYBRIDGE_WARM_DIAG: '0', RELAYBRIDGE_REMOTE_MCP: '0' } });
+  }, { env: { RELAYBRIDGE_WARM_DIAG: '0', RELAYBRIDGE_REMOTE_MCP: '0' } });
   return { ...bridge, events };
 }
 // Explicitly declared native protocol with a disposable metadata profile and
@@ -86,7 +85,7 @@ async function nativeClaudeFixture(t, { mutate = () => {}, registry = null, chan
       oneshot_safe_filesystem_policy: 'read_only_enforced', oneshot_capabilities: { safe: ['model_invocation', 'workspace_read', 'tool_use'] } };
     if (probeMode) entry.native_usage_probe = { enabled: true, command: [process.execPath, probeScript], timeout_ms: 2500 };
     const cfg = { _models: { discoverOnBoot: false }, claude: entry, claude_fable: { ...entry } }; changeConfig(cfg, root); return cfg;
-  }, { nodeArgs, env: { ...unsetBridgeEnv, RELAYBRIDGE_WARM_DIAG: '0', RELAYBRIDGE_REMOTE_MCP: '0', ...env } });
+  }, { nodeArgs, env: { RELAYBRIDGE_WARM_DIAG: '0', RELAYBRIDGE_REMOTE_MCP: '0', ...env } });
   return { ...bridge, profile, events, initial, usageFile: path.join(bridge.root, 'data', 'usage', 'native-usage.json'),
     ask: (prompt = 'Complete synthetic protocol.', kind = 'claude') => bridge.request('/api/oneshot',
       { kind, cwd: bridge.root, prompt, dangerous: false, modelTier: 'standard', effort: 'medium', useCache: false }) };

@@ -8,6 +8,7 @@ const { spawn, spawnSync } = require('node:child_process');
 const { createCooldownStore, BACKOFF } = require('../lib/provider-cooldown');
 const { authorizeContextCorrection, validCorrectionRequest, readCorrectionReceipts } = require('../lib/cooldown-correction');
 const { startTestBridge, completeJsonLines } = require('./helpers/temporary-bridge');
+const { isolatedEnv } = require('./helpers/isolated-env');
 const seat = 'subscription:anthropic:default';
 function receipt(current, store = 'store') {
   return { receiptId: current.sourceReceiptId, receiptStoreId: store, timestamp: new Date(current.lastOffenceAt + 1).toISOString(),
@@ -146,7 +147,7 @@ async function runWriters(file, { children, calls, fault = false }) {
   return Promise.all(Array.from({ length: children }, () => new Promise((resolve) => {
     const argv = ['-e', source, require.resolve('../lib/provider-cooldown'), file, seat, String(calls), String(fault)];
     let child, stdout = '', stderr = '', spawnError = null;
-    try { child = spawn(process.execPath, argv, { stdio: 'pipe' }); }
+    try { child = spawn(process.execPath, argv, { env: isolatedEnv(), stdio: 'pipe' }); }
     catch (error) { resolve({ code: null, signal: null, spawnError: error.message, stdout, stderr }); return; }
     child.stdout.on('data', (data) => { stdout += data; });
     child.stderr.on('data', (data) => { stderr += data; });
@@ -323,7 +324,7 @@ function runWaves(file, { children: count, waves }) {
         settled: false, stdout: '', stderr: '', spawnError: null, sendErrors: [], close: null, evidence: null, parseError: null };
       kids.push(kid);
       try { kid.child = spawn(process.execPath, ['-e', source, require.resolve('../lib/provider-cooldown'), file, seat, String(index)],
-        { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] }); }
+        { env: isolatedEnv(), stdio: ['ignore', 'pipe', 'pipe', 'ipc'] }); }
       catch (error) { kid.spawnError = error.message; kid.settled = true; fail('spawn_failed', { child: index, ...errorText(error) }); continue; }
       const child = kid.child; kid.pid = child.pid;
       child.stdout.on('data', (data) => { kid.stdout += data; });
@@ -462,7 +463,7 @@ test('contended genuine failure creates durable unknown authority before correct
     const result=createCooldownStore({file:process.argv[2]}).noteFailure(${JSON.stringify(seat)},'rate_limited',{retryAfterSec:3600});
     if(result!==null)throw new Error('contention must return null');`;
   const result = store.correctObservation(seat, expected, () => {
-    const child = spawnSync(process.execPath, ['-e', code, require.resolve('../lib/provider-cooldown'), file]);
+    const child = spawnSync(process.execPath, ['-e', code, require.resolve('../lib/provider-cooldown'), file], { env: isolatedEnv() });
     assert.equal(child.status, 0, child.stderr.toString());
     return { ok: true, proof: {} };
   });

@@ -7,13 +7,14 @@ const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const { spawnSync } = require('child_process');
+const { isolatedEnv } = require('./helpers/isolated-env');
 const {
   captureWriterWorkspaceSnapshot,
   summarizeWriterWorkspaceDiff,
 } = require('../lib/writer-diff-summary');
 
 function git(cwd, ...args) {
-  const result = spawnSync('git', args, { cwd, encoding: 'utf8', windowsHide: true });
+  const result = spawnSync('git', args, { env: isolatedEnv(), cwd, encoding: 'utf8', windowsHide: true });
   assert.equal(result.status, 0, result.stderr);
 }
 

@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const http = require('node:http');
 const path = require('node:path');
 const { startTestBridge, waitFor, completeJsonLines } = require('./helpers/temporary-bridge');
+const { isolatedEnv } = require('./helpers/isolated-env');
 
 async function fixture(t, { supervisor = { idleMs: 1000, hardCapMs: 3000 } } = {}) {
   const requests = [];
@@ -127,8 +128,8 @@ test('MCP HTTP result and both receipt layers preserve physical lifecycle identi
   const [{ Client }, { StdioClientTransport }] = await Promise.all([import('@modelcontextprotocol/client'), import('@modelcontextprotocol/client/stdio')]);
   const root = path.resolve(__dirname, '..');
   const transport = new StdioClientTransport({ command: process.execPath, args: [path.join(root, 'mcp/server.mjs')], cwd: root,
-    env: { ...process.env, NODE_ENV: 'test', RELAYBRIDGE_TEST_BUILD_ID: 'security-integration-fixture', RELAYBRIDGE_URL: bridge.base,
-      RELAYBRIDGE_TOKEN_FILE: path.join(bridge.root, 'token'), RELAYBRIDGE_DATA_DIR: path.join(bridge.root, 'data'), RELAYBRIDGE_CONFIG_FILE: bridge.configPath }, stderr: 'pipe' });
+    env: isolatedEnv({ NODE_ENV: 'test', RELAYBRIDGE_TEST_BUILD_ID: 'security-integration-fixture', RELAYBRIDGE_URL: bridge.base,
+      RELAYBRIDGE_TOKEN_FILE: path.join(bridge.root, 'token'), RELAYBRIDGE_DATA_DIR: path.join(bridge.root, 'data'), RELAYBRIDGE_CONFIG_FILE: bridge.configPath }), stderr: 'pipe' });
   const client = new Client({ name: 'http-lifecycle-test', version: '1' });
   t.after(async () => { await client.close(); await transport.close(); }); await client.connect(transport);
   const pending = client.callTool({ name: 'ask_provider', arguments: { kind: 'ollama_fast', prompt: 'bounded MCP transport', cwd: bridge.root, useCache: false } });

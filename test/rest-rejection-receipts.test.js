@@ -9,6 +9,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { pathToFileURL } = require('node:url');
 const { spawn, spawnSync } = require('node:child_process');
+const { isolatedEnv } = require('./helpers/isolated-env');
 
 const ROOT = path.resolve(__dirname, '..');
 const TEST_BUILD_ID = 'rest-rejection-receipts-test';
@@ -45,7 +46,7 @@ function dereferenceReceipt(dataDir, receiptId) {
   ].join('\n');
   const result = spawnSync(process.execPath, ['--input-type=module', '--eval', script], {
     cwd: ROOT,
-    env: { ...process.env, RELAYBRIDGE_DATA_DIR: dataDir },
+    env: isolatedEnv({ RELAYBRIDGE_DATA_DIR: dataDir }),
     encoding: 'utf8',
     windowsHide: true,
   });
@@ -145,8 +146,7 @@ test('direct REST pre-admission failures persist deduplicated zero-invocation re
   const baseUrl = `http://127.0.0.1:${port}`;
   const proc = spawn(process.execPath, [path.join(ROOT, 'server.js')], {
     cwd: ROOT,
-    env: {
-      ...process.env,
+    env: isolatedEnv({
       NODE_ENV: 'test',
       RELAYBRIDGE_TEST_BUILD_ID: TEST_BUILD_ID,
       PORT: String(port),
@@ -157,7 +157,7 @@ test('direct REST pre-admission failures persist deduplicated zero-invocation re
       RELAYBRIDGE_MAX_ACTIVE_ONESHOTS: '4',
       RELAYBRIDGE_MAX_ACTIVE_PER_PROVIDER: '1',
       RELAYBRIDGE_ALLOWED_ROOTS: allowedRoots.join(';'),
-    },
+    }),
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'],
   });

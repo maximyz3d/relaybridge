@@ -1,4 +1,5 @@
 'use strict';
+require('./helpers/isolated-env').scrubInheritedEnv();
 
 // The connector transport: the same tools as stdio, over HTTP, minus anything
 // that must never be reachable from a public URL.

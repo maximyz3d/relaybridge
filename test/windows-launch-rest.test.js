@@ -35,7 +35,7 @@ test('native Windows REST keeps hostile argv/env exact across argument/file/stdi
     fs.writeFileSync(entry, [
       "const fs=require('fs'); const [role,...args]=process.argv.slice(2);",
       `const marker=${JSON.stringify(marker)};`,
-      "let input=''; const finish=()=>{const record={role,args,input,env:process.env.RB_FIXTURE_ENV};",
+      "let input=''; const finish=()=>{const fixtureEnv=process.env.RB_FIXTURE_ENV;const record={role,args,input,env:fixtureEnv};",
       "if(role==='file')record.input=fs.readFileSync(args[0],'utf8');",
       "fs.appendFileSync(marker,JSON.stringify(record)+'\\n');process.stdout.write(JSON.stringify(record));",
       "if(role==='exit')process.exitCode=7;};",

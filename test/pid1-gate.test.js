@@ -9,6 +9,7 @@ const { spawn } = require('node:child_process');
 const { createOwnerControl } = require('../lib/owner-control');
 const { pinLinuxNamespace, probeLinuxNamespace } = require('../lib/linux-owner-identity');
 const { waitFor } = require('./helpers/temporary-bridge');
+const { isolatedEnv } = require('./helpers/isolated-env');
 const ROOT = path.resolve(__dirname, '..');
 const AVAILABLE = process.platform === 'linux' && fs.existsSync('/usr/bin/bwrap');
 
@@ -23,8 +24,8 @@ async function gate(t, program, extraEnv = {}) {
     '--proc', '/proc', '--info-fd', '3', '--chdir', ROOT, '--', process.execPath,
     path.join(ROOT, 'tools/pid1-gate.js'), '--', process.execPath, '-e', program], {
     cwd: ROOT, stdio: ['pipe', 'pipe', 'pipe', 'pipe'],
-    env: { ...process.env, ...extraEnv, RELAYBRIDGE_OWNER_SOCKET: control.address,
-      RELAYBRIDGE_OWNER_NONCE: control.nonce, RELAYBRIDGE_OWNER_RUN_ID: 'run_gate_fixture' },
+    env: isolatedEnv({ ...extraEnv, RELAYBRIDGE_OWNER_SOCKET: control.address,
+      RELAYBRIDGE_OWNER_NONCE: control.nonce, RELAYBRIDGE_OWNER_RUN_ID: 'run_gate_fixture' }),
   });
   let stdout = [], stderr = [];
   proc.stdout.on('data', (data) => stdout.push(data)); proc.stderr.on('data', (data) => stderr.push(data));
@@ -89,8 +90,8 @@ test('no proceed means no provider dispatch; disconnect destroys the pinned name
 
 test('gate refuses to execute outside a namespace PID1 even with a valid-looking hello environment', { timeout: 5000 }, async () => {
   const proc = spawn(process.execPath, [path.join(ROOT, 'tools/pid1-gate.js'), '--', process.execPath, '-e', "process.stdout.write('UNOWNED');"],
-    { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, RELAYBRIDGE_OWNER_SOCKET: '/tmp/no-owner-control',
-      RELAYBRIDGE_OWNER_NONCE: 'a'.repeat(64), RELAYBRIDGE_OWNER_RUN_ID: 'run_not_pid1' } });
+    { stdio: ['ignore', 'pipe', 'pipe'], env: isolatedEnv({ RELAYBRIDGE_OWNER_SOCKET: '/tmp/no-owner-control',
+      RELAYBRIDGE_OWNER_NONCE: 'a'.repeat(64), RELAYBRIDGE_OWNER_RUN_ID: 'run_not_pid1' }) });
   let stdout = ''; proc.stdout.on('data', (data) => stdout += data); proc.stderr.resume();
   const code = await new Promise((resolve) => proc.once('close', resolve));
   assert.equal(code, 78); assert.equal(stdout, '');

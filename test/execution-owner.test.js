@@ -1,9 +1,11 @@
 'use strict';
+require('./helpers/isolated-env').scrubInheritedEnv();
 const nativeTest=require('node:test'),assert=require('node:assert/strict');
 const test=process.platform==='linux'?nativeTest:nativeTest.skip;
 const fs=require('node:fs'),os=require('node:os'),path=require('node:path');
 const {spawn,spawnSync}=require('node:child_process');
 const {createOwnerJournal,controllerLock,hash}=require('../lib/execution-owner');
+const { isolatedEnv } = require('./helpers/isolated-env');
 const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 const pin={hostPid:12345,starttime:'100',nsIno:'99999',namespacePid:1,bootId:'11111111-1111-1111-1111-111111111111'};
 const binding={requestId:'request_one',invocationId:'invoke_one',attemptId:'attempt_one',runId:'run_one',taskId:'task_one',provider:'fixture',accountId:'default',executionHash:hash('execution'),cwdIdentityHash:hash('cwd'),cwdPolicyId:hash('policy'),reservationId:'reservation_one'};
@@ -25,9 +27,9 @@ function input(store,id){const s=store.inspect(id);return {recoveryId:'recover_o
 
 test('actual flock controller excludes another process and child does not inherit lock',async t=>{
  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'rb-real-flock-'));fs.chmodSync(dir,0o700);t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
- const first=controllerLock(dir);const contender=()=>spawnSync('/usr/bin/flock',['-n','-E','73',path.join(dir,'controller.lock'),'/bin/true'],{encoding:'utf8'});
+ const first=controllerLock(dir);const contender=()=>spawnSync('/usr/bin/flock',['-n','-E','73',path.join(dir,'controller.lock'),'/bin/true'],{ env: isolatedEnv(), encoding:'utf8'});
  assert.equal(contender().status,73);
- const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});t.after(()=>child.kill());await wait(30);
+ const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{ env: isolatedEnv(), stdio:'ignore'});t.after(()=>child.kill());await wait(30);
  first.close();assert.equal(contender().status,0,'ordinary child must not retain controller fd');
  const second=controllerLock(dir);second.close();
 });

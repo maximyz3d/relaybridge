@@ -18,6 +18,8 @@ import { compileOutputProfile } from '../lib/output-profiles.js';
 import { redactCheckpointSecrets } from '../lib/partial-checkpoint.js';
 import { normalizeQualitativeQuotaExhaustion } from '../lib/vendor-quota.js';
 
+import fundingRouting from '../lib/funding-routing.js';
+
 const OUTPUT_PROFILE_SCHEMA = z.object({ id:z.string().regex(/^[a-z][a-z0-9-]{0,63}$/),
   version:z.number().int().positive(), digest:z.string().regex(/^[0-9a-f]{64}$/).optional() }).strict()
   .describe('Optional output criteria selected from list_output_profiles. Use the returned id/version/digest to pin guidance; it grants no permissions.');
@@ -577,6 +579,17 @@ async function buildContextBundle({
       preference: allocatedCreditRaw.preference ? { mode: allocatedCreditRaw.preference.mode,
         manualTarget: allocatedCreditRaw.preference.manualTarget, source: allocatedCreditRaw.preference.source } : null,
       effective: allocatedCreditRaw.effective || null,
+      fundingProfiles: allocatedCreditRaw.fundingProfiles ? {
+        storeState: allocatedCreditRaw.fundingProfiles.storeState,
+        storeRevision: allocatedCreditRaw.fundingProfiles.storeRevision,
+        selected: allocatedCreditRaw.fundingProfiles.selected ? {
+          profileId: allocatedCreditRaw.fundingProfiles.selected.profileId,
+          profileRevision: allocatedCreditRaw.fundingProfiles.selected.profileRevision,
+        } : null,
+        profiles: (allocatedCreditRaw.fundingProfiles.profiles || []).slice(0, 100).map(p => ({
+          id: p.id, provider: p.provider, revision: p.revision, dispatchAllowed: p.dispatchAllowed,
+        })),
+      } : null,
     } : null,
     continuity: {
       settings: continuitySettingsRaw.settings || null,
@@ -1277,7 +1290,7 @@ export function sanitizeProviderResponse(response) {
     cancelled: !!response.cancelled,
     modelInvocation,
     tokenUsageSource: modelInvocation === false ? 'not_invoked' : strictBoundedString(response.token_usage_source) || (modelInvocation === null ? 'unknown' : response.usage?.token_source || 'chars_div_4'),
-    failureClass: PROVIDER_FAILURE_CLASSES.has(rawFailureClass) ? rawFailureClass : null,
+    failureClass: (PROVIDER_FAILURE_CLASSES.has(rawFailureClass) || fundingRouting.FUNDING_ERROR_CODES.has(rawFailureClass)) ? rawFailureClass : null,
     resultSubtype: strictBoundedString(response.result_subtype),
     outputDetector: normalizeOutputDetector(response.output_detector),
     resultSchemaDisagreement: response.result_schema_disagreement === true,
@@ -1428,6 +1441,7 @@ function providerSucceeded(response) {
 }
 
 function bridgeFailureResult(error, { kind, signal }) {
+  const fundingError = fundingRouting.FUNDING_ERROR_CODES.has(error.detail?.errorCode) ? error.detail.errorCode : null;
   const bridgeStatus = error instanceof BridgeError && Number.isInteger(error.status)
     ? error.status : null;
   const rawFailureClass = error instanceof BridgeError
@@ -1462,8 +1476,8 @@ function bridgeFailureResult(error, { kind, signal }) {
       exitCode: -1,
       droppedOut: true,
       stdout: '',
-      stderr: validation?.reason || error.message,
-      route: {},
+      stderr: fundingError || validation?.reason || error.message,
+      route: fundingError ? error.detail?.route || {} : {},
       cancelled: !!cancellationClass,
       timedOut: false,
       authFailed: authRequired,
@@ -1479,10 +1493,10 @@ function bridgeFailureResult(error, { kind, signal }) {
       transportReceiptPersistenceError: transportReceiptId
         ? strictBoundedString(error.detail?.receiptPersistenceError, 500) : null,
       failureClass: deterministicPreflightRejection
-        ? (preflightFailureClass || 'policy') : cancellationClass,
+        ? (fundingError || preflightFailureClass || 'policy') : cancellationClass,
       stopReason: cancellationClass,
       actionPreflight: error.detail?.actionPreflight || null,
-      errorCode: validation?.code || null,
+      errorCode: fundingError || validation?.code || null,
       validation,
     },
   };
@@ -1638,6 +1652,8 @@ export function collectionBudgetMs(collectionMs, collectionOverride) {
 
 async function callProvider({
   kind,
+  funding,
+  expectedAccountId,
   prompt,
   outputProfile,
   cwd,
@@ -1663,6 +1679,7 @@ async function callProvider({
   effort,
   maxEffortOverride = false,
 }) {
+  if (funding !== undefined || expectedAccountId !== undefined) useCache = false; // Never reuse evidence across profile/account revisions.
   // A host/transport deadline (SDK TimeoutError) must not abort the bridge
   // request: the provider process keeps running and the bridge still stores
   // the receipt, retrievable later by requestId via get_receipt/get_run. An
@@ -1745,13 +1762,17 @@ async function callProvider({
     }
     const response = await bridgeRequest('/api/workspace/validate', {
       method: 'POST',
-      body: { kind, prompt, outputProfile, cwd, requestId, model, execution, requiresWorkspaceAccess, inlineEvidence,
+      body: { kind, funding, expectedAccountId, prompt, outputProfile, cwd, requestId, model, execution, requiresWorkspaceAccess, inlineEvidence,
         taskTier: effectiveTaskTier, modelTier: effectiveModelTier,
         effort, maxEffortOverride, providerBudget, childProcessPolicy, allowedWritePaths, dangerous: false },
       timeoutMs: durableTaskId ? collectionRemaining() : TIMEOUT_POLICY.transportTimeoutMs(timeoutMs),
       signal: bridgeSignal,
       actionIdentity: true,
     });
+    if (funding !== undefined) {
+      if (!response.funding) throw new Error('funding_admission_missing');
+      funding = response.funding;
+    }
     workspaceAdmission = normalizeWorkspaceAdmission(response);
     if (!workspaceAdmission) {
       throw new Error('RelayBridge returned malformed cwd admission identity; provider execution is blocked.');
@@ -1876,7 +1897,7 @@ async function callProvider({
     };
     try {
       handle = await bridgeRequest('/api/tasks', { method: 'POST', actionIdentity: true, signal: bridgeSignal, timeoutMs: collectionRemaining(),
-        body: { deliveryMode: 'queued', taskId: durableTaskId, kind, prompt, cwd, requiresWorkspaceAccess, inlineEvidence,
+        body: { deliveryMode: 'queued', taskId: durableTaskId, kind, funding, expectedAccountId, prompt, cwd, requiresWorkspaceAccess, inlineEvidence,
           requestId, outerReceiptId, continuityId, continuityEpoch, expectedCwdIdentityHash: workspaceAdmission.cwdIdentityHash,
           expectedCwdPolicyId: workspaceAdmission.cwdPolicyId,
           ...(admittedPromptHash ? { expectedPromptHash: admittedPromptHash } : {}),
@@ -1920,6 +1941,8 @@ async function callProvider({
       method: 'POST',
       body: {
         kind,
+        funding,
+        expectedAccountId,
         prompt,
         cwd,
         requiresWorkspaceAccess,
@@ -2289,6 +2312,17 @@ export function buildServer() {
   // bounded parameter cannot be added without its range being documented.
   const registerToolRaw = server.registerTool.bind(server);
   server.registerTool = (name, config, handler) => {
+    // Capture reserved routing selectors before Zod can strip unknown fields.
+    // Unsupported wrappers must fail, never silently launch a subscription.
+    if (config?.inputSchema?.extend) {
+      config = { ...config, inputSchema: config.inputSchema.extend(Object.fromEntries(
+        ['funding', ...fundingRouting.FUNDING_ALIASES].map(key => [key, z.unknown().optional()]))) };
+      const original = handler;
+      handler = safeHandler(async (args, context) => {
+        fundingRouting.assertCanonicalFunding(args, ['ask_provider', 'submit_task', 'preview_funding_route'].includes(name));
+        return original(args, context);
+      });
+    }
     try {
       const ranges = describeNumericBounds(config?.inputSchema);
       if (ranges && config?.description && !config.description.includes('Accepted ranges:')) {
@@ -2715,6 +2749,7 @@ export function buildServer() {
     title: 'Ask one provider safely',
     description: 'Run one safe provider turn; omitted timeout uses a durable task and may return a pending taskId after bounded collection. An explicit timeout is a hard deadline. Run one bounded, non-agentic provider turn with dangerous:false forced, available route metadata, cache controls, quota/failure signals, and an append-only receipt. The provider CLI runs in its own safe/headless mode, which is a vendor-side restriction rather than an OS sandbox. Hosted CLIs may not reveal final model revisions, usage, plan, or provider request IDs.',
     inputSchema: z.object({
+      expectedAccountId: z.string().min(1).max(100).optional(),
       outputProfile: OUTPUT_PROFILE_SCHEMA.optional(),
       ...GROUNDING_FIELDS,
       continuityId: z.string().regex(/^ct_[a-f0-9]{24}$/).optional(),
@@ -3797,10 +3832,80 @@ export function buildServer() {
       ownerToken: z.string().regex(/^[a-f0-9]{64}$/).optional(), expectedEpoch: z.number().int().min(1).optional() }).strict(), annotations: ACTION,
   }, safeHandler(async ({ id, ...input }) => result(await bridgeRequest(`/api/continuity/${id}/resume`, { method: 'POST', body: input, actionIdentity: true }))));
 
+  server.registerTool('list_funding_profiles', {
+    title: 'List private organization/project profiles', description: 'Read references, revisions and selection. Profiles do not qualify credits or activate an API transport.',
+    inputSchema: z.object({}), annotations: READ_ONLY,
+  }, safeHandler(async () => result(await bridgeRequest('/api/funding-profiles'))));
+  server.registerTool('set_funding_profile', {
+    title: 'Save a funding profile', description: 'Save metadata and a reserved credential reference only. expectedRevision is the current storeRevision; no keys or funding assertions are accepted.',
+    inputSchema: z.object({ profile: z.unknown(), expectedRevision: z.number().int().nonnegative() }), annotations: ACTION,
+  }, safeHandler(async input => result(await bridgeRequest('/api/funding-profiles', { method: 'POST', body: input, actionIdentity: true }))));
+  server.registerTool('remove_funding_profile', {
+    title: 'Remove a funding profile', description: 'Remove one profile with a store revision check; does not remove credentials or change provider logins.',
+    inputSchema: z.object({ profileId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$/), expectedRevision: z.number().int().nonnegative() }), annotations: ACTION,
+  }, safeHandler(async ({ profileId, expectedRevision }) => result(await bridgeRequest(`/api/funding-profiles/${encodeURIComponent(profileId)}`, {
+    method: 'DELETE', body: { expectedRevision }, actionIdentity: true }))));
+  server.registerTool('select_funding_profile', {
+    title: 'Select organization/project for new funded requests', description: 'Set or clear the profile default with a store revision check. Existing queued tasks keep their accepted binding.',
+    inputSchema: z.object({ profileId: z.string().nullable(), expectedRevision: z.number().int().nonnegative() }), annotations: ACTION,
+  }, safeHandler(async input => result(await bridgeRequest('/api/settings/funding-selection', { method: 'PUT', body: input, actionIdentity: true }))));
+  server.registerTool('preview_funding_route', {
+    title: 'Preview API eligibility and explicit subscription fallback', description: 'No model call. Included API execution remains blocked without provider-enforced grant-only spending. route authorized_prepaid is allowed only with the owner\'s private prepaid permit for one OpenAI profile (read-only API agent, not grant-only, provider hard cap can lag; no purchase, reload or renewal). Subscription fallback still needs normal admission.',
+    inputSchema: z.object({ kind: z.enum(['claude', 'codex']), funding: z.unknown(), expectedAccountId: z.string().optional() }), annotations: READ_ONLY,
+  }, safeHandler(async input => result(await bridgeRequest('/api/funding-route/preview', { method: 'POST', body: input, actionIdentity: true }))));
+
+  // Unified runs: the request is forwarded unchanged (unknown keys included) so
+  // the bridge applies exactly the validation the CLI and HTTP API get.
+  // Server-internal fields such as unifiedRun or reserveRelease are refused there.
+  const UNIFIED_RUN_ID = z.string().regex(/^ur_[a-f0-9]{24}$/);
+  server.registerTool('unified_run_create', {
+    title: 'Start a unified run across listed native segments',
+    description: 'Carry one objective across the listed native accounts (each with accountId, model and effort; accountId "default" is the existing login). dangerous=true needs acknowledgeFilesystemWrites=true and edits the workspace. advisoryFileScope is shown to the provider but is NOT enforced (writeBoundary advisory_unenforced); exact allowedWritePaths contracts are refused. API segments are read-only and blocked unless grant-only funding is verified; owner-authorized prepaid never applies to unified runs.',
+    inputSchema: z.object({
+      objective: z.string().min(1).max(20000),
+      constraints: z.string().max(12000).optional(),
+      advisoryFileScope: z.array(z.string().min(1).max(500)).max(128).optional(),
+      cwd: z.string().max(1000).optional(),
+      title: z.string().max(120).optional(),
+      dangerous: z.boolean().optional(),
+      acknowledgeFilesystemWrites: z.boolean().optional(),
+      segments: z.array(z.unknown()).min(1).max(8),
+    }).passthrough(),
+    annotations: { ...DESTRUCTIVE, openWorldHint: true },
+  }, safeHandler(async (input, context) => result(await bridgeRequest('/api/unified-runs', {
+    method: 'POST', body: input, actionIdentity: true, signal: context?.mcpReq?.signal }))));
+  server.registerTool('unified_run_status', {
+    title: 'Read a unified run',
+    description: 'Read state, segments and writer_diff_summary. Reading may advance a run whose segment has settled. An uncertain writer segment reports workspaceReconciliation with a workspaceEffectsDigest for unified_run_link.',
+    inputSchema: z.object({ runId: UNIFIED_RUN_ID }).strict(), annotations: ACTION,
+  }, safeHandler(async ({ runId }, context) => result(await bridgeRequest(`/api/unified-runs/${encodeURIComponent(runId)}`, {
+    signal: context?.mcpReq?.signal }))));
+  server.registerTool('unified_run_resume', {
+    title: 'Resume a waiting unified run',
+    description: 'Retry a run waiting for quota or for a writer. A terminal run returns its record without any new submit or model call. An uncertain segment is refused; use unified_run_link.',
+    inputSchema: z.object({ runId: UNIFIED_RUN_ID }).passthrough(), annotations: { ...ACTION, openWorldHint: true },
+  }, safeHandler(async ({ runId, ...body }, context) => result(await bridgeRequest(`/api/unified-runs/${encodeURIComponent(runId)}/resume`, {
+    method: 'POST', body, actionIdentity: true, signal: context?.mcpReq?.signal }))));
+  server.registerTool('unified_run_link', {
+    title: 'Continue after an uncertain unified segment',
+    description: 'Start exactly one new segment after an uncertain one, only once it is physically settled. A writer run needs the current workspaceEffectsDigest from unified_run_status; confirmDuplicateBillingRisk=true is required when a call may have been sent.',
+    inputSchema: z.object({ runId: UNIFIED_RUN_ID, workspaceEffectsDigest: z.string().max(128).optional(),
+      confirmDuplicateBillingRisk: z.boolean().optional() }).passthrough(), annotations: { ...DESTRUCTIVE, openWorldHint: true },
+  }, safeHandler(async ({ runId, ...body }, context) => result(await bridgeRequest(`/api/unified-runs/${encodeURIComponent(runId)}/link`, {
+    method: 'POST', body, actionIdentity: true, signal: context?.mcpReq?.signal }))));
+
+  server.registerTool('unified_run_cancel', {
+    title: 'Cancel a unified run safely',
+    description: 'Cancel a unified run only when no segment can be running: a waiting run, a segment still queued and never started (verified by its exact intent), or a segment already physically settled. A running, uncertain or unrecorded segment is refused, never stopped or replayed. Cancelled runs never auto-start pending work.',
+    inputSchema: z.object({ runId: UNIFIED_RUN_ID }).strict(), annotations: { ...DESTRUCTIVE, openWorldHint: false },
+  }, safeHandler(async ({ runId }, context) => result(await bridgeRequest(`/api/unified-runs/${encodeURIComponent(runId)}/cancel`, {
+    method: 'POST', body: {}, actionIdentity: true, signal: context?.mcpReq?.signal }))));
+
   server.registerTool('submit_task', {
     title: 'Submit a background task',
     description: 'Queue a prompt to a provider and return a task id IMMEDIATELY without waiting for the run. Use for work longer than a chat turn, or when the result should be collectable later from a different surface. Link a collab id to append the result to that shared thread.',
     inputSchema: z.object({
+      expectedAccountId: z.string().min(1).max(100).optional(),
       deliveryMode: z.literal('queued').optional().describe('Return a sanitized pending/result handle; taskId must be caller-known for retry without duplicate execution.'),
       taskId: z.string().regex(/^t_[A-Za-z0-9_]{1,120}$/).optional(),
       outputProfile: OUTPUT_PROFILE_SCHEMA.optional(),
@@ -3962,6 +4067,8 @@ export function buildServer() {
           allow: z.array(z.string().max(120)).max(64).optional(),
           deny: z.array(z.string().max(120)).max(64).optional(),
         }).optional(),
+        // Accepted only so the bridge can refuse them; Zod would strip them otherwise.
+        ...Object.fromEntries(['funding', 'expectedAccountId', ...fundingRouting.FUNDING_ALIASES].map(key => [key, z.unknown().optional()])),
       })).min(1).max(50),
       requestId: z.string().max(200).optional(),
       actor: z.string().max(64).optional(),

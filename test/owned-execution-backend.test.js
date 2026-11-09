@@ -1,7 +1,8 @@
 'use strict';
 const test = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
-const { createOwnedExecutionBackend } = require('../lib/owned-execution-backend');
+const { createOwnedExecutionBackend, physicalOwnerHolder } = require('../lib/owned-execution-backend');
+const { workspacesOverlap } = require('../lib/continuity');
 const { qualifyOwnedFixtureHost, qualifyOwnedHost } = require('../lib/owned-host-qualification');
 const { createTaskQueue } = require('../lib/task-queue');
 const { createWorkflowPipeline } = require('../lib/workflow-pipeline');
@@ -90,6 +91,7 @@ test('default disabled backend creates no authority or runtime directory', async
   assert.equal(backend.writerAuthority, null); assert.equal(backend.taskAuthority, null);
   assert.equal(backend.writerRecoveryBackend, null); assert.equal(fs.existsSync(path.join(temp, 'execution-owners')), false);
   assertCode(() => backend.assertQualifiedRevision({}), 'OWNER_BACKEND_UNAVAILABLE');
+  assert.deepEqual(backend.heldWorkspaces(), []);
   assert.equal((await backend.initialize()).held, 0); backend.close();
 });
 
@@ -133,6 +135,58 @@ native('same-cwd ordinary dangerous launches are fenced; authentic context alone
     backend.assertWorkspaceLaunchAllowed({ cwd: f.cwd, dangerous: true, privateContext: context }); reached(); await release;
   } });
   f.submit(); await atGate; assert.equal(f.dispatched(), 0); proceed(); await waitFor(() => f.pipeline.get(RUN).phase === 'revision_ready');
+});
+
+native('held owner workspaces expose only the exact task, reservation and owner binding, read-only', async (t) => {
+  let reached, proceed, held; const atGate = new Promise((resolve) => { reached = resolve; }), release = new Promise((resolve) => { proceed = resolve; });
+  const f = await fixture(t, { beforeStart: async ({ handle, context, backend }) => {
+    held = { rows: backend.heldWorkspaces(), handle, context }; reached(); await release;
+  } });
+  const task = f.submit(); await atGate;
+  assert.equal(held.rows.length, 1);
+  const [row] = held.rows;
+  assert.equal(Object.isFrozen(row), true);
+  assert.deepEqual(Object.keys(row).sort(), ['cwd', 'ownerId', 'reservationId', 'taskId']);
+  assert.equal(row.taskId, task.id); assert.equal(row.reservationId, held.context.reservationId); assert.equal(row.ownerId, held.handle.ownerId);
+  assert.equal(fs.realpathSync(row.cwd), fs.realpathSync(f.cwd));
+  proceed(); await waitFor(() => f.pipeline.get(RUN).phase === 'revision_ready');
+  assert.deepEqual(f.backend.heldWorkspaces(), []);
+});
+
+test('physical owner holder: overlap holds both ways, only the exact binding is exempt, unavailable authority holds all', () => {
+  const row = Object.freeze({ cwd: '/srv/repo/sub', taskId: 't_a', reservationId: 'qr_a', ownerId: 'owner_a' });
+  const backend = { heldWorkspaces: () => [row] };
+  const holder = (cwd, exempt) => physicalOwnerHolder(backend, cwd, { overlap: (a, b) => workspacesOverlap(a, b, { platform: 'linux' }), exempt });
+  for (const cwd of ['/srv/repo', '/srv/repo/sub', '/srv/repo/sub/deep']) assert.deepEqual(holder(cwd), { holder: 'physical_owner', id: 'owner_a' }, cwd);
+  assert.equal(holder('/srv/repo/other'), null); assert.equal(holder('/srv/repo-two'), null);
+  assert.equal(holder('/srv/repo', { taskId: 't_a', reservationId: 'qr_a', ownerId: 'owner_a' }), null);
+  for (const exempt of [{ taskId: 't_b', reservationId: 'qr_a', ownerId: 'owner_a' }, { taskId: 't_a', reservationId: 'qr_b', ownerId: 'owner_a' },
+    { taskId: 't_a', reservationId: 'qr_a', ownerId: 'owner_b' }, { taskId: 't_a', reservationId: 'qr_a', ownerId: null }, { taskId: 't_a', reservationId: 'qr_a' }]) {
+    assert.deepEqual(holder('/srv/repo', exempt), { holder: 'physical_owner', id: 'owner_a' }, JSON.stringify(exempt));
+  }
+  const unavailable = { heldWorkspaces: () => { throw Object.assign(new Error('x'), { code: 'OWNER_BACKEND_UNAVAILABLE' }); } };
+  for (const cwd of ['/srv/repo', '/elsewhere']) {
+    assert.deepEqual(physicalOwnerHolder(unavailable, cwd, { overlap: workspacesOverlap, exempt: { taskId: 't_a', reservationId: 'qr_a', ownerId: 'owner_a' } }),
+      { holder: 'physical_owner', id: null });
+  }
+  assert.equal(physicalOwnerHolder(null, '/srv/repo', { overlap: workspacesOverlap }), null);
+});
+
+native('physical owner holder over real owner rows exempts only the running task\'s exact task, reservation and owner', async (t) => {
+  let reached, proceed, seen; const atGate = new Promise((resolve) => { reached = resolve; }), release = new Promise((resolve) => { proceed = resolve; });
+  const f = await fixture(t, { beforeStart: async ({ handle, context, backend }) => {
+    const exact = { taskId: context.taskId, reservationId: context.reservationId, ownerId: handle.ownerId };
+    const check = (cwd, exempt) => physicalOwnerHolder(backend, cwd, { overlap: workspacesOverlap, exempt });
+    seen = { exact, parent: check(path.dirname(f.cwd)), same: check(f.cwd), exempted: check(f.cwd, exact), sibling: check(path.join(f.temp, 'data')),
+      mismatches: [{ ...exact, taskId: 't_other' }, { ...exact, reservationId: 'qr_other' }, { ...exact, ownerId: 'owner_other' }].map((exempt) => check(f.cwd, exempt)) };
+    reached(); await release;
+  } });
+  f.submit(); await atGate;
+  const held = { holder: 'physical_owner', id: seen.exact.ownerId };
+  assert.deepEqual(seen.parent, held); assert.deepEqual(seen.same, held); assert.equal(seen.exempted, null); assert.equal(seen.sibling, null);
+  for (const result of seen.mismatches) assert.deepEqual(result, held);
+  proceed(); await waitFor(() => f.pipeline.get(RUN).phase === 'revision_ready');
+  assert.equal(physicalOwnerHolder(f.backend, f.cwd, { overlap: workspacesOverlap }), null);
 });
 
 native('owned lease before task enrollment fences ordinary writes across disabled restart', async (t) => {

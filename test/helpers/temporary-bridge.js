@@ -5,6 +5,7 @@ const os = require('node:os');
 const path = require('node:path');
 const http = require('node:http');
 const { spawn } = require('node:child_process');
+const { isolatedEnv } = require('./isolated-env');
 const ROOT = path.resolve(__dirname, '../..');
 
 async function waitFor(check, timeoutMs = 10000) {
@@ -17,7 +18,24 @@ async function waitFor(check, timeoutMs = 10000) {
   throw new Error('fixture condition did not become true');
 }
 
+const MANDATORY_ENV = ['RELAYBRIDGE_CONFIG_FILE', 'RELAYBRIDGE_TOKEN_FILE', 'RELAYBRIDGE_DATA_DIR', 'RELAYBRIDGE_ALLOWED_ROOTS', 'HOME', 'USERPROFILE'];
+
+// Fixture bindings must point at the disposable root; an undefined or empty override would delete them.
+function fixtureEnv(root, port, configPath, nativeHome, extraEnv = {}) {
+  for (const [key, value] of Object.entries(extraEnv)) {
+    if (MANDATORY_ENV.includes(key.toUpperCase()) && (value === undefined || value === '')) {
+      throw new Error(`startTestBridge: env.${key} would remove a mandatory fixture binding`);
+    }
+  }
+  return isolatedEnv({ HOME: nativeHome, USERPROFILE: nativeHome, CLAUDE_CONFIG_DIR: undefined, CODEX_HOME: undefined,
+    NODE_ENV: 'test', RELAYBRIDGE_TEST_BUILD_ID: 'security-integration-fixture',
+    PORT: String(port), PTY_MODE: 'none', RELAYBRIDGE_CONFIG_FILE: configPath,
+    RELAYBRIDGE_TOKEN_FILE: path.join(root, 'token'), RELAYBRIDGE_DATA_DIR: path.join(root, 'data'),
+    RELAYBRIDGE_ALLOWED_ROOTS: root, ...extraEnv });
+}
+
 async function startTestBridge(t, configure, { env: extraEnv = {}, nodeArgs = [] } = {}) {
+  fixtureEnv('', 0, '', '', extraEnv); // reject bad overrides before creating anything
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rb-security-bridge-'));
   const nativeHome = path.join(root, 'native-home'); fs.mkdirSync(nativeHome);
   const configPath = path.join(root, 'config.json');
@@ -29,11 +47,7 @@ async function startTestBridge(t, configure, { env: extraEnv = {}, nodeArgs = []
   const base = `http://127.0.0.1:${port}`;
   const proc = spawn(process.execPath, [...nodeArgs, path.join(ROOT, 'server.js')], {
     cwd: ROOT, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, HOME: nativeHome, USERPROFILE: nativeHome, CLAUDE_CONFIG_DIR: undefined, CODEX_HOME: undefined,
-      NODE_ENV: 'test', RELAYBRIDGE_TEST_BUILD_ID: 'security-integration-fixture',
-      PORT: String(port), PTY_MODE: 'none', RELAYBRIDGE_CONFIG_FILE: configPath,
-      RELAYBRIDGE_TOKEN_FILE: path.join(root, 'token'), RELAYBRIDGE_DATA_DIR: path.join(root, 'data'),
-      RELAYBRIDGE_ALLOWED_ROOTS: root, ...extraEnv },
+    env: fixtureEnv(root, port, configPath, nativeHome, extraEnv),
   });
   let output = '', headers;
   const collect = (data) => { output = (output + data).slice(-16000); };
@@ -66,4 +80,4 @@ function completeJsonLines(file) {
   return text.slice(0, text.lastIndexOf('\n') + 1).split('\n').filter(Boolean).map((line) => JSON.parse(line));
 }
 
-module.exports = { startTestBridge, waitFor, completeJsonLines };
+module.exports = { startTestBridge, fixtureEnv, waitFor, completeJsonLines };

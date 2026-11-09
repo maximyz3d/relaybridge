@@ -7,6 +7,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { EventEmitter } = require('node:events');
 const { spawnSync } = require('node:child_process');
+const { isolatedEnv } = require('./helpers/isolated-env');
 const {
   validateBrowserUrl,
   chromeOpeners,
@@ -64,13 +65,13 @@ test('unknown browser choices fail closed', () => {
 });
 
 posixOnly('Chrome setup scripts pass their native shell syntax checks', () => {
-  const installCheck = spawnSync('sh', ['-n', installScript], { encoding: 'utf8' });
+  const installCheck = spawnSync('sh', ['-n', installScript], { env: isolatedEnv(), encoding: 'utf8' });
   assert.equal(installCheck.status, 0, installCheck.stderr);
-  const relayInstallCheck = spawnSync('sh', ['-n', relayInstallScript], { encoding: 'utf8' });
+  const relayInstallCheck = spawnSync('sh', ['-n', relayInstallScript], { env: isolatedEnv(), encoding: 'utf8' });
   assert.equal(relayInstallCheck.status, 0, relayInstallCheck.stderr);
-  const startCheck = spawnSync('bash', ['-n', startScript], { encoding: 'utf8' });
+  const startCheck = spawnSync('bash', ['-n', startScript], { env: isolatedEnv(), encoding: 'utf8' });
   assert.equal(startCheck.status, 0, startCheck.stderr);
-  const proxyCheck = spawnSync(process.execPath, ['--check', windowsProxyScript], { encoding: 'utf8' });
+  const proxyCheck = spawnSync(process.execPath, ['--check', windowsProxyScript], { env: isolatedEnv(), encoding: 'utf8' });
   assert.equal(proxyCheck.status, 0, proxyCheck.stderr);
 });
 
@@ -150,7 +151,7 @@ test('RelayBridge MCP installer converts signals to failures before transactiona
 });
 
 posixOnly('Chrome MCP installer fails closed when both clients are skipped', () => {
-  const result = spawnSync('sh', [installScript, '--skip-codex', '--skip-claude'], { encoding: 'utf8' });
+  const result = spawnSync('sh', [installScript, '--skip-codex', '--skip-claude'], { env: isolatedEnv(), encoding: 'utf8' });
   assert.equal(result.status, 1);
   assert.match(result.stderr, /both clients were skipped/);
 });
@@ -209,14 +210,13 @@ posixOnly('WSL launcher passes an injection-safe literal port and verifies Chrom
 
   const result = spawnSync('bash', [startScript], {
     encoding: 'utf8',
-    env: {
-      ...process.env,
+    env: isolatedEnv({
       PATH: `${binDir}:${process.env.PATH || ''}`,
       RELAYBRIDGE_CHROME_PORT: '9333',
       RELAYBRIDGE_TEST_ARGS: capturedArgs,
       RELAYBRIDGE_TEST_NAT_ATTEMPTED: natAttempted,
       WSL_DISTRO_NAME: 'RelayBridgeTest',
-    },
+    }),
   });
   assert.equal(result.status, 0, result.stderr);
   const args = fs.readFileSync(capturedArgs, 'utf8');
@@ -231,7 +231,7 @@ posixOnly('WSL launcher passes an injection-safe literal port and verifies Chrom
 posixOnly('Chrome launcher rejects invalid ports before invoking an opener', () => {
   const result = spawnSync('bash', [startScript], {
     encoding: 'utf8',
-    env: { ...process.env, RELAYBRIDGE_CHROME_PORT: '9222;whoami', WSL_DISTRO_NAME: 'RelayBridgeTest' },
+    env: isolatedEnv({ RELAYBRIDGE_CHROME_PORT: '9222;whoami', WSL_DISTRO_NAME: 'RelayBridgeTest' }),
   });
   assert.equal(result.status, 1);
   assert.match(result.stderr, /must be 1-65535/);
@@ -241,12 +241,11 @@ posixOnly('Chrome launcher rejects a colliding or malformed WSL bridge port', ()
   for (const bridgePort of ['9222', '49222;whoami']) {
     const result = spawnSync('bash', [startScript], {
       encoding: 'utf8',
-      env: {
-        ...process.env,
+      env: isolatedEnv({
         RELAYBRIDGE_CHROME_PORT: '9222',
         RELAYBRIDGE_CHROME_WSL_BRIDGE_PORT: bridgePort,
         WSL_DISTRO_NAME: 'RelayBridgeTest',
-      },
+      }),
     });
     assert.equal(result.status, 1);
     assert.match(result.stderr, /must (?:be 1-65535|differ)/);

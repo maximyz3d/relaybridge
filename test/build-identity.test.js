@@ -1,4 +1,5 @@
 'use strict';
+require('./helpers/isolated-env').scrubInheritedEnv();
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -16,6 +17,7 @@ const {
   writeBuildInfoAtomic,
 } = require('../lib/build-identity.cjs');
 const { receiptStoreIdentity } = require('../lib/receipt-store-identity.cjs');
+const { isolatedEnv } = require('./helpers/isolated-env');
 
 const ROOT = path.resolve(__dirname, '..');
 const posixOnly = process.platform === 'win32' ? test.skip : test;
@@ -42,7 +44,7 @@ function copyStartPreflightFixture(root) {
 }
 
 function git(root, ...args) {
-  const result = spawnSync('git', ['-C', root, ...args], { encoding: 'utf8', windowsHide: true });
+  const result = spawnSync('git', ['-C', root, ...args], { env: isolatedEnv(), encoding: 'utf8', windowsHide: true });
   assert.equal(result.status, 0, result.stderr || result.stdout);
   return result.stdout.trim();
 }
@@ -100,7 +102,7 @@ async function waitUntil(predicate, timeoutMs = 5000) {
 
 function isLiveProcess(pid) {
   try { process.kill(pid, 0); } catch { return false; }
-  const result = spawnSync('ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8' });
+  const result = spawnSync('ps', ['-o', 'stat=', '-p', String(pid)], { env: isolatedEnv(), encoding: 'utf8' });
   const state = (result.stdout || '').trim();
   return result.status === 0 && state !== '' && !state.startsWith('Z');
 }
@@ -510,7 +512,7 @@ test('concurrent source preparations publish one complete deterministic manifest
   const root = makeSourceRepo(t);
   const tool = path.join(ROOT, 'tools', 'prepare-build-info.cjs');
   const runs = Array.from({ length: 4 }, () => new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [tool, root], {
+    const child = spawn(process.execPath, [tool, root], { env: isolatedEnv(),
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
     });
@@ -792,7 +794,7 @@ posixOnly('POSIX MCP registration cannot strand a new token on snapshot or build
   const privateTmp = path.join(root, 'private-tmp');
   fs.mkdirSync(privateTmp);
 
-  const earlyFailureEnv = { ...process.env, TMPDIR: privateTmp };
+  const earlyFailureEnv = isolatedEnv({ TMPDIR: privateTmp });
   delete earlyFailureEnv.HOME;
   delete earlyFailureEnv.CODEX_HOME;
   delete earlyFailureEnv.CLAUDE_CONFIG_DIR;
@@ -813,13 +815,12 @@ posixOnly('POSIX MCP registration cannot strand a new token on snapshot or build
   fs.chmodSync(path.join(fakeBin, 'cp'), 0o755);
   result = spawnSync('sh', [installer, '--skip-codex', '--skip-claude'], {
     cwd: root,
-    env: {
-      ...process.env,
+    env: isolatedEnv({
       HOME: home,
       CODEX_HOME: path.join(home, '.codex'),
       PATH: `${fakeBin}${path.delimiter}${process.env.PATH}`,
       TMPDIR: privateTmp,
-    },
+    }),
     encoding: 'utf8',
   });
   assert.notEqual(result.status, 0, result.stdout + result.stderr);
@@ -829,7 +830,7 @@ posixOnly('POSIX MCP registration cannot strand a new token on snapshot or build
 
   result = spawnSync('sh', [installer, '--skip-codex', '--skip-claude'], {
     cwd: root,
-    env: { ...process.env, HOME: home, CODEX_HOME: path.join(home, '.codex'), TMPDIR: privateTmp },
+    env: isolatedEnv({ HOME: home, CODEX_HOME: path.join(home, '.codex'), TMPDIR: privateTmp }),
     encoding: 'utf8',
   });
   assert.notEqual(result.status, 0, result.stdout + result.stderr);
@@ -918,8 +919,7 @@ exit 2
     const checkoutToken = path.join(checkoutRoot, '.bridge-token');
     const child = spawn('sh', [path.join(checkoutRoot, 'install-mcp.sh'), '--skip-claude'], {
       cwd: checkoutRoot,
-      env: {
-        ...process.env,
+      env: isolatedEnv({
         HOME: home,
         CODEX_HOME: codexHome,
         PATH: `${fakeBin}${path.delimiter}${process.env.PATH}`,
@@ -927,7 +927,7 @@ exit 2
         RELAYBRIDGE_TEST_CONTROL: control,
         RELAYBRIDGE_TEST_MCP_SERVER: path.join(checkoutRoot, 'mcp', 'launcher.mjs'),
         RELAYBRIDGE_TEST_TOKEN_FILE: checkoutToken,
-      },
+      }),
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let output = '';
@@ -974,12 +974,11 @@ exit 2
   write(path.join(lock, 'owner'), staleOwner);
   const staleAttempt = spawnSync('sh', [path.join(rootB, 'install-mcp.sh'), '--skip-codex', '--skip-claude'], {
     cwd: rootB,
-    env: {
-      ...process.env,
+    env: isolatedEnv({
       HOME: home,
       CODEX_HOME: codexHome,
       RELAYBRIDGE_MCP_INSTALL_LOCK_WAIT_ATTEMPTS: '1',
-    },
+    }),
     encoding: 'utf8',
   });
   assert.notEqual(staleAttempt.status, 0);
@@ -1028,13 +1027,12 @@ test('same-version stale MCP identity is rejected with the same receipt store', 
   `;
   const child = spawn(process.execPath, ['--input-type=module', '--eval', childScript], {
     cwd: ROOT,
-    env: {
-      ...process.env,
+    env: isolatedEnv({
       NODE_ENV: 'test',
       RELAYBRIDGE_TEST_BUILD_ID: '2.0.1+aaaaaaaaaaaaaaaa',
       RELAYBRIDGE_URL: `http://127.0.0.1:${port}`,
       RELAYBRIDGE_DATA_DIR: dataDir,
-    },
+    }),
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
   });
@@ -1061,8 +1059,7 @@ test('an unready REST build rejects an MCP mutation even when display version an
   const dataDir = path.join(tempRoot, 'data');
   const proc = spawn(process.execPath, [path.join(ROOT, 'server.js')], {
     cwd: ROOT,
-    env: {
-      ...process.env,
+    env: isolatedEnv({
       NODE_ENV: 'test',
       RELAYBRIDGE_TEST_BUILD_IDENTITY_UNREADY: '1',
       PORT: String(port),
@@ -1070,7 +1067,7 @@ test('an unready REST build rejects an MCP mutation even when display version an
       RELAYBRIDGE_TOKEN_FILE: tokenPath,
       RELAYBRIDGE_DATA_DIR: dataDir,
       RELAYBRIDGE_ALLOWED_ROOTS: tempRoot,
-    },
+    }),
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
   });
@@ -1114,13 +1111,12 @@ test('a launcher-pinned expected identity makes server startup fail before liste
   const port = await reservePort();
   const proc = spawn(process.execPath, [path.join(ROOT, 'server.js')], {
     cwd: ROOT,
-    env: {
-      ...process.env,
+    env: isolatedEnv({
       NODE_ENV: 'test',
       RELAYBRIDGE_TEST_BUILD_ID: '2.0.1+aaaaaaaaaaaaaaaa',
       RELAYBRIDGE_EXPECTED_BUILD_ID: '2.0.1+bbbbbbbbbbbbbbbb',
       PORT: String(port),
-    },
+    }),
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
   });
@@ -1155,7 +1151,7 @@ posixOnly('start.sh owns the exact server across a forced setsid fork', async (t
     });
     server.listen(Number(process.env.PORT), '127.0.0.1');
   `);
-  const realSetsid = spawnSync('sh', ['-c', 'command -v setsid'], { encoding: 'utf8' }).stdout.trim();
+  const realSetsid = spawnSync('sh', ['-c', 'command -v setsid'], { env: isolatedEnv(), encoding: 'utf8' }).stdout.trim();
   assert.ok(realSetsid, 'test host must provide setsid');
   const fakeBin = path.join(root, 'bin');
   const wrapperPidFile = path.join(root, 'setsid-wrapper.pid');
@@ -1168,13 +1164,12 @@ posixOnly('start.sh owns the exact server across a forced setsid fork', async (t
   });
   const child = spawn('bash', [path.join(root, 'start.sh')], {
     cwd: root,
-    env: {
-      ...process.env,
+    env: isolatedEnv({
       PORT: String(port),
       RELAYBRIDGE_PORT: String(port),
       PATH: `${fakeBin}${path.delimiter}${process.env.PATH}`,
       RELAYBRIDGE_TEST_SETSID_WRAPPER_PID: wrapperPidFile,
-    },
+    }),
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let output = '';
@@ -1215,7 +1210,7 @@ posixOnly('start.sh aborts a forced-fork child when its inside-session PID hando
       buildIdentityReady: true,
     }))).listen(Number(process.env.PORT), '127.0.0.1');
   `);
-  const realSetsid = spawnSync('sh', ['-c', 'command -v setsid'], { encoding: 'utf8' }).stdout.trim();
+  const realSetsid = spawnSync('sh', ['-c', 'command -v setsid'], { env: isolatedEnv(), encoding: 'utf8' }).stdout.trim();
   assert.ok(realSetsid, 'test host must provide setsid');
   const fakeBin = path.join(root, 'bin');
   write(path.join(fakeBin, 'setsid'), `#!/bin/sh
@@ -1228,12 +1223,11 @@ exec ${JSON.stringify(realSetsid)} "$@"
   const port = await reservePort();
   const child = spawn('bash', [path.join(root, 'start.sh')], {
     cwd: root,
-    env: {
-      ...process.env,
+    env: isolatedEnv({
       PORT: String(port),
       RELAYBRIDGE_PORT: String(port),
       PATH: `${fakeBin}${path.delimiter}${process.env.PATH}`,
-    },
+    }),
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let output = '';
@@ -1252,7 +1246,7 @@ exec ${JSON.stringify(realSetsid)} "$@"
 
 posixOnly('start.sh never signals an unproven PID injected into its handoff', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relaybridge-start-untrusted-handoff-'));
-  const victim = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+  const victim = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { env: isolatedEnv(),
     stdio: 'ignore',
   });
   t.after(async () => {
@@ -1278,13 +1272,12 @@ exit 74
   const port = await reservePort();
   const child = spawn('bash', [path.join(root, 'start.sh')], {
     cwd: root,
-    env: {
-      ...process.env,
+    env: isolatedEnv({
       PORT: String(port),
       RELAYBRIDGE_PORT: String(port),
       PATH: `${fakeBin}${path.delimiter}${process.env.PATH}`,
       RELAYBRIDGE_TEST_UNTRUSTED_PID: String(victim.pid),
-    },
+    }),
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let output = '';
@@ -1304,9 +1297,9 @@ exit 74
 
 posixOnly('start.sh rejects an unrelated valid session leader without signaling it', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relaybridge-start-unrelated-session-'));
-  const realSetsid = spawnSync('sh', ['-c', 'command -v setsid'], { encoding: 'utf8' }).stdout.trim();
+  const realSetsid = spawnSync('sh', ['-c', 'command -v setsid'], { env: isolatedEnv(), encoding: 'utf8' }).stdout.trim();
   assert.ok(realSetsid, 'test host must provide setsid');
-  const victim = spawn(realSetsid, [process.execPath, '-e', 'setInterval(() => {}, 1000)'], {
+  const victim = spawn(realSetsid, [process.execPath, '-e', 'setInterval(() => {}, 1000)'], { env: isolatedEnv(),
     stdio: 'ignore',
   });
   t.after(async () => {
@@ -1316,7 +1309,7 @@ posixOnly('start.sh rejects an unrelated valid session leader without signaling 
   });
   await waitUntil(() => {
     if (!isLiveProcess(victim.pid)) return false;
-    const status = spawnSync('ps', ['-o', 'pgid=,sid=', '-p', String(victim.pid)], { encoding: 'utf8' });
+    const status = spawnSync('ps', ['-o', 'pgid=,sid=', '-p', String(victim.pid)], { env: isolatedEnv(), encoding: 'utf8' });
     const [pgid, sid] = String(status.stdout || '').trim().split(/\s+/).map(Number);
     return status.status === 0 && pgid === victim.pid && sid === victim.pid;
   });
@@ -1338,13 +1331,12 @@ exec sleep 30
   const startedAt = Date.now();
   const child = spawn('bash', [path.join(root, 'start.sh')], {
     cwd: root,
-    env: {
-      ...process.env,
+    env: isolatedEnv({
       PORT: String(port),
       RELAYBRIDGE_PORT: String(port),
       PATH: `${fakeBin}${path.delimiter}${process.env.PATH}`,
       RELAYBRIDGE_TEST_UNRELATED_SESSION_PID: String(victim.pid),
-    },
+    }),
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let output = '';
@@ -1403,12 +1395,11 @@ posixOnly('start.sh removes wrong or unready exact candidates without leaving a 
       const port = await reservePort();
       const child = spawn('bash', [path.join(root, 'start.sh')], {
         cwd: root,
-        env: {
-          ...process.env,
+        env: isolatedEnv({
           PORT: String(port),
           RELAYBRIDGE_PORT: String(port),
           RELAYBRIDGE_TEST_SERVER_PID_FILE: serverPidFile,
-        },
+        }),
         stdio: ['ignore', 'pipe', 'pipe'],
       });
       let output = '';
@@ -1448,7 +1439,7 @@ posixOnly('start.sh signal cleanup terminates its exact detached session', async
   const pidfile = path.join(root, `.bridge.${port}.pid`);
   const child = spawn('bash', [path.join(root, 'start.sh')], {
     cwd: root,
-    env: { ...process.env, PORT: String(port), RELAYBRIDGE_PORT: String(port) },
+    env: isolatedEnv({ PORT: String(port), RELAYBRIDGE_PORT: String(port) }),
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let output = '';
@@ -1469,8 +1460,8 @@ posixOnly('start.sh signal cleanup terminates its exact detached session', async
 });
 
 posixOnly('POSIX lifecycle scripts pass their native shell syntax checks', () => {
-  assert.equal(spawnSync('sh', ['-n', path.join(ROOT, 'install-mcp.sh')]).status, 0);
-  assert.equal(spawnSync('bash', ['-n', path.join(ROOT, 'start.sh')]).status, 0);
+  assert.equal(spawnSync('sh', ['-n', path.join(ROOT, 'install-mcp.sh')], { env: isolatedEnv() }).status, 0);
+  assert.equal(spawnSync('bash', ['-n', path.join(ROOT, 'start.sh')], { env: isolatedEnv() }).status, 0);
 });
 
 test('lifecycle scripts guard credentials, preserve generated identity, and require exact ready health', () => {

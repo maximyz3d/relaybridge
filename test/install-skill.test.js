@@ -6,6 +6,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
+const { isolatedEnv } = require('./helpers/isolated-env');
 const ROOT = path.resolve(__dirname, '..');
 
 test('skill installation discovers RelayBridge and its slash entry, preserves user files, and is repeatable', {
@@ -16,7 +17,7 @@ test('skill installation discovers RelayBridge and its slash entry, preserves us
   const promptDir = path.join(profile, '.codex/prompts'); fs.mkdirSync(promptDir, { recursive: true });
   const prompt = path.join(promptDir, 'relaybridge.md'); fs.writeFileSync(prompt, 'user prompt');
   const install = (extra = {}) => execFileSync('sh', [path.join(ROOT, 'install-skill.sh')], {
-    cwd: profile, encoding: 'utf8', env: { ...process.env, HOME: profile, CODEX_HOME: '', ...extra },
+    cwd: profile, encoding: 'utf8', env: isolatedEnv({ HOME: profile, CODEX_HOME: '', ...extra }),
   });
   assert.match(install(), /\/prompts:relaybridge/);
   for (const relative of ['.agents/skills/relaybridge', '.codex/skills/relaybridge', '.claude/skills/relaybridge']) {

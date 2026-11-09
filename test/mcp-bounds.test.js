@@ -1,4 +1,5 @@
 'use strict';
+require('./helpers/isolated-env').scrubInheritedEnv();
 
 // Issue #26: numeric bounds reached the JSON Schema, but not the human-readable
 // description. Many clients surface only the description to the model, so a

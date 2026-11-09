@@ -7,6 +7,7 @@ const path = require('node:path');
 const os = require('node:os');
 const { spawnSync } = require('node:child_process');
 const { resolveWindowsLaunch } = require('../lib/win-shim-launch');
+const { isolatedEnv } = require('./helpers/isolated-env');
 
 const FIXTURES = path.join(__dirname, 'fixtures', 'windows-shims');
 const ADVERSARIAL_ARGS = [
@@ -172,7 +173,7 @@ test('native Windows roundtrip preserves all adversarial argv and cannot run an 
   const args = [...ADVERSARIAL_ARGS, `" & echo INJECTED > "${sentinel}" & rem "`];
   const launch = resolve({ args });
   assert.equal(launch.mode, 'direct');
-  const result = spawnSync(launch.file, launch.args, {
+  const result = spawnSync(launch.file, launch.args, { env: isolatedEnv(),
     shell: false, windowsHide: true, encoding: 'utf8', cwd: root,
   });
   assert.equal(result.status, 0, result.stderr);

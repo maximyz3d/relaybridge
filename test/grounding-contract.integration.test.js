@@ -8,6 +8,7 @@ const crypto = require('node:crypto');
 const { spawnSync } = require('node:child_process');
 const { startTestBridge, waitFor, completeJsonLines } = require('./helpers/temporary-bridge');
 const { prepareGroundedPrompt } = require('../lib/workspace-grounding');
+const { isolatedEnv } = require('./helpers/isolated-env');
 const ROOT = path.resolve(__dirname, '..');
 const sha = (value) => crypto.createHash('sha256').update(value).digest('hex');
 
@@ -52,8 +53,8 @@ test('grounding is a zero-spend gate across plans, REST, CLI, queue, broadcast a
   assert.equal(route.body.selected.some((row) => row.kind === 'ollama_coder'), false);
   assert.equal(route.body.fleetState.groundingSkipped.some((row) => row.kind === 'ollama_coder'), true);
   const cli = spawnSync(process.execPath, [path.join(ROOT, 'bin/relaybridge.js'), 'ask', '--kind', 'ollama_coder',
-    '--requires-workspace-access', prompt], { cwd: bridge.root, env: { ...process.env, RELAYBRIDGE_URL: bridge.base,
-      RELAYBRIDGE_TOKEN_FILE: path.join(bridge.root, 'token') }, encoding: 'utf8' });
+    '--requires-workspace-access', prompt], { cwd: bridge.root, env: isolatedEnv({ RELAYBRIDGE_URL: bridge.base,
+      RELAYBRIDGE_TOKEN_FILE: path.join(bridge.root, 'token') }), encoding: 'utf8' });
   assert.notEqual(cli.status, 0); assert.match(cli.stderr, /cannot read the workspace/);
   assert.equal(httpCalls.length, 0); assert.equal(completeJsonLines(cliMarker).length, 0);
 
@@ -87,9 +88,9 @@ test('grounding is a zero-spend gate across plans, REST, CLI, queue, broadcast a
     import('@modelcontextprotocol/client'), import('@modelcontextprotocol/client/stdio'),
   ]);
   const transport = new StdioClientTransport({ command: process.execPath, args: [path.join(ROOT, 'mcp/server.mjs')], cwd: ROOT,
-    env: { ...process.env, NODE_ENV: 'test', RELAYBRIDGE_TEST_BUILD_ID: 'security-integration-fixture',
+    env: isolatedEnv({ NODE_ENV: 'test', RELAYBRIDGE_TEST_BUILD_ID: 'security-integration-fixture',
       RELAYBRIDGE_URL: bridge.base, RELAYBRIDGE_TOKEN_FILE: path.join(bridge.root, 'token'),
-      RELAYBRIDGE_DATA_DIR: path.join(bridge.root, 'data'), RELAYBRIDGE_CONFIG_FILE: bridge.configPath }, stderr: 'pipe' });
+      RELAYBRIDGE_DATA_DIR: path.join(bridge.root, 'data'), RELAYBRIDGE_CONFIG_FILE: bridge.configPath }), stderr: 'pipe' });
   const client = new Client({ name: 'grounding-test', version: '1' });
   t.after(async () => { await client.close(); await transport.close(); });
   await client.connect(transport);

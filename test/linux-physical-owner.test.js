@@ -1,4 +1,5 @@
 'use strict';
+require('./helpers/isolated-env').scrubInheritedEnv();
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -7,6 +8,7 @@ const path = require('node:path');
 const { createLinuxPhysicalOwner } = require('../lib/linux-physical-owner');
 const { probeLinuxNamespace } = require('../lib/linux-owner-identity');
 const { waitFor } = require('./helpers/temporary-bridge');
+const { isolatedEnv } = require('./helpers/isolated-env');
 const ROOT = path.resolve(__dirname, '..');
 const AVAILABLE = process.platform === 'linux' && fs.existsSync('/usr/bin/bwrap');
 
@@ -18,7 +20,7 @@ function fixture(t, options = {}) {
   t.after(async () => { owner.requestStop(); await owner.completion; clearInterval(keepAlive); });
   return owner;
 }
-async function launch(owner, program, env = process.env, file = process.execPath) {
+async function launch(owner, program, env = isolatedEnv(), file = process.execPath) {
   const proc = await owner.start({ file, args: ['-e', program], cwd: ROOT, env });
   const stdout = [], stderr = [];
   if (proc) {
@@ -30,7 +32,7 @@ async function launch(owner, program, env = process.env, file = process.execPath
 test('Linux adapter pins before release and preserves binary streams plus provider Node options', { skip: !AVAILABLE, timeout: 10000 }, async (t) => {
   const owner = fixture(t);
   const child = await launch(owner, "process.stderr.write(Buffer.from([255,0,10]));if(process.env.NODE_OPTIONS!=='--no-warnings'||Object.keys(process.env).some(k=>k.startsWith('RELAYBRIDGE_OWNER_')))process.exit(99);process.stdin.pipe(process.stdout);",
-    { ...process.env, NODE_OPTIONS: '--no-warnings' });
+    isolatedEnv({ NODE_OPTIONS: '--no-warnings' }));
   await owner.ready;
   assert.equal(owner.snapshot().physicalAttemptCount, 1);
   assert.equal(owner.snapshot().providerState, 'not_released');
@@ -105,7 +107,7 @@ test('wrapper exit and pipe EOF do not settle without namespace death; late proo
 });
 
 test('a provider executable failure remains distinct from its successfully spawned owner', { skip: !AVAILABLE, timeout: 10000 }, async (t) => {
-  const owner = fixture(t), child = await launch(owner, '', process.env, '/nonexistent/rb-provider-fixture');
+  const owner = fixture(t), child = await launch(owner, '', isolatedEnv(), '/nonexistent/rb-provider-fixture');
   await owner.allowProvider(); child.proc.stdin.end();
   const done = await owner.physicalDone;
   assert.equal(done.evidence, 'process_tree_settled'); assert.equal(done.snapshot.physicalAttemptCount, 1);
@@ -124,7 +126,7 @@ test('a stopped active provider uses control-driven namespace termination', { sk
 
 test('provider-only failing Node preload cannot execute inside the trusted gate', { skip: !AVAILABLE, timeout: 10000 }, async (t) => {
   const owner = fixture(t), child = await launch(owner, "process.stdout.write('unexpected');",
-    { ...process.env, NODE_OPTIONS: '--require=/nonexistent/rb-provider-preload-fixture' });
+    isolatedEnv({ NODE_OPTIONS: '--require=/nonexistent/rb-provider-preload-fixture' }));
   await owner.ready;
   assert.equal(owner.snapshot().providerState, 'not_released');
   await owner.allowProvider(); child.proc.stdin.end();

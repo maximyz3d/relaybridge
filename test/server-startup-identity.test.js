@@ -1,4 +1,5 @@
 'use strict';
+require('./helpers/isolated-env').scrubInheritedEnv();
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -9,6 +10,7 @@ const path = require('node:path');
 const { spawn, spawnSync } = require('node:child_process');
 
 const { prepareBuildInfo } = require('../lib/build-identity.cjs');
+const { isolatedEnv } = require('./helpers/isolated-env');
 
 const ROOT = path.resolve(__dirname, '..');
 const posixOnly = process.platform === 'win32' ? test.skip : test;
@@ -19,7 +21,7 @@ function write(file, contents) {
 }
 
 function git(root, ...args) {
-  const result = spawnSync('git', ['-C', root, ...args], {
+  const result = spawnSync('git', ['-C', root, ...args], { env: isolatedEnv(),
     encoding: 'utf8',
     windowsHide: true,
   });
@@ -136,8 +138,7 @@ if (startupIdentityBarrier) {
   const prepared = prepareBuildInfo(root);
   assert.equal(prepared.identity.ready, true);
   const port = await reservePort();
-  const env = {
-    ...process.env,
+  const env = isolatedEnv({
     PORT: String(port),
     PTY_MODE: 'none',
     RELAYBRIDGE_EXPECTED_BUILD_ID: prepared.identity.buildId,
@@ -147,7 +148,7 @@ if (startupIdentityBarrier) {
     RELAYBRIDGE_CONFIG_FILE: path.join(root, 'cli-config.json'),
     RELAYBRIDGE_ALLOWED_ROOTS: root,
     RELAYBRIDGE_REMOTE_MCP: '0',
-  };
+  });
   delete env.NODE_ENV;
   delete env.RELAYBRIDGE_TEST_BUILD_ID;
   delete env.RELAYBRIDGE_TEST_BUILD_IDENTITY_UNREADY;

@@ -1,15 +1,12 @@
 'use strict';
 const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path');
 const {startTestBridge,waitFor,completeJsonLines}=require('./helpers/temporary-bridge');
-// Clear inherited bridge settings, but never the temporary config/data/token/root paths the helper assigns.
-const HELPER_ENV=new Set(['RELAYBRIDGE_CONFIG_FILE','RELAYBRIDGE_TOKEN_FILE','RELAYBRIDGE_DATA_DIR','RELAYBRIDGE_ALLOWED_ROOTS','RELAYBRIDGE_TEST_BUILD_ID']);
-const inheritedBridgeEnv=()=>Object.fromEntries(Object.keys(process.env).filter(k=>/^(RELAYBRIDGE_|PS_BRIDGE_)/.test(k)&&!HELPER_ENV.has(k)).map(k=>[k,undefined]));
-async function fixture(t, providerOverrides={}){let events;const unset=inheritedBridgeEnv();
+async function fixture(t, providerOverrides={}){let events;
  const bridge=await startTestBridge(t,root=>{events=path.join(root,'events.jsonl');const script=path.join(root,'provider.cjs');fs.writeFileSync(script,`const fs=require('node:fs');let prompt='';process.stdin.on('data',c=>prompt+=c);process.stdin.on('end',()=>{fs.appendFileSync(${JSON.stringify(events)},JSON.stringify({kind:process.argv[2],args:process.argv.slice(3),prompt})+'\\n');if(prompt.includes('INVALID_DECISION_FIXTURE'))console.log('not a decision');else if(prompt.includes('You are a senior project advisor'))console.log('ADVISOR_EVIDENCE: inspect the existing record contract first.');else if(prompt.includes('Perform this bounded read-only task'))console.log('Read-only inspection complete; no files changed.');else if(prompt.includes('Advisor result (must inform this decision)'))console.log(JSON.stringify({action:'allocate',text:'The advisor recommends inspecting the existing records first.',tasks:[{title:'Inspect records',kind:'read_only',provider:'codex',tier:'light',prompt:'Inspect the record contract read-only.'}]}));else console.log(JSON.stringify({action:'consult',question:'How should we preserve the existing record contract?'}));});`);
  return{_models:{discoverOnBoot:false},...Object.fromEntries(['codex','claude'].map(kind=>[kind,{label:kind,model:'fixture-standard',safe:[process.execPath],probe:[process.execPath,'--version'],version_probe:[process.execPath,'--version'],
  oneshot_safe:[process.execPath,script,kind,'--model','fixture-standard','--effort','medium'],oneshot_output_parser:'text',oneshot_safe_filesystem_policy:'read_only_enforced',oneshot_capabilities:{safe:['model_invocation','workspace_read','tool_use']},
  effort_flags:Object.fromEntries(['low','medium','high'].map(x=>[x,['--effort',x]])),model_tiers:Object.fromEntries(['light','standard','heavy'].map(x=>[x,{model:'fixture-'+x,args:['--model','fixture-'+x]}])),...(providerOverrides[kind]||{})}]))};
- },{env:{...unset,RELAYBRIDGE_WARM_DIAG:'0',RELAYBRIDGE_REMOTE_MCP:'0'}});return{...bridge,events};}
+ },{env:{RELAYBRIDGE_WARM_DIAG:'0',RELAYBRIDGE_REMOTE_MCP:'0'}});return{...bridge,events};}
 test('project chat performs durable Codex → stronger advisor → Codex → worker round trip',{timeout:45000},async t=>{const b=await fixture(t);const created=await b.request('/api/project-workspace/projects',{actionId:'project_0001',name:'Project test',cwd:b.root});assert.equal(created.status,202,JSON.stringify(created.body));const {threadId,projectId}=created.body;
  const input={actionId:'message_0001',threadId,text:'Design the next project step.'};assert.equal((await b.request('/api/project-workspace/messages',input)).status,202);assert.equal((await b.request('/api/project-workspace/messages',input)).status,200);
  const state=await waitFor(async()=>{const v=(await b.request('/api/project-workspace/state')).body;return v.tasks?.[0]?.state==='completed'&&v;},35000);
@@ -71,9 +68,8 @@ test('attaching a completed queued task to another project is observational, ide
  await new Promise(r=>setTimeout(r,1500));assert.deepEqual({events:completeJsonLines(b.events).length,tasks:taskFiles()},before,'attach and reads dispatch nothing');
 });
 test('attached direct call follows a live run to its terminal receipt without retaining or inventing a result',{timeout:60000},async t=>{
- const unset=inheritedBridgeEnv();
  const b=await startTestBridge(t,root=>{const helper=path.join(root,'hold.cjs');fs.writeFileSync(helper,"const fs=require('node:fs');const label=process.argv[2];setInterval(()=>{if(fs.existsSync('release-'+label)){console.log('Synthetic fixture completed '+label);process.exit(0);}},25);");
-  return{_models:{discoverOnBoot:false},fixture:{oneshot_safe:[process.execPath,helper,'{prompt}'],oneshot_capabilities:{safe:['model_invocation']}}};},{env:{...unset,RELAYBRIDGE_WARM_DIAG:'0',RELAYBRIDGE_REMOTE_MCP:'0'}});
+  return{_models:{discoverOnBoot:false},fixture:{oneshot_safe:[process.execPath,helper,'{prompt}'],oneshot_capabilities:{safe:['model_invocation']}}};},{env:{RELAYBRIDGE_WARM_DIAG:'0',RELAYBRIDGE_REMOTE_MCP:'0'}});
  const project=(await b.request('/api/project-workspace/projects',{actionId:'project_0001',name:'Direct call project',cwd:b.root})).body;
  let early=null;const pending=b.request('/api/oneshot',{kind:'fixture',prompt:'D',cwd:b.root,dangerous:false,requestId:'fx-direct-0001'});pending.then(v=>{early=v;});
  const run=await waitFor(async()=>(await b.request('/api/runs/active')).body.runs?.find(r=>r.route.request_id==='fx-direct-0001'),15000).catch(error=>{throw new Error(error.message+': '+JSON.stringify(early));});

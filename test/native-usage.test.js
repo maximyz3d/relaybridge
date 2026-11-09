@@ -3,6 +3,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
 const { parseCodexRateLimits, parseClaudeStreamRateLimit, parseClaudeStatuslineUsage, readCodexRateLimits } = require('../lib/native-usage');
+const { isolatedEnv } = require('./helpers/isolated-env');
 const T = 1700000000000, reset = T / 1000 + 86400;
 const { parseClaudeNativeCache, readClaudeNativeUsage } = require('../lib/native-usage');
 const accountUuid = '11111111-2222-3333-4444-555555555555';
@@ -100,7 +101,7 @@ test('regular-profile replacement by a FIFO cannot block the reader', { skip: pr
     io.lstatSync=(...args)=>{const value=fs.lstatSync(...args);if(!replaced){replaced=true;fs.unlinkSync(file);cp.execFileSync('mkfifo',[file]);}return value;};
     const result=require(${JSON.stringify(require.resolve('../lib/native-usage'))}).readClaudeNativeUsage({env:{HOME:home},defaultHome:home,quotaSeat:'claude',fsImpl:io});
     if(result.identity!==null)process.exit(2);`;
-  const result = require('node:child_process').spawnSync(process.execPath, ['-e', script, home], { timeout: 3000, encoding: 'utf8' });
+  const result = require('node:child_process').spawnSync(process.execPath, ['-e', script, home], { timeout: 3000, encoding: 'utf8', env: isolatedEnv({ HOME: home }) });
   assert.equal(result.error, undefined, 'bounded child must return without a FIFO writer');
   assert.equal(result.status, 0, result.stderr);
 });

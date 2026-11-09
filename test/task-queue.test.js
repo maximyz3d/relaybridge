@@ -853,3 +853,81 @@ test('unsettledInWorkspace keeps claiming a workspace for still-queued work and 
   assert.equal(q.unsettledInWorkspace(cwd), false,
     'a cancelled never-started task must not block the workspace forever');
 });
+
+test('only the queue\'s own running-task context is a task context, and only while it runs', async () => {
+  const dir = tmpdir();
+  let release, seen = null;
+  const gate = new Promise((r) => { release = r; });
+  const q = createTaskQueue({
+    dataDir: dir, maxConcurrent: 1,
+    executeOneShot: async (body, res, context) => { seen = context; await gate; res.json({ stdout: 'ok', exitCode: 0 }); },
+  });
+  const task = q.submit({ kind: 'claude', prompt: 'context' });
+  for (let i = 0; i < 40 && !seen; i++) await new Promise((r) => setTimeout(r, 10));
+  assert.ok(seen);
+  assert.equal(q.isTaskContext(seen), true);
+  assert.equal(Object.isFrozen(seen), true);
+  for (const forged of [{ ...seen }, { taskId: task.id }, null, undefined, task]) assert.equal(q.isTaskContext(forged), false);
+  // An unowned task is never owned-settled, running or not.
+  assert.equal(q.isOwnedSettled(task.id), false);
+  release();
+  await settled(q, task.id);
+  assert.equal(q.isTaskContext(seen), false);
+  assert.equal(q.isOwnedSettled(task.id), false);
+  assert.equal(q.isOwnedSettled('t_missing'), false);
+  q.shutdown();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+const linuxOnly = process.platform === 'linux' ? test : test.skip;
+linuxOnly('an owned task is owned-settled only after its private projection matches the journal\'s release', async (t) => {
+  const crypto = require('node:crypto');
+  const { canonical } = require('../lib/owned-task-projection');
+  const hash = (value) => crypto.createHash('sha256').update(canonical(value)).digest('hex');
+  const dir = tmpdir();
+  const references = new Map(), committed = new Map(), bindings = new Map();
+  let q;
+  q = createTaskQueue({
+    dataDir: dir, maxConcurrent: 1, autoStart: false,
+    executionOwners: {
+      listTaskReservations: () => [...references.values()].map((row) => ({ ...row })),
+      readPreparedTaskOwner: (ownerId) => ({ locallyPrepared: true, started: false, reference: [...references.values()].find((row) => row.ownerId === ownerId) }),
+      readCommittedTaskRelease: (_ownerId, decisionId) => committed.get(decisionId) || null,
+    },
+    requiresExecutionOwner: (task) => task.body.prompt === 'owned',
+    executeOneShot: async (body, res, context) => {
+      const binding = { taskId: context.taskId, reservationId: context.reservationId, runId: `run_${context.taskId}` };
+      const reference = { taskId: context.taskId, reservationId: context.reservationId, ownerId: `owner_${crypto.randomBytes(16).toString('hex')}`,
+        bindingHash: hash(binding), cwd: dir, held: true, decisionId: null };
+      references.set(context.taskId, reference); bindings.set(context.taskId, binding);
+      q.attachOwnedExecution(context, { ownerId: reference.ownerId, bindingHash: reference.bindingHash, reservationId: context.reservationId });
+      res.json({ stdout: 'ok', exitCode: 0, model_invocation: false, physicalAttemptCount: 0, physicalSettled: true, ownerFenced: true });
+    },
+  });
+  t.after(() => { q.shutdown(); fs.rmSync(dir, { recursive: true, force: true }); });
+  const owned = q.submit({ kind: 'fixture', prompt: 'owned', cwd: dir });
+  q.resume();
+  await settled(q, owned.id);
+  await new Promise(setImmediate);
+  // Terminal but still held by its owner: not settled.
+  assert.equal(q.get(owned.id).execution.state, 'owned_held');
+  assert.equal(q.isOwnedSettled(owned.id), false);
+  const row = references.get(owned.id), decisionId = hash({ taskId: owned.id, decision: 'release' });
+  committed.set(decisionId, { version: 1, taskId: owned.id, reservationId: row.reservationId, ownerId: row.ownerId, bindingHash: row.bindingHash, decisionId, scope: 'task_capacity' });
+  assert.equal(q.applyOwnedTaskRelease(bindings.get(owned.id), { decisionId, bindingHash: row.bindingHash, scope: 'task_capacity' }), true);
+  // The projection exists, but the journal reference is still held.
+  assert.equal(q.isOwnedSettled(owned.id), false);
+  Object.assign(row, { held: false, decisionId });
+  q.refreshOwnedReservations();
+  assert.equal(q.get(owned.id).execution.state, 'owned_settled');
+  assert.equal(q.isOwnedSettled(owned.id), true);
+  // A tampered projection no longer proves settlement.
+  const projectionDir = path.join(dir, 'owned-settlements');
+  for (const name of fs.readdirSync(projectionDir)) {
+    const file = path.join(projectionDir, name);
+    try { fs.chmodSync(file, 0o600); } catch {}
+    const value = JSON.parse(fs.readFileSync(file, 'utf8'));
+    fs.writeFileSync(file, JSON.stringify({ ...value, decisionId: 'e'.repeat(64) }));
+  }
+  assert.equal(q.isOwnedSettled(owned.id), false);
+});

@@ -1,4 +1,5 @@
 'use strict';
+require('./helpers/isolated-env').scrubInheritedEnv();
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -8,6 +9,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 const { createWorkflowPipeline } = require('../lib/workflow-pipeline');
+const { isolatedEnv } = require('./helpers/isolated-env');
 
 const ROOT = path.resolve(__dirname, '..');
 
@@ -465,8 +467,7 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   const baseUrl = `http://127.0.0.1:${port}`;
   const bridge = spawn(process.execPath, [path.join(ROOT, 'server.js')], {
     cwd: ROOT,
-    env: {
-      ...process.env,
+    env: isolatedEnv({
       PORT: String(port),
       PTY_MODE: 'none',
       PS_BRIDGE_CONFIG_FILE: configPath,
@@ -476,7 +477,7 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
       RELAYBRIDGE_TEST_BUILD_ID: 'integration-current',
       RELAYBRIDGE_DIAGNOSTIC_CACHE_TTL_MS: '1',
       RELAYBRIDGE_ALLOWED_ROOTS: `${allowedRootA};${allowedRootB}`,
-    },
+    }),
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -512,15 +513,14 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
     command: process.execPath,
     args: [path.join(ROOT, 'mcp', 'server.mjs')],
     cwd: ROOT,
-    env: {
-      ...process.env,
+    env: isolatedEnv({
       PS_BRIDGE_URL: baseUrl,
       PS_BRIDGE_TOKEN_FILE: tokenPath,
       PS_BRIDGE_DATA_DIR: dataDir,
       PS_BRIDGE_CONFIG_FILE: configPath,
       NODE_ENV: 'test',
       RELAYBRIDGE_TEST_BUILD_ID: 'integration-current',
-    },
+    }),
     stderr: 'pipe',
   });
   let mcpStderr = '';
@@ -767,7 +767,8 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
   const managedTool = listedTools.tools.find((tool) => tool.name === 'start_pipeline_implementation');
   assert.equal(managedTool.annotations.destructiveHint, true);
   assert.equal(managedTool.inputSchema.additionalProperties, false);
-  assert.deepEqual(Object.keys(managedTool.inputSchema.properties).sort(), ['leaseMs', 'runId']);
+  assert.deepEqual(Object.keys(managedTool.inputSchema.properties).sort(),
+    ['leaseMs', 'runId', 'funding', 'funding_route', 'fundingRoute', 'billing_mode', 'billingMode'].sort());
   const managedHeaders = { ...collabHeaders, 'X-RelayBridge-Client': 'mcp',
     'X-RelayBridge-Expected-Build-Id': healthPayload.buildId,
     'X-RelayBridge-Expected-Receipt-Store-Id': healthPayload.receiptStoreId };
@@ -784,6 +785,18 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
       method: 'POST', headers, body: JSON.stringify(body) });
   }
   const managedRun = managedFixture();
+  for (const [key, value, code] of [
+    ['funding', { route: 'included_api_credit', fallback: 'subscription' }, 'funding_envelope_unsupported'],
+    ...['funding_route', 'fundingRoute', 'billing_mode', 'billingMode'].map(key => [key, 'included_api_credit', 'funding_alias_unsupported']),
+    ['funding_route', 'allocated_api_credit', 'allocated_credit_unavailable'],
+  ]) {
+    const before = durablePipeline.get(managedRun.runId);
+    const refused = await client.callTool({ name: 'start_pipeline_implementation',
+      arguments: { runId: managedRun.runId, [key]: value } });
+    assert.equal(refused.isError, true, JSON.stringify(refused));
+    assert.ok(JSON.stringify(refused).includes(code), JSON.stringify(refused));
+    assert.deepEqual(durablePipeline.get(managedRun.runId), before, 'rejection cannot acquire a writer or dispatch a task');
+  }
   for (const [extra, body, code, status] of [
     [{ permissionMode: 'safe' }, {}, 'FULL_PERMISSION_REQUIRED', 409],
     [{ profile: 'codex-astra-ultra' }, {}, 'INVALID_WRITER_MODE', 400],
@@ -1149,15 +1162,14 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
     command: process.execPath,
     args: [path.join(ROOT, 'mcp', 'server.mjs')],
     cwd: ROOT,
-    env: {
-      ...process.env,
+    env: isolatedEnv({
       PS_BRIDGE_URL: baseUrl,
       PS_BRIDGE_TOKEN_FILE: tokenPath,
       PS_BRIDGE_DATA_DIR: staleDataDir,
       PS_BRIDGE_CONFIG_FILE: configPath,
       NODE_ENV: 'test',
       RELAYBRIDGE_TEST_BUILD_ID: 'integration-stale',
-    },
+    }),
     stderr: 'pipe',
   });
   let staleMcpStderr = '';
@@ -1970,15 +1982,14 @@ test('MCP stdio exposes resources, safe tools, routing, and provider receipts', 
     command: process.execPath,
     args: [path.join(ROOT, 'mcp', 'server.mjs')],
     cwd: ROOT,
-    env: {
-      ...process.env,
+    env: isolatedEnv({
       PS_BRIDGE_URL: baseUrl,
       PS_BRIDGE_TOKEN_FILE: tokenPath,
       PS_BRIDGE_DATA_DIR: dataDir,
       PS_BRIDGE_CONFIG_FILE: configPath,
       NODE_ENV: 'test',
       RELAYBRIDGE_TEST_BUILD_ID: 'integration-current',
-    },
+    }),
     stderr: 'ignore',
   });
   const detachClient = new DetachClient({ name: 'ps-bridge-detach-test', version: '1.0.0' });

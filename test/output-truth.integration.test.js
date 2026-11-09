@@ -1,10 +1,12 @@
 'use strict';
+require('./helpers/isolated-env').scrubInheritedEnv();
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { startTestBridge, completeJsonLines } = require('./helpers/temporary-bridge');
+const { isolatedEnv } = require('./helpers/isolated-env');
 const ROOT = path.resolve(__dirname, '..');
 const refusal = 'Sorry, I cannot fulfill your request. I am unable to perform adversarial reviews, vulnerability scanning, or security analysis on user-provided codebases.';
 const progress = 'I am downloading the datasheets. This should just take a moment.';
@@ -79,9 +81,9 @@ test('refusal/progress remain non-success across REST, MCP, receipt replay, cach
     import('@modelcontextprotocol/client'), import('@modelcontextprotocol/client/stdio'),
   ]);
   const transport = new StdioClientTransport({ command: process.execPath, args: [path.join(ROOT, 'mcp/server.mjs')], cwd: ROOT,
-    env: { ...process.env, NODE_ENV: 'test', RELAYBRIDGE_TEST_BUILD_ID: 'security-integration-fixture',
+    env: isolatedEnv({ NODE_ENV: 'test', RELAYBRIDGE_TEST_BUILD_ID: 'security-integration-fixture',
       RELAYBRIDGE_URL: bridge.base, RELAYBRIDGE_TOKEN_FILE: path.join(bridge.root, 'token'),
-      RELAYBRIDGE_DATA_DIR: path.join(bridge.root, 'data'), RELAYBRIDGE_CONFIG_FILE: bridge.configPath }, stderr: 'pipe' });
+      RELAYBRIDGE_DATA_DIR: path.join(bridge.root, 'data'), RELAYBRIDGE_CONFIG_FILE: bridge.configPath }), stderr: 'pipe' });
   const client = new Client({ name: 'output-truth-test', version: '1.0.0' });
   t.after(async () => { await client.close(); await transport.close(); });
   await client.connect(transport);

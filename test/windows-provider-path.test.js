@@ -7,6 +7,7 @@ const http = require('http');
 const os = require('os');
 const path = require('path');
 const { spawn, spawnSync } = require('child_process');
+const { isolatedEnv } = require('./helpers/isolated-env');
 
 const ROOT = path.resolve(__dirname, '..');
 const TEST_BUILD_ID = 'relaybridge-windows-path-test';
@@ -76,8 +77,7 @@ test('Windows child PATH discovers the official Cursor install directory and kee
 
   const port = await reservePort();
   const baseUrl = `http://127.0.0.1:${port}`;
-  const serverEnv = {
-    ...process.env,
+  const serverEnv = isolatedEnv({
     NODE_ENV: 'test',
     RELAYBRIDGE_TEST_BUILD_ID: TEST_BUILD_ID,
     PORT: String(port),
@@ -87,7 +87,7 @@ test('Windows child PATH discovers the official Cursor install directory and kee
     RELAYBRIDGE_TOKEN_FILE: tokenPath,
     RELAYBRIDGE_DATA_DIR: path.join(tempRoot, 'data'),
     RELAYBRIDGE_ALLOWED_ROOTS: allowedRoot,
-  };
+  });
   const inheritedPath = Object.entries(process.env)
     .find(([key]) => key.toUpperCase() === 'PATH')?.[1];
   assert.ok(inheritedPath, 'Windows test runner must provide PATH');
@@ -96,7 +96,7 @@ test('Windows child PATH discovers the official Cursor install directory and kee
   }
   // Source build identity still needs git. Preserve only its exact directory,
   // not the host provider PATH: Cursor discovery remains the behavior under test.
-  const gitLookup = spawnSync('where.exe', ['git.exe'], { encoding: 'utf8', windowsHide: true });
+  const gitLookup = spawnSync('where.exe', ['git.exe'], { env: isolatedEnv(), encoding: 'utf8', windowsHide: true });
   assert.equal(gitLookup.status, 0, gitLookup.stderr || 'git is required by source build verification');
   const gitDirectory = path.dirname(gitLookup.stdout.trim().split(/\r?\n/)[0]);
   serverEnv.Path = [path.join(process.env.SystemRoot || 'C:\\Windows', 'System32'), gitDirectory].join(';');

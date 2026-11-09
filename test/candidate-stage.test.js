@@ -3,6 +3,7 @@ const test = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const { createCandidateStage, normalizeAllowedWritePaths, hash } = require('../lib/candidate-stage');
+const { isolatedEnv } = require('./helpers/isolated-env');
 const linuxTest = process.platform === 'linux' ? test : test.skip;
 const binding = { runId: 'run_fixture', attemptId: 'attempt_fixture', cwdIdentityHash: hash('cwd'), policyId: hash('policy') };
 function fixture(t, { files = { 'dirty.txt': 'DIRTY INPUT\n', 'plain.txt': 'unchanged\n', 'untracked.txt': 'untracked input\n' }, ...extra } = {}) {
@@ -64,7 +65,7 @@ linuxTest('source symlink, hardlink, special file, path alias and nested git fai
     const f = fixture(t);
     if (kind === 'symlink') fs.symlinkSync(path.join(f.source, 'dirty.txt'), path.join(f.source, 'link.txt'));
     if (kind === 'hardlink') fs.linkSync(path.join(f.source, 'dirty.txt'), path.join(f.source, 'link.txt'));
-    if (kind === 'fifo') assert.equal(spawnSync('/usr/bin/mkfifo', [path.join(f.source, 'pipe')]).status, 0);
+    if (kind === 'fifo') assert.equal(spawnSync('/usr/bin/mkfifo', [path.join(f.source, 'pipe')], { env: isolatedEnv() }).status, 0);
     if (kind === 'alias') fs.writeFileSync(path.join(f.source, 'DIRTY.txt'), 'alias');
     if (kind === 'nested-git') { fs.mkdirSync(path.join(f.source, 'nested')); fs.mkdirSync(path.join(f.source, 'nested/.git')); }
     assert.throws(() => f.create(), /STAGE_/, kind);

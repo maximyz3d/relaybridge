@@ -1,4 +1,5 @@
 'use strict';
+require('./helpers/isolated-env').scrubInheritedEnv();
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -9,6 +10,7 @@ const { spawnSync } = require('child_process');
 
 const tracker = require('../lib/github-tracker');
 const onboard = require('../lib/github-onboard');
+const { isolatedEnv } = require('./helpers/isolated-env');
 const HOST_PLATFORM = process.platform === 'win32'
   ? { isWindows: true, isWSL: false, label: 'Windows' }
   : { isWindows: false, isWSL: false, label: 'POSIX' };
@@ -201,7 +203,7 @@ posixOnly('migration CLI rejects raw Windows runtime and root paths before host 
       expected: /RelayBridge root must be an absolute path/,
     },
   ]) {
-    const result = spawnSync(process.execPath, [tool, ...fixture.args], { encoding: 'utf8' });
+    const result = spawnSync(process.execPath, [tool, ...fixture.args], { env: isolatedEnv(), encoding: 'utf8' });
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, fixture.expected);
   }
@@ -372,7 +374,7 @@ test('a legacy disappearance after initial lstat is an error, not a missing regi
 });
 
 posixOnly('a legacy regular-file-to-FIFO replacement is rejected without reading or blocking', (t) => {
-  if (spawnSync('sh', ['-c', 'command -v mkfifo'], { encoding: 'utf8' }).status !== 0) {
+  if (spawnSync('sh', ['-c', 'command -v mkfifo'], { env: isolatedEnv(), encoding: 'utf8' }).status !== 0) {
     t.skip('mkfifo is unavailable');
     return;
   }
@@ -421,7 +423,7 @@ posixOnly('a legacy regular-file-to-FIFO replacement is rejected without reading
       fs.readFileSync = originalReadFileSync;
     }
   `;
-  const result = spawnSync(process.execPath, ['-e', script], {
+  const result = spawnSync(process.execPath, ['-e', script], { env: isolatedEnv(),
     encoding: 'utf8',
     timeout: 2000,
   });
@@ -601,7 +603,7 @@ test('a regular-file replacement after lstat fails inode validation before readi
 });
 
 posixOnly('a regular-file-to-FIFO replacement is rejected without blocking', (t) => {
-  if (spawnSync('sh', ['-c', 'command -v mkfifo'], { encoding: 'utf8' }).status !== 0) {
+  if (spawnSync('sh', ['-c', 'command -v mkfifo'], { env: isolatedEnv(), encoding: 'utf8' }).status !== 0) {
     t.skip('mkfifo is unavailable');
     return;
   }
@@ -633,7 +635,7 @@ posixOnly('a regular-file-to-FIFO replacement is rejected without blocking', (t)
       process.stdout.write('rejected');
     }
   `;
-  const result = spawnSync(process.execPath, ['-e', script], {
+  const result = spawnSync(process.execPath, ['-e', script], { env: isolatedEnv(),
     encoding: 'utf8',
     timeout: 2000,
   });
@@ -1132,7 +1134,7 @@ const { execFileSync } = require('child_process');
 
 function tempRepo() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rbgit-'));
-  const g = (...a) => execFileSync('git', a, { cwd: dir, stdio: 'pipe' });
+  const g = (...a) => execFileSync('git', a, { env: isolatedEnv(), cwd: dir, stdio: 'pipe' });
   g('init', '-q');
   g('config', 'user.email', 't@example.com');
   g('config', 'user.name', 'test');
@@ -1147,10 +1149,10 @@ test('secrets inside a NEW directory are still caught (the -uall guarantee)', ()
   fs.writeFileSync(path.join(dir, 'feature', 'app.js'), 'code');
   fs.writeFileSync(path.join(dir, 'feature', '.env'), 'SECRET=hunter2');
 
-  const collapsed = execFileSync('git', ['status', '--porcelain'], { cwd: dir }).toString();
+  const collapsed = execFileSync('git', ['status', '--porcelain'], { env: isolatedEnv(), cwd: dir }).toString();
   assert.match(collapsed, /feature\//, 'precondition: plain porcelain collapses the directory');
 
-  const raw = execFileSync('git', ['status', '--porcelain', '-uall', '-z'], { cwd: dir }).toString();
+  const raw = execFileSync('git', ['status', '--porcelain', '-uall', '-z'], { env: isolatedEnv(), cwd: dir }).toString();
   const paths = tracker.parsePorcelainZ(raw);
   assert.ok(paths.includes('feature/.env'), 'the secret must be listed individually');
   const { safe, skipped } = tracker.partitionSecretPaths(paths);
@@ -1191,11 +1193,11 @@ test('paths with spaces and non-ASCII survive parsing (-z, no octal escapes)', (
   fs.mkdirSync(path.join(dir, 'dir with space'));
   fs.writeFileSync(path.join(dir, 'dir with space', 'café.js'), 'y');
   const paths = tracker.parsePorcelainZ(
-    execFileSync('git', ['status', '--porcelain', '-uall', '-z'], { cwd: dir }).toString());
+    execFileSync('git', ['status', '--porcelain', '-uall', '-z'], { env: isolatedEnv(), cwd: dir }).toString());
   assert.ok(paths.includes('dir with space/café.js'), `got ${JSON.stringify(paths)}`);
   assert.ok(!paths.some((p) => p.includes('\\303')), 'octal escapes must not survive into a path');
   // The parsed path must be usable as-is by git add.
-  execFileSync('git', ['add', '--', ...paths], { cwd: dir });
+  execFileSync('git', ['add', '--', ...paths], { env: isolatedEnv(), cwd: dir });
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -1214,7 +1216,7 @@ test('rollback creates a branch WITHOUT switching the working tree', async () =>
   const res = await tracker.checkoutVersion('o/r', 'v1.0.0', registry);
   assert.match(res.branch, /^restore\/v1\.0\.0-/);
   assert.equal(res.switched, false);
-  const head = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: dir }).toString().trim();
+  const head = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { env: isolatedEnv(), cwd: dir }).toString().trim();
   assert.equal(head, 'wip', 'the working branch must be left alone');
   assert.ok(fs.existsSync(path.join(dir, 'inprogress.txt')), 'uncommitted work must survive');
   fs.rmSync(dir, { recursive: true, force: true });

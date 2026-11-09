@@ -13,6 +13,7 @@ const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const { spawnSync } = require('child_process');
+const { isolatedEnv } = require('./helpers/isolated-env');
 
 const REPO_ROOT = path.join(__dirname, '..');
 const SCRIPT_PATH = path.join(REPO_ROOT, 'scripts', 'migrate-uncap-config.sh');
@@ -50,7 +51,7 @@ function writeFixture(dir) {
 }
 
 function run(args) {
-  return spawnSync('bash', [SCRIPT_PATH, ...args], { encoding: 'utf8' });
+  return spawnSync('bash', [SCRIPT_PATH, ...args], { env: isolatedEnv(), encoding: 'utf8' });
 }
 
 test('migrate-uncap-config: --dry-run leaves the target file untouched', () => {

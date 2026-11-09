@@ -7,6 +7,7 @@ const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const { allocatedCreditStatus, creditSetup, CREDIT_SECRET_NAMES } = require('../lib/allocated-credit');
 const { startTestBridge } = require('./helpers/temporary-bridge');
+const { isolatedEnv } = require('./helpers/isolated-env');
 
 test('a key never enables unverified funding; policy preserves the final 2% after included credits', () => {
   const env = Object.fromEntries(CREDIT_SECRET_NAMES.map((key) => [key, 'private-fixture-secret']));
@@ -15,6 +16,8 @@ test('a key never enables unverified funding; policy preserves the final 2% afte
   assert.deepEqual(status.policy.order, ['subscription', 'included_api_credit', 'subscription_reserve', 'stop']);
   assert.equal(status.policy.reserveRelease, 'only_after_provider_verified_included_credit_exhaustion');
   assert.equal(status.automationAvailable, false);
+  assert.equal(status.apiTransport, 'implemented_not_activated');
+  assert.match(status.detail, /no provider is qualified/);
   for (const info of Object.values(status.providers)) {
     assert.equal(info.apiKeyPresent, true);
     assert.equal(info.dispatchAllowed, false);
@@ -27,7 +30,7 @@ test('a key never enables unverified funding; policy preserves the final 2% afte
     assert.equal(Object.hasOwn(setup, 'apiKeyVariable'), false);
     assert.equal(Object.hasOwn(status.providers[provider], 'apiKeyVariable'), false);
     const printed = execFileSync(process.execPath, [path.join(__dirname, '../bin/relaybridge.js'), 'credit', 'setup', provider, '--json'], {
-      encoding: 'utf8', env: { ...process.env, ...env },
+      encoding: 'utf8', env: isolatedEnv({ ...env }),
     });
     assert.equal(JSON.parse(printed).environmentVariableName, name);
     assert.equal(printed.includes('private-fixture-secret'), false);
@@ -35,6 +38,38 @@ test('a key never enables unverified funding; policy preserves the final 2% afte
   assert.equal(allocatedCreditStatus({}).providers.claude.apiKeyPresent, false);
   assert.match(creditSetup('openai').limitation, /Codex API-key usage is excluded/);
   assert.throws(() => creditSetup('toString'));
+});
+
+test('a promotional permit summary adds only promotional status and never claims grant-only funding', () => {
+  const env = Object.fromEntries(CREDIT_SECRET_NAMES.map((key) => [key, 'private-fixture-secret']));
+  const base = allocatedCreditStatus(env);
+  assert.deepEqual(allocatedCreditStatus(env, undefined, null, null, null), base);
+  for (const key of ['promotionalAuthorization', 'promotionalTransport', 'promotionalDetail']) assert.equal(Object.hasOwn(base, key), false);
+  const without = (status) => Object.fromEntries(Object.entries(status).filter(([key]) => !key.startsWith('promotional')));
+  const valid = allocatedCreditStatus(env, undefined, null, null, { state: 'valid', authorizationId: 'pp_1', grantOnly: false, reserveRelease: 'never' });
+  assert.deepEqual(without(valid), base);
+  assert.equal(valid.promotionalTransport, 'owner_authorized_promotional_supervised');
+  assert.equal(valid.promotionalAuthorization.grantOnly, false);
+  assert.match(valid.promotionalDetail, /read-only one-shot runs only/);
+  assert.match(valid.promotionalDetail, /not grant-only/);
+  assert.match(valid.promotionalDetail, /not billing isolation/);
+  assert.match(valid.promotionalDetail, /purchased balance is not authorized/);
+  assert.match(valid.promotionalDetail, /can lag/);
+  assert.match(valid.promotionalDetail, /other clients and dashboard changes are not monitored/);
+  assert.doesNotMatch(valid.promotionalDetail, /\b(guarantee|only promotional|cannot be charged)\b/i);
+  // The prepaid and grant-only views are unchanged by a valid promotional permit.
+  assert.equal(valid.apiTransport, 'implemented_not_activated');
+  for (const info of Object.values(valid.providers)) {
+    assert.equal(info.dispatchAllowed, false);
+    assert.equal(info.blockedReason, 'grant_only_funding_unverified');
+  }
+  const blocked = allocatedCreditStatus(env, undefined, null, null, { state: 'blocked', reason: 'promotional_authorization_missing' });
+  assert.equal(blocked.promotionalTransport, 'implemented_not_activated');
+  assert.match(blocked.promotionalDetail, /authorized_promotional route is blocked/);
+  const prepaid = allocatedCreditStatus(env, undefined, null, { state: 'valid' }, { state: 'blocked', reason: 'promotional_authorization_missing' });
+  assert.equal(prepaid.apiTransport, 'owner_authorized_prepaid_supervised');
+  assert.equal(prepaid.promotionalTransport, 'implemented_not_activated');
+  assert.equal(JSON.stringify([valid, blocked, prepaid]).includes('private-fixture-secret'), false);
 });
 
 test('real server rejects credit claims before CLI/HTTP/session dispatch and records zero invocation', async (t) => {
@@ -102,9 +137,21 @@ test('ordinary child environments drop dedicated credit secrets including case v
 test('CLI setup works offline, never accepts credentials, and distinguishes Codex eligibility', () => {
   const cli = path.resolve(__dirname, '../bin/relaybridge.js');
   const output = execFileSync(process.execPath, [cli, 'credit', 'setup', 'openai', '--json'], {
-    encoding: 'utf8', env: { ...process.env, RELAYBRIDGE_URL: 'http://127.0.0.1:1' },
+    encoding: 'utf8', env: isolatedEnv({ RELAYBRIDGE_URL: 'http://127.0.0.1:1' }),
   });
   const result = JSON.parse(output);
   assert.equal(result.activationAvailable, false);
   assert.match(result.limitation, /excluded/);
+});
+
+test('each provider reports that provider-confirmed grant evidence is unavailable and why', () => {
+  const { allocatedCreditStatus } = require('../lib/allocated-credit');
+  const status = allocatedCreditStatus({});
+  for (const provider of ['openai', 'claude']) {
+    const e = status.providers[provider].providerConfirmedGrantEvidence;
+    assert.equal(e.state, 'unavailable');
+    assert.ok(e.missing.length >= 2 && e.missing.every((m) => typeof m === 'string'), provider);
+    assert.ok(e.missing.some((m) => /per_request_funding_source/.test(m)), provider);
+    assert.equal(status.providers[provider].dispatchAllowed, false);
+  }
 });

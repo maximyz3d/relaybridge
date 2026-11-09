@@ -6,12 +6,13 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
+const { isolatedEnv } = require('./helpers/isolated-env');
 const {
   githubRepoFromOrigin, gitEnvironment, validateCheckoutIdentity, prepareTemplateTargets, publishTemplateTargets,
 } = require('../lib/onboard-safety');
 
 function git(args, opts = {}) {
-  const result = spawnSync('git', args, { ...opts, encoding: 'utf8', windowsHide: true });
+  const result = spawnSync('git', args, { env: isolatedEnv(), ...opts, encoding: 'utf8', windowsHide: true });
   return { code: result.status, stdout: result.stdout || '', stderr: result.stderr || '' };
 }
 function fixture(t) {

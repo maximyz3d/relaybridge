@@ -8,6 +8,7 @@ const os = require('os');
 const path = require('path');
 const { execFile } = require('child_process');
 const { promisify } = require('util');
+const { isolatedEnv } = require('./helpers/isolated-env');
 
 const {
   PHASES,
@@ -420,7 +421,7 @@ test('concurrent restarted processes cannot replace expired workspace ownership'
     catch (error) { process.stdout.write(JSON.stringify({ code: error.code, phase: p.get(process.argv[4]).phase })); }`;
   const results = await Promise.all(contenders.map((id) => promisify(execFile)(process.execPath,
     ['-e', script, require.resolve('../lib/workflow-pipeline'), dataDir, String(clock.value), id],
-    { timeout: 10000, maxBuffer: 8192 })));
+    { timeout: 10000, maxBuffer: 8192, env: isolatedEnv() })));
   for (const result of results) assert.deepEqual(JSON.parse(result.stdout), {
     code: 'WRITER_EXECUTION_UNCERTAIN', phase: 'plan_ready',
   });
@@ -940,4 +941,174 @@ test('malformed or contradictory planning replacement state fails closed on load
   }
   fs.writeFileSync(file, original);
   assert.equal(restart().get(runId).planningReplacement.replacementProvider, 'claude');
+});
+
+// ---- exact workspace lock precedence over shared holder checks (N3) ---------
+function holderFixture(t, options = {}) {
+  const calls = [];
+  let busy = null;
+  const env = fixture(t, { ...options, pipeline: { leaseMs: 100, ...(options.pipeline || {}),
+    externalWriterBusy: (cwd, context) => { calls.push({ cwd, context }); return busy ? busy(cwd, context) : null; } } });
+  env.calls = calls;
+  env.setBusy = (fn) => { busy = fn; };
+  env.lockPath = (runId) => path.join(env.dataDir, 'writer-locks', `${env.pipeline.get(runId).writerLease.cwdSha256}.json`);
+  return env;
+}
+
+test('an exact expired workflow lock reports its own owner, expiry and recovery before any shared holder', (t) => {
+  const env = holderFixture(t);
+  const ownerId = 'wf_exactown_333333333333', nextId = 'wf_exactnext_444444444444';
+  for (const id of [ownerId, nextId]) advanceToPlanReady(env.pipeline, env.cwd, id);
+  const first = env.pipeline.startImplementation(ownerId, { actor: 'codex-a' });
+  const lockPath = env.lockPath(ownerId);
+  const original = fs.readFileSync(lockPath, 'utf8');
+  const lock = JSON.parse(original);
+  // The shared check would report this same lock generically, as server.js does.
+  env.setBusy(() => ({ holder: { kind: 'workflow_writer_lock', runId: ownerId } }));
+  env.calls.length = 0;
+  for (const [advance, code] of [[99, 'WRITER_CONFLICT'], [1, 'WRITER_EXECUTION_UNCERTAIN']]) {
+    env.clock.value += advance;
+    for (const instance of [env.pipeline, env.restart()]) {
+      assert.throws(() => instance.startImplementation(nextId, { actor: 'codex-b' }), (error) => {
+        assert.ok(error instanceof WorkflowPipelineError);
+        assert.equal(error.code, code);
+        const expected = { cwd: lock.cwd, runId: ownerId, actor: 'codex-a', expiresAt: lock.expiresAt,
+          ...(code === 'WRITER_EXECUTION_UNCERTAIN' ? { expired: true, recovery: 'unavailable_unbound_owner' } : {}) };
+        assert.deepEqual(error.details, expected);
+        assert.equal(JSON.stringify(error.details).includes(first.lease.leaseToken), false);
+        assert.equal(error.message.includes(first.lease.leaseToken), false);
+        return true;
+      });
+      assert.equal(fs.readFileSync(lockPath, 'utf8'), original, 'the lock stays byte-for-byte intact');
+      assert.equal(instance.get(nextId).phase, 'plan_ready');
+    }
+  }
+  assert.equal(env.calls.length, 0, 'an exact lock already refuses; no holder is consulted or exempted');
+});
+
+test('without an exact lock every shared overlapping, physical or corrupt holder still refuses', (t) => {
+  const env = holderFixture(t);
+  const runId = 'wf_shared_333333333333';
+  advanceToPlanReady(env.pipeline, env.cwd, runId);
+  const locksDir = path.join(env.dataDir, 'writer-locks');
+  const before = fs.existsSync(locksDir) ? fs.readdirSync(locksDir) : [];
+  for (const holder of [
+    { kind: 'workflow_writer_lock', runId: 'wf_parent_555555555555', cwd: path.dirname(env.cwd) },
+    { kind: 'unified_run', runId: 'ur_fixture' },
+    { kind: 'physical_owner', pid: 4242 },
+    { kind: 'workflow_writer_lock', corrupt: true, cwd: null },
+  ]) {
+    env.calls.length = 0;
+    env.setBusy(() => ({ holder }));
+    assert.throws(() => env.pipeline.startImplementation(runId), (error) => {
+      assert.equal(error.code, 'WRITER_CONFLICT');
+      assert.deepEqual(error.details, { cwd: env.pipeline.get(runId).cwd, holder });
+      return true;
+    });
+    assert.equal(env.calls.length, 1);
+    assert.deepEqual(env.calls[0].context, { runId });
+    assert.deepEqual(fs.existsSync(locksDir) ? fs.readdirSync(locksDir) : [], before, 'no lock is created');
+    assert.equal(env.pipeline.get(runId).phase, 'plan_ready');
+  }
+  env.setBusy(() => true);
+  throwsCode(() => env.pipeline.startImplementation(runId), 'WRITER_CONFLICT');
+  env.setBusy(null);
+  assert.equal(env.pipeline.startImplementation(runId).workflow.phase, 'implementing');
+});
+
+test('a corrupt, symlinked or directory exact lock refuses before shared holders and is preserved', (t) => {
+  const env = holderFixture(t);
+  const ownerId = 'wf_corrupt_333333333333', nextId = 'wf_corruptnext_444444444444';
+  for (const id of [ownerId, nextId]) advanceToPlanReady(env.pipeline, env.cwd, id);
+  env.pipeline.startImplementation(ownerId);
+  const lockPath = env.lockPath(ownerId);
+  const target = path.join(env.root, 'elsewhere.json');
+  fs.copyFileSync(lockPath, target);
+  env.calls.length = 0;
+  env.setBusy(() => ({ holder: { kind: 'unified_run' } }));
+  fs.writeFileSync(lockPath, '{corrupt fixture');
+  throwsCode(() => env.pipeline.startImplementation(nextId), 'LOCK_CORRUPT');
+  assert.equal(fs.readFileSync(lockPath, 'utf8'), '{corrupt fixture');
+  fs.unlinkSync(lockPath); fs.symlinkSync(target, lockPath);
+  throwsCode(() => env.pipeline.startImplementation(nextId), 'LOCK_CORRUPT');
+  assert.ok(fs.lstatSync(lockPath).isSymbolicLink());
+  fs.unlinkSync(lockPath); fs.mkdirSync(lockPath);
+  throwsCode(() => env.pipeline.startImplementation(nextId), 'LOCK_CORRUPT');
+  assert.ok(fs.lstatSync(lockPath).isDirectory());
+  assert.equal(env.calls.length, 0);
+  assert.equal(env.pipeline.get(nextId).phase, 'plan_ready');
+});
+
+test('an exact lock released during the preflight read still faces every shared holder check', (t) => {
+  const env = holderFixture(t);
+  const ownerId = 'wf_preown_333333333333', nextId = 'wf_prenext_444444444444';
+  for (const id of [ownerId, nextId]) advanceToPlanReady(env.pipeline, env.cwd, id);
+  const first = env.pipeline.startImplementation(ownerId);
+  const lockPath = env.lockPath(ownerId);
+  const original = fs.lstatSync;
+  let armed = true;
+  fs.lstatSync = function (file, ...args) {
+    if (String(file) === lockPath && armed) {
+      armed = false;
+      env.pipeline.completeImplementation(ownerId, { leaseToken: first.lease.leaseToken,
+        markdown: 'The original writer explicitly finished before the contender inspected its lock.' });
+    }
+    return original.call(this, file, ...args);
+  };
+  env.calls.length = 0;
+  env.setBusy(() => ({ holder: { kind: 'unified_run' } }));
+  try { throwsCode(() => env.pipeline.startImplementation(nextId), 'WRITER_CONFLICT'); }
+  finally { fs.lstatSync = original; }
+  assert.equal(armed, false);
+  assert.equal(env.calls.length, 1, 'the shared check ran once the exact lock was gone');
+  assert.equal(fs.existsSync(lockPath), false);
+  env.setBusy(null);
+  assert.equal(env.pipeline.startImplementation(nextId).workflow.phase, 'implementing');
+});
+
+test('a lock that appears after the preflight is still refused or retried through the exclusive create', (t) => {
+  const env = holderFixture(t);
+  const ownerId = 'wf_raceown_333333333333', nextId = 'wf_racenext_444444444444';
+  for (const id of [ownerId, nextId]) advanceToPlanReady(env.pipeline, env.cwd, id);
+  const first = env.pipeline.startImplementation(ownerId, { actor: 'codex-a' });
+  const lockPath = env.lockPath(ownerId);
+  const raced = fs.readFileSync(lockPath, 'utf8');
+  const lock = JSON.parse(raced);
+  env.pipeline.completeImplementation(ownerId, { actor: 'codex-a', leaseToken: first.lease.leaseToken,
+    markdown: 'The original writer finished; its lock bytes are replayed below as a racing writer.' });
+  assert.equal(fs.existsSync(lockPath), false);
+  // A racing writer publishes its lock between the preflight and the exclusive create.
+  const race = () => { env.setBusy(() => { env.setBusy(null); fs.writeFileSync(lockPath, raced, { mode: 0o600 }); return null; }); };
+  race();
+  assert.throws(() => env.pipeline.startImplementation(nextId), (error) => {
+    assert.equal(error.code, 'WRITER_CONFLICT');
+    assert.deepEqual(error.details, { cwd: lock.cwd, runId: ownerId, actor: 'codex-a', expiresAt: lock.expiresAt });
+    return true;
+  });
+  assert.equal(fs.readFileSync(lockPath, 'utf8'), raced);
+  fs.unlinkSync(lockPath);
+  env.clock.value = lock.expiresAt;
+  race();
+  assert.throws(() => env.pipeline.startImplementation(nextId), (error) => {
+    assert.equal(error.code, 'WRITER_EXECUTION_UNCERTAIN');
+    assert.deepEqual(error.details, { cwd: lock.cwd, runId: ownerId, actor: 'codex-a', expiresAt: lock.expiresAt,
+      expired: true, recovery: 'unavailable_unbound_owner' });
+    return true;
+  });
+  assert.equal(fs.readFileSync(lockPath, 'utf8'), raced, 'an expired raced lock is never released');
+  fs.unlinkSync(lockPath);
+  // The raced lock disappears again before the EEXIST read: creation retries.
+  race();
+  const original = fs.lstatSync;
+  let lstats = 0;
+  fs.lstatSync = function (file, ...args) {
+    if (String(file) === lockPath && ++lstats === 2) fs.unlinkSync(lockPath);
+    return original.call(this, file, ...args);
+  };
+  let next;
+  try { next = env.pipeline.startImplementation(nextId); }
+  finally { fs.lstatSync = original; }
+  assert.equal(lstats, 2, 'preflight read, then the EEXIST read');
+  assert.equal(next.workflow.phase, 'implementing');
+  assert.equal(JSON.parse(fs.readFileSync(lockPath, 'utf8')).runId, nextId);
 });

@@ -4,8 +4,6 @@ const fs = require('node:fs'), path = require('node:path');
 const { startTestBridge, completeJsonLines } = require('./helpers/temporary-bridge');
 const { readClaudeNativeUsage } = require('../lib/native-usage');
 const { createSubscriptionUsage } = require('../lib/subscription-usage');
-const inheritedBridgeKeys = Object.keys(process.env).filter((key) => /^(RELAYBRIDGE_|PS_BRIDGE_)/.test(key));
-const unsetBridgeEnv = Object.fromEntries(inheritedBridgeKeys.map((key) => [key, undefined]));
 
 // Trimmed variant of test/continuity.integration.test.js's nativeClaudeFixture.
 //
@@ -90,7 +88,7 @@ async function staleNativeFixture(t, { initialUtilization = 20, initialResetOffs
       oneshot_safe_filesystem_policy: 'read_only_enforced', oneshot_capabilities: { safe: ['model_invocation', 'workspace_read', 'tool_use'] } };
     if (probeMode) entry.native_usage_probe = { enabled: true, command: [process.execPath, probeScript], timeout_ms: 2500 };
     return { _models: { discoverOnBoot: false }, claude: entry };
-  }, { env: { ...unsetBridgeEnv, RELAYBRIDGE_WARM_DIAG: '0', RELAYBRIDGE_REMOTE_MCP: '0', PTY_MODE: 'auto' } });
+  }, { env: { RELAYBRIDGE_WARM_DIAG: '0', RELAYBRIDGE_REMOTE_MCP: '0', PTY_MODE: 'auto' } });
   return { ...bridge, profile, events, usageFile,
     ask: (extra = {}) => bridge.request('/api/oneshot',
       { kind: 'claude', cwd: bridge.root, prompt: 'Complete synthetic protocol.', dangerous: false, modelTier: 'standard', effort: 'medium', useCache: false, ...extra }) };
