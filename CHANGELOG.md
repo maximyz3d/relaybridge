@@ -1,3 +1,6 @@
+## v2.6.1 - 2026-11-09
+- #154 feat(credits): local spend ledger and fail-closed credit fallback for included/prepaid API credits
+
 ## v2.6.0 - 2026-10-30
 - #153 feat(credits): add mode controls and Codex RelayBridge options
 
